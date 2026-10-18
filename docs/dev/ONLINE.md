@@ -571,7 +571,7 @@ modal; pad, keyboard, mouse and touch):
   click, or Up from the top row and Cross). Settings → Online has **Download
   update** (the dialog) and **Release notes**.
 
-**Downloads.** Every GitHub Release carries copies of its packages under
+**Downloads.** Every GitHub Release carries its packages under
 stable names, so `https://github.com/<owner>/<repo>/releases/latest/download/<name>`
 is always the newest:
 

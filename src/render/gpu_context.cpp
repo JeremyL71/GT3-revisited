@@ -31,7 +31,28 @@ std::unique_ptr<GpuContext> GpuContext::create(SDL_Window* window, const GpuOpti
 
 bool GpuContext::init(SDL_Window* window, const GpuOptions& options) {
 #if GT3R_HAVE_GPU_RENDERER
-    device_ = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_MSL, options.debug, nullptr);
+    // Ask only for the optional Vulkan features the renderer uses. SDL requests clip distances,
+    // depth clamping and first-instance indirect draws by default, and rejects every GPU without
+    // them, e.g. Mali (Pixel, Galaxy, Tensor phones), which lacks shaderClipDistance. We clip
+    // depth normally, draw directly and write no clip distances. Anisotropic filtering is the one
+    // we use: a GPU without it gets a second try with it off (anisotropy_ = false).
+    for (bool aniso : {true, false}) {
+        SDL_PropertiesID props = SDL_CreateProperties();
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, options.debug);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_CLIP_DISTANCE_BOOLEAN, false);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_DEPTH_CLAMPING_BOOLEAN, false);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_INDIRECT_DRAW_FIRST_INSTANCE_BOOLEAN, false);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_ANISOTROPY_BOOLEAN, aniso);
+        device_ = SDL_CreateGPUDeviceWithProperties(props);
+        SDL_DestroyProperties(props);
+        if (device_) {
+            anisotropy_ = aniso;
+            if (!aniso) LOG_INFO("3D renderer: anisotropic filtering unavailable on this GPU");
+            break;
+        }
+    }
     if (!device_) {
         LOG_WARN("No SDL_GPU device: %s", SDL_GetError());
         return false;
@@ -66,8 +87,8 @@ bool GpuContext::init(SDL_Window* window, const GpuOptions& options) {
         si.address_mode_v = (i & 2) ? SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE : SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
         si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
         si.max_lod = 1000.0f;
-        si.enable_anisotropy = true;
-        si.max_anisotropy = 4;
+        si.enable_anisotropy = anisotropy_;
+        si.max_anisotropy = anisotropy_ ? 4.0f : 1.0f;
         samplers_[i] = SDL_CreateGPUSampler(device_, &si);
         if (!samplers_[i]) {
             LOG_WARN("Sampler creation failed: %s", SDL_GetError());

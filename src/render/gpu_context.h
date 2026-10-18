@@ -96,6 +96,7 @@ private:
     void release_pipelines();
 
     SDL_GPUDevice* device_ = nullptr;
+    bool anisotropy_ = true; // the device was created with anisotropic filtering
     float render_scale_ = 1.0f;
     SDL_Renderer* renderer_ = nullptr;
     SDL_GPUShader* vs_ = nullptr;

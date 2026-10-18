@@ -17,7 +17,7 @@ on:
 # Release packages (job `package`, on tags v* and manual runs) build SDL from
 # source so they run without a system SDL. They contain no game data. On a
 # v* tag, job `release` collects them into a draft GitHub Release with
-# SHA256SUMS and build provenance attestations, plus copies under stable names
+# SHA256SUMS and build provenance attestations, one file per platform under a stable name
 # (gt3r-<platform>.<ext>) for .../releases/latest/download/; review it, then publish.
 
 jobs:
@@ -173,11 +173,14 @@ jobs:
       id-token: write     # sign the provenance attestations
       attestations: write
     steps:
+      # Only this tag's packages (gt3r-<tag>-*), not the CI builds (gt3r-android-debug).
       - uses: actions/download-artifact@v4
         with:
           path: assets
+          pattern: gt3r-${{ github.ref_name }}-*
           merge-multiple: true
-      # Copies under stable names, so https://github.com/<owner>/<repo>/releases/latest/download/<name>
+      # Renamed to stable names (the release itself carries the version), so
+      # https://github.com/<owner>/<repo>/releases/latest/download/<name>
       # always fetches the newest package (the game's "Download update" uses these; docs/dev/ONLINE.md
       # "Versions and updates"): gt3r-windows-x64.zip, gt3r-macos-arm64.zip, gt3r-linux-x86_64.tar.gz,
       # gt3r-android.apk (only when the APK was built).
@@ -186,7 +189,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          for f in "gt3r-$TAG-"*; do cp "$f" "gt3r-${f#gt3r-$TAG-}"; done
+          for f in "gt3r-$TAG-"*; do mv "$f" "gt3r-${f#gt3r-$TAG-}"; done # one file per platform
           ls -l
       - name: Checksums
         working-directory: assets

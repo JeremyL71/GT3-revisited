@@ -63,7 +63,7 @@ certificate, so the first launch needs one extra step:
   and allow installing from that source when asked. In countries where
   Android requires verified developers for sideloaded apps, use Android's
   advanced install flow for unverified apps (Developer options) or install
-  with `adb install gt3r-<version>-android.apk`.
+  with `adb install gt3r-android.apk`.
 
 Direct links to the newest release, always the same:
 [gt3r-windows-x64.zip](https://github.com/matt-pulsipher/GT3-revisited/releases/latest/download/gt3r-windows-x64.zip),
