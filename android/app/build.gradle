@@ -1,0 +1,88 @@
+plugins {
+    id 'com.android.application'
+}
+
+// SDL3's Java glue and native sources come from one SDL checkout so the two
+// always match. fetch-sdl.sh (or fetch-sdl.ps1) creates it.
+def sdlDir = file(project.findProperty('SDL_DIR') ?: "${rootDir}/third_party/SDL")
+if (!file("${sdlDir}/android-project").exists()) {
+    throw new GradleException("SDL3 source not found at ${sdlDir}. Run android/fetch-sdl.sh first.")
+}
+
+// The game's version comes from the top-level CMakeLists.txt (project(... VERSION x.y.z)),
+// the single source: versionName is "x.y.z", versionCode x*10000 + y*100 + z (minor and
+// patch stay below 100), so every release has a higher code than the one before.
+def gt3rVersion = {
+    def m = file('../../CMakeLists.txt').text =~ /project\(GT3Revisited VERSION (\d+)\.(\d+)\.(\d+)/
+    if (!m.find()) throw new GradleException('No project(GT3Revisited VERSION x.y.z) in CMakeLists.txt')
+    def v = [m.group(1) as int, m.group(2) as int, m.group(3) as int]
+    if (v[1] > 99 || v[2] > 99) throw new GradleException("Version ${v.join('.')}: minor and patch must stay below 100")
+    return v
+}()
+
+android {
+    namespace 'org.gt3revisited.gt3r'
+    compileSdk 35
+    ndkVersion '27.0.12077973'
+
+    defaultConfig {
+        applicationId 'org.gt3revisited.gt3r'
+        minSdk 24
+        targetSdk 35
+        versionCode gt3rVersion[0] * 10000 + gt3rVersion[1] * 100 + gt3rVersion[2]
+        versionName gt3rVersion.join('.')
+        externalNativeBuild {
+            cmake {
+                arguments '-DANDROID_STL=c++_static',
+                          "-DFETCHCONTENT_SOURCE_DIR_SDL3=${sdlDir}",
+                          '-DGT3R_BUILD_TOOLS=OFF', '-DGT3R_BUILD_TESTS=OFF',
+                          // 16 KB page devices (Android 15+): 16 KB-aligned LOAD segments
+                          '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
+                abiFilters 'arm64-v8a', 'x86_64'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('../../CMakeLists.txt')
+            version '3.22.1+'
+        }
+    }
+
+    sourceSets.main.java.srcDirs += "${sdlDir}/android-project/app/src/main/java"
+
+    // Release signing: the project's own key (android/make-release-key.sh), never
+    // committed. CI writes it from secrets; locally, set the same variables.
+    def keystore = System.getenv('GT3R_KEYSTORE')
+    signingConfigs {
+        if (keystore) {
+            release {
+                storeFile file(keystore)
+                storePassword System.getenv('GT3R_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('GT3R_KEY_ALIAS') ?: 'gt3r'
+                keyPassword System.getenv('GT3R_KEY_PASSWORD') ?: System.getenv('GT3R_KEYSTORE_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        // The engine is far too slow unoptimised (menus took ~45 s to load on a
+        // phone), so debug APKs build the native code like the desktop default:
+        // optimised with debug info. The APK itself stays debuggable.
+        debug {
+            externalNativeBuild {
+                cmake {
+                    arguments '-DCMAKE_BUILD_TYPE=RelWithDebInfo'
+                }
+            }
+        }
+        release {
+            minifyEnabled false
+            if (keystore) signingConfig signingConfigs.release // otherwise an unsigned APK
+        }
+    }
+    lint {
+        abortOnError false
+    }
+}

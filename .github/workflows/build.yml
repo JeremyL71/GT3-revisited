@@ -1,0 +1,204 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: # also builds the release packages
+
+
+# Desktop: build the game, gt3tool and the unit tests on all three desktop
+# platforms and run the tests that need no disc image.
+# Android: build the debug APK (arm64-v8a + x86_64) with the pinned NDK.
+#
+# SDL 3.4.12 and zlib are fetched by CMake (cmake/Dependencies.cmake) when the
+# runner has no system package. Shaders are compiled offline and committed
+# (src/render/shaders/generated), so no shader tools are needed here.
+#
+# Release packages (job `package`, on tags v* and manual runs) build SDL from
+# source so they run without a system SDL. They contain no game data. On a
+# v* tag, job `release` collects them into a draft GitHub Release with
+# SHA256SUMS and build provenance attestations, plus copies under stable names
+# (gt3r-<platform>.<ext>) for .../releases/latest/download/; review it, then publish.
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux SDL build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+            libwayland-dev libdecor-0-dev libxkbcommon-dev libegl1-mesa-dev libdrm-dev libgbm-dev \
+            libudev-dev libdbus-1-dev zlib1g-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build game, tools and tests
+        run: cmake --build build --config Release --parallel 4 --target gt3r gt3tool gt3r_tests
+      - name: Unit tests (no disc image)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 21
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;27.0.12077973" "cmake;3.22.1" > /dev/null
+      - name: Fetch SDL
+        run: android/fetch-sdl.sh
+      - name: Build APK
+        working-directory: android
+        run: ./gradlew --no-daemon assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gt3r-android-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+
+  package:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: macos-arm64
+          - os: windows-2022
+            name: windows-x64
+          - os: ubuntu-22.04 # older glibc: runs on more distributions
+            name: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    env:
+      PKG: gt3r-${{ github.ref_name }}-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux SDL build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+            libwayland-dev libdecor-0-dev libxkbcommon-dev libegl1-mesa-dev libdrm-dev libgbm-dev \
+            libudev-dev libdbus-1-dev zlib1g-dev
+      - name: Configure
+        shell: bash
+        run: |
+          extra=""
+          if [ "$RUNNER_OS" = "Windows" ]; then extra="-DGT3R_SDL_SHARED=ON"; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then extra="-DCMAKE_OSX_DEPLOYMENT_TARGET=12.0"; fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGT3R_FETCH_SDL=ON -DGT3R_BUILD_TESTS=OFF $extra
+      - name: Build
+        run: cmake --build build --config Release --parallel 4 --target gt3r gt3tool
+      - name: Install
+        run: cmake --install build --config Release --prefix "dist/${{ env.PKG }}"
+      - name: Archive (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent "dist/$PKG" "$PKG.zip"
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/$env:PKG" -DestinationPath "$env:PKG.zip"
+      - name: Archive (Linux)
+        if: runner.os == 'Linux'
+        run: tar -C dist -czf "$PKG.tar.gz" "$PKG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: |
+            ${{ env.PKG }}.zip
+            ${{ env.PKG }}.tar.gz
+          if-no-files-found: error
+
+  package-android:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 21
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;27.0.12077973" "cmake;3.22.1" > /dev/null
+      - name: Fetch SDL
+        run: android/fetch-sdl.sh
+      # Signed with the project's release key (secrets from android/make-release-key.sh):
+      # the same key on every release, so installed copies update in place.
+      # Without the key the release goes out without an APK (a warning, not a failure).
+      - name: Build APK (release key)
+        id: apk
+        working-directory: android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          GT3R_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set: no APK in this release (android/README.md, Release signing)"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/gt3r-release.jks"
+          GT3R_KEYSTORE="$RUNNER_TEMP/gt3r-release.jks" ./gradlew --no-daemon assembleRelease
+          rm -f "$RUNNER_TEMP/gt3r-release.jks"
+          echo "built=true" >> "$GITHUB_OUTPUT"
+      - name: Rename
+        if: steps.apk.outputs.built == 'true'
+        run: cp android/app/build/outputs/apk/release/app-release.apk "gt3r-${{ github.ref_name }}-android.apk"
+      - uses: actions/upload-artifact@v4
+        if: steps.apk.outputs.built == 'true'
+        with:
+          name: gt3r-${{ github.ref_name }}-android
+          path: gt3r-${{ github.ref_name }}-android.apk
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package, package-android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write     # create the release
+      id-token: write     # sign the provenance attestations
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      # Copies under stable names, so https://github.com/<owner>/<repo>/releases/latest/download/<name>
+      # always fetches the newest package (the game's "Download update" uses these; docs/dev/ONLINE.md
+      # "Versions and updates"): gt3r-windows-x64.zip, gt3r-macos-arm64.zip, gt3r-linux-x86_64.tar.gz,
+      # gt3r-android.apk (only when the APK was built).
+      - name: Stable names
+        working-directory: assets
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          for f in "gt3r-$TAG-"*; do cp "$f" "gt3r-${f#gt3r-$TAG-}"; done
+          ls -l
+      - name: Checksums
+        working-directory: assets
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+      # Anyone can check a download came from this workflow:
+      #   gh attestation verify <file> --repo <owner>/<repo>
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: assets/gt3r-*
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" assets/* --repo "${{ github.repository }}" \
+            --draft --generate-notes --title "GT3 Revisited ${{ github.ref_name }}"

@@ -1,0 +1,31 @@
+# Never commit game data
+*.iso
+*.ISO
+*.bin
+*.img
+*.vol
+*.VOL
+*.7z
+*.zip
+*.chd
+*.cso
+extracted/
+dump/
+
+build*/
+.DS_Store
+.vscode/
+.idea/
+*.user
+android/app/build/
+android/.gradle/
+*.log
+__pycache__/
+*.pyc
+.cache/
+compile_commands.json
+dist/
+
+# Signing keys
+*.jks
+*.keystore

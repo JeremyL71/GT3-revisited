@@ -1,0 +1,147 @@
+#include "formats/course/course_model.h"
+
+#include "formats/model/gtm1.h"
+
+#include <cmath>
+
+namespace gt3r::course {
+
+Course load_course(ByteSpan data) {
+    Course c;
+    c.file = CourseFile::parse(data);
+    ByteSpan road = c.file.section(data, kSlotRoad);
+    if (!road.empty()) c.road = Road::parse(road);
+    ByteSpan ai = c.file.section(data, kSlotAiLines);
+    if (!ai.empty()) {
+        c.ai = AiLines::parse(ai);
+        c.ai.project(c.road);
+    }
+    return c;
+}
+
+void append_model(scene::Model& dst, scene::Model&& src) {
+    int base = int(dst.textures.size());
+    for (scene::Texture& t : src.textures) dst.textures.push_back(std::move(t));
+    for (scene::Mesh& m : src.meshes) {
+        for (scene::Primitive& p : m.primitives)
+            if (p.texture >= 0) p.texture += base;
+        dst.meshes.push_back(std::move(m));
+    }
+}
+
+namespace {
+
+scene::Model gtm1_model(ByteSpan block, const CourseModelOptions& opt, const std::string& name) {
+    gtm1::Gtm1 g = gtm1::Gtm1::parse(block);
+    if (!opt.reflections)
+        for (gtm1::Chunk& c : g.chunks)
+            if (c.flags & 4) c.packets.clear(); // env-mapped second pass over the same vertices
+    gtm1::Options o;
+    o.run.lod = opt.lod;
+    o.textures = opt.textures;
+    o.reflection = opt.reflections;
+    o.road_sheen = opt.reflections;
+    o.frame_alpha = opt.frame_alpha;
+    o.alpha_test = true;
+    o.gs_state = true;
+    scene::Model m = gtm1::build_model(g, o, name);
+    for (scene::Mesh& mesh : m.meshes) mesh.name = name + "/" + mesh.name;
+    return m;
+}
+
+u32 surface_color(u32 surface) {
+    switch (surface) {
+    case 0: return 0xFF808080u; // u32 0xAABBGGRR (bytes R,G,B,A); 0 = plain road
+    case 1: return 0xFF4060C0u;
+    case 8: return 0xFF3030C0u;
+    case 16: return 0xFF30A0E0u;
+    case 17: return 0xFF2080F0u;
+    case 24: return 0xFF40B040u;
+    default: return 0xFFC000C0u;
+    }
+}
+
+} // namespace
+
+scene::Mesh make_road_mesh(const Road& road) {
+    scene::Mesh mesh;
+    mesh.name = "road";
+    for (const RoadSegment& s : road.segments) {
+        for (const RoadTriangle& t : s.triangles) {
+            const Vec3* v[3] = {&s.vertices[t.a], &s.vertices[t.b], &s.vertices[t.c]};
+            u32 base = u32(mesh.vertices.size());
+            for (const Vec3* p : v) {
+                scene::Vertex sv;
+                sv.pos[0] = p->x;
+                sv.pos[1] = p->y + 0.05f;
+                sv.pos[2] = p->z;
+                sv.normal[1] = 1;
+                sv.color = surface_color(t.surface);
+                mesh.vertices.push_back(sv);
+            }
+            mesh.indices.insert(mesh.indices.end(), {base, base + 1, base + 2});
+        }
+    }
+    mesh.primitives.push_back({0, u32(mesh.indices.size()), -1, scene::kUnlit | scene::kDoubleSided});
+    return mesh;
+}
+
+scene::Mesh make_ribbon(const std::vector<Vec3>& pts, float width, u32 color, float lift, const std::string& name) {
+    scene::Mesh mesh;
+    mesh.name = name;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        const Vec3& a = pts[i > 0 ? i - 1 : i];
+        const Vec3& b = pts[i + 1 < pts.size() ? i + 1 : i];
+        float dx = b.x - a.x, dz = b.z - a.z, len = std::hypot(dx, dz);
+        if (len < 1e-6f) dx = 1, dz = 0, len = 1;
+        float nx = -dz / len * width * 0.5f, nz = dx / len * width * 0.5f;
+        for (int side = -1; side <= 1; side += 2) {
+            scene::Vertex v;
+            v.pos[0] = pts[i].x + side * nx;
+            v.pos[1] = pts[i].y + lift;
+            v.pos[2] = pts[i].z + side * nz;
+            v.normal[1] = 1;
+            v.color = color;
+            mesh.vertices.push_back(v);
+        }
+        if (i > 0) {
+            u32 k = u32(i * 2);
+            mesh.indices.insert(mesh.indices.end(), {k - 2, k - 1, k, k - 1, k + 1, k});
+        }
+    }
+    mesh.primitives.push_back({0, u32(mesh.indices.size()), -1, scene::kUnlit | scene::kDoubleSided});
+    return mesh;
+}
+
+scene::Model build_course_model(ByteSpan data, const CourseModelOptions& opt, const std::string& name) {
+    CourseFile file = CourseFile::parse(data);
+    scene::Model model;
+    model.name = name;
+    auto add = [&](int slot, const char* label) {
+        ByteSpan s = file.section(data, slot);
+        if (s.empty() || !gtm1::Gtm1::is_gtm1(s)) return;
+        append_model(model, gtm1_model(s, opt, label));
+    };
+    if (opt.scenery) add(kSlotScenery, "scenery");
+    if (opt.scenery2) add(kSlotScenery2, "scenery2");
+    if (opt.extras) add(27, "extra27");
+    if (opt.road_reflection) add(9, "reflection");
+    if (opt.road_reflection_mask) add(13, "reflection_mask");
+    if (opt.backdrop) add(kSlotBackdrop, "backdrop");
+    if (opt.sky_object) add(kSlotSkyObject, "sky_object");
+    if (opt.sky) add(kSlotSky, "sky");
+    if (opt.sky_low) add(kSlotSky2, "sky2");
+    if (opt.road_mesh || opt.ai_lines) {
+        Course c = load_course(data);
+        if (opt.road_mesh) model.meshes.push_back(make_road_mesh(c.road));
+        if (opt.ai_lines) {
+            model.meshes.push_back(make_ribbon(c.road.centre_line(), 0.6f, 0xFFFFFF00u, 0.2f, "centre_line"));
+            if (!c.ai.lines.empty() && !c.ai.lines[0].points.empty())
+                model.meshes.push_back(make_ribbon(c.ai.lines[0].sample(c.road, 2.0f), 1.2f, 0xFF0000FFu, 0.3f, "ai_line0"));
+        }
+    }
+    model.compute_bounds();
+    return model;
+}
+
+} // namespace gt3r::course

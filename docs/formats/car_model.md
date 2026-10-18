@@ -1,0 +1,361 @@
+# Car and wheel models (GTM1)
+
+Implemented in `src/formats/model/` (`gtm1.*`, `car_model.*`, `wheel_model.*`)
+with the generic VIF/GIF helpers in `src/formats/ps2/vif.*`.
+Status: geometry, UVs, normals/colours, LODs, texture binding, paint colours
+and wheel placement are decoded for every car and wheel: `gt3tool model-survey`
+decodes 2073/2073 files (859 `cars/*` files at 3 LODs, 287 `menu/cars`, 464
+`wheel`, 463 `menu/wheel`; 4 empty placeholders skipped). Tyres are generated,
+as the game does. Open: the render-state ops, chunk flag high byte, time-of-day
+differences.
+
+Sources: own analysis of the disc data, rendering comparisons with the original, and the course format work
+(opcode table).
+
+All values are little endian. Positions are IEEE floats in metres.
+
+## Car file: `cars/{day,eve,night}/<id>` (gzip)
+
+The ids are listed one per line in `cars/.list` (287 lines). `ho0100` is an
+empty (0-byte) placeholder in all three folders (the C++ `Volume` fails to
+inflate these 0-byte gzip members; see the final report). `day`, `eve` and
+`night` share the layout. The race picks the folder by time of day.
+`eve`/`night` GTM1s are identical to each other for 285 cars and differ from
+`day` (re-baked darker palettes, one more texture per set, more materials).
+`menu/cars/<id>` is the same container with a smaller, single-texture-set
+model.
+
+```
+0x00 u32 0              offset of this header
+0x04 u32 0x40           "GTCI" car info
+0x08 u32                "GTM1" body model
+0x0C u32                "GTTR" tyre
+0x10 u32                "GTTW" wheel
+0x14 u32                end of data (file size - 64)
+0x18..0x3F 0
+end: 64 bytes, "dummy" + zeros
+```
+All 859 non-empty car files match this exactly.
+
+### GTCI (car info)
+
+```
+0x00 "GTCI"  0x0C u32 size
+0x10 a few u32/float pairs, then a table of (u32 count, u32 offset) groups
+```
+followed by 0x80-byte records holding a 3x4 matrix, a position and
+parameters. In `am0006` they are: 6 tail lamps (z ≈ -2.05..-2.16), 4 head
+lamps (z ≈ +2.38), 2 more front points, then camera-like records (position,
+two angles in degrees, a float near 1.2..1.7 and a type code 3/7/0xA/0xD/0xF).
+Wheel positions were **not** found here.
+
+### GTTR (tyre)
+
+```
+0x00 "GTTR"  0x0C u32 size  0x10 u32 texture repeats around the tread (2 or 1)
+0x14 u32 flags (0, 1, 3)  0x18 f32 8.0  0x1C u32 0x20 (Tex1 offset)
+0x20 Tex1 set (one 128x64 T4 texture: tread in the top half, sidewall lettering below)
+```
+The `tire/n1..n49` files have the same structure; the embedded one equals
+`tire/n1`. There is no tyre geometry: the game builds a ring mesh (18/12/8
+segments for LOD 0-2, a disc for LOD 3) from the size parameters. The decoder
+generates a 32-segment tread band + sidewalls.
+
+### GTTW (wheel) — also `wheel/<id>`
+
+```
+0x00 "GTTW"  0x0C u32 size  0x10 u32 flags (0 or 8)  0x1C u32 0x20 (GTM1 offset)
+0x20 GTM1 model
+```
+Section 4 of a car file is byte-identical to `wheel/<id>`. There are 464 wheel
+files: one per car and aftermarket rims (`enw001_s` and similar; the suffix is
+probably the colour). The GTM1 holds only the **rim** at unit scale (lip
+radius ≈ 1.0, outer face at x = 0 pointing -X, barrel to x ≈ +0.17), i.e. a
+left-hand wheel. Wheels have 1 node with 4 LODs and 6 texture-LOD/variant
+tables (+0x34). Their textured packets use the runtime texture slot (`mat`
+texture field 0x1FF, set with op 0x29); the decoder uses the first texture of
+the current set (the rim image). GTTW +0x10 flags: bit 0 = texture set per
+axle, bit 1 = left/right variants, bit 2 = right wheel mirrored (asymmetric
+spokes), bit 3 = no variants (medium confidence).
+
+## GTM1 model
+
+Offsets are relative to the `GTM1` magic. Pointer fields are relocated in
+place by the game (header `+0x04` holds the relocation base at run time).
+
+```
+0x00 "GTM1"
+0x10 u16 node count            0x20 u32 -> u32 node program offsets[]
+0x12 u16 chunk count           0x24 u32 -> u32 chunk offsets[]
+0x14 u16 material count        0x28 u32 -> material records (0x50 bytes each)
+0x16 u16 texture set count     0x2C u32 -> u32 Tex1 offsets[] (0 = empty slot)
+0x18 u16 texture LOD count     0x30 u32 -> bounding spheres, 16 bytes per node (centre xyz, radius)
+0x1A u16 count for 0x38        0x34 u32 -> per-texture-LOD tables of Tex1 offsets (0 for cars)
+                               0x38 u32 -> ? (cars: 0x1E0, small table)
+                               0x3C u32 -> texture animation list (0 for cars)
+```
+
+Car bodies have 7 nodes. Node 0 is the body (3 LODs, or 4 for a few cars).
+Node 1 is the light shadow: a band at roof-outline height (alpha 0 at the outer
+edge), skirts down to y = 0 and a footprint cap; the race draws it sheared
+along the light in the car's ground frame (x' = x + d.x·y, y' = 0, z' = z +
+d.z·y). Node 6 is the contact shadow: the footprint at y = 0, alpha fading to
+a 0 rim, drawn unsheared. Both use shape type 5 packets (positions, an RGBA
+byte per vertex whose alpha is the coverage, no normals): colour = clamp(bias
++ byte·scale), with the bias = the course's Env0 +0xA60 shadow colour and
+alpha = vertex alpha × Env0 +0xA6C (× a road-shade factor F for node 1,
+Env0 +0xAB0/+0xAB8), normal alpha blend, no depth writes, lifted 2 cm with a
+small depth bias. Node 5 is not a shadow: two flat textured quads ahead of
+the nose (texture set 4 on the R34), the headlamp pool, drawn additively only
+when Env0 +0x58 is non-zero (night and dusk courses). Nodes 2..4 are empty
+(`00`). Each has 3 or 4 LODs. Op 0x07 picks the LOD from the projected size of a sphere (always radius
+3.0 on disc); car models use 3 levels. Wheels have 1 node with 4 LODs. Every car has 4 texture sets, one per
+body LOD plus one for the shadow.
+
+### Node programs
+
+These are byte-coded programs with unaligned little-endian operands, run when
+the node is drawn. Operand sizes (bytes after the opcode); all
+1323 car/wheel programs parse with them and every jump lands on an opcode:
+
+| op | operands | meaning |
+|---|---|---|
+| 00 | 0 | end |
+| 01 | 0 | no-op |
+| 02 / 03 | u8 / u16 | call node |
+| 04 / 05 | u8 / u16 | draw chunk |
+| 06 | s16, u8 n, s16 rel[n] | switch on a runtime selector (e.g. lamp on/off variants); out of range = skip |
+| 07 | 16 B sphere, u8 n, s16 rel[n] | LOD switch, branch = min(lod, n-1) |
+| 08 / 09 | s8 / s16 | relative jump |
+| 0A | u8 n, n×12 B points, s16 skip | bounding-box cull; skip if fully outside |
+| 0B | 0 | end of culled block (re-enable clipping) |
+| 0C / 0D | 0 | push / pop matrix |
+| 0E | u8 | |
+| 0F / 10 | 64 B | load / multiply 4x4 matrix (row vectors, v' = v·M) |
+| 11 / 12 | 12 B | translate / scale |
+| 13 | 16 B | axis + angle rotation |
+| 14 / 15 / 16 | f32 | rotate about X / Y / Z (degrees) |
+| 17, 18, 1A, 1B, 1D, 1E, 22, 23, 25, 26, 2D, 2E, 30 | 0 | render state toggles |
+| 19, 1F, 29, 2A, 2F | u8 | render state |
+| 1C, 20 | u8 u8 | render state |
+| 21, 24, 32, 36 | 4 B | render state (24: inverted u32 colour; 32 / 36: f32 reflection rows C1 / C0, below) |
+| 27, 34 | f32 | |
+| 28, 33, 37 | 16 B | (33 / 37: vec4 reflection rows C1 / C0, e.g. 0.8,0.8,0.8,0) |
+| 31 | 12 B | |
+| 2B / 2C | u8 / u16 | select texture set (index into 0x2C, or the 0x34 table of the active texture LOD) |
+| 35 | u16 base, u16 count | draw an animated chunk range (morphing parts, e.g. pop-up lamps) |
+
+Render-state ops that matter for cars (each sets GS drawing state):
+
+| op | GS state | car usage |
+|---|---|---|
+| 1A / 1B | TEST.ATE on / off | on for body passes, off for reflection passes |
+| 1C a, r | TEST.ATST = a, AREF = r | (6 GREATER, 0x20) by default; (6, 0) or (5 GEQUAL, 0) before some passes |
+| 1D / 1E | TEST.DATE on / off | on for reflection passes |
+| 20 m, f | ALPHA = m (A\|B<<2\|C<<4\|D<<6), FIX = f | 0x44 = (Cs-Cd)·As+Cd for glass/decals, 0x58 = Cs·Ad+Cd for reflections |
+| 24 v | FRAME.FBMSK = v | 0xFF000000 = colour only (glass, decals keep the reflectivity alpha), 0xFFFFFFFF = depth only, 0 = all |
+| 17 / 18 | depth test on / off (17 only when depth testing is enabled globally) | |
+| 25 / 26 | ZBUF.ZMSK on / off (depth write off / on) | shadow nodes |
+| 2D / 2E | back-face culling on / off | |
+| 2F a | TEST.AFAIL = a & 3 (0 KEEP, 1 FB_ONLY, 2 ZB_ONLY, 3 RGB_ONLY) | courses (foliage) |
+
+The entry state of a node program stream (also for course scenery) is: depth
+test per the global flag, ATE on, DATE off, culling on, ALPHA 0x44, depth write
+on, FBMSK 0, ATST GREATER AREF 0x20, DATM 1, AFAIL KEEP.
+
+Programs leave ATE on with (GREATER, 0x20) and DATE off when they end (1581
+of 1607 car/wheel streams), so that is the entry state the decoder assumes.
+
+**What this means for car rendering:** body textures carry a *reflectivity*
+in their alpha (texel alpha 0 = hole, otherwise 0x21..0x80). The opaque body
+passes run with the alpha test (alpha > 0x20), which cuts the wheel arches,
+grilles and so on out of flat side panels; without it the wheels are hidden
+behind dark panels (the R34 front wheels, for example). The decoder applies the test as a binary-alpha copy of
+the texture plus `kAlphaTest` (`Options::program_alpha_test`). The opaque
+passes also write the texel alpha to the frame buffer, and the
+reflection passes (normal in the UV slot, env map from a runtime slot) are
+blended Cs·Ad + Cd: reflection weighted by that alpha.
+`Options::weighted_reflection` turns these into `kAdditive | kEnvironmentMap |
+kUnlit | kNoDepthWrite` primitives. Reflection triangles whose three corners
+come from the same textured pass get that pass's texture and UVs, and the renderer
+weights the reflection per pixel by the texel alpha (0 in the cut-outs, so the
+reflection doesn't haze over the wheels in the arches). The remaining triangles
+are untextured with a per-vertex weight. Glass is a nearly uniform dark texture
+with GS alpha ≈ 0x73, drawn with normal blending and the alpha channel
+write-masked, so it is ~90 % dark plus the reflection on top. The glass's own
+texture is used as its reflectivity because the real Ad (whatever lies
+behind it) is unknown.
+
+Offsets in `06`/`07`/`08`/`09`/`0A` are relative to the address of the operand
+field that holds them. Ops 0x0C and 0x10 (matrices) appear in a few cars only
+(24 matrices in total, e.g. `ty0032`).
+
+### Chunks
+
+```
+0x00 u32 0, u32 0
+0x08 u16 flags        low byte: 0 = colour+UV (unlit), 1 = normal+UV (lit),
+                      2 = colour + normal in the UV slot (reflection pass), 4/5 = variants,
+                      0x41 = morph (2 key frames); high byte 0/1/2 = ?
+0x0A u16 packet count
+0x0C u16 total vertices
+0x0E u16 total triangles
+0x10 packet entries: u32 offset (from chunk start), u16 size in qwords, u16 mat
+```
+`mat`: bits 0-8 = texture index + 1 in the current texture set (0 = none,
+0x1FF = runtime slot, e.g. the environment map on reflection passes and the
+rim image on wheels); bits 9-15 = material index + 1 (0 = none, 0x7F =
+runtime slot).
+
+#### Materials
+
+Materials are 0x50-byte records: four vec4 rows, ambient Ma (+0x00), diffuse
+Md (+0x10), specular Ms (+0x20) and emission Me (+0x30); f32 shininess at
++0x40; u32 flags at +0x44; +0x48 a relocated pointer (127.0f in the per-colour
+sets; unused). Flag bit 0 marks **lamp** materials: the game multiplies
+their rows by a global tint whose emission is (k/4, k/4, k/4) for k lamps on
+(ambient, diffuse and specular × 1). It is not the body paint.
+
+The array at +0x28 (count +0x14) is the base set. `+0x38` points to `u32
+offsets[count at +0x1A]`, one full material array (same record count) per
+paint colour. Selecting colour c replaces the active array with +0x38[c] when
+c < count. The count equals the paint-variant count in 832 of 859 car files
+and is 0 in the other 27; the base array is not one of the colour sets
+(`am0006`: base 0x50, colour sets 0x200/0x390/0x520/0x6B0). The colour sets
+carry the paint finish: diffuse 0.5-1.0, specular 0-3.0 (coloured on pearl
+paints, e.g. `ho0099` (0.3, 0, 2.0)), shininess 0/8/16/20 (`am0006` body
+material 2: metallic colours Md 0.5, Ms 1.1, shininess 8; silver Ms 1.5,
+shininess 16; white Md 1, Ms 0).
+
+Lighting of lit packets (normals, no colours) is OpenGL-style fixed function
+on the VU, from the course's Env0 car lights (up to 4, Env0 +0xD0 + 0x80·i:
+direction, ambient +0x10, diffuse +0x20, specular +0x30; enabled by Env0 +0x10
+bit i) and the global ambient (Env0 +0xEF0): colour = Me + Ga·Ma + Σ La·Ma +
+Σ max(N·L, 0)·Ld·Md + Σ max(N·H, 0)^p·Ls·Ms (infinite viewer), times 128
+(255 when chunk header byte 9 bit 0 is set), clamped to 255. Textured packets
+MODULATE the texel with it (0x80 = 1.0, so up to about 2× the texel);
+untextured packets (TME off) show the byte as is (255 = 1.0), so a lit sum of
+1.0 is mid grey at scale 128 and white at scale 255. Lights may have negative
+colours (most day courses enable a second car light from below, e.g. direction
+(0, −0.29, 0) with diffuse −0.21, which darkens the lower body: see
+[course.md](course.md) Env0).
+The exponent p is quantised from the shininess: < 6 → 4, 6-12 → 8, ≥ 12 → 16.
+The specular term is used only when Ms and some light's specular are non-zero.
+
+Reflection passes (texture field 0x1FF) sample a 256×256 sphere map of the
+course that the race renders every frame from the focus car (0.8 m above it).
+UVs: R = reflect(V, N) in view space, m = √(Rx² + Ry² + (Rz + 1)²),
+s = 0.5 + 0.5·Rx/m, t = 0.5 − 0.5·Ry/m. Colour = vertex colour × (C0 + C1 ·
+min(V̂·N, 0)) × K per channel, with C0 set by op 0x36 (f → (f, f, f, 1)) /
+0x37 (vec4) and C1 by op 0x32 (f → (f, f, f, 0)) / 0x33 (vec4) (car data: C0 1,
+C1 0.8: weight 0.2 head-on, 1.0 at grazing angles; prize models use coloured
+rows, e.g. the gold cups C0 0.9, C1 (−0.5, −0.36, −0.26): a warm boost
+head-on), K = 1 − (a per-car value, meaning open). The result is an 8-bit GS
+colour (≤ 255, i.e. ≤ 255/128 of the texel after MODULATE). Blend ALPHA 0x58 (Cs·Ad + Cd) with the fog colour set to black; Ad is
+the frame alpha the body pass wrote (texel alpha × lit alpha). Later reflection
+chunks use the destination-alpha test so overlaps are not added twice.
+
+### VIF packets
+
+Each packet is a VIF stream of UNPACKs (always `usn=1 flg=1`, i.e. double
+buffered relative to TOPS) followed by NOP padding:
+
+| UNPACK | address | content |
+|---|---|---|
+| V3-32, num 1 | 0xC0 | GIF tag (3 words): NLOOP = vertex count, EOP, PRE=1, PRIM, PACKED, NREG=3, REGS = ST, RGBAQ, XYZF2 |
+| V3-32 | 0x00 | positions (floats) |
+| V3-32 | 0x20 | second key frame positions (morph chunks only) |
+| S-8 | 0x40 | strip table: count, then per strip (vertices - 2) × 3 |
+| V3-32 | 0x80 | normals (lit chunks) |
+| V4-8 | 0x80 | colours, GS scale (0x80 = 1.0) |
+| V3-32 | 0xA0 | second key frame normals |
+| V2-32, masked | 0x40 | S,T texture coordinates (floats, Q = 1, origin top-left) |
+| V3-32, masked | 0x40 | normal used for the environment map (reflection chunks) |
+| V2-32, masked | 0x60 | second key frame S,T |
+
+PRIM is a triangle strip with Gouraud shading; TME, FGE and ABE vary
+(`0x3C`, `0x7C` with alpha blending, `0x6C` untextured with blending, and so on).
+Strips use the usual alternating winding: triangle *i* is (v[i], v[i+1],
+v[i+2]) for even *i* and (v[i+1], v[i], v[i+2]) for odd *i*. These triangles are
+counter-clockwise when seen from the side the vertex normals point to
+(1825 of 1842 triangles agree on `am0006`; the rest are degenerate stitches).
+Each VIF packet stays under about 0x80 vertices, so that it fits in double-buffered VU1 memory.
+
+## Textures
+
+Texture sets are ordinary Tex1 sets (see FORMATS.md). Car body sets use 4-bit
+textures whose CLUTs are selected with **TEX0.CSA** (entry offset in units of
+16 in the CSM1 layout): palette entry *i* is at x = (i & 7) + (CSA & 1)·8,
+y = (i >> 3) + (CSA >> 1)·2 of the 32-bit CLUT rect at CBP (width 1).
+`GsMemory::decode_rgba` ignores CSA, which made painted panels decode grey.
+`gtm1::decode_texture_set` has its own CSA-aware path for indexed textures with
+32-bit CLUTs.
+
+**Paint.** Tex1 +0x20 is an offset (from the Tex1 start, 0 = none) to
+`u32 V; u32 variant_offsets[V]`, each variant `u32 n` (entry count in the low
+16 bits) followed by n × u32 entries. Each entry patches three TEX0 fields of
+one texture record: bits 0-4 CSA, bits 5-18 CBP (relative to the set's base,
+the u16 at Tex1 +0x10, 0 on disc), bits 19-22 CPSM (0 = CT32, 2 = CT16), bits
+23-31 the index of the texture record (0x28-byte records at Tex1 +0x18) that
+is patched. Entries do not have to follow texture order: 1,550 of 13,909
+variants (about 11 cars per time of day, e.g. `ho1086`) skip textures, and
+1,044 entries switch the CLUT between CT32 and CT16 (e.g. `ar0006`). Variant 0
+holds the TEX0 values. All CLUTs are already in the uploaded buffers, so
+painting is just choosing CBP/CPSM/CSA. V equals the car's colour
+count in `database/carcolor.db` (verified for 275 of 287 cars, all LOD sets). For example,
+`am0006` has 7 colours: British Racing Green, Derwent Green, Grasmere Blue,
+Braemar Blue, Solent Silver, Malham White and Sutherland Red. Car textures are
+4-bit (all but about 30), TCC 1, TFX MODULATE; the carcolor.db RGB never reaches
+the renderer (UI swatches and opponent colour picks only). The paint finish
+(solid, metallic, pearl) is in the per-colour material sets (see Materials). Textures that don't take
+paint (glass, lamps) have the same entry in every variant. `carcolor.db`
+("GT2K") is a 288-entry index keyed by `id_hash(model id)` → colour ids →
+(name string ids, representative 0x00BBGGRR RGB used for UI). The decoder
+takes a colour *index* (`CarModelOptions::paint`, `gt3tool model --paint=N`).
+
+The decoder always decodes the full power-of-two size because the UVs address
+the whole texture, not the REGION_CLAMP rectangle.
+
+## Coordinate system
+
++Y up, the **nose towards -Z**, +X to the car's right. The origin is the
+wheelbase midpoint on the ground (y = 0), and the body is symmetric in X. The
+physics puts the front axle at -wheelbase/2, the GTCI front lamps are at
+-Z, and rear wings sit at +Z. Example (`am0006`, Aston Martin V8 Vantage):
+x ±0.98, y 0..1.19, z -2.30..2.42 m.
+
+## Wheel placement (`wheel_spec.*`)
+
+The values come from the parameter database (`database/paramdb*.db`, via the
+car that uses the model):
+
+| value | source |
+|---|---|
+| wheelbase | table 3 (`ch_`) u16 mm at +0x18 |
+| front / rear track | table 5 (`rm_`) u16 mm at +0x32 / +0x34 (centreline to centreline) |
+| tyre size | tables 28/29 (`ft_`/`rt_`) u64 size id at +0x18 → table 25 (`sz…`): u8 +0x08 rim inches, +0x09 aspect/5, +0x0A width/5 mm |
+
+width W = w mm, sidewall sw = W · aspect %, outer radius R = rim · 25.4 mm / 2 + sw.
+Wheel *i*: axle i >> 1, side i & 1 (left = -X). Centre = (±track/2, R,
+∓wheelbase/2) with the front at -Z. The rim model is scaled by R - 0.75·sw and
+offset by -W/2 along X (outer face at the outer sidewall). Right wheels are
+rotated 180° about Y. Example `am0006`: wheelbase 2.611, track 1.548/1.566,
+285/45R18 → R 0.357 m, W 0.285 m. When no database entry exists, the loader
+estimates from the body bounds.
+
+The decoder's wheel centres (y = R over a body whose lowest point is at y = 0)
+are a static layout. GT3 itself puts the model origin at the physics body
+height, which at rest is the ride height q (spec 0x5C × 0.001 m) above the
+ground, and draws each wheel at y = R − q − (x′ − x_s) in model space (x′ the
+suspension coordinate, x_s its static value; compression raises the wheel),
+x = the signed hub half-track ((tread − 2·offset) × 0.0005 m, shrunk by the
+swing arm spec 0x38/0x39 as the wheel moves), z = ∓wheelbase/2. Its showroom
+uses x′ = x_s and lifts the body by q so the tyres touch the floor. See
+docs/dev/RACE.md "Car placement".
+
+## Open questions
+
+- The rest of the chunk flag high byte, and the render-state ops (renderer domain).
+- What changes geometrically between `day` and `eve`/`night` models.
+- Morph chunks (op 0x35, flag 0x41/0x20: pop-up lamps, wings): only key frame
+  0 is decoded; the game blends key k and k+1 by a factor.

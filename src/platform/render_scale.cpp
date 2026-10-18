@@ -1,0 +1,38 @@
+#include "platform/render_scale.h"
+
+#include <SDL3/SDL_platform_defines.h>
+
+#include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <string>
+
+namespace gt3r::platform {
+
+std::optional<float> parse_render_scale(std::string_view value) {
+    while (!value.empty() && value.front() == ' ') value.remove_prefix(1);
+    while (!value.empty() && value.back() == ' ') value.remove_suffix(1);
+    if (value.empty() || value == "auto") return std::nullopt;
+    std::string s(value);
+    char* end = nullptr;
+    float v = std::strtof(s.c_str(), &end);
+    if (end == s.c_str() || !std::isfinite(v)) return std::nullopt;
+    return std::clamp(v, 0.5f, 1.0f);
+}
+
+float auto_render_scale(int pixel_w, int pixel_h, bool mobile) {
+    if (!mobile || pixel_w <= 0 || pixel_h <= 0) return 1.0f;
+    // Height of the letterboxed 16:9 game area.
+    float lines = std::min(float(pixel_h), float(pixel_w) * 9.0f / 16.0f);
+    return std::clamp(float(kAutoTargetLines) / lines, 0.5f, 1.0f);
+}
+
+bool is_mobile() {
+#if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)
+    return true;
+#else
+    return false;
+#endif
+}
+
+} // namespace gt3r::platform

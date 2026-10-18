@@ -1,0 +1,312 @@
+#include "race/camera_rig.h"
+
+#include "race/interp.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+
+namespace gt3r::race {
+
+namespace {
+
+constexpr float kPi = 3.14159265f;
+
+render::Vec3 rv(const sim::Vec3& v) { return {v.x, v.y, v.z}; }
+
+float heading_yaw(const sim::Quat& q) {
+    sim::Vec3 f = rotate(q, {0, 0, -1});
+    return std::atan2(-f.x, -f.z);
+}
+
+float wrap(float a) {
+    while (a > kPi) a -= 2 * kPi;
+    while (a < -kPi) a += 2 * kPi;
+    return a;
+}
+
+float stick(const PadState& pad, PadAxis a) {
+    float v = pad.axis_f(a);
+    return std::fabs(v) < 0.15f ? 0.0f : v;
+}
+
+} // namespace
+
+const char* camera_mode_name(CameraMode m) {
+    switch (m) {
+    case CameraMode::Chase: return "chase";
+    case CameraMode::ChaseFar: return "chase (far)";
+    case CameraMode::Bumper: return "bumper";
+    case CameraMode::Roof: return "roof";
+    case CameraMode::Orbit: return "free orbit";
+    case CameraMode::Tv: return "replay (TV)";
+    default: return "?";
+    }
+}
+
+float CameraRig::shake_random() {
+    // s <- 17 s + 17; out = s ^ rotl(s, 16); 23 mantissa bits -> [1, 2) - 1. Every draw first
+    // advances once and discards the result.
+    auto next = [this] {
+        shake_rng_ = shake_rng_ * 17u + 17u;
+        return shake_rng_ ^ ((shake_rng_ << 16) | (shake_rng_ >> 16));
+    };
+    next();
+    u32 bits = (next() & 0x7FFFFFu) | 0x3F800000u;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f - 1.0f;
+}
+
+void CameraRig::next_mode() {
+    if (mode_ == CameraMode::Bumper && mirror() && !gt3_views_) {
+        mirror_ = false;
+        return;
+    }
+    mirror_ = true;
+    if (mode_ == CameraMode::Bumper) set_mode(CameraMode::Chase);
+    else if (mode_ == CameraMode::Chase && !gt3_views_) set_mode(CameraMode::ChaseFar);
+    else if (mode_ == CameraMode::Chase || mode_ == CameraMode::ChaseFar) set_mode(CameraMode::Bumper);
+    else set_mode(CameraMode::Chase);
+}
+
+void CameraRig::set_mode(CameraMode m) {
+    mode_ = m;
+    snapped_ = false;
+}
+
+namespace {
+float pitch_of(const sim::Quat& q) {
+    sim::Vec3 f = rotate(q, {0, 0, -1});
+    return std::asin(std::clamp(float(f.y), -1.0f, 1.0f));
+}
+} // namespace
+
+void CameraRig::snap(const sim::VehicleState& s) {
+    chase_yaw_ = heading_yaw(s.orientation);
+    lag_yaw_ = chase_yaw_, lag_yaw_w_ = lag_yaw_acc_ = 0;
+    lag_pitch_ = pitch_of(s.orientation), lag_pitch_w_ = 0;
+    lag_time_ = 0;
+    chase_height_ = s.position.y;
+    snapped_ = true;
+}
+
+void CameraRig::update(const sim::VehicleState& s, const sim::VehicleSetup& setup, const PadState& pad, double dt) {
+    float fdt = float(std::min(dt, 0.1));
+    if (!snapped_) snap(s);
+    render::Vec3 pos = rv(s.position);
+    sim::Vec3 fwd_s = rotate(s.orientation, {0, 0, -1}), up_s = rotate(s.orientation, {0, 1, 0});
+    render::Vec3 fwd = rv(fwd_s), up = rv(up_s);
+
+    // Chase smoothing runs in every mode so switching back is seamless.
+    float yaw = heading_yaw(s.orientation);
+    float speed = s.speed_kmh / 3.6f;
+    // When reversing slowly, keep looking forwards along the car.
+    float k = 3.5f + std::min(speed, 40.0f) * 0.05f;
+    chase_yaw_ = wrap(chase_yaw_ + wrap(yaw - chase_yaw_) * (1 - std::exp(-k * fdt)));
+    chase_height_ += (s.position.y - chase_height_) * (1 - std::exp(-6.0f * fdt));
+    // GT3's chase lags, stepped at 60 Hz.
+    lag_time_ += dt;
+    for (int n = 0; lag_time_ >= 1.0 / 60.0 && n < 12; ++n) {
+        lag_time_ -= 1.0 / 60.0;
+        const float h = 1.0f / 60.0f;
+        float acc = 30.0f * wrap(yaw - lag_yaw_) - 10.0f * lag_yaw_w_;
+        lag_yaw_w_ += 0.5f * (acc + lag_yaw_acc_) * h;
+        lag_yaw_acc_ = acc;
+        lag_yaw_ = wrap(lag_yaw_ + lag_yaw_w_ * h);
+        float e = wrap(pitch_of(s.orientation) - lag_pitch_);
+        lag_pitch_w_ += (20.0f * e - 10.0f * lag_pitch_w_) * h;
+        lag_pitch_ = wrap(lag_pitch_ + lag_pitch_w_ * h);
+    }
+    if (lag_time_ > 1.0 / 60.0) lag_time_ = 0;
+    // GT3's in-car vibration (OnBoardCamera, view point 0 only), once per 60 Hz camera update.
+    // Amplitude A = sum over the wheels of |slip ratio| 0.3 + |slip angle| / (pi/2), at most 3;
+    // speed factor S = speed clamped to 10..120 km/h over 120 km/h. On about half the updates
+    // each axis is kicked by (r - 0.5) A 250 through the shaker lag (v' = (du - 12 v)/60, x' = v/60);
+    // the view turns by 8 S x degrees of pitch and 2 S x of yaw (x clamped to +-1), about the eye.
+    // The original also draws for two replay onboard shakers first: their draws are kept so the
+    // random sequence matches.
+    bool shaking = shake_on_ && mode_ == CameraMode::Bumper && !intro_;
+    if (shaking) {
+        shake_time_ += dt;
+        for (int n = 0; shake_time_ >= 1.0 / 60.0 && n < 12; ++n) {
+            shake_time_ -= 1.0 / 60.0;
+            float amp = 0;
+            for (const sim::WheelState& w : s.wheels)
+                amp += std::fabs(w.slip_ratio) * 0.3f + std::fabs(w.slip_angle) / (kPi * 0.5f);
+            amp = std::clamp(amp, 0.0f, 3.0f);
+            for (int i = 0; i < 2; ++i) // the replay onboard shakers' draws
+                if (shake_random() < 0.4f) shake_random();
+            shake_speed_ = std::clamp(s.speed_kmh / 3.6f, 2.7777778f, 33.333333f) / 33.333333f;
+            float u_yaw = 0, u_pitch = 0;
+            if (shake_random() < 0.5f) {
+                u_yaw = (shake_random() - 0.5f) * amp * 250.0f;
+                u_pitch = (shake_random() - 0.5f) * amp * 250.0f;
+            }
+            shake_yaw_.step(u_yaw);
+            shake_pitch_.step(u_pitch);
+        }
+        if (shake_time_ > 1.0 / 60.0) shake_time_ = 0;
+    } else {
+        shake_yaw_ = shake_pitch_ = {};
+        shake_time_ = 0;
+    }
+    // GT3 player views: eye at -p of the car's camera point in a frame at the body origin (ride
+    // height above the sim's ground-level origin), looking along that frame's forward axis; 60
+    // degrees horizontal over the 640x448 frame = 44 degrees vertical.
+    auto gt3_view = [&](int index) {
+        float q = setup.wheels[0].ride_height > 0 ? setup.wheels[0].ride_height : 0.13f;
+        render::Vec3 origin = rv(s.position + rotate(s.orientation, {0, q, 0}));
+        render::Vec3 f, u;
+        if (index == 1) { // chase: lagged yaw and pitch, no roll
+            // Between 60 Hz steps (frame rates above 60) the lags carry on at their own rates:
+            // held still, the view would turn on every other frame only (judder in fast turns).
+            float yaw_now = lag_yaw_ + lag_yaw_w_ * float(lag_time_), pitch_now = lag_pitch_ + lag_pitch_w_ * float(lag_time_);
+            float th = yaw_now + (look_back_ ? kPi : 0.0f), ph = look_back_ ? -pitch_now : pitch_now;
+            f = {-std::sin(th) * std::cos(ph), std::sin(ph), -std::cos(th) * std::cos(ph)};
+            render::Vec3 r = render::normalize(render::cross(f, {0, 1, 0}));
+            u = render::cross(r, f);
+        } else { // in-car: the body's attitude
+            f = fwd, u = up;
+            if (look_back_) f = render::Vec3{0, 0, 0} - f;
+        }
+        render::Vec3 r = render::normalize(render::cross(f, u));
+        render::Vec3 e = point_[index] * -1.0f; // model frame: x right, y up, z back
+        if (look_back_ && index == 0) e.z = -e.z;
+        eye_ = origin + r * e.x + u * e.y - f * e.z;
+        view_ = render::look_at(eye_, eye_ + f, u);
+        fovy_ = 2.0f * std::atan(224.0f / (320.0f * 1.7320508f));
+    };
+
+    if (intro_ && mode_ != CameraMode::Orbit && mode_ != CameraMode::Tv) {
+        // start.cam (GTRC record 0, kind 0x420, curves in the car's frame with z forward): three
+        // cuts, t 0..0.8 from 30 m ahead to 6 m ahead (2.5 m up), 0.8..0.9 a sweep past the car's
+        // side towards the rear, 0.9..1 round the front corner, aimed near the car's centre;
+        // zoom 2.41 (45 degrees horizontal over 640x448).
+        float t = std::clamp(intro_t_, 0.0f, 1.0f);
+        sim::Vec3 e, tg;
+        float zoom = 2.41f;
+        if (start_shot_) {
+            const GtrcRecord& r = *start_shot_;
+            e = {r.pos[0].eval(t), r.pos[1].eval(t), -r.pos[2].eval(t)}; // our car frame: z back
+            tg = {r.target[0].eval(t), r.target[1].eval(t), -r.target[2].eval(t)};
+            if (!r.zoom.empty()) zoom = std::max(0.2f, r.zoom.eval(t));
+        } else {
+            sim::Vec3 a{3.04f, 2.04f, -30.44f}, b{-1.64f, 0.59f, -3.97f};
+            e = a + (b - a) * t, tg = {0.65f, 0.4f, 0};
+        }
+        eye_ = rv(s.position + rotate(s.orientation, e));
+        render::Vec3 target = rv(s.position + rotate(s.orientation, tg));
+        view_ = render::look_at(eye_, target, {0, 1, 0});
+        fovy_ = 2.0f * std::atan(224.0f / (320.0f * zoom));
+        return;
+    }
+    switch (mode_) {
+    case CameraMode::Chase: gt3_view(1); break;
+    case CameraMode::Bumper: {
+        gt3_view(0);
+        if (shaking) {
+            constexpr float kDeg = kPi / 180.0f;
+            float pitch = 8.0f * shake_speed_ * std::clamp(shake_pitch_.x, -1.0f, 1.0f) * kDeg;
+            float dyaw = 2.0f * shake_speed_ * std::clamp(shake_yaw_.x, -1.0f, 1.0f) * kDeg;
+            view_ = render::rotate_x(pitch) * render::rotate_y(dyaw) * view_; // in eye space
+        }
+        break;
+    }
+    case CameraMode::ChaseFar: {
+        bool far = mode_ == CameraMode::ChaseFar;
+        float dist = (far ? 7.5f : 4.6f) + setup.length * 0.5f;
+        float height = far ? 2.4f : 1.55f;
+        render::Vec3 back{std::sin(chase_yaw_), 0, std::cos(chase_yaw_)};
+        render::Vec3 base{pos.x, chase_height_, pos.z};
+        eye_ = base + back * dist + render::Vec3{0, height, 0};
+        render::Vec3 target = base + render::Vec3{0, far ? 1.0f : 0.85f, 0} - back * 2.5f;
+        view_ = render::look_at(eye_, target, {0, 1, 0});
+        fovy_ = far ? 0.72f : 0.78f;
+        break;
+    }
+    case CameraMode::Roof: {
+        bool roof = true;
+        sim::Vec3 local = roof ? sim::Vec3{0, setup.height + 0.2f, 0.2f} : sim::Vec3{0, 0.62f, -setup.length * 0.5f + 0.15f};
+        eye_ = rv(s.position + rotate(s.orientation, local));
+        render::Vec3 target = eye_ + fwd * 10.0f - up * (roof ? 0.9f : 0.25f);
+        view_ = render::look_at(eye_, target, up);
+        fovy_ = roof ? 0.85f : 0.9f;
+        break;
+    }
+    case CameraMode::Orbit: {
+        float ox = stick(pad, PadAxis::RX), oy = stick(pad, PadAxis::RY);
+        orbit_yaw_ += ox * 2.0f * fdt;
+        orbit_pitch_ = std::clamp(orbit_pitch_ + oy * 1.5f * fdt, -0.2f, 1.45f);
+        float z = (pad.down(PadButton::R2) ? 1.0f : 0.0f) - (pad.down(PadButton::L2) ? 1.0f : 0.0f);
+        orbit_dist_ = std::clamp(orbit_dist_ * std::exp(z * 1.5f * fdt), 2.0f, 400.0f);
+        render::Vec3 target = pos + render::Vec3{0, 0.8f, 0};
+        float cp = std::cos(orbit_pitch_);
+        eye_ = target + render::Vec3{std::sin(orbit_yaw_) * cp, std::sin(orbit_pitch_), std::cos(orbit_yaw_) * cp} * orbit_dist_;
+        view_ = render::look_at(eye_, target, {0, 1, 0});
+        fovy_ = 0.8f;
+        break;
+    }
+    case CameraMode::Tv: {
+        render::Vec3 target = pos + render::Vec3{0, 0.7f, 0};
+        director_record_ = -1;
+        if (director_) {
+            ReplayDirector::Shot shot = director_->update(track_s_, lap_, pos, dt, 16.0f / 9.0f);
+            director_record_ = shot.record;
+            if (shot.valid && shot.onboard) { // on-board record: the bumper view
+                eye_ = rv(s.position + rotate(s.orientation, {0, 0.62f, -setup.length * 0.5f + 0.15f}));
+                view_ = render::look_at(eye_, eye_ + fwd * 10.0f - up * 0.25f, up);
+                fovy_ = 0.9f;
+                break;
+            }
+            if (shot.valid) {
+                eye_ = shot.eye;
+                view_ = render::look_at(eye_, shot.target, {0, 1, 0});
+                fovy_ = std::clamp(shot.fovy, 0.02f, 2.4f);
+                break;
+            }
+        }
+        if (tv_.empty()) { // no trackside cameras: a high, wide chase
+            eye_ = pos + render::Vec3{std::sin(chase_yaw_) * 14.0f, 6.0f, std::cos(chase_yaw_) * 14.0f};
+            view_ = render::look_at(eye_, target, {0, 1, 0});
+            fovy_ = 0.7f;
+            break;
+        }
+        // The camera whose point is closest to slightly ahead of the car (cuts as the car passes).
+        int best = 0;
+        float bd = 1e30f;
+        for (size_t i = 0; i < tv_.size(); ++i) {
+            float d = tv_[i].s - (track_s_ + 20.0f);
+            if (tv_length_ > 0) d = std::remainder(d, tv_length_);
+            if (std::fabs(d) < bd) bd = std::fabs(d), best = int(i);
+        }
+        tv_active_ = best;
+        eye_ = tv_[size_t(best)].position;
+        view_ = render::look_at(eye_, target, {0, 1, 0});
+        // Zoom so the car keeps a similar size on screen.
+        float dist = render::length(target - eye_);
+        fovy_ = std::clamp(2.0f * std::atan(6.0f / std::max(dist, 1.0f)) / tv_[size_t(best)].zoom, 0.08f, 0.9f);
+        break;
+    }
+    default: break;
+    }
+}
+
+bool CameraRig::handle_event(const SDL_Event& e) {
+    if (mode_ != CameraMode::Orbit) return false;
+    switch (e.type) {
+    case SDL_EVENT_MOUSE_BUTTON_DOWN: dragging_ = true; return true;
+    case SDL_EVENT_MOUSE_BUTTON_UP: dragging_ = false; return true;
+    case SDL_EVENT_MOUSE_MOTION:
+        if (!dragging_) return false;
+        orbit_yaw_ -= e.motion.xrel * 0.01f;
+        orbit_pitch_ = std::clamp(orbit_pitch_ + e.motion.yrel * 0.01f, -0.2f, 1.45f);
+        return true;
+    case SDL_EVENT_MOUSE_WHEEL: orbit_dist_ = std::clamp(orbit_dist_ * std::exp(-e.wheel.y * 0.1f), 2.0f, 400.0f); return true;
+    default: return false;
+    }
+}
+
+render::Mat4 CameraRig::projection(float aspect) const { return render::perspective(fovy_, aspect, near_plane, far_plane); }
+
+} // namespace gt3r::race

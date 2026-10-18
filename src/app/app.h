@@ -1,0 +1,150 @@
+#pragma once
+
+#include "app/screen_touch_overlay.h"
+#include "app/ui.h"
+#include "audio/audio_engine.h"
+#include "base/config.h"
+#include "disc/disc.h"
+#include "input/input_manager.h"
+#include "platform/display_insets.h"
+#include "render/gpu_context.h"
+#include "vfs/vfs.h"
+
+#include <SDL3/SDL.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace gt3r {
+
+class App;
+
+class Screen {
+public:
+    virtual ~Screen() = default;
+    virtual void update(App& app, double dt) = 0;
+    virtual void render(App& app, Ui& ui) = 0;
+    virtual void on_event(App&, const SDL_Event&) {}
+    // Screens that consume raw input (rebinding) disable menu navigation.
+    virtual bool wants_menu_input() const { return true; }
+    // On-screen touch controls for this screen (phones/tablets): menu
+    // navigation by default; screens that drive a car return Driving.
+    virtual TouchLayout touch_layout() const { return TouchLayout::Menu; }
+    // Our own frontend screens (setup, hub, settings) lay out to the whole
+    // window instead of the letterboxed 640x360 space: Ui::width()/height()
+    // vary, Ui::safe() is the area clear of display cutouts and rounded
+    // corners, and Ui::touch() asks for finger-sized targets (see App::layout_ui).
+    virtual bool adaptive_ui() const { return false; }
+    // The startup update dialog (app/updates.h) may open over this screen: the main menu, the
+    // first-run screen and the game's title menu.
+    virtual bool update_prompts() const { return false; }
+};
+
+class App {
+public:
+    bool init(int argc, char** argv);
+    SDL_AppResult iterate();
+    SDL_AppResult event(const SDL_Event& e);
+    void shutdown();
+
+    // Opens a disc image and remembers it in the config. Returns an error
+    // message on failure, empty on success.
+    std::string open_disc(const std::string& path);
+    void close_disc();
+    void show_open_dialog();
+    // Opens `path` on the next frame, like a file picked in the dialog: on
+    // success the screen stack restarts (hub + game start) for the new disc.
+    void request_disc(const std::string& path) { set_dialog_result(path); }
+    // [game] recent1..5, most recent first (see platform/recent_discs.h).
+    std::vector<std::string> recent_discs() const;
+    void forget_recent_disc(const std::string& path);
+    // The path of the last disc image that failed to open (empty after a success).
+    const std::string& failed_disc_path() const { return failed_disc_path_; }
+
+    // Desktop window mode, remembered as [video] fullscreen (F11 toggles).
+    bool fullscreen() const;
+    void set_fullscreen(bool on);
+
+    void push(std::unique_ptr<Screen> s) { pending_.push_back(std::move(s)); }
+    void pop() { ++pops_; }
+    void quit() { quit_ = true; }
+    void save_config();
+
+    Disc* disc() { return disc_.get(); }
+    Vfs* vfs() { return vfs_.get(); }
+    InputManager& input() { return *input_; }
+    AudioEngine& audio() { return *audio_; }
+    IniDocument& config() { return config_; }
+    TouchOverlay& touch() { return touch_; }
+    const MenuInput& menu() const { return menu_; }
+    MenuInput& menu() { return menu_; }
+    SDL_Renderer* renderer() { return renderer_; }
+    SDL_Window* window() { return window_; }
+    // Shared SDL_GPU device for 3D views; nullptr when running 2D-only.
+    render::GpuContext* gpu() { return gpu_.get(); }
+    const std::string& data_dir() const { return data_dir_; }
+    std::string mods_dir() const { return data_dir_ + "mods"; }
+    // Set by the async file dialog callback; consumed on the main thread.
+    void set_dialog_result(std::string path);
+    const std::string& last_error() const { return last_error_; }
+
+private:
+    void apply_screen_changes();
+    void save_screenshot(const std::string& path);
+    void push_game_start(); // boot screen: opening movie, then the title menu
+    // Sets the renderer's logical presentation and the Ui layout for the frame.
+    void layout_ui(bool adaptive);
+    // Window area (window coordinates) clear of display cutouts and, on
+    // phones, the rounded screen corners.
+    SDL_FRect safe_area_window() const;
+    void draw_phone_mask(); // GT3R_PHONE: cutout and rounded corners, for screenshots
+    void open_saved_disc(const std::string& saved); // [game] disc, with fallbacks for old relative paths
+
+    SDL_Window* window_ = nullptr;
+    SDL_Renderer* renderer_ = nullptr;     // owned by gpu_ when it exists
+    std::unique_ptr<render::GpuContext> gpu_;
+    std::unique_ptr<Ui> ui_;
+    std::unique_ptr<InputManager> input_;
+    std::unique_ptr<AudioEngine> audio_;
+    std::unique_ptr<Disc> disc_;
+    std::unique_ptr<Vfs> vfs_;
+    IniDocument config_;
+    std::string data_dir_;
+    std::string config_path_;
+    MenuInput menu_;
+    TouchOverlay touch_;
+    std::vector<std::unique_ptr<Screen>> screens_;
+    std::vector<std::unique_ptr<Screen>> pending_;
+    int pops_ = 0;
+    bool quit_ = false;
+    Uint64 last_ticks_ = 0;
+
+    SDL_Mutex* dialog_mutex_ = nullptr;
+    std::string dialog_result_;
+    std::string last_error_;
+    std::string failed_disc_path_;
+
+    bool screenshot_requested_ = false;
+    std::string auto_shot_path_; // --shot: capture after a few frames, then exit
+    int frame_ = 0;
+    bool touch_ui_ = false;  // phone/tablet sizing (mobile builds, or GT3R_PHONE)
+    bool phone_sim_ = false; // GT3R_PHONE=1: desktop window shaped like a 20:9 phone
+    int ui_lw_ = 0, ui_lh_ = 0; // logical presentation currently set
+    std::optional<platform::DisplayInsets> display_insets_; // phones: cutout and corner radius (pixels)
+    int insets_retry_ = 0;                                  // frames until the next query (0: now)
+};
+
+// Screen factories (one file each).
+std::unique_ptr<Screen> make_setup_screen();
+std::unique_ptr<Screen> make_hub_screen();       // home menu under the game
+std::unique_ptr<Screen> make_developer_screen(); // Developer options (tools)
+std::unique_ptr<Screen> make_browser_screen(const std::string& open_path = "");
+std::unique_ptr<Screen> make_jukebox_screen();
+std::unique_ptr<Screen> make_input_screen();
+std::unique_ptr<Screen> make_mods_screen();
+// Settings; `tab` picks the first page shown (SettingsTab order: 0 Display .. 5 Game disc).
+std::unique_ptr<Screen> make_settings_screen(int tab = 0);
+constexpr int kSettingsTabDisc = 5;
+
+} // namespace gt3r

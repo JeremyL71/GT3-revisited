@@ -1,0 +1,27 @@
+# systemd unit for a bare-metal / VPS install (binary in /usr/local/bin):
+#   sudo cp gt3r-relay.service /etc/systemd/system/ && sudo systemctl enable --now gt3r-relay
+[Unit]
+Description=GT3 Revisited relay server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Limits (gt3r-relay --help; docs/dev/ONLINE.md "Link slots and the queue", "Abuse protection"):
+# 300 racing links (~45 Mbit/s each way when all are in use) suit a small VPS; size it with
+# gt3r-relay-bench ("Benchmark") and raise it on a bigger one. Never add --bench here.
+# Game versions (latest, min_online, release page): /etc/gt3r-relay/versions.conf, written by
+# tools/gt3r-relay/set-versions.sh. Missing: every game version may play. `systemctl reload
+# gt3r-relay` re-reads it without dropping sessions.
+ExecStart=/usr/local/bin/gt3r-relay --port 47631 --relay-links 300 --sessions-per-ip 8 --ip-rate 10 --versions-file /etc/gt3r-relay/versions.conf
+ExecReload=/bin/kill -HUP $MAINPID
+DynamicUser=yes
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

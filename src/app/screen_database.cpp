@@ -1,0 +1,327 @@
+// Car database browser: GT3's car catalogue (database/paramdb_us.db), with
+// specs, the engine torque curve, upgrade parts and the race events.
+
+#include "app/app.h"
+#include "app/screen_registry.h"
+#include "formats/text/charset.h"
+#include "game/data/car_database.h"
+#include "vfs/vfs.h"
+
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+
+namespace gt3r {
+
+namespace {
+
+using data::CarDatabase;
+using data::TableId;
+
+std::string fmt(const char* f, ...)
+#if defined(__MINGW32__)
+    __attribute__((format(gnu_printf, 1, 2)))
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 1, 2)))
+#endif
+    ;
+std::string fmt(const char* f, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, f);
+    std::vsnprintf(buf, sizeof(buf), f, ap);
+    va_end(ap);
+    return buf;
+}
+
+std::string clip(std::string s, size_t n) {
+    if (s.size() > n) s = s.substr(0, n - 2) + "..";
+    return s;
+}
+
+class DatabaseScreen : public Screen {
+public:
+    void update(App& app, double) override {
+        if (!loaded_) load(app);
+        const MenuInput& m = app.menu();
+        if (m.pressed(PadButton::Triangle)) {
+            app.pop();
+            return;
+        }
+        if (m.pressed(PadButton::Square)) {
+            mode_ = mode_ == Mode::Cars ? Mode::Events : Mode::Cars;
+        }
+        int n = mode_ == Mode::Cars ? int(order_.size()) : int(db_.events().size());
+        int& sel = mode_ == Mode::Cars ? car_sel_ : event_sel_;
+        if (n) {
+            int step = m.held(PadButton::R1) || m.held(PadButton::L1) ? 10 : 1;
+            sel = std::clamp(sel + m.vertical() * step, 0, n - 1);
+        }
+        if (mode_ == Mode::Cars && m.horizontal()) page_ = (page_ + 3 + m.horizontal()) % 3;
+        if (mode_ == Mode::Cars && m.pressed(PadButton::Circle)) {
+            sort_by_power_ = !sort_by_power_;
+            sort();
+        }
+    }
+
+    void render(App&, Ui& ui) override {
+        if (!error_.empty()) {
+            ui.header("CAR DATABASE", "");
+            ui.text_center(150, error_, colors::kBad);
+            ui.footer("Triangle: back");
+            return;
+        }
+        if (mode_ == Mode::Cars) render_cars(ui);
+        else render_events(ui);
+    }
+
+private:
+    enum class Mode { Cars, Events };
+    static constexpr int kRows = 26;
+
+    void load(App& app) {
+        loaded_ = true;
+        if (!app.vfs()) {
+            error_ = "No disc loaded";
+            return;
+        }
+        if (auto jis = app.vfs()->read("font/jis2uni.dat")) {
+            try {
+                jis_ = text::JisTable::parse(*jis);
+            } catch (const std::exception&) {
+            }
+        }
+        if (!db_.load(*app.vfs())) {
+            error_ = db_.error();
+            return;
+        }
+        for (size_t i = 0; i < db_.cars().size(); ++i) {
+            const data::Car& c = db_.cars()[i];
+            names_.push_back(ascii(c.name));
+            if (c.label.rfind("sample", 0) != 0) order_.push_back(i); // skip placeholder rows
+        }
+        sort();
+        car_sel_ = 0;
+    }
+
+    // Game text (ASCII + EUC-JP) -> printable ASCII for the debug font.
+    std::string ascii(const std::string& s) const {
+        std::u32string u = text::decode_game_text(ByteSpan(reinterpret_cast<const u8*>(s.data()), s.size()),
+                                                  jis_.empty() ? nullptr : &jis_);
+        std::string out;
+        for (char32_t c : u) {
+            if (c >= 0x20 && c < 0x7F) out += char(c);
+            else if (c >= 0xFF01 && c <= 0xFF5E) out += char(c - 0xFEE0);
+            else if (c == 0x30FB || c == 0x2010 || c == 0x2212 || c == 0x2015) out += '-';
+            else if (c == 0x3000) out += ' ';
+            else out += '?';
+        }
+        return out;
+    }
+
+    void sort() {
+        size_t keep = order_.empty() ? 0 : order_[std::min<size_t>(car_sel_, order_.size() - 1)];
+        std::stable_sort(order_.begin(), order_.end(), [&](size_t a, size_t b) {
+            const data::Car& x = db_.cars()[a];
+            const data::Car& y = db_.cars()[b];
+            if (sort_by_power_) {
+                auto ex = db_.engine(x.parts[6]), ey = db_.engine(y.parts[6]);
+                return (ex ? ex->power_ps : 0) > (ey ? ey->power_ps : 0);
+            }
+            if (x.maker != y.maker) return x.maker < y.maker;
+            return names_[a] < names_[b];
+        });
+        auto it = std::find(order_.begin(), order_.end(), keep);
+        car_sel_ = it == order_.end() ? 0 : int(it - order_.begin());
+    }
+
+    void render_cars(Ui& ui) {
+        ui.header("CAR DATABASE", fmt("%zu cars  %s", order_.size(), sort_by_power_ ? "by power" : "by maker"));
+        int n = int(order_.size());
+        int first = ui.list_window(n, car_sel_, kRows);
+        for (int i = 0; i < kRows && first + i < n; ++i) {
+            int idx = first + i;
+            const data::Car& c = db_.cars()[order_[idx]];
+            float y = 26 + i * 12.0f;
+            if (idx == car_sel_) ui.fill(4, y - 2, 236, 12, colors::kHighlight);
+            ui.text(8, y, clip(ascii(c.maker), 8), colors::kDim);
+            ui.text(80, y, clip(names_[order_[idx]], 20), idx == car_sel_ ? colors::kAccent : colors::kText);
+        }
+        if (n == 0) return;
+        const data::Car& c = db_.cars()[order_[car_sel_]];
+        float x = 250;
+        ui.fill(x - 6, 22, Ui::kWidth - x, Ui::kHeight - 46, colors::kPanel);
+        ui.text(x, 26, clip(names_[order_[car_sel_]], 48), colors::kAccent);
+        auto s = db_.summarize(c);
+        ui.text(x, 38, fmt("%s  %u  %s  model %s", clip(ascii(c.maker), 14).c_str(), s.year, c.label.c_str(),
+                           s.model.c_str()),
+                colors::kDim);
+        const char* pages[] = {"SPECS", "TORQUE CURVE", "UPGRADES"};
+        ui.text_right(Ui::kWidth - 8, 26, fmt("< %s >", pages[page_]), colors::kDim);
+        if (page_ == 0) render_specs(ui, x, c, s);
+        else if (page_ == 1) render_curve(ui, x, c);
+        else render_parts(ui, x, c);
+        ui.footer("Up/Down: car  Left/Right: page  Circle: sort  Square: events  Triangle: back");
+    }
+
+    void render_specs(Ui& ui, float x, const data::Car& c, const CarDatabase::Summary& s) {
+        float y = 56;
+        auto row = [&](const char* k, const std::string& v) {
+            ui.text(x, y, k, colors::kDim);
+            ui.text(x + 104, y, v);
+            y += 12;
+        };
+        row("Price", s.price ? fmt("%u Cr", s.price) : "not for sale");
+        row("Engine", fmt("%s %s %s", s.displacement.c_str(), s.layout.c_str(), s.aspiration.c_str()));
+        row("Max power", fmt("%u PS @ %s", s.power_ps, s.power_rpm.c_str()));
+        row("Max torque", fmt("%.1f kgf-m @ %s", s.torque_kgfm, s.torque_rpm.c_str()));
+        row("Drivetrain", s.drive);
+        row("Weight", fmt("%u kg  (front %u%%)", s.weight_kg, s.front_weight_pct));
+        if (s.weight_kg) row("Power/weight", fmt("%.2f kg/PS", s.power_ps ? double(s.weight_kg) / s.power_ps : 0.0));
+        row("Dimensions", fmt("%u x %u x %u mm", s.length_mm, s.width_mm, s.height_mm));
+        row("Wheelbase", fmt("%u mm", s.wheelbase_mm));
+        if (auto b = db_.body(c.parts[5])) row("Tread F/R", fmt("%u / %u mm", b->front_tread_mm, b->rear_tread_mm));
+        row("Gearbox", fmt("%u-speed, final %.3f", s.gears, s.final_drive));
+        std::string ratios;
+        for (float r : s.ratios) ratios += fmt("%.3f ", r);
+        row("Ratios", ratios);
+        row("Tires F", s.front_tire);
+        row("Tires R", s.rear_tire);
+        y += 6;
+        ui.text(x, y, "Default parts", colors::kDim);
+        y += 12;
+        std::string line;
+        for (u64 id : c.parts) {
+            if (!id) continue;
+            std::string l = db_.label(id);
+            if (l.size() < 3 || l[2] != '_') continue;
+            std::string p = l.substr(0, 2);
+            if (line.size() + p.size() + 1 > 46) {
+                ui.text(x, y, line);
+                y += 12;
+                line.clear();
+            }
+            line += p + " ";
+        }
+        if (!line.empty()) ui.text(x, y, line);
+    }
+
+    void render_curve(Ui& ui, float x, const data::Car& c) {
+        auto e = db_.engine(c.parts[6]);
+        if (!e || e->rpm.empty()) {
+            ui.text(x, 60, "No engine data", colors::kBad);
+            return;
+        }
+        const float gx = x + 30, gy = 60, gw = Ui::kWidth - gx - 20, gh = 200;
+        float tmax = 1, pmax = 1;
+        u16 rmax = e->rpm.back();
+        for (size_t i = 0; i < e->rpm.size(); ++i) {
+            tmax = std::max(tmax, e->torque[i]);
+            pmax = std::max(pmax, e->torque[i] * e->rpm[i] / 716.2f);
+        }
+        ui.frame(gx, gy, gw, gh, colors::kDim);
+        auto px = [&](u16 rpm) { return gx + gw * rpm / float(rmax + 500); };
+        float bw = std::max(2.0f, gw / float(e->rpm.size() + 2) / 2.5f);
+        for (size_t i = 0; i < e->rpm.size(); ++i) {
+            float tx = px(e->rpm[i]);
+            float th = gh * e->torque[i] / tmax * 0.95f;
+            float ph = gh * (e->torque[i] * e->rpm[i] / 716.2f) / pmax * 0.95f;
+            ui.fill(tx - bw, gy + gh - th, bw, th, Color{90, 160, 240});
+            ui.fill(tx, gy + gh - ph, bw, ph, colors::kAccent);
+            if (i % 2 == 0) ui.text(tx - 12, gy + gh + 4, fmt("%u", e->rpm[i] / 100), colors::kDim);
+        }
+        ui.text(gx, gy + gh + 16, "rpm x100", colors::kDim);
+        ui.text(x, gy + gh + 30, fmt("Torque (blue) peak %.1f kgf-m   Power (amber) peak %.0f PS", tmax, pmax),
+                colors::kText);
+        ui.text(x, gy + gh + 42,
+                fmt("Catalogue %u PS; table scale byte %u%%", e->power_ps, unsigned(e->torque_scale_pct)),
+                colors::kDim);
+    }
+
+    void render_parts(Ui& ui, float x, const data::Car& c) {
+        float y = 56;
+        static const TableId kTables[] = {
+            TableId::Muffler,  TableId::Computer,    TableId::PortPolish, TableId::EngineBalance,
+            TableId::Displacement, TableId::NaTune,  TableId::TurbineKit, TableId::Intercooler,
+            TableId::Flywheel, TableId::Clutch,      TableId::PropellerShaft, TableId::Gear,
+            TableId::Lsd,      TableId::Suspension,  TableId::Brake,      TableId::BrakeController,
+            TableId::Lightweight,
+        };
+        for (TableId t : kTables) {
+            auto parts = db_.parts_for(t, c.label);
+            std::string line;
+            for (const auto& p : parts)
+                if (p.stage) line += fmt("%u:%u ", p.stage, p.price);
+            if (line.empty()) continue;
+            ui.text(x, y, data::table_name(t), colors::kDim);
+            ui.text(x + 136, y, clip(line, 30));
+            y += 12;
+        }
+        ui.text(x, y + 6, "stage:price (credits)", colors::kDim);
+    }
+
+    void render_events(Ui& ui) {
+        const auto& ev = db_.events();
+        ui.header("RACE EVENTS", fmt("%zu events", ev.size()));
+        int n = int(ev.size());
+        int first = ui.list_window(n, event_sel_, kRows);
+        for (int i = 0; i < kRows && first + i < n; ++i) {
+            int idx = first + i;
+            float y = 26 + i * 12.0f;
+            if (idx == event_sel_) ui.fill(4, y - 2, 236, 12, colors::kHighlight);
+            ui.text(8, y, clip(ev[idx].label, 28), idx == event_sel_ ? colors::kAccent : colors::kText);
+        }
+        if (n == 0) return;
+        const data::Event& e = ev[event_sel_];
+        float x = 250, y = 26;
+        ui.fill(x - 6, 22, Ui::kWidth - x, Ui::kHeight - 46, colors::kPanel);
+        ui.text(x, y, e.label, colors::kAccent);
+        y += 14;
+        std::string course = e.course;
+        for (const auto& c : db_.courses())
+            if (c.label == e.course && !c.name.empty()) course = ascii(c.name) + " (" + e.course + ")";
+        auto row = [&](const char* k, const std::string& v) {
+            ui.text(x, y, k, colors::kDim);
+            ui.text(x + 96, y, clip(v, 36));
+            y += 12;
+        };
+        row("Course", course);
+        row("Mode", e.race_mode);
+        row("Laps", fmt("%u", e.laps));
+        row("Regulation", e.regulation.empty() ? "-" : e.regulation);
+        std::string prize;
+        for (size_t place = 0; place < 4; ++place)
+            if (u32 cr = e.prize_credits(place)) prize += fmt("%zu: %u  ", place + 1, cr);
+        row("Prize (Cr)", prize.empty() ? "-" : prize);
+        ui.text(x, y + 4, fmt("Entries (%zu)", e.entries.size()), colors::kDim);
+        y += 16;
+        for (size_t i = 0; i < e.entries.size() && y < Ui::kHeight - 40; ++i) {
+            const data::CarVariant* v = db_.variant(e.entries[i]);
+            std::string name = e.entries[i];
+            if (v) {
+                if (const data::Car* c = db_.car(v->car)) name = ascii(c->name) + "  [" + e.entries[i] + "]";
+            }
+            ui.text(x, y, clip(name, 46));
+            y += 11;
+        }
+        ui.footer("Up/Down: event  Square: cars  Triangle: back   (prize/laps fields partly inferred)");
+    }
+
+    CarDatabase db_;
+    text::JisTable jis_;
+    std::vector<size_t> order_;
+    std::vector<std::string> names_;
+    std::string error_;
+    bool loaded_ = false;
+    bool sort_by_power_ = false;
+    Mode mode_ = Mode::Cars;
+    int car_sel_ = 0, event_sel_ = 0, page_ = 0;
+};
+
+} // namespace
+
+GT3R_REGISTER_PLAYER_SCREEN(database, "database", "Car database",
+                     "Browse the car catalogue: specs, torque curves, upgrades and race events.", 10,
+                     [] { return std::make_unique<DatabaseScreen>(); });
+
+} // namespace gt3r

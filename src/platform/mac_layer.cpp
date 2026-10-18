@@ -1,0 +1,55 @@
+#include "platform/mac_layer.h"
+
+#include <SDL3/SDL.h>
+
+#if defined(SDL_PLATFORM_MACOS)
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
+
+namespace gt3r::platform {
+
+#if defined(SDL_PLATFORM_MACOS)
+namespace {
+
+id send(id obj, const char* sel) { return reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(obj, sel_registerName(sel)); }
+
+int mark_layers(id layer, Class metal_layer) {
+    if (!layer) return 0;
+    int n = 0;
+    if (metal_layer && reinterpret_cast<BOOL (*)(id, SEL, Class)>(objc_msgSend)(layer, sel_registerName("isKindOfClass:"), metal_layer)) {
+        reinterpret_cast<void (*)(id, SEL, BOOL)>(objc_msgSend)(layer, sel_registerName("setOpaque:"), NO);
+        ++n;
+    }
+    id subs = send(layer, "sublayers");
+    unsigned long count = subs ? reinterpret_cast<unsigned long (*)(id, SEL)>(objc_msgSend)(subs, sel_registerName("count")) : 0;
+    for (unsigned long i = 0; i < count; ++i)
+        n += mark_layers(reinterpret_cast<id (*)(id, SEL, unsigned long)>(objc_msgSend)(subs, sel_registerName("objectAtIndex:"), i), metal_layer);
+    return n;
+}
+
+int mark_views(id view, Class metal_layer) {
+    if (!view) return 0;
+    int n = mark_layers(send(view, "layer"), metal_layer);
+    id subs = send(view, "subviews");
+    unsigned long count = subs ? reinterpret_cast<unsigned long (*)(id, SEL)>(objc_msgSend)(subs, sel_registerName("count")) : 0;
+    for (unsigned long i = 0; i < count; ++i)
+        n += mark_views(reinterpret_cast<id (*)(id, SEL, unsigned long)>(objc_msgSend)(subs, sel_registerName("objectAtIndex:"), i), metal_layer);
+    return n;
+}
+
+} // namespace
+#endif
+
+void keep_composited(SDL_Window* window) {
+#if defined(SDL_PLATFORM_MACOS)
+    id ns_window = static_cast<id>(SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr));
+    if (!ns_window) return;
+    int n = mark_views(send(ns_window, "contentView"), objc_getClass("CAMetalLayer"));
+    if (n == 0) SDL_Log("keep_composited: no Metal layer found");
+#else
+    (void)window;
+#endif
+}
+
+} // namespace gt3r::platform

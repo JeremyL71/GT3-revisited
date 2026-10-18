@@ -1,0 +1,46 @@
+# Third-party dependencies. A system/package-manager install is preferred;
+# otherwise the dependency is fetched and built from source so that Windows,
+# Linux, macOS and Android builds all work without manual setup.
+
+include(FetchContent)
+
+# --- SDL3: windowing, input (gamepads, wheels, sensors), audio, GPU ---------
+# Release packages build SDL from source (GT3R_FETCH_SDL) so they don't depend
+# on a system or Homebrew SDL; Windows packages use SDL3.dll (GT3R_SDL_SHARED).
+option(GT3R_FETCH_SDL "Always build SDL3 from source instead of using an installed one" OFF)
+option(GT3R_SDL_SHARED "Build the fetched SDL3 as a shared library" OFF)
+if(NOT GT3R_FETCH_SDL)
+  find_package(SDL3 CONFIG QUIET)
+endif()
+if(NOT SDL3_FOUND)
+  message(STATUS "Building SDL3 from source")
+  set(SDL_SHARED ${GT3R_SDL_SHARED} CACHE BOOL "" FORCE)
+  if(GT3R_SDL_SHARED)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+  else()
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+  endif()
+  set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(SDL3
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG release-3.4.12
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(SDL3)
+endif()
+
+# --- zlib: GT3 stores compressed files as gzip / raw deflate ---------------
+find_package(ZLIB QUIET)
+if(NOT ZLIB_FOUND)
+  message(STATUS "zlib not found on system; fetching")
+  set(SKIP_INSTALL_ALL ON) # a static zlib is linked in; don't install its files into packages
+  # zlib's example programs register CTest tests ("example", "minigzip") that our build never
+  # builds, so ctest reported them as failed ("Not Run") on Windows CI.
+  set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(zlib
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG v1.3.1
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(zlib)
+  add_library(ZLIB::ZLIB ALIAS zlibstatic)
+  target_include_directories(zlibstatic INTERFACE ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
+endif()
