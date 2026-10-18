@@ -262,12 +262,12 @@ void Updates::dialog_render(Ui& ui) {
 
     ui.fill(0, 0, ui.width(), ui.height(), Color{0, 0, 0, 160}); // modal: the screen behind dims
     const float w = std::floor(std::min(ui.width() - 32, touch ? 440.0f : 340.0f));
-    const float pad = touch ? 18 : 14, bh = touch ? 38 : 24, lh = touch ? 28 : 16;
+    const float pad = touch ? 18.0f : 14.0f, bh = touch ? 38.0f : 24.0f, lh = touch ? 28.0f : 16.0f;
     std::vector<std::string> lines = Ui::wrap(body, w - 2 * pad);
     const float h = pad + 2 * Ui::kTitleCap + 12 + 11 * float(lines.size()) + 12 + bh + (notes ? 8 + lh : 0) + pad;
     const float x = std::floor((ui.width() - w) / 2), y = std::floor((ui.height() - h) / 2);
-    ui.fill_round(x, y, w, h, touch ? 8 : 6, colors::kPanel);
-    ui.frame_round(x, y, w, h, touch ? 8 : 6, 1, req ? colors::kBad : colors::kOutline);
+    ui.fill_round(x, y, w, h, touch ? 8.0f : 6.0f, colors::kPanel);
+    ui.frame_round(x, y, w, h, touch ? 8.0f : 6.0f, 1, req ? colors::kBad : colors::kOutline);
     float ty = y + pad;
     ui.text_big(x + pad, ty, title, 2, req ? colors::kBad : colors::kAccent);
     ty += 2 * Ui::kTitleCap + 12;

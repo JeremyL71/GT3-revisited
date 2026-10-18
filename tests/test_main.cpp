@@ -3,6 +3,8 @@
 
 #include "test_framework.h"
 
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -37,12 +39,38 @@ Disc* test_disc() {
 
 } // namespace gt3r::test
 
+namespace {
+
+// The test running now, so a crash names it (a crashed process loses its buffered output).
+const char* volatile g_current = nullptr;
+
+extern "C" void on_crash(int sig) {
+    std::signal(sig, SIG_DFL);
+    const char* name = g_current ? g_current : "(between tests)";
+    std::fputs("\nCRASH (signal) in test ", stderr);
+    std::fputs(name, stderr);
+    std::fputs("\n", stderr);
+    std::fflush(stderr);
+    std::raise(sig);
+}
+
+} // namespace
+
 int main(int argc, char** argv) {
     using namespace gt3r::test;
     const char* filter = argc > 1 ? argv[1] : nullptr; // substring filter
+    // A line per test even into a pipe (CI). MSVC has no line buffering (_IOLBF means full
+    // buffering there, and a size of 0 aborts), so Windows writes unbuffered.
+#ifdef _WIN32
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+#else
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+#endif
+    for (int sig : {SIGSEGV, SIGABRT, SIGFPE, SIGILL}) std::signal(sig, on_crash);
     int skipped = 0;
     for (const TestCase& t : registry()) {
         if (filter && !std::strstr(t.name, filter)) continue;
+        g_current = t.name;
         int before = failures();
         try {
             t.fn();

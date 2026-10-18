@@ -186,8 +186,7 @@ bool Session::join(const std::string& address, const std::string& name, const st
     if (!sock_.open_for(a, error)) return false;
     host_ = false;
     my_id_ = -1;
-    local_eps_.clear();
-    for (const std::string& ip : local_addresses()) local_eps_.push_back(ip + ":" + std::to_string(sock_.local_port()));
+    collect_local_endpoints();
     auto c = std::make_unique<Conn>();
     c->addr = a;
     c->player = 0;
@@ -228,8 +227,7 @@ bool Session::host_via(const std::string& server, const std::string& name, const
     me.car = car;
     me.paint = paint;
     players_ = {me};
-    local_eps_.clear();
-    for (const std::string& ip : local_addresses()) local_eps_.push_back(ip + ":" + std::to_string(sock_.local_port()));
+    collect_local_endpoints();
     phase_ = Phase::Lobby;
     server_started_ = now();
     server_sent_ = 0;
@@ -254,8 +252,7 @@ bool Session::join_code(const std::string& server, const std::string& code, cons
     lookup_code_ = c;
     host_ = false;
     my_id_ = -1;
-    local_eps_.clear();
-    for (const std::string& ip : local_addresses()) local_eps_.push_back(ip + ":" + std::to_string(sock_.local_port()));
+    collect_local_endpoints();
     Writer w;
     w.u8_(u8(Msg::Hello));
     w.u16_(kProtocolVersion);
@@ -2027,6 +2024,18 @@ void Session::package_chunk(Conn& from, Reader& r) {
 Session& online() {
     static Session s;
     return s;
+}
+
+namespace {
+bool g_advertise_lan = true;
+} // namespace
+
+void Session::set_advertise_lan(bool on) { g_advertise_lan = on; }
+
+void Session::collect_local_endpoints() {
+    local_eps_.clear();
+    if (!g_advertise_lan) return;
+    for (const std::string& ip : local_addresses()) local_eps_.push_back(ip + ":" + std::to_string(sock_.local_port()));
 }
 
 } // namespace gt3r::net

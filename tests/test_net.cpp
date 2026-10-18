@@ -81,6 +81,9 @@ void step_clock(double ms) {
 }
 
 // Pumps every session until `done` or 3 s of simulated time pass.
+// Loopback only: no LAN endpoints in any session of these tests (see Session::set_advertise_lan).
+const bool kNoLanEndpoints = (net::Session::set_advertise_lan(false), true);
+
 bool pump(std::vector<net::Session*> s, const std::function<bool()>& done) {
     for (int i = 0; i < 600; ++i) {
         for (net::Session* x : s) x->poll();

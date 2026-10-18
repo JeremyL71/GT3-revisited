@@ -241,6 +241,9 @@ public:
     void set_clock_skew(double ms) { skew_ = ms; }
     void set_block_direct(bool on) { block_direct_ = on; }
     void set_punch_give_up_ms(double ms) { punch_give_up_ms_ = ms; }
+    // Tests on loopback: advertise no LAN addresses (on machines whose own LAN address drops
+    // packets to itself, e.g. CI runners, a pair would otherwise link up over it and lose states).
+    static void set_advertise_lan(bool on);
 
 private:
     struct Conn;
@@ -356,6 +359,7 @@ private:
     int reserve_links_ = 0;               // host: the links last asked for
     double reserve_started_ = 0, reserve_sent_ = 0, reserve_heard_ = 0;
     std::vector<std::string> local_eps_;  // client: our LAN endpoints (sent in Hello)
+    void collect_local_endpoints();
     std::deque<Event> events_;
     Settings settings_;
     std::vector<u8> grid_;
