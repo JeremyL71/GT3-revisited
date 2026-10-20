@@ -254,9 +254,7 @@ void RaceScreen::tick(App& app, const PadState& pad) {
         ev2.offroad = track_->is_offroad(track_->query().probe(s2.position.x, s2.position.z, s2.position.y + 2.0f));
         ev2.impact = field_->second_impact();
         rumble2_.update(s2, ev2, last_in2_, dt);
-        RaceField::LapInfo l2 = field_->second_laps();
-        bool time_up2 = time_limit_ > 0 && field_->race_time() >= time_limit_;
-        if (!finished2_ && ((race_laps_ > 0 && l2.laps >= race_laps_) || time_up2)) {
+        if (!finished2_ && field_->second_finish() >= 0) { // the field's finish rule (race::finishes_at_line)
             finished2_ = true;
             finish_position2_ = field_->second_position();
             if (!finished_) p2_won_ = true;
@@ -283,7 +281,8 @@ void RaceScreen::tick(App& app, const PadState& pad) {
     } else {
         race_time_ += dt;
     }
-    bool lap_done = !holding && track_->lap_update(s.position, race_time_);
+    // Races: the field's race clock (0 = GO, the same for every car).
+    bool lap_done = !holding && track_->lap_update(s.position, field_ ? std::max(field_->race_time(), 0.0) : race_time_);
     u32 tick_index = replaying_ ? player_.tick() : recorder_.tick(); // ticks simulated so far
 
     // Lap bookkeeping for the ghost: frame k = state k ticks after the lap started.
@@ -389,10 +388,12 @@ void RaceScreen::tick(App& app, const PadState& pad) {
         finish_position_ = 1;
         finish_record_rank_ = saved_best_ < 0 || track_->best_lap_time() < saved_best_ ? 0 : -1;
     }
-    bool time_up = field_ && time_limit_ > 0 && field_->race_time() >= time_limit_;
-    if (field_ && !finished_ && ((race_laps_ > 0 && track_->laps_completed() >= race_laps_) || time_up)) {
+    // Races: the field's finish rule (race::finishes_at_line: the race's laps, the leader has
+    // finished, or the first crossing after a time limit); the place is the race order's.
+    if (field_ && !finished_ && field_->player_finish() >= 0) {
         finished_ = true;
-        finish_position_ = field_->player_position(track_->race_distance());
+        track_->lap_freeze(); // no more laps after the finish (the HUD's lap time runs on)
+        finish_position_ = field_->player_position();
         if (online_) finish_position_ = online_finish_position();
         if (two_player_ && !finished2_) p1_won_ = true;
         LOG_INFO("Race: finished %d of %d after %d laps (%.3f s)", finish_position_, field_->opponents() + 1,

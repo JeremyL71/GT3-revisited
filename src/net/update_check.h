@@ -34,7 +34,8 @@ bool show_startup_prompt(const GameVersion& ours, const GameVersion& latest, con
 enum class CpuArch : u8 { X64, Arm64, Other };
 CpuArch this_arch();
 // The stable package name for a platform ("": no package for it, e.g. Linux arm64, Intel macOS).
-std::string release_asset(RvPlatform platform, CpuArch arch);
+// `vr`: the VR build (GT3R_XR), whose Android package is the Meta Quest APK.
+std::string release_asset(RvPlatform platform, CpuArch arch, bool vr = false);
 std::string this_release_asset(); // this build's
 struct UpdateLinks {
     std::string download; // the package file (or the release page when there is none)

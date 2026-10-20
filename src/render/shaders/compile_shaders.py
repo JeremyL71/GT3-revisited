@@ -23,7 +23,8 @@ import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 OUT = HERE / "generated"
-SHADERS = [("model_vert", "model.vert"), ("model_frag", "model.frag")]
+SHADERS = [("model_vert", "model.vert"), ("model_frag", "model.frag"),
+           ("present_vert", "present.vert"), ("present_frag", "present.frag")]
 
 
 def run(*args):

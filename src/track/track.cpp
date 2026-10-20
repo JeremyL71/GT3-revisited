@@ -793,11 +793,30 @@ void LapTimer::set_sector_distances(std::vector<float> ends) {
     sector_count_ = int(sector_ends_.size());
 }
 
+long long LapTimer::clock_ms(double t) { return std::llround(std::max(t, 0.0) * 3000.0) / 3; }
+
+long long LapTimer::crossing_ms(double before, double after, double line, double t_prev, double t) {
+    // The original: clock before the tick + trunc(50 f) at 60 Hz (f a float; any tick length
+    // here, in 1/3000 s units).
+    float f = after > before ? float(std::clamp((line - before) / (after - before), 0.0, 1.0)) : 1.0f;
+    long long prev = std::llround(std::max(t_prev, 0.0) * 3000.0);
+    long long step = std::max(0LL, std::llround(std::max(t, 0.0) * 3000.0) - prev);
+    return (prev + (long long)(f * float(step))) / 3;
+}
+
+double LapTimer::current_lap_time(double now) const {
+    if (from_go_ && time_before_line_ ? now <= 0 : !started_) return 0;
+    return double(std::max(0LL, clock_ms(now) - lap_start_ms_)) / 1000.0;
+}
+
 void LapTimer::reset(double time) {
     located_ = false;
     started_ = false;
+    frozen_ = false;
     laps_ = 0;
-    lap_start_ = sector_start_ = time;
+    prev_time_ = time;
+    lap_start_ms_ = sector_start_ms_ = from_go_ ? 0 : clock_ms(time);
+    last_cross_ms_ = -1;
     last_lap_ = best_lap_ = -1;
     sector_ = 0;
     sector_times_.clear();
@@ -831,12 +850,15 @@ bool LapTimer::update(const sim::Vec3& position, double time) {
         // Cars on the grid sit just behind the line (distance near L).
         progress_ = tp.distance > L * 0.5f ? double(tp.distance) - L : double(tp.distance);
         located_ = true;
-        if (progress_ >= 0) { // already past the line: the lap runs from now
+        if (progress_ >= 0) { // already past the line: the lap runs from now (from GO in a race)
             started_ = true;
-            lap_start_ = sector_start_ = time;
+            lap_start_ms_ = sector_start_ms_ = from_go_ ? 0 : clock_ms(time);
         }
+        prev_time_ = time;
         return false;
     }
+    const double t_prev = prev_time_;
+    prev_time_ = time;
     TrackPosition tp = track_.locate(position, distance_);
     float delta = tp.distance - distance_;
     if (delta > L * 0.5f) delta -= L;
@@ -855,27 +877,31 @@ bool LapTimer::update(const sim::Vec3& position, double time) {
     if (!started_) {
         if (before < 0 && progress_ >= 0) {
             started_ = true;
-            lap_start_ = sector_start_ = time;
+            // A race times lap 1 from GO; otherwise the crossing starts it.
+            lap_start_ms_ = sector_start_ms_ = from_go_ ? 0 : crossing_ms(before, progress_, 0.0, t_prev, time);
             sector_ = 0;
             sector_times_.clear();
         }
         return false;
     }
+    if (frozen_) return false;
     // Sectors (except the last, which ends with the lap).
-    double lap_pos = progress_ - double(laps_) * L;
-    while (sector_ + 1 < sector_count_ && lap_pos >= sector_ends_[size_t(sector_)]) {
-        sector_times_.push_back(time - sector_start_);
-        sector_start_ = time;
+    const double lap0 = double(laps_) * L;
+    while (sector_ + 1 < sector_count_ && progress_ - lap0 >= sector_ends_[size_t(sector_)]) {
+        long long ms = crossing_ms(before, progress_, lap0 + sector_ends_[size_t(sector_)], t_prev, time);
+        sector_times_.push_back(double(ms - sector_start_ms_) / 1000.0);
+        sector_start_ms_ = ms;
         ++sector_;
     }
     if (progress_ >= double(laps_ + 1) * L) {
-        sector_times_.push_back(time - sector_start_);
+        long long ms = crossing_ms(before, progress_, double(laps_ + 1) * L, t_prev, time);
+        sector_times_.push_back(double(ms - sector_start_ms_) / 1000.0);
         last_sectors_ = sector_times_;
         sector_times_.clear();
-        last_lap_ = time - lap_start_;
+        last_lap_ = double(ms - lap_start_ms_) / 1000.0;
         if (best_lap_ < 0 || last_lap_ < best_lap_) best_lap_ = last_lap_;
         ++laps_;
-        lap_start_ = sector_start_ = time;
+        lap_start_ms_ = sector_start_ms_ = last_cross_ms_ = ms;
         sector_ = 0;
         return true;
     }

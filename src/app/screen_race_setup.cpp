@@ -381,6 +381,7 @@ void RaceScreen::restart() {
     replaying_ = false;
     run_recorded_ = false;
     result_latch_.reset(); // a new live run
+    latched_rows_.reset();
     TrackPose p = track_->grid_pose(0);
     if (race_mode_ && app_) {
         build_vehicle(*app_); // fresh field: opponents back on the grid
@@ -630,6 +631,11 @@ void RaceScreen::reset_run_state() {
     machine_dist_ = 0, machine_time_ = -1, top_speed_kmh_ = 0;
     tt_failed_ = false;
     tt_hold_ = !field_ && (tt_start_.type == 0 || tt_start_.type == 1) && !tt_start_.flying() ? tt_start_.countdown : 0;
+    // Lap 1 (presentation spec "Race order and finish"): a race times it from GO for every car
+    // (the HUD's lap time runs from GO), a standing licence test too (shown once past the line);
+    // time trials, free runs and flying tests from the first line crossing.
+    const bool standing_licence = !license_event_.empty() && !tt_start_.flying();
+    track_->lap_set_lap1_from_go(field_ || standing_licence, field_ != nullptr);
     track_->lap_reset(0);
     track_->lap_update(vehicle_->state().position, 0);
     controls_.reset();

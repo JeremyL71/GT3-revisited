@@ -136,6 +136,7 @@ void GameFlow::open_control(const std::string& set, const std::string& page, int
         // The option pages' multi items show the stored values.
         for (const GameOption& o : game_options()) ctl_->set_choice(o.page, o.multi, option_index(options_, o));
     carousel_ = {};
+    carousel_jump_ = -1;
     ++generation_;
     ctl_->open(page);
     if (is_code_page(page)) build_carousel(page);
@@ -320,10 +321,27 @@ bool GameFlow::tap(float x, float y) {
             }
     if (ctl_->tap(x, y)) return true;
     if (!carousel_.entries.empty() && ctl_->items().empty()) {
+        if (int k = carousel_icon_at(x, y); k >= 0) {
+            if (k == carousel_.index) injected_ = key_bit(MenuKey::Confirm);
+            else carousel_jump_ = k;
+            return true;
+        }
         injected_ = key_bit(x < 640.0f / 3 ? MenuKey::Left : x > 640.0f * 2 / 3 ? MenuKey::Right : MenuKey::Confirm);
         return true;
     }
     return false;
+}
+
+bool GameFlow::hover(float x, float y) {
+    if (!ctl_ || switching() || waiting_game_ || ctl_->busy()) return false;
+    if (gt_active())
+        if (const GtModeHooks& h = gt_mode_hooks(); h.hover)
+            if (int r = h.hover(*ctl_, x, y)) {
+                if (r == 2) sounds_.push_back("select");
+                return true;
+            }
+    // (Not the carousels' strip: it scrolls to centre the chosen icon.)
+    return ctl_->hover(x, y);
 }
 
 void GameFlow::tick(MenuKeys held) {
@@ -485,7 +503,7 @@ void GameFlow::tick(MenuKeys held) {
     if (two_page_) {
         if (!ctl_->busy()) two_player_frame();
     } else if (!carousel_.entries.empty()) {
-        int move = 0;
+        int move = 0, jumped_from = -1;
         if (!ctl_->busy()) {
             MenuKeys f = ctl_->fired();
             int n = int(carousel_.entries.size());
@@ -500,6 +518,13 @@ void GameFlow::tick(MenuKeys held) {
                     sounds_.push_back("cursor");
                 }
                 d = 0;
+            }
+            // A tapped icon of the strip: straight there (the cross moves one step's way).
+            if (int k = std::exchange(carousel_jump_, -1); k >= 0 && k < n && k != carousel_.index && !d) {
+                jumped_from = carousel_.index;
+                move = k > carousel_.index ? 1 : -1;
+                carousel_.index = k;
+                sounds_.push_back("select");
             }
             if (d) {
                 int next = carousel_.index + d;
@@ -530,7 +555,7 @@ void GameFlow::tick(MenuKeys held) {
                     }
                 }
             }
-        animate_carousel(move);
+        animate_carousel(move, jumped_from);
     }
     const u32 gen = generation_;
     for (const MenuEvent& e : ctl_->take_events()) {
@@ -1161,14 +1186,31 @@ std::vector<std::string> GameFlow::carousel_parts(const std::string& id) const {
     return parts;
 }
 
-void GameFlow::animate_carousel(int move) {
+int GameFlow::carousel_icon_at(float x, float y) const {
+    const Carousel& c = carousel_;
+    if (c.entries.empty() || c.step > 1 || c.strip_alpha < 0.5f || !ctl_ || !ctl_->page()) return -1;
+    const Layer* hidden = find_layer(ctl_->page().layout(), "hidden");
+    const Element* strip = find_element(hidden, strip_name(c.page));
+    if (!strip) return -1;
+    // As drawn (draw_list): icon k at scroll + k (width + 4), centred on the strip.
+    for (size_t k = 0; k < c.entries.size(); ++k) {
+        const Element* icon = find_element(hidden, entry_image(c.entries[k]) + "_mini");
+        if (!icon) continue;
+        float ix = c.scroll + float(k) * (icon->w + 4.0f), cy = strip->y + strip->h * 0.5f;
+        if (x >= ix && x <= ix + icon->w && y >= cy - icon->h * 0.5f && y <= cy + icon->h * 0.5f) return int(k);
+    }
+    return -1;
+}
+
+void GameFlow::animate_carousel(int move, int prev_index) {
     Carousel& c = carousel_;
     if (c.entries.empty()) return;
     const std::string& id = c.entries[size_t(c.index)];
     if (move) {
         // The old art slides out with the cross and fades over 16 frames; the new art
         // starts 680 px to the side.
-        const std::string& prev = c.entries[size_t((c.index - move + int(c.entries.size())) % int(c.entries.size()))];
+        const int n = int(c.entries.size());
+        const std::string& prev = c.entries[size_t(prev_index >= 0 ? prev_index : (c.index - move + n) % n)];
         c.old.push_back({prev, c.art_offset, std::min(1.0f, float(c.age) / 24.0f), 16});
         if (c.has_cross) c.cross_target -= float(move) * 680.0f; // no cross (2 players): swapped in place
         c.art_offset = -c.cross_target;

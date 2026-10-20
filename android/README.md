@@ -41,6 +41,28 @@ and tilt, back button, home and resume (the race pauses), rotation,
 and the system file picker. Status and testing tips:
 [docs/dev/PLATFORMS.md](../docs/dev/PLATFORMS.md).
 
+## Meta Quest (VR)
+
+The same game as an immersive VR app for Meta Quest headsets: menus on a virtual
+screen, races in stereo from the driver's seat. It needs SDL's development branch
+(SDL_GPU's OpenXR support):
+
+```bash
+android/fetch-sdl.sh --xr
+```
+```bash
+cd android && ./gradlew assembleDebug -Pquest
+```
+```bash
+adb install -r app/build/outputs/apk/debug/app-quest-debug.apk
+```
+
+The headset must be in developer mode. Releases carry it signed as
+`gt3r-quest.apk` (`./gradlew assembleRelease -Pquest` with the release key below).
+Players copy their disc image into the headset's Download folder and pick it with
+**Open disc image** (the system file picker opens over the game). Details, controls
+and testing tips: [docs/dev/VR.md](../docs/dev/VR.md).
+
 ## Release signing
 
 Release APKs are signed with the project's own key, so every release can

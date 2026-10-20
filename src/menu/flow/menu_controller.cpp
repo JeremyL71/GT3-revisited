@@ -242,7 +242,10 @@ void MenuController::build(const std::string& name, const std::string& from, boo
         lv.focus = std::clamp(f, 0, std::max(0, int(lv.items.size()) - 1));
         lv.scroll = float(lv.focus);
     }
+    // One popup level: a popup opened from a popup replaces it (the tune shop's Purchase? ->
+    // Install parts now? -> Installed), so closing it returns to the base page.
     if (!popup) levels_.clear();
+    else if (levels_.size() > 1) levels_.pop_back();
     levels_.push_back(std::move(lv));
     Level& t = top();
     if (t.flags & page_flag::kFadeIn) {
@@ -338,7 +341,7 @@ void MenuController::tick(MenuKeys held) {
     held_ = held;
     for (Level& lv : levels_) {
         step_layers(lv);
-        lv.scroll += (float(lv.focus) - lv.scroll) * kScrollFactor;
+        if (!lv.pinned) lv.scroll += (float(lv.focus) - lv.scroll) * kScrollFactor;
     }
     if (!levels_.empty()) {
         Level& t = top();
@@ -371,8 +374,9 @@ void MenuController::tick(MenuKeys held) {
     switch (phase_) {
     case Phase::Idle: break;
     case Phase::Feedback:
-        // The feedback starts once the list has stopped scrolling (< 1 px left).
-        if (!levels_.empty() && std::fabs(top().scroll - float(top().focus)) * 32.0f > 1.0f) return;
+        // The feedback starts once the list has stopped scrolling (< 1 px left). A row held
+        // still for a hovering pointer (pinned) has stopped where it is.
+        if (!levels_.empty() && !top().pinned && std::fabs(top().scroll - float(top().focus)) * 32.0f > 1.0f) return;
         if (--phase_frames_ <= 0) {
             phase_ = Phase::Idle;
             feedback_item_ = -1;
@@ -471,6 +475,7 @@ bool MenuController::move_focus(int delta, int dir_code) {
     }
     free_moved_ = false;
     lv.focus = f;
+    lv.pinned = false;
     lv.pulse = 0.25f;
     sound("select");
     refresh_layers(lv, dir_code);
@@ -670,12 +675,30 @@ bool MenuController::tap(float x, float y) {
     return true;
 }
 
+bool MenuController::hover(float x, float y) {
+    if (busy() || levels_.empty() || !top().page) return false;
+    Level& lv = top();
+    const bool scrolls = scroller_window(lv.page.layout()) != nullptr;
+    if (scrolls && !(lv.flags & page_flag::kHorizontal)) return false;
+    int i = hit_test(x, y);
+    if (i < 0) return false;
+    if (i != lv.focus) {
+        lv.focus = i;
+        lv.pinned = scrolls; // (lv.scroll left where it is)
+        lv.pulse = 0.25f;
+        refresh_layers(lv, 0);
+        sound("select");
+    }
+    return true;
+}
+
 void MenuController::set_focus(int index) {
     if (levels_.empty()) return;
     Level& lv = top();
     if (index >= 0 && index < int(lv.items.size()) && index != lv.focus) {
         lv.focus = index;
         lv.scroll = float(index);
+        lv.pinned = false;
         lv.pulse = 0.25f;
         refresh_layers(lv, 0);
     }

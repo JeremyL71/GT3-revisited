@@ -71,7 +71,8 @@ unavailable" note.
 ## Shaders
 
 Shaders are authored once in Vulkan GLSL (`src/render/shaders/model.vert`,
-`model.frag`) and compiled **offline**. The outputs are committed, so CI and
+`model.frag`; `present.vert` / `.frag` are VR's present pass, [VR](VR.md)) and
+compiled **offline**. The outputs are committed, so CI and
 the Android Gradle build need no shader tools:
 
 ```
@@ -198,9 +199,9 @@ returns meshes drawn/culled, draw calls and triangles of the last draw.
 |---|---|
 | `render/gpu_context.h` | `GpuContext` (device, 2D renderer, pipelines, samplers), `Uploader` |
 | `render/gpu_model.h` | `GpuModel` (upload of a `scene::Model`), `model_stats()` |
-| `render/view3d.h` | `View3D::draw(renderer, rect, camera, items, options)`, `DrawOptions`, `WireMode` |
+| `render/view3d.h` | `View3D::draw(renderer, rect, camera, items, options)`, `draw_to` (straight into a texture: VR eyes), `DrawOptions`, `WireMode` |
 | `render/camera.h` | `OrbitCamera` (pad, mouse, touch, turntable) |
-| `render/math3d.h` | `Vec3`, `Mat4` (column-major), `perspective`, `look_at`, `inverse` |
+| `render/math3d.h` | `Vec3`, `Mat4` (column-major), `perspective`, `frustum` (off-centre, VR eyes), `Frustum` (screen placement for any field of view), `look_at`, `inverse` |
 | `render/test_models.h` | procedural test scenes, ground grid |
 | `app/screen_model_viewer.h` | `make_model_viewer(title, items, loader)` |
 

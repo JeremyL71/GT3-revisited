@@ -637,6 +637,135 @@ TEST(race_results_text) {
     CHECK(result_time_text(false, false, 0, 344, 0) == "Running...");
 }
 
+// The original's race order and finish rule (presentation.md "Race order and finish").
+TEST(race_order_and_finish_rules) {
+    auto st = [](int laps, double distance, double finish = -1) {
+        RaceField::Standing s;
+        s.laps = laps, s.distance = distance, s.time = finish, s.finished = finish >= 0;
+        return s;
+    };
+    CHECK(ranks_ahead(st(3, 0), st(2, 9000)));                    // laps first
+    CHECK(ranks_ahead(st(2, 9000, 300), st(1, 5000, 290)));       // a lapped car finishing earlier stays behind
+    CHECK(ranks_ahead(st(2, 7000), st(2, 6000)));                 // running: race distance
+    CHECK(ranks_ahead(st(2, 6000), st(2, 6500, 280)));            // a running car ahead of a finished one
+    CHECK(!ranks_ahead(st(2, 6500, 280), st(2, 6000)));
+    CHECK(ranks_ahead(st(2, 6000, 270), st(2, 6500, 280)));       // finished: finish time
+    CHECK(!ranks_ahead(st(2, 6000), st(2, 6000)));                // ties keep their places
+    // The race's laps (an equality after the crossing), the leader finished, the time limit.
+    CHECK(finishes_at_line(3, 3, false, 100, 0));
+    CHECK(!finishes_at_line(2, 3, false, 100, 0));
+    CHECK(finishes_at_line(2, 3, true, 100, 0));
+    CHECK(!finishes_at_line(5, 0, false, 100, 0));                // no laps (a time-limited race)
+    CHECK(!finishes_at_line(5, 0, false, 7199.9, 7200));
+    CHECK(finishes_at_line(5, 0, false, 7200, 7200));
+}
+
+// The finish rule in a field: two cars moved over the line by the test (no CPU cars). The
+// leader finishes on the race's laps; the other car, a lap down, finishes at its next
+// crossing ("+1 lap"); laps stop counting at the finish. A time limit ends nothing by itself:
+// each car finishes at its first crossing after it.
+TEST(race_field_finish_rules_disc) {
+    Disc* disc = test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    Vfs vfs(&disc->volume());
+    data::CarDatabase db;
+    CHECK(db.load(vfs));
+    Bytes course = disc->volume().read(*disc->volume().find("courses/US/trialmt"));
+    std::unique_ptr<RaceTrack> track = make_track(vfs, course, "trialmt");
+    const track::Track* rt = track->runtime();
+    CHECK(rt != nullptr);
+    if (!rt) return;
+    const float L = rt->length();
+    auto make = [&](double time_limit) {
+        FieldConfig cfg;
+        cfg.player = "r34_gtr_v_99";
+        cfg.second_player = "r34_gtr_v_99";
+        cfg.max_opponents = 0;
+        cfg.countdown = 0;
+        cfg.time_limit = time_limit;
+        std::string err;
+        return RaceField::create(*track, db, cfg, &err);
+    };
+    const double dt = 1.0 / 60;
+    auto pose = [&](float d) {
+        track::Pose p = rt->respawn_pose(std::fmod(d + L, L));
+        return TrackPose{p.position, p.orientation};
+    };
+    // Around the lap in hops of L / 4 (the timers follow), then over the line at speed.
+    auto lap1 = [&](RaceField& f) { // player 1 (placed without the respawn hold)
+        for (int k = 1; k <= 3; ++k) {
+            f.player().place(pose(L * float(k) / 4));
+            f.player().step({}, dt);
+        }
+        f.player().reset_moving(pose(L - 3), 30);
+        for (int i = 0; i < 60; ++i) f.player().step({}, dt);
+    };
+    auto cross2 = [&](RaceField& f) { // player 2: from 2 m before the line, after the respawn hold, under throttle
+        f.reset_second(pose(L - 2));
+        for (int i = 0; i < 125; ++i) f.player().step({}, dt);
+        sim::ControlInputs gas;
+        gas.throttle = 1;
+        for (int i = 0; i < 90; ++i) {
+            f.set_second_inputs(gas);
+            f.player().step({}, dt);
+        }
+        f.set_second_inputs({});
+    };
+    auto lap2 = [&](RaceField& f) {
+        for (int k = 1; k <= 3; ++k) {
+            f.reset_second(pose(L * float(k) / 4 + 5));
+            f.player().step({}, dt);
+        }
+        cross2(f);
+    };
+    // Both cars driven over the start line (a lap timer starts only on a crossing).
+    auto start = [&](RaceField& f) {
+        f.player().reset_moving(pose(-3), 30);
+        for (int i = 0; i < 60; ++i) f.player().step({}, dt);
+        cross2(f);
+    };
+    auto standing = [](const RaceField& f, int car) {
+        for (const RaceField::Standing& s : f.standings())
+            if (s.car == car) return s;
+        return RaceField::Standing{};
+    };
+
+    std::unique_ptr<RaceField> f = make(0);
+    CHECK(f != nullptr && f->has_second());
+    if (!f) return;
+    f->set_laps(2);
+    start(*f);
+    CHECK(f->second_laps().started && standing(*f, -1).laps == 0 && standing(*f, -2).laps == 0);
+    lap1(*f);
+    lap1(*f);
+    CHECK(f->player_finish() >= 0 && standing(*f, -1).laps == 2);
+    CHECK(f->second_finish() < 0 && standing(*f, -2).laps == 0);
+    lap2(*f); // a lap down: finishes at this crossing
+    CHECK(f->second_finish() > f->player_finish());
+    RaceField::Standing s2 = standing(*f, -2);
+    CHECK(s2.finished && s2.laps == 1);
+    CHECK(f->player_position() == 1 && f->second_position() == 2);
+    CHECK(result_time_text(false, true, s2.time, f->player_finish(), 2 - s2.laps) == "+1 lap");
+    lap2(*f);
+    lap1(*f);
+    CHECK(standing(*f, -2).laps == 1 && standing(*f, -1).laps == 2); // frozen at the finish
+
+    // Time limit 20 s, no laps: player 1 crosses before it (no finish) and after it (finish);
+    // player 2 never crosses after it and races on.
+    f = make(20);
+    CHECK(f != nullptr);
+    if (!f) return;
+    f->set_laps(0);
+    start(*f);
+    lap1(*f);
+    CHECK(f->race_time() < 20 && f->player_finish() < 0 && standing(*f, -1).laps == 1);
+    while (f->race_time() < 20.5) f->player().step({}, dt);
+    CHECK(f->player_finish() < 0 && f->second_finish() < 0);
+    lap1(*f);
+    CHECK(f->player_finish() >= 20 && standing(*f, -1).laps == 2);
+    CHECK(f->second_finish() < 0);
+}
+
 // A race field on Trial Mountain: opponents from the event, player last on the
 // grid, everyone held during the countdown, standings ordered by distance.
 TEST(race_field_event) {

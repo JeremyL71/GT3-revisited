@@ -2672,6 +2672,8 @@ TEST(net_release_asset_per_platform) {
     CHECK(net::release_asset(P::Android, A::Arm64) == "gt3r-android.apk");
     CHECK(net::release_asset(P::Android, A::X64) == "gt3r-android.apk"); // one APK for both ABIs
     CHECK(net::release_asset(P::Android, A::Other).empty());
+    CHECK(net::release_asset(P::Android, A::Arm64, true) == "gt3r-quest.apk"); // the VR build
+    CHECK(net::release_asset(P::Android, A::X64, true).empty());
     CHECK(net::release_asset(P::Other, A::Arm64).empty()); // iOS and anything else
     CHECK(net::release_asset(P::Unknown, A::X64).empty());
 #if defined(__APPLE__) && defined(__aarch64__)

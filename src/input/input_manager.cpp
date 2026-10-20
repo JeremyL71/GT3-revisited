@@ -90,8 +90,9 @@ std::string initial_race_layout(const IniDocument& cfg, const std::string& sec, 
 
 InputManager::InputManager() {
     for (int i = 0; i < kMaxPlayers; ++i) {
-        players_[i].profile = make_preset("racing");
-        players_[i].race_profile = make_race_preset("modern", "racing");
+        players_[i].profile = make_preset(default_preset());
+        players_[i].preset = std::string(default_preset());
+        players_[i].race_profile = make_race_preset("modern", default_preset());
         players_[i].keyboard = (i == 0);
     }
     int count = 0;
@@ -123,7 +124,7 @@ void InputManager::load(const IniDocument& cfg) {
     for (int i = 0; i < kMaxPlayers; ++i) {
         Player& p = players_[i];
         std::string sec = section_name(i);
-        p.preset = cfg.get(sec, "preset").value_or("racing");
+        p.preset = cfg.get(sec, "preset").value_or(std::string(default_preset()));
         p.device_filter = cfg.get(sec, "device").value_or("auto");
         if (auto kb = cfg.get(sec, "keyboard")) p.keyboard = to_lower(*kb) == "on" || *kb == "1";
         p.profile = make_preset(p.preset);
@@ -220,6 +221,14 @@ void InputManager::clear_race_target(int player, const PadTarget& target) {
 
 void InputManager::add_device(SDL_JoystickID id) {
     if (find_device(id)) return;
+#if GT3R_XR
+    // A Meta headset's own controllers and buttons, as Android gamepads: the Touch controllers
+    // come through OpenXR instead (xr::Session's virtual gamepad).
+    if (SDL_GetJoystickVendorForID(id) == 0x2833) {
+        LOG_INFO("Input device ignored: %s (headset)", SDL_GetJoystickNameForID(id) ? SDL_GetJoystickNameForID(id) : "?");
+        return;
+    }
+#endif
     Device d;
     d.id = id;
     if (SDL_IsGamepad(id)) {

@@ -99,6 +99,17 @@ float power_to_weight(const sim::CarSpec& s) {
     return ps > 1 ? s.mass / ps : 1e9f;
 }
 
+bool ranks_ahead(const RaceField::Standing& a, const RaceField::Standing& b) {
+    if (a.laps != b.laps) return a.laps > b.laps;
+    if (a.finished != b.finished) return !a.finished; // a finished car's place on the lap stopped at the line
+    if (a.finished) return a.time < b.time;
+    return a.distance > b.distance;
+}
+
+bool finishes_at_line(int laps_completed, int race_laps, bool leader_finished, double race_time, double time_limit) {
+    return (race_laps > 0 && laps_completed == race_laps) || leader_finished || (time_limit > 0 && race_time >= time_limit);
+}
+
 namespace {
 
 class Field : public RaceField {
@@ -175,6 +186,7 @@ public:
             o.driver = std::make_unique<ai::AiDriver>(course_, params, index);
             o.driver->reset(o.v->state());
             o.timer = std::make_unique<track::LapTimer>(track_);
+            o.timer->set_lap1_from_go(true); // a race: every car's lap 1 from GO
             o.timer->update(pose.position, 0);
             o.prev = o.v->state();
             // CPU pit stops (ai.md §13): only in races with tyre wear and a pit lane.
@@ -215,6 +227,7 @@ public:
             o.world_index = world_.add(std::move(v));
             world_.set_kinematic(o.world_index, true);
             o.timer = std::make_unique<track::LapTimer>(track_);
+            o.timer->set_lap1_from_go(true);
             o.timer->update(pose.position, 0);
             o.prev = o.v->state();
             labels_.push_back(r.car);
@@ -252,6 +265,7 @@ public:
             v2->reset(g2.position, g2.orientation);
             me2_ = world_.add(std::move(v2));
             timer2_ = std::make_unique<track::LapTimer>(track_);
+            timer2_->set_lap1_from_go(true);
             timer2_->update(g2.position, 0);
             prev2_ = world_.vehicle(me2_).state();
         }
@@ -260,8 +274,13 @@ public:
             for (int i = 0; i < world_.size(); ++i) world_.vehicle(i).set_tire_wear(cfg_.wear);
         world_.set_car_collisions(true);
         player_timer_ = std::make_unique<track::LapTimer>(track_);
+        player_timer_->set_lap1_from_go(true);
         snaps_.resize(size_t(world_.size()));
         race_time_ = -cfg_.countdown;
+        order_.push_back(-1);
+        if (me2_ >= 0) order_.push_back(-2);
+        for (size_t i = 0; i < opps_.size(); ++i) order_.push_back(int(i));
+        rank();
         LOG_INFO("Race field: %d opponents (event %s), player on grid slot %d", int(opps_.size()), cfg_.event.c_str(),
                  player_slot());
         return true;
@@ -298,13 +317,13 @@ public:
     const sim::VehicleSetup& opponent_setup(int i) const override { return opps_[size_t(i)].v->setup(); }
     int opponent_laps(int i) const override { return opps_[size_t(i)].timer->laps_completed(); }
     double race_time() const override { return race_time_; }
-    int player_position(double player_distance) const override {
-        int pos = 1;
-        if (timer2_ && timer2_->race_distance() > player_distance) ++pos;
-        for (const Opp& o : opps_)
-            if (o.timer->race_distance() > player_distance) ++pos;
-        return pos;
+    int position_of(int car) const {
+        auto it = std::find(order_.begin(), order_.end(), car);
+        return it == order_.end() ? 0 : int(it - order_.begin()) + 1;
     }
+    int player_position() const override { return position_of(-1); }
+    double player_finish() const override { return finish_player_; }
+    double second_finish() const override { return me2_ >= 0 ? finish2_ : -1; }
     int contacts_last_tick() const override { return int(world_.contacts().size()); }
     const std::vector<std::string>& labels() const override { return labels_; }
 
@@ -359,25 +378,27 @@ public:
     void set_laps(int laps) override { laps_ = laps; }
     std::vector<int> take_pit_entries() override { return std::exchange(pit_entries_, {}); }
     bool opponent_in_pits(int i) const override { const Opp& o = opps_.at(size_t(i)); return o.pit && o.pit->driving(); }
+    Standing standing_of(int car) const {
+        Standing s;
+        s.car = car;
+        const track::LapTimer& t = car == -1 ? *player_timer_ : car == -2 ? *timer2_ : *opps_[size_t(car)].timer;
+        s.time = car == -1 ? finish_player_ : car == -2 ? finish2_ : opps_[size_t(car)].finish;
+        s.finished = s.time >= 0;
+        s.laps = t.laps_completed(); // (a finished car's timer is frozen at its finish)
+        s.distance = t.race_distance();
+        return s;
+    }
+    // The race order after a tick: ranks_ahead over the last order (a stable sort, as the
+    // original's insertion sort: ties keep their places).
+    void rank() {
+        std::vector<Standing> v;
+        for (int car : order_) v.push_back(standing_of(car));
+        std::stable_sort(v.begin(), v.end(), ranks_ahead);
+        for (size_t i = 0; i < v.size(); ++i) order_[i] = v[i].car;
+    }
     std::vector<Standing> standings() const override {
         std::vector<Standing> out;
-        auto add = [&](int car, const track::LapTimer& t, double fin) {
-            Standing s;
-            s.car = car;
-            s.finished = fin >= 0;
-            s.time = fin;
-            s.laps = t.laps_completed();
-            s.distance = t.race_distance();
-            out.push_back(s);
-        };
-        add(-1, *player_timer_, finish_player_);
-        if (timer2_) add(-2, *timer2_, finish2_);
-        for (size_t i = 0; i < opps_.size(); ++i) add(int(i), *opps_[i].timer, opps_[i].finish);
-        std::stable_sort(out.begin(), out.end(), [](const Standing& a, const Standing& b) {
-            if (a.finished != b.finished) return a.finished;
-            if (a.finished && a.time != b.time) return a.time < b.time;
-            return a.distance > b.distance; // running, or finished together (time limit)
-        });
+        for (int car : order_) out.push_back(standing_of(car));
         return out;
     }
     bool opponent_remote(int i) const override { return opps_.at(size_t(i)).remote; }
@@ -417,15 +438,7 @@ public:
         const auto& o = opps_.at(size_t(i));
         world_.set_active(o.world_index, !(o.ghost || o.finished || o.retired));
     }
-    int second_position() const override {
-        if (!timer2_) return 0;
-        double d = timer2_->race_distance();
-        int pos = 1;
-        if (player_timer_->race_distance() > d) ++pos;
-        for (const Opp& o : opps_)
-            if (o.timer->race_distance() > d) ++pos;
-        return pos;
-    }
+    int second_position() const override { return timer2_ ? position_of(-2) : 0; }
 
     // --- player vehicle ---
     void reset_player(const TrackPose& p, float speed_mps = 0, bool grid = false) {
@@ -591,26 +604,18 @@ public:
         sim::Vec3 dv = world_.vehicle(me_).state().velocity - before;
         dv.y = 0;
         player_.impact_ = std::max(0.0f, dv.length() - 2.0f * 9.81f * float(dt));
-        player_timer_->update(world_.vehicle(me_).state().position, std::max(race_time_, 0.0));
-        if (laps_ > 0 && finish_player_ < 0 && player_timer_->laps_completed() >= laps_) finish_player_ = race_time_;
+        const bool player_crossed = player_timer_->update(world_.vehicle(me_).state().position, std::max(race_time_, 0.0));
+        bool second_crossed = false;
         if (me2_ >= 0) {
             sim::Vec3 dv2 = world_.vehicle(me2_).state().velocity - before2;
             dv2.y = 0;
             impact2_ = std::max(0.0f, dv2.length() - 2.0f * 9.81f * float(dt));
-            timer2_->update(world_.vehicle(me2_).state().position, std::max(race_time_, 0.0));
-            if (laps_ > 0 && finish2_ < 0 && timer2_->laps_completed() >= laps_) finish2_ = race_time_;
-        }
-        if (cfg_.time_limit > 0 && race_time_ >= cfg_.time_limit) { // time-limited race: over for everyone
-            if (finish_player_ < 0) finish_player_ = race_time_;
-            if (me2_ >= 0 && finish2_ < 0) finish2_ = race_time_;
-            for (Opp& o : opps_)
-                if (o.finish < 0) o.finish = race_time_;
+            second_crossed = timer2_->update(world_.vehicle(me2_).state().position, std::max(race_time_, 0.0));
         }
         double t = std::max(race_time_, 0.0);
         for (Opp& o : opps_) {
             if (o.remote) { // lap timing from where it is shown; its finish comes from its owner
-                o.timer->update(o.v->state().position, t);
-                if (laps_ > 0 && o.observed_finish < 0 && o.timer->laps_completed() >= laps_) o.observed_finish = race_time_;
+                o.crossed = o.timer->update(o.v->state().position, t);
                 continue;
             }
             const sim::VehicleState& st = o.v->state();
@@ -634,11 +639,33 @@ public:
                 o.last_progress = t;
                 o.off_mesh_ticks = 0;
             }
-            o.timer->update(o.v->state().position, t);
-            if (laps_ > 0 && o.finish < 0 && o.timer->laps_completed() >= laps_) o.finish = race_time_;
+            o.crossed = o.timer->update(o.v->state().position, t);
             double d = o.timer->race_distance();
             if (d > o.best + 10) o.best = d, o.last_progress = t;
         }
+        // Finishes at the line (finishes_at_line), judged in the last race order with the
+        // leader first, so a car crossing on the tick the leader finishes finishes too. The
+        // finish time is the crossing's; the car's timer stops there (no more laps).
+        auto finishes = [&](const track::LapTimer& tm) {
+            return finishes_at_line(tm.laps_completed(), laps_, standing_of(order_.front()).finished,
+                                    tm.last_crossing_time(), cfg_.time_limit);
+        };
+        for (int car : order_) {
+            if (car == -1) {
+                if (player_crossed && finish_player_ < 0 && finishes(*player_timer_))
+                    finish_player_ = player_timer_->last_crossing_time(), player_timer_->freeze();
+            } else if (car == -2) {
+                if (second_crossed && finish2_ < 0 && finishes(*timer2_)) finish2_ = timer2_->last_crossing_time(), timer2_->freeze();
+            } else {
+                Opp& o = opps_[size_t(car)];
+                if (!o.crossed) continue;
+                // A remote car: when we saw it finish (its owner's claim is checked against it).
+                if (o.remote && o.observed_finish < 0 && (o.finish >= 0 || finishes(*o.timer)))
+                    o.observed_finish = o.timer->last_crossing_time(), o.timer->freeze();
+                else if (!o.remote && o.finish < 0 && finishes(*o.timer)) o.finish = o.timer->last_crossing_time(), o.timer->freeze();
+            }
+        }
+        rank();
     }
 
 private:
@@ -653,6 +680,7 @@ private:
         sim::VehicleState prev;
         double last_progress = 0, best = 0;
         double finish = -1;
+        bool crossed = false; // completed a lap on the last tick
         float brake = 0; // last tick's brake pedal
         float contact = 0; // strongest car-car impulse of the last step
         // Online battle: a remote player's car.
@@ -679,6 +707,7 @@ private:
     float brake2_ = 0;
     int laps_ = 0;
     double finish_player_ = -1, finish2_ = -1;
+    std::vector<int> order_; // the race order (ranks_ahead), kept from tick to tick
     std::unique_ptr<track::LapTimer> timer2_;
     sim::ControlInputs in2_;
     sim::VehicleState prev2_;

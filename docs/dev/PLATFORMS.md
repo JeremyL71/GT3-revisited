@@ -18,6 +18,7 @@ run interactively; "unverified" means neither.
 | Android arm64 (API 36 emulator) | NDK 27 clang | ✅ verified | Boot → opening movie → title → Arcade → Time Trial → driving with Vulkan; touch controls, tilt, back, home/resume, rotation, file picker |
 | Android x86_64 | NDK 27 clang | ✅ built | Part of the same APK; not run |
 | Android real device | | ⚠️ unverified | Emulator only. Frame time must be measured on hardware (see below) |
+| Meta Quest 3 (VR) | NDK 27 clang | ✅ verified | The Quest APK (`-Pquest`, SDL 3.6 development branch): menus on a virtual screen, stereo races at a steady 90 fps; see [VR](VR.md) |
 | iOS | | ❌ not started | SDL supports it; touch controls are already platform-neutral |
 
 ## Building and testing
@@ -108,8 +109,13 @@ cd android && ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+Meta Quest (VR): `android/fetch-sdl.sh --xr`, then `./gradlew assembleDebug -Pquest`
+(writes `app-quest-debug.apk`); building, testing over adb and the design are in
+[VR](VR.md).
+
 Testing on an emulator without the file picker: the app reads extra
-command-line arguments from `<user data>/args.txt`, one per line. On a
+command-line arguments from `<user data>/args.txt`, one per line
+(`--env NAME=value` sets a testing variable such as `GT3R_RACE`). On a
 debug build:
 
 ```bash
@@ -155,9 +161,10 @@ system or Homebrew SDL.
 | Windows x64 | `gt3r.exe` (icon resource), `gt3tool.exe`, `SDL3.dll`, README | same with `-DGT3R_SDL_SHARED=ON`; zip |
 | Linux x86_64 | `bin/gt3r`, `bin/gt3tool`, `share/applications/gt3r.desktop`, icon, README | same; `tar czf` (built on Ubuntu 22.04 for an older glibc) |
 | Android | `gt3r-<tag>-android.apk`, signed with the project's release key (CI secrets; [android/README.md](../../android/README.md#release-signing)) | `./gradlew assembleRelease` |
+| Meta Quest | `gt3r-<tag>-quest.apk`, the VR build, same key | `android/fetch-sdl.sh --xr`, `./gradlew assembleRelease -Pquest` ([VR](VR.md)) |
 
-CI job `package` / `package-android` builds these on `v*` tags and manual
-runs (`workflow_dispatch`) and uploads them as artifacts. The macOS app is
+CI jobs `package`, `package-android` and `package-quest` build these on `v*` tags and manual
+runs (`workflow_dispatch`) and upload them as artifacts. The macOS app is
 not code-signed or notarized: first launch needs right-click → Open. The
 icon is original artwork drawn by `packaging/make_icon.py` (also writes the
 Windows `.ico` and the Android launcher icons).

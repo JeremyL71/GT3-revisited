@@ -236,6 +236,52 @@ TEST(track_synthetic_laps) {
     CHECK(near(float(w.race_distance() - before), 3, 0.6f)); // last update was at s = 29
 }
 
+// The original's lap clock (presentation spec "Race order and finish"): a crossing at
+// clock-before-the-tick + trunc(50 f) units of 1/3000 s, ms = floor(units / 3); a race times
+// lap 1 from GO, a time trial from the first crossing; a frozen (finished) timer counts no
+// more laps.
+TEST(track_lap_clock) {
+    Track t(make_ring());
+    const double L = t.length(), dt = 1.0 / 60;
+    // 30 m/s (0.5 m a tick) from 10.205 m behind the line: the line is passed on tick 20
+    // (0-based) at f = 0.41, so at floor((50 x 20 + trunc(20.5)) / 3) = 340 ms.
+    const double s0 = -10.205, step = 0.5;
+    auto run = [&](LapTimer& lt, int ticks, int first_tick = 0) {
+        int done = -1;
+        for (int k = first_tick; k < first_tick + ticks; ++k)
+            if (lt.update(t.point_at(float(s0 + step * double(k + 1)), 0), double(k + 1) * dt) && done < 0) done = k;
+        return done;
+    };
+    LapTimer tt(t), race(t), lic(t);
+    race.set_lap1_from_go(true);
+    lic.set_lap1_from_go(true, false); // a standing licence test: from GO, shown past the line
+    for (LapTimer* lt : {&tt, &race, &lic}) lt->update(t.point_at(float(s0), 0), 0);
+    // Before the line: the race's lap time runs from GO, the others show 0.
+    for (LapTimer* lt : {&tt, &race, &lic}) run(*lt, 6);
+    CHECK(near(float(race.current_lap_time(6 * dt)), 0.1f, 1e-6f)); // floor(300 / 3) ms
+    CHECK(tt.current_lap_time(6 * dt) == 0 && lic.current_lap_time(6 * dt) == 0);
+    for (LapTimer* lt : {&tt, &race, &lic}) run(*lt, 15, 6); // over the line on tick 20
+    CHECK(tt.lap_started() && race.lap_started() && lic.lap_started());
+    CHECK(near(float(tt.current_lap_time(21 * dt)), 0.350f - 0.340f, 1e-6f)); // from the crossing
+    CHECK(near(float(lic.current_lap_time(21 * dt)), 0.350f, 1e-6f));         // from GO
+    // Lap 1 ends at the line's crossing time; lap 1 = that minus 340 ms (time trial) or minus
+    // 0 (from GO).
+    int k_end = int(std::ceil((L - s0) / step)) - 1;
+    double before = s0 + step * double(k_end);
+    float f = float((L - before) / step);
+    long long end_ms = (50LL * k_end + (long long)(50.0f * f)) / 3;
+    int k_tt = run(tt, k_end + 5 - 21, 21), k_race = run(race, k_end + 5 - 21, 21);
+    CHECK(k_tt == k_end && k_race == k_end);
+    CHECK(std::fabs(race.last_lap_time() - double(end_ms) / 1000.0) <= 0.0015); // (locate precision)
+    CHECK(std::fabs(tt.last_lap_time() - double(end_ms - 340) / 1000.0) <= 0.0015);
+    CHECK(near(float(race.last_crossing_time()), float(race.last_lap_time()), 1e-6f));
+    // Frozen after its finish: no more laps; the lap time runs on from the finish.
+    race.freeze();
+    int k2 = run(race, int(L / step) + 10, k_end + 5);
+    CHECK(k2 < 0 && race.laps_completed() == 1);
+    CHECK(race.current_lap_time(double(k_end + 5 + int(L / step) + 10) * dt) > 0.9 * L / 30.0);
+}
+
 // --- real courses -----------------------------------------------------------------
 
 namespace {

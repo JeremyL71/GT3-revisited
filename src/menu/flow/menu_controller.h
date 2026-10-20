@@ -67,7 +67,8 @@ public:
     // goes to the item linking to it). Returns false if it cannot be resolved.
     bool open(std::string_view page, std::string_view from = {});
     // Opens a page as a popup level from control code (e.g. the garage sort
-    // panel on START). False while a transition runs or if the page is missing.
+    // panel on START); an open popup is replaced (there is one popup level).
+    // False while a transition runs or if the page is missing.
     bool popup(std::string_view page);
 
     void tick(MenuKeys held);
@@ -128,6 +129,11 @@ public:
     // on another item it moves the focus there (SE "select"). Returns false when
     // nothing was hit or the menu is busy.
     bool tap(float x, float y);
+    // A pointer that hovers (mouse, a VR controller): the item under it is focused, so one click
+    // then confirms. On a horizontal scrolling row the row then holds still (a still pointer
+    // stays over its item) until the focus moves by key; vertical scrolling selectors, which
+    // centre the focused item by design, are left to taps.
+    bool hover(float x, float y);
     bool set_focus(std::string_view item);
     int choice(std::string_view item) const;
     void set_choice(std::string_view item, int child);
@@ -160,6 +166,7 @@ private:
         u32 built = 0; // frame the page was built (element fade-ins)
         float pulse = 0.25f;
         float scroll = 0; // list scroll position (in items), eases towards focus
+        bool pinned = false; // a hovering pointer moved the focus: the scroll stays put (hover())
         std::vector<LayerInst> layers;
         std::map<std::string, int> layer_override;
     };

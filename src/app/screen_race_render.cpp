@@ -89,6 +89,10 @@ void RaceScreen::draw_mirror(App& app, Ui& ui, const SDL_FRect& frame, const ren
     if (half) o.fixed_width = o.fixed_height = 0;
     render::Mat4 proj = render::perspective(2.0f * std::atan(t), mr.w / mr.h, 0.1f, 120.0f);
     render::Mat4 view = render::scale({1, 1, -1}) * cam.view();
+    // An opaque backing: the course passes keep the target's alpha, which is transparent on a
+    // VR HUD panel.
+    SDL_SetRenderDrawColor(ui.renderer(), 0, 0, 0, 255);
+    SDL_RenderFillRect(ui.renderer(), &mr);
     mv->draw(ui.renderer(), mr, view, proj, eye, items_, o);
     SDL_SetRenderDrawColor(ui.renderer(), 0, 0, 0, 255);
     SDL_RenderRect(ui.renderer(), &mr);
@@ -237,10 +241,12 @@ void RaceScreen::collect_items(const render::Vec3& eye, const sim::Vec3& right, 
         render::Vec3 up = render::normalize(render::Vec3{0, 1, 0} - r * r.y);
         smoke_.add_items(items_, eye, r, up, smoke_v);
     }
+    player_items_[0] = player_items_[1] = items_.size();
     if (player) {
         CarLook look = car_look(render_state_, true);
         look.lamp = brake_lamps_.factor(0); look.brake_now = brake_lamps_.now(0);
         car_visual_->add_items(items_, render_state_, vehicle_->setup(), eye, look);
+        player_items_[1] = items_.size();
     }
     if (second && field_ && field_->has_second()) {
         const CarVisual* v2 = car2_visual_ ? car2_visual_.get() : car_visual_.get();
@@ -332,7 +338,7 @@ HudData RaceScreen::hud_data(int player) {
         d.lap_time = l.current, d.last_lap = l.last, d.best_lap = l.best, d.wrong_way = l.wrong_way;
     } else {
         d.lap = track_->lap_started() ? track_->laps_completed() + 1 : 0;
-        d.lap_time = track_->current_lap_time(race_time_);
+        d.lap_time = track_->current_lap_time(field_ ? field_->race_time() : race_time_);
         // Time trial stopped by a course-out / hit: the run's best lap, or dashes.
         if (tt_failed_) d.lap_time = track_->best_lap_time();
         d.last_lap = track_->last_lap_time();
@@ -347,7 +353,7 @@ HudData RaceScreen::hud_data(int player) {
         if (time_limit_ > 0) d.time_left = std::max(0.0, time_limit_ - std::max(0.0, field_->race_time()));
         d.cars = field_->opponents() + 1 + (field_->has_second() ? 1 : 0);
         if (p2) d.position = finished2_ ? finish_position2_ : field_->second_position();
-        else d.position = finished_ ? finish_position_ : field_->player_position(track_->race_distance());
+        else d.position = finished_ ? finish_position_ : field_->player_position();
         // 3, 2, 1 over the last 3 s of the hold (GT3 holds 10 s), START for 1 s after the
         // signal (rolling start: when the computer hands the car over).
         double rt = field_->race_time(), go = rolling_ ? kRollingAutoDrive : 0.0;
@@ -547,6 +553,14 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
     }
     frame_rect_ = rect;
     Uint64 t0 = SDL_GetPerformanceCounter();
+#if GT3R_XR
+    if (vr_stereo(app, split)) { // both eyes; the HUD and menus below go onto the panel in front
+        if (update_env_cube()) o.env_cube = view_->env_cube(), o.env_gt3_lookup = env_gt3_scene_;
+        render_vr_eyes(app, ui, o);
+        frame_rect_ = rect = {0, 0, float(Ui::kWidth), float(Ui::kHeight)};
+    } else
+#endif
+    {
     Uint64 h_e0 = SDL_GetTicksNS();
     if (update_env_cube()) o.env_cube = view_->env_cube(), o.env_gt3_lookup = env_gt3_scene_;
     Uint64 h_e1 = SDL_GetTicksNS();
@@ -582,6 +596,7 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
         if (horizontal && !replaying_ && camera2_.onboard() && camera2_.mirror() && !camera2_.look_back())
             draw_mirror(app, ui, rect2, o, true, true);
     }
+    } // (the flat views)
     if (preset_.gpusync) SDL_WaitForGPUIdle(app.gpu()->device()); // measure: CPU + GPU time of the 3D pass
     double draw_ms = double(SDL_GetPerformanceCounter() - t0) * 1000.0 / double(SDL_GetPerformanceFrequency());
     if (!paused_ && frame_ms_ > 0) perf_.add(frame_ms_, draw_ms);
@@ -723,7 +738,8 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
 
 // GT3's wet-road reflection (docs/dev/RACE.md) for the main view: the buffer (slot 9, mirrored cars, lamp
 // streaks) rendered and blurred, then the frame items (alpha clear, slot 13 mask, composite).
-void RaceScreen::add_wet_road(const render::Vec3& eye, float aspect, const render::DrawOptions& o) {
+void RaceScreen::add_wet_road(const render::Vec3& eye, const render::Mat4& view, const render::Mat4& proj,
+                              const render::Frustum& fr, const render::DrawOptions& o) {
     wet_items_.clear();
     std::vector<WetRoad::Car> cars;
     auto add = [&](const CarVisual* v, const sim::VehicleState& s, const sim::VehicleSetup& su, size_t idx) {
@@ -743,9 +759,9 @@ void RaceScreen::add_wet_road(const render::Vec3& eye, float aspect, const rende
                     interpolate(field_->opponent_prev_state(i), field_->opponent_state(i), step_.alpha()),
                     field_->opponent_setup(i), 2 + size_t(i));
     }
-    wet_.add_buffer_items(wet_items_, camera_.view(), eye, cars);
-    SDL_GPUTexture* t = wet_.render(*view_, camera_.view(), camera_.projection(aspect), eye, wet_items_, o);
-    wet_.add_frame_items(items_, camera_.view(), camera_.fovy(), aspect, t);
+    wet_.add_buffer_items(wet_items_, view, eye, cars);
+    SDL_GPUTexture* t = wet_.render(*view_, view, proj, eye, wet_items_, o);
+    wet_.add_frame_items(items_, view, fr, t);
 }
 
 // Every car's lamps for the glow pass: the player, player 2 and the opponents.

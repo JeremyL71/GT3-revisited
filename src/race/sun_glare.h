@@ -92,7 +92,12 @@ public:
     void load(const Vfs& vfs, SDL_Renderer* r, ByteSpan env0);
     const SunParams& params() const { return p_; }
     // Draws the glare into `rect` for a camera (view, vertical FOV); `visibility` 0..1.
-    void draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, float fovy, float visibility) const;
+    void draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, float fovy, float visibility) const {
+        draw(r, rect, view, render::Frustum::symmetric(fovy, rect.w / rect.h), visibility);
+    }
+    // Any frustum (VR eyes).
+    void draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Frustum& fr,
+              float visibility) const;
 
 private:
     SunParams p_;

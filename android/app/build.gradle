@@ -2,11 +2,16 @@ plugins {
     id 'com.android.application'
 }
 
+// -Pquest builds the Meta Quest APK instead (docs/dev/VR.md): the same game with OpenXR, on
+// SDL's development branch (fetch-sdl.sh --xr), arm64 only, with the headset's manifest.
+def quest = project.hasProperty('quest')
+
 // SDL3's Java glue and native sources come from one SDL checkout so the two
 // always match. fetch-sdl.sh (or fetch-sdl.ps1) creates it.
-def sdlDir = file(project.findProperty('SDL_DIR') ?: "${rootDir}/third_party/SDL")
+def sdlDir = quest ? file(project.findProperty('SDL_XR_DIR') ?: "${rootDir}/third_party/SDL-xr")
+                   : file(project.findProperty('SDL_DIR') ?: "${rootDir}/third_party/SDL")
 if (!file("${sdlDir}/android-project").exists()) {
-    throw new GradleException("SDL3 source not found at ${sdlDir}. Run android/fetch-sdl.sh first.")
+    throw new GradleException("SDL3 source not found at ${sdlDir}. Run android/fetch-sdl.sh${quest ? ' --xr' : ''} first.")
 }
 
 // The game's version comes from the top-level CMakeLists.txt (project(... VERSION x.y.z)),
@@ -37,10 +42,14 @@ android {
                           "-DFETCHCONTENT_SOURCE_DIR_SDL3=${sdlDir}",
                           '-DGT3R_BUILD_TOOLS=OFF', '-DGT3R_BUILD_TESTS=OFF',
                           // 16 KB page devices (Android 15+): 16 KB-aligned LOAD segments
-                          '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
-                abiFilters 'arm64-v8a', 'x86_64'
+                          '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON',
+                          "-DGT3R_XR=${quest ? 'ON' : 'OFF'}"
+                if (quest) abiFilters 'arm64-v8a'
+                else abiFilters 'arm64-v8a', 'x86_64'
             }
         }
+        // (the OpenXR loader package brings every ABI; the Quest is arm64)
+        if (quest) ndk { abiFilters 'arm64-v8a' }
     }
 
     externalNativeBuild {
@@ -51,6 +60,14 @@ android {
     }
 
     sourceSets.main.java.srcDirs += "${sdlDir}/android-project/app/src/main/java"
+    if (quest) sourceSets.main.manifest.srcFile 'src/quest/AndroidManifest.xml'
+
+    // The Quest APK under its own name (app-quest-debug.apk, app-quest-release.apk).
+    if (quest) {
+        applicationVariants.all { variant ->
+            variant.outputs.all { outputFileName = "app-quest-${variant.buildType.name}.apk" }
+        }
+    }
 
     // Release signing: the project's own key (android/make-release-key.sh), never
     // committed. CI writes it from secrets; locally, set the same variables.
@@ -85,4 +102,10 @@ android {
     lint {
         abortOnError false
     }
+}
+
+dependencies {
+    // The Khronos OpenXR loader (libopenxr_loader.so), which SDL opens on the Quest; keep it at
+    // the OpenXR version of the headers SDL builds with.
+    if (quest) implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.65'
 }

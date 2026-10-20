@@ -581,6 +581,7 @@ is always the newest:
 | macOS arm64 | `gt3r-macos-arm64.zip` |
 | Linux x86_64 | `gt3r-linux-x86_64.tar.gz` |
 | Android (arm64, x86_64) | `gt3r-android.apk` (only when the APK was built) |
+| Meta Quest (the VR build, `GT3R_XR`) | `gt3r-quest.apk` (likewise) |
 
 The relay's `release_url` may hold an `{asset}` placeholder
 (`net::update_links`, `net::release_asset`; tested in

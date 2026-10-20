@@ -164,9 +164,52 @@ jobs:
           path: gt3r-${{ github.ref_name }}-android.apk
           if-no-files-found: error
 
+  # The Meta Quest APK (docs/dev/VR.md): SDL's development branch (OpenXR), arm64, the same
+  # release key as the phone APK. Without the key the release goes out without it.
+  package-quest:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 21
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;27.0.12077973" "cmake;3.22.1" > /dev/null
+      - name: Fetch SDL (development branch)
+        run: android/fetch-sdl.sh --xr
+      - name: Build Quest APK (release key)
+        id: apk
+        working-directory: android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          GT3R_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set: no Quest APK in this release (android/README.md, Release signing)"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/gt3r-release.jks"
+          GT3R_KEYSTORE="$RUNNER_TEMP/gt3r-release.jks" ./gradlew --no-daemon assembleRelease -Pquest
+          rm -f "$RUNNER_TEMP/gt3r-release.jks"
+          echo "built=true" >> "$GITHUB_OUTPUT"
+      - name: Rename
+        if: steps.apk.outputs.built == 'true'
+        run: cp android/app/build/outputs/apk/release/app-quest-release.apk "gt3r-${{ github.ref_name }}-quest.apk"
+      - uses: actions/upload-artifact@v4
+        if: steps.apk.outputs.built == 'true'
+        with:
+          name: gt3r-${{ github.ref_name }}-quest
+          path: gt3r-${{ github.ref_name }}-quest.apk
+          if-no-files-found: error
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [package, package-android]
+    needs: [package, package-android, package-quest]
     runs-on: ubuntu-24.04
     permissions:
       contents: write     # create the release
@@ -183,7 +226,7 @@ jobs:
       # https://github.com/<owner>/<repo>/releases/latest/download/<name>
       # always fetches the newest package (the game's "Download update" uses these; docs/dev/ONLINE.md
       # "Versions and updates"): gt3r-windows-x64.zip, gt3r-macos-arm64.zip, gt3r-linux-x86_64.tar.gz,
-      # gt3r-android.apk (only when the APK was built).
+      # gt3r-android.apk and gt3r-quest.apk (only when the APKs were built).
       - name: Stable names
         working-directory: assets
         env:

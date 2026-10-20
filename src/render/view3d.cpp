@@ -212,6 +212,67 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
     SDL_SetTextureAlphaModFloat(wrapper_, 1.0f);
 }
 
+bool View3D::draw_to(SDL_GPUTexture* target, int w, int h, const Mat4& view, const Mat4& proj, const Vec3& eye,
+                     const std::vector<DrawItem>& items, const DrawOptions& opt) {
+    if (!target || w <= 0 || h <= 0) return false;
+    SDL_GPUDevice* dev = ctx_.device();
+    Offscreen& o = direct_;
+    if (!o.depth || o.w != w || o.h != h || o.samples != ctx_.msaa()) {
+        for (SDL_GPUTexture** t : {&o.msaa, &o.depth}) {
+            if (*t) SDL_ReleaseGPUTexture(dev, *t);
+            *t = nullptr;
+        }
+        SDL_GPUTextureCreateInfo ti{};
+        ti.type = SDL_GPU_TEXTURETYPE_2D;
+        ti.width = u32(w), ti.height = u32(h);
+        ti.layer_count_or_depth = 1;
+        ti.num_levels = 1;
+        ti.sample_count = ctx_.sample_count();
+        if (ctx_.sample_count() != SDL_GPU_SAMPLECOUNT_1) {
+            ti.format = GpuContext::kColorFormat;
+            ti.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+            o.msaa = SDL_CreateGPUTexture(dev, &ti);
+        }
+        ti.format = ctx_.depth_format();
+        ti.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+        o.depth = SDL_CreateGPUTexture(dev, &ti);
+        o.w = w, o.h = h, o.samples = ctx_.msaa();
+        if (!o.depth || (ctx_.sample_count() != SDL_GPU_SAMPLECOUNT_1 && !o.msaa)) {
+            LOG_WARN("3D target %dx%d: %s", w, h, SDL_GetError());
+            return false;
+        }
+    }
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(dev);
+    if (!cmd) return false;
+    SDL_GPUColorTargetInfo ct{};
+    ct.clear_color = {opt.clear[0], opt.clear[1], opt.clear[2], opt.clear[3]};
+    ct.load_op = SDL_GPU_LOADOP_CLEAR;
+    if (o.msaa) {
+        ct.texture = o.msaa;
+        ct.store_op = SDL_GPU_STOREOP_RESOLVE;
+        ct.resolve_texture = target;
+        ct.cycle = true;
+        ct.cycle_resolve_texture = true;
+    } else {
+        ct.texture = target;
+        ct.store_op = SDL_GPU_STOREOP_STORE;
+        ct.cycle = true;
+    }
+    SDL_GPUDepthStencilTargetInfo dt{};
+    dt.texture = o.depth;
+    dt.clear_depth = 1.0f;
+    dt.load_op = SDL_GPU_LOADOP_CLEAR;
+    dt.store_op = SDL_GPU_STOREOP_DONT_CARE;
+    dt.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+    dt.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+    dt.cycle = true;
+    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &ct, 1, &dt);
+    frame_alpha_written_ = false;
+    encode(cmd, pass, view, proj, eye, items, opt);
+    SDL_EndGPURenderPass(pass);
+    return SDL_SubmitGPUCommandBuffer(cmd);
+}
+
 void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Mat4& view, const Mat4& proj,
                     const Vec3& eye, const std::vector<DrawItem>& items, const DrawOptions& opt) {
     const Mat4 view_proj = proj * view;
@@ -354,7 +415,9 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
                     : (p.flags & scene::kAdditive)   ? BlendMode::Additive
                     : (p.flags & scene::kAlphaBlend) ? BlendMode::Alpha
                                                      : BlendMode::Opaque;
-        key.cull = opt.cull ? *opt.cull : (p.flags & scene::kDoubleSided) ? CullMode::None : CullMode::Back;
+        key.cull = opt.cull                                                  ? *opt.cull
+                   : (p.flags & scene::kDoubleSided) && !v.item->single_sided ? CullMode::None
+                                                                               : CullMode::Back;
         if (opt.mirrored && key.cull != CullMode::None)
             key.cull = key.cull == CullMode::Back ? CullMode::Front : CullMode::Back;
         key.depth_write = !(p.flags & scene::kNoDepthWrite) && !background && half != 2;
@@ -671,7 +734,8 @@ SDL_GPUTexture* View3D::placeholder_cube() {
 }
 
 void View3D::release_offscreen() {
-    for (Offscreen& o : offscreen_) {
+    for (Offscreen* p : {&offscreen_[0], &offscreen_[1], &offscreen_[2], &offscreen_[3], &direct_}) {
+        Offscreen& o = *p;
         for (SDL_GPUTexture** t : {&o.color, &o.msaa, &o.depth}) {
             if (*t) SDL_ReleaseGPUTexture(ctx_.device(), *t);
             *t = nullptr;

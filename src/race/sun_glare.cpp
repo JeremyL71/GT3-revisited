@@ -151,7 +151,8 @@ void SunGlare::load(const Vfs& vfs, SDL_Renderer* r, ByteSpan env0) {
     }
 }
 
-void SunGlare::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, float fovy, float visibility) const {
+void SunGlare::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Frustum& fr,
+                    float visibility) const {
     if (!p_.enabled || !tex_ || visibility <= 0 || p_.glare_size <= 0) return;
     // The sun direction in camera space (view rotation only).
     render::Vec3 d = p_.direction();
@@ -159,10 +160,8 @@ void SunGlare::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& 
     float cy = view.at(1, 0) * d.x + view.at(1, 1) * d.y + view.at(1, 2) * d.z;
     float cz = view.at(2, 0) * d.x + view.at(2, 1) * d.y + view.at(2, 2) * d.z;
     if (cz >= -1e-3f) return; // behind the camera (it looks down -z)
-    float t = std::tan(fovy * 0.5f), aspect = rect.w / rect.h;
-    float sx = (cx / -cz) / (t * aspect), sy = (cy / -cz) / t; // -1..1 inside the view
-    float px = rect.x + (sx * 0.5f + 0.5f) * rect.w, py = rect.y + (0.5f - sy * 0.5f) * rect.h;
-    float half = p_.glare_size / t * rect.h * 0.5f; // angular half-size atan(k)
+    float px = fr.screen_x(cx, -cz, rect.x, rect.w), py = fr.screen_y(cy, -cz, rect.y, rect.h);
+    float half = p_.glare_size * fr.per_metre(1.0f, rect.h); // angular half-size atan(k)
     if (px + half < rect.x || px - half > rect.x + rect.w || py + half < rect.y || py - half > rect.y + rect.h) return;
     // Colour: sun RGB x visibility, with the original's 0.5 = full weight convention.
     float k = std::clamp(p_.weight, 0.0f, 1.0f) * visibility;

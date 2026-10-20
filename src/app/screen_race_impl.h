@@ -264,6 +264,15 @@ private:
     void update_pylons(double dt);
     void update_smoke(double dt);
 
+#if GT3R_XR
+    // VR headsets (screen_race_vr.cpp): while driving, the race in stereo from the head pose,
+    // seated in the car (in-car views) or floating behind it (chase views); the HUD, mirror and
+    // menus on the panel in front.
+    bool vr_stereo(App& app, bool split) const;
+    render::Mat4 vr_base(const xr::Settings& st) const; // the seated space's origin -> world
+    void render_vr_eyes(App& app, Ui& ui, const render::DrawOptions& o);
+#endif
+
     // Drawing the race (screen_race_render.cpp)
     bool update_env_cube();
     void draw_mirror(App& app, Ui& ui, const SDL_FRect& frame, const render::DrawOptions& main, bool p2 = false,
@@ -274,6 +283,7 @@ private:
     static TyreSmoke::View smoke_view(const CameraRig& c, float aspect, float fovy);
     void collect_items(const render::Vec3& eye, const sim::Vec3& right = {1, 0, 0}, bool player = true,
                        bool second = true, const TyreSmoke::View& smoke_v = {});
+    size_t player_items_[2] = {0, 0}; // collect_items: the player's car is items_[first, end)
     HudData hud_data(int player);
     float sun_visibility(const render::Vec3& eye, float fovy, float rect_h);
     bool split_horizontal(App& app) const;
@@ -281,7 +291,12 @@ private:
     static sim::Vec3 cam_forward(const CameraRig& c);
     render::DrawOptions draw_options() const;
     void render_drive(App& app, Ui& ui);
-    void add_wet_road(const render::Vec3& eye, float aspect, const render::DrawOptions& o);
+    void add_wet_road(const render::Vec3& eye, float aspect, const render::DrawOptions& o) {
+        add_wet_road(eye, camera_.view(), camera_.projection(aspect),
+                     render::Frustum::symmetric(camera_.fovy(), aspect), o);
+    }
+    void add_wet_road(const render::Vec3& eye, const render::Mat4& view, const render::Mat4& proj,
+                      const render::Frustum& fr, const render::DrawOptions& o);
     std::vector<CarLampGlows::Car> lamp_cars() const;
     static sim::Vec3 to_sim(const render::Vec3& v) { return {v.x, v.y, v.z}; }
     FieldLap field_lap2() const { return field_ && field_->has_second() ? field_->second_laps() : FieldLap{}; }
@@ -334,6 +349,7 @@ private:
     static std::string ascii(const std::string& s);
     std::string car_display_name(const std::string& label, bool full = false) const;
     std::vector<ResultRow> result_rows(bool full_names = false) const;
+    std::vector<ResultRow> result_menu_rows() const;
     void latch_result();
     menu::flow::GameResult build_result() const;
     void leave(App& app);
@@ -490,6 +506,7 @@ private:
     bool race_se_ = true, replay_se_ = true, ghost_on_ = true, wide_mode_ = false;
     QuickMenu quick_menu_;
     RaceResultLatch result_latch_;
+    std::optional<std::vector<ResultRow>> latched_rows_; // the result menu's rows, kept with the latched result
     PauseMenu pause_menu_;
     bool pause_loaded_ = false;
     menu::flow::MenuSounds quick_sounds_; // the menus' sound effects (quick / pause menus)
@@ -580,6 +597,9 @@ private:
     sim::VehicleState render_state2_;
     std::unique_ptr<render::View3D> view2_;
     std::unique_ptr<render::View3D> mirror_view_, mirror_view2_;
+#if GT3R_XR
+    std::unique_ptr<render::View3D> vr_views_[2]; // the eyes (screen_race_vr.cpp)
+#endif
     std::vector<std::unique_ptr<render::View3D>> icon_views_; // 2P results panel car pictures
     std::unique_ptr<CarVisual> car2_visual_;
     bool finished2_ = false;

@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace gt3r::game {
 
@@ -73,6 +74,10 @@ std::string arcade_entry_car(const std::string& entry);
 // Arcade garage classes: the car page entries "hg<i>" (home garage) / "gg<i>" (guest
 // garage), i = the garage list index. Returns the garage car (nullptr for other entries).
 const GarageCar* arcade_garage_car(const std::string& entry);
+// The race information's Cars Permitted list (page 00cmn/car_reguration) for a race code:
+// each car of the event's regulation as "<name> <second name>", a string listed once (at
+// its last place); empty when the race has no list ("No Limitations").
+std::vector<std::string> permitted_car_names(const GtMode& gt, const std::string& code);
 // Prepares the car settings menu (menu/setting.mbl) for the ride car: a working
 // copy for the sliders; `event` (race code, may be empty) is checked on every
 // change (settings that would break its rules are refused). False without a
@@ -115,6 +120,8 @@ public:
     int color_cursor = 0;      // dealer car page: paint index
     int garage_focus = -1;     // garage car chosen (set_garage_car)
     int focus_goods = -1;      // tune-shop goods (set_focus_parts)
+    float part_power_before = 0; // tune shop: the ride car's power before the last part was fitted
+    int regulated_cursor = 0;  // 00cmn/car_reguration: the permitted-car list cursor
     std::string focus_wheel;   // wheel shop (set_focus_wheel_code)
     std::string focus_wheel_preview; // wheel shop: the wheel under the cursor (shown on the car)
     int wheel_cursor = 0;      // hm/hm_wheel: wheel inventory cursor (-1 = stock)

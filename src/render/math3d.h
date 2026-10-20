@@ -63,6 +63,24 @@ Mat4 rotate_z(float radians);
 Mat4 rotate_quat(float w, float x, float y, float z);
 // Right-handed perspective, depth mapped to 0..1. `fovy` in radians.
 Mat4 perspective(float fovy, float aspect, float znear, float zfar);
+// Off-centre perspective from the tangents of the four half angles (VR eyes; left and down
+// are negative for a frustum around the view axis), depth mapped to 0..1.
+Mat4 frustum(float tan_left, float tan_right, float tan_down, float tan_up, float znear, float zfar);
+
+// A view's field of view as the tangents of its half angles (left and down negative), for
+// placing screen-space effects (sun glare, lamp glows) over a 3D view drawn into `rect`.
+struct Frustum {
+    float left = -1, right = 1, down = -1, up = 1;
+    static Frustum symmetric(float fovy, float aspect) {
+        float t = std::tan(fovy * 0.5f);
+        return {-t * aspect, t * aspect, -t, t};
+    }
+    // Screen x / y in `rect` units of a view-space point (x, y) at distance z in front.
+    float screen_x(float x, float z, float rect_x, float rect_w) const { return rect_x + (x / z - left) / (right - left) * rect_w; }
+    float screen_y(float y, float z, float rect_y, float rect_h) const { return rect_y + (up - y / z) / (up - down) * rect_h; }
+    // Rectangle units per metre at distance z (vertical).
+    float per_metre(float z, float rect_h) const { return rect_h / ((up - down) * z); }
+};
 Mat4 look_at(const Vec3& eye, const Vec3& target, const Vec3& up);
 // General inverse; returns identity for singular matrices.
 Mat4 inverse(const Mat4& a);

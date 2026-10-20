@@ -36,7 +36,29 @@ bool GpuContext::init(SDL_Window* window, const GpuOptions& options) {
     // them, e.g. Mali (Pixel, Galaxy, Tensor phones), which lacks shaderClipDistance. We clip
     // depth normally, draw directly and write no clip distances. Anisotropic filtering is the one
     // we use: a GPU without it gets a second try with it off (anisotropy_ = false).
+#if GT3R_XR
+    // A headset: one attempt through its OpenXR runtime (the Quest runtime cannot be set up a
+    // second time in a process), with the same features as below.
+    if (options.xr) {
+        SDL_PropertiesID props = SDL_CreateProperties();
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, options.debug);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_CLIP_DISTANCE_BOOLEAN, false);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_DEPTH_CLAMPING_BOOLEAN, false);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_INDIRECT_DRAW_FIRST_INSTANCE_BOOLEAN, false);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_ANISOTROPY_BOOLEAN, true);
+        if (xr::Session::prepare_device(props, xr_request_)) {
+            device_ = SDL_CreateGPUDeviceWithProperties(props);
+            if (device_) xr_ = true;
+            else LOG_INFO("VR: no headset (%s); using the window", SDL_GetError());
+        }
+        SDL_DestroyProperties(props);
+    }
     for (bool aniso : {true, false}) {
+        if (device_) break;
+#else
+    for (bool aniso : {true, false}) {
+#endif
         SDL_PropertiesID props = SDL_CreateProperties();
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);
@@ -57,13 +79,18 @@ bool GpuContext::init(SDL_Window* window, const GpuOptions& options) {
         LOG_WARN("No SDL_GPU device: %s", SDL_GetError());
         return false;
     }
-    // The 2D renderer claims the window and owns the swapchain.
-    renderer_ = SDL_CreateGPURenderer(device_, window);
+    // The 2D renderer claims the window and owns the swapchain (a headset: offscreen, it draws
+    // into the session's canvases and the headset sets the pace).
+    SDL_Window* target = window;
+#if GT3R_XR
+    if (xr_) target = nullptr;
+#endif
+    renderer_ = SDL_CreateGPURenderer(device_, target);
     if (!renderer_) {
         LOG_WARN("SDL_CreateGPURenderer failed: %s", SDL_GetError());
         return false;
     }
-    SDL_SetRenderVSync(renderer_, options.vsync ? 1 : 0);
+    if (target) SDL_SetRenderVSync(renderer_, options.vsync ? 1 : 0);
 
     vs_ = make_shader(true);
     fs_ = make_shader(false);

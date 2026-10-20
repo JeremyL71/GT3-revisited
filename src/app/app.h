@@ -9,6 +9,7 @@
 #include "platform/display_insets.h"
 #include "render/gpu_context.h"
 #include "vfs/vfs.h"
+#include "xr/xr_session.h"
 
 #include <SDL3/SDL.h>
 
@@ -83,6 +84,12 @@ public:
     SDL_Window* window() { return window_; }
     // Shared SDL_GPU device for 3D views; nullptr when running 2D-only.
     render::GpuContext* gpu() { return gpu_.get(); }
+#if GT3R_XR
+    // The VR headset session (docs/dev/VR.md); nullptr without a headset. The 2D renderer then
+    // draws into its canvases: screens may draw a stereo frame while driving.
+    xr::Session* xr() { return xr_.get(); }
+    void set_xr_settings(const xr::Settings& s);
+#endif
     const std::string& data_dir() const { return data_dir_; }
     std::string mods_dir() const { return data_dir_ + "mods"; }
     // Set by the async file dialog callback; consumed on the main thread.
@@ -104,6 +111,14 @@ private:
     SDL_Window* window_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;     // owned by gpu_ when it exists
     std::unique_ptr<render::GpuContext> gpu_;
+#if GT3R_XR
+    std::unique_ptr<xr::Session> xr_;
+    s64 xr_last_display_ = 0; // previous frame's display time (frame step)
+    // The right controller's pointer on the virtual screen: mouse events to the screens.
+    void xr_pointer();
+    bool xr_pointer_on_ = false, xr_pointer_down_ = false;
+    float xr_pointer_x_ = 0, xr_pointer_y_ = 0;
+#endif
     std::unique_ptr<Ui> ui_;
     std::unique_ptr<InputManager> input_;
     std::unique_ptr<AudioEngine> audio_;
@@ -130,7 +145,6 @@ private:
     int frame_ = 0;
     bool touch_ui_ = false;  // phone/tablet sizing (mobile builds, or GT3R_PHONE)
     bool phone_sim_ = false; // GT3R_PHONE=1: desktop window shaped like a 20:9 phone
-    int ui_lw_ = 0, ui_lh_ = 0; // logical presentation currently set
     std::optional<platform::DisplayInsets> display_insets_; // phones: cutout and corner radius (pixels)
     int insets_retry_ = 0;                                  // frames until the next query (0: now)
 };

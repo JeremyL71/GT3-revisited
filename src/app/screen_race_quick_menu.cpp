@@ -137,20 +137,13 @@ void RaceScreen::open_quick_menu(App& app) {
     silence(app);
     std::string pmb = quick_menu_layout(false);
     if (!quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), pmb)) quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), "qm_arc_result1.pmb");
-    {
-        // The result quick menu lists every finished car's own race time (the reference
-        // capture), not the gaps the overlay shows.
-        std::vector<ResultRow> rows = result_rows();
-        if (field_) {
-            std::vector<RaceField::Standing> st = field_->standings();
-            for (size_t i = 0; i < rows.size() && i < st.size(); ++i)
-                if (st[i].finished) rows[i].time = Hud::format_time(st[i].time);
-        }
-        quick_menu_.set_rows(std::move(rows));
-    }
+    // The live race's rows: after a replay (a GT race's own, or the 2P one) the field is the
+    // replay's.
+    std::vector<ResultRow> rows = latched_rows_ ? *latched_rows_ : result_menu_rows();
+    for (const ResultRow& r : rows) LOG_INFO("Race result: %-40s %s", r.name.c_str(), r.time.c_str());
+    quick_menu_.set_rows(std::move(rows));
     if (!license_event_.empty()) fill_license_menu(app); // the test's name and target times
     fill_top3();
-    for (const ResultRow& r : result_rows()) LOG_INFO("Race result: %-40s %s", r.name.c_str(), r.time.c_str());
 }
 
 void RaceScreen::update_quick_menu(App& app, double dt) {

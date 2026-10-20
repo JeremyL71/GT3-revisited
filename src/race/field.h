@@ -49,8 +49,8 @@ struct FieldConfig {
     // GT-mode grid: opponents ranked by power-to-weight (kg per PS, lightest per PS on pole);
     // otherwise they take the slots in the given order (arcade: the random draw).
     bool grid_by_power = false;
-    // Time-limited race (endurance events with 0 laps, event +0x1E4 minutes): every car's
-    // race ends when the race clock reaches it; the order is by distance covered.
+    // Time-limited race (endurance events with 0 laps, event +0x1E4 minutes): a car finishes at
+    // its first line crossing at or after it (finishes_at_line).
     double time_limit = 0;
     // Non-original fail-safe ([race] respawn): put a CPU car that is lost or has made no
     // progress for 12 s back on the track. The original never respawns a car.
@@ -125,8 +125,11 @@ public:
 
     // Seconds since the start signal (< 0 during the countdown).
     virtual double race_time() const = 0;
-    // Player's position (1 = leader), from race distances.
-    virtual int player_position(double player_race_distance) const = 0;
+    // Player's position (1 = leader) in the race order (standings()), as the HUD shows it.
+    virtual int player_position() const = 0;
+    // Race time of the player's / second player's finish (finishes_at_line), < 0 = still racing.
+    virtual double player_finish() const = 0;
+    virtual double second_finish() const = 0;
     virtual int contacts_last_tick() const = 0;
     virtual const std::vector<std::string>& labels() const = 0; // opponent labels as configured
 
@@ -159,13 +162,13 @@ public:
     virtual LapInfo second_laps() const = 0;
     virtual int second_position() const = 0;
 
-    // Finishing order: every car (player = -1, second player = -2, opponents
-    // 0..n-1), finished cars first by finish time, then by race distance.
+    // The race order: every car (player = -1, second player = -2, opponents 0..n-1), ranked
+    // by ranks_ahead after every tick (ties keep the previous order).
     struct Standing {
         int car = -1;
         bool finished = false;
         double time = 0; // race time at the finish (s)
-        int laps = 0;
+        int laps = 0;    // laps completed (frozen at the finish)
         double distance = 0;
     };
     virtual void set_laps(int laps) = 0;
@@ -200,5 +203,15 @@ public:
     virtual void set_remote_ghost(int i, bool on) { (void)i, (void)on; }
     virtual bool opponent_ghost(int i) const { (void)i; return false; }
 };
+
+// The race rules of the original (presentation spec, "Race order and finish").
+// Ranking: more laps completed first; at equal laps two running cars by race distance, a
+// running car ahead of a finished one, two finished cars by finish time.
+bool ranks_ahead(const RaceField::Standing& a, const RaceField::Standing& b);
+// Whether a car finishes at a line crossing (cars are judged in race order, the leader
+// first): it has completed the race's laps (race_laps > 0), the car ranked first has
+// finished, or the crossing is at or after the time limit (seconds, 0 = none). There is no
+// other finish: a car that stops short never finishes.
+bool finishes_at_line(int laps_completed, int race_laps, bool leader_finished, double race_time, double time_limit);
 
 } // namespace gt3r::race

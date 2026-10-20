@@ -203,23 +203,35 @@ private:
 // counts, so reversing over the line or cutting across the infield does not
 // count laps. Sectors split the lap into `sector_count` equal track-distance
 // parts unless set explicitly.
+// Times are the original's race clock (presentation spec "Race order and finish"): 1/3000 s
+// units, a crossing timed at the clock before the tick plus trunc(f x the tick's units), f =
+// the tick's fraction at the line on track progress, ms = floor(units / 3). Every time is
+// whole milliseconds.
 class LapTimer {
 public:
     explicit LapTimer(const Track& track, int sector_count = 3);
 
-    // Feed the car position each tick (or every few ticks) with the race clock
-    // in seconds. Returns true on the tick a lap was completed.
+    // Feed the car position every tick with the race clock in seconds after this tick's
+    // advance (0 = GO). Returns true on the tick a lap was completed.
     bool update(const sim::Vec3& position, double time);
-    // Resets to "before the start line"; the first crossing starts lap 1.
+    // Resets to "before the start line".
     void reset(double time = 0);
     // Re-locates the car (after a respawn) without counting progress.
     void teleport(const sim::Vec3& position);
+    // Where lap 1 is timed from: the first line crossing (the default: time trials, free runs,
+    // flying licence tests), or GO, clock 0 (races, standing licence tests: the start-line
+    // crossing does not start it). `before_line`: the current lap time runs from GO before
+    // the car reaches the line (races); else it shows 0 until then. Kept by reset().
+    void set_lap1_from_go(bool from_go, bool before_line = true) { from_go_ = from_go, time_before_line_ = before_line; }
+    // A finished car: no more laps or lap times (its lap count stops); distance is still followed.
+    void freeze() { frozen_ = true; }
 
     void set_sector_distances(std::vector<float> ends); // ascending, last = lap length
 
     int laps_completed() const { return laps_; }
     bool lap_started() const { return started_; }
-    double current_lap_time(double now) const { return started_ ? now - lap_start_ : 0; }
+    double current_lap_time(double now) const;
+    double last_crossing_time() const { return last_cross_ms_ / 1000.0; } // the last lap's end (< 0: none)
     double last_lap_time() const { return last_lap_; }          // < 0 until a lap is done
     double best_lap_time() const { return best_lap_; }          // < 0 until a lap is done
     int current_sector() const { return sector_; }
@@ -234,14 +246,21 @@ public:
     bool wrong_way() const { return wrong_way_; }
 
 private:
+    // The clock in whole ms at a time (floor(units / 3)), and the time of a line at unwrapped
+    // progress `line` passed between `before` and `after` on the tick from `t_prev` to `t`.
+    static long long clock_ms(double t);
+    static long long crossing_ms(double before, double after, double line, double t_prev, double t);
+
     const Track& track_;
     int sector_count_;
     std::vector<float> sector_ends_;
     float distance_ = 0;
     bool located_ = false;
     bool started_ = false;
+    bool from_go_ = false, time_before_line_ = true, frozen_ = false;
     int laps_ = 0;
-    double lap_start_ = 0, sector_start_ = 0;
+    double prev_time_ = 0; // the clock at the last update (= before this tick's advance)
+    long long lap_start_ms_ = 0, sector_start_ms_ = 0, last_cross_ms_ = -1;
     double last_lap_ = -1, best_lap_ = -1;
     int sector_ = 0;
     std::vector<double> sector_times_, last_sectors_;

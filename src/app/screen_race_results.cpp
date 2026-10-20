@@ -57,13 +57,26 @@ std::vector<ResultRow> RaceScreen::result_rows(bool full_names) const {
     return rows;
 }
 
-// The live race ended (results shown / left): latch its result (RaceResultLatch); races only
-// (licence tests keep their own best-run logic). GT single races also go into the save at
-// once, as the original records them before the replay.
+// The result quick menu's rows, in race order: every finished car's own race time (the
+// reference capture), not the gaps the overlay shows; "--'--.---" for a car still racing.
+std::vector<ResultRow> RaceScreen::result_menu_rows() const {
+    std::vector<ResultRow> rows = result_rows();
+    if (field_) {
+        std::vector<RaceField::Standing> st = field_->standings();
+        for (size_t i = 0; i < rows.size() && i < st.size(); ++i)
+            rows[i].time = st[i].finished ? Hud::format_time(st[i].time) : "--'--.---";
+    }
+    return rows;
+}
+
+// The live race ended (results shown / left): latch its result (RaceResultLatch) and the
+// result menu's rows; races only (licence tests keep their own best-run logic). GT single
+// races also go into the save at once, as the original records them before the replay.
 void RaceScreen::latch_result() {
     if (!field_ || replaying_ || attract_ || demo_ || result_latch_.has()) return;
     menu::flow::GameResult r = build_result();
     result_latch_.capture(r);
+    latched_rows_ = result_menu_rows();
     LOG_INFO("Race: result latched: finished %d position %d", int(r.finished), r.position);
     if (from_menu_ && r.mode == "go_race" && r.finished && !championship() && !launch_.request.practice)
         game::save_race_run(r);

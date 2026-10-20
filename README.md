@@ -1,7 +1,7 @@
 # GT3 Revisited
 
 An open-source reimplementation of the *Gran Turismo 3 A-Spec* engine for
-modern platforms: **Windows, macOS, Linux and Android**.
+modern platforms: **Windows, macOS, Linux, Android and Meta Quest (VR)**.
 
 GT3 Revisited contains **no game content and no original code**. It needs a
 disc image (`.iso`) that you made from your own copy of the game. At runtime
@@ -27,6 +27,7 @@ disk or redistributed.
 | **Quick race** | any of the game's events with any car, nothing to unlock |
 | **Saves** | any number of named saves; import from and export to the PS2 original |
 | **Modern display** | any resolution and aspect ratio, widescreen, high refresh rates, MSAA, or the original 640×448 look |
+| **VR** | Meta Quest: the menus on a large virtual screen, races in stereo from the driver's seat, Touch controllers (sticks and analog triggers, or grab a steering wheel) |
 | **Controllers** | keyboard, any gamepad, wheels and pedals, all remappable; analog pressure buttons, DualSense adaptive triggers, Xbox impulse triggers, wheel force feedback, tilt steering, touch controls on phones and tablets |
 | **Mods** | replace any game file, add music, add new cars (electric ones too) to the dealers |
 
@@ -64,12 +65,19 @@ certificate, so the first launch needs one extra step:
   Android requires verified developers for sideloaded apps, use Android's
   advanced install flow for unverified apps (Developer options) or install
   with `adb install gt3r-android.apk`.
+- **Meta Quest** (verified on Quest 3; Quest 2, 3S and Pro untested): turn on
+  developer mode for the headset in the Meta Horizon phone app, then install
+  `gt3r-quest.apk` from a computer with `adb install gt3r-quest.apk` (or
+  SideQuest / Meta Quest Developer Hub). Copy your disc image into the
+  headset's **Download** folder over USB. The game is in the library under
+  **Unknown Sources**. Details: [VR](docs/dev/VR.md).
 
 Direct links to the newest release, always the same:
 [gt3r-windows-x64.zip](https://github.com/matt-pulsipher/GT3-revisited/releases/latest/download/gt3r-windows-x64.zip),
 [gt3r-macos-arm64.zip](https://github.com/matt-pulsipher/GT3-revisited/releases/latest/download/gt3r-macos-arm64.zip),
 [gt3r-linux-x86_64.tar.gz](https://github.com/matt-pulsipher/GT3-revisited/releases/latest/download/gt3r-linux-x86_64.tar.gz),
-[gt3r-android.apk](https://github.com/matt-pulsipher/GT3-revisited/releases/latest/download/gt3r-android.apk).
+[gt3r-android.apk](https://github.com/matt-pulsipher/GT3-revisited/releases/latest/download/gt3r-android.apk),
+[gt3r-quest.apk](https://github.com/matt-pulsipher/GT3-revisited/releases/latest/download/gt3r-quest.apk).
 The game's **Download update** uses them.
 
 Or build it yourself ([Building](#building)); a build from source needs none
@@ -89,8 +97,8 @@ gt3r                                  # first run asks for your disc image
 gt3r "/path/to/Gran Turismo 3.iso"    # or pass it directly
 ```
 
-You can also drag the `.iso` onto the window. On Android, tap **Open disc
-image** and pick the file ([android/README.md](android/README.md)). The path
+You can also drag the `.iso` onto the window. On Android and the Quest, choose
+**Open disc image** and pick the file ([android/README.md](android/README.md)). The path
 is remembered, with the last five discs you opened. If the remembered disc
 is missing at startup (moved, or on a drive that isn't connected), the first
 screen says which file failed and offers the recent discs that still exist.

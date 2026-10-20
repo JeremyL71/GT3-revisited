@@ -96,10 +96,10 @@ void LampGlows::load(SDL_Renderer* r, ByteSpan g, ByteSpan env) {
     }
 }
 
-void LampGlows::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Vec3& eye, float fovy,
+void LampGlows::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Vec3& eye,
+                     const render::Frustum& fr,
                      const std::function<bool(const render::Vec3&, const render::Vec3&)>& blocked) const {
     if (lamps_.empty() || !glow_) return;
-    float t = std::tan(fovy * 0.5f), aspect = rect.w / rect.h;
     int drawn = 0;
     for (const Lamp& l : lamps_) {
         if (drawn >= 100) break;
@@ -123,9 +123,8 @@ void LampGlows::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4&
         float I = ty.intensity / std::max(1e-3f, ty.att_c + ty.att_l * z + ty.att_q * z * z);
         if (ty.blink > 0) I *= 0.5f + 0.5f * float(std::sin(2 * 3.14159265 * (time_ / ty.blink + l.phase)));
         float zz = z - 0.5f; // pulled 0.5 m towards the camera
-        float sx = (vx / zz) / (t * aspect), sy = (vy / zz) / t;
-        float px = rect.x + (sx * 0.5f + 0.5f) * rect.w, py = rect.y + (0.5f - sy * 0.5f) * rect.h;
-        float per_m = rect.h * 0.5f / (t * zz); // pixels per metre at the lamp
+        float px = fr.screen_x(vx, zz, rect.x, rect.w), py = fr.screen_y(vy, zz, rect.y, rect.h);
+        float per_m = fr.per_metre(zz, rect.h); // pixels per metre at the lamp
         float glow_r = ty.glow * 1.17f * per_m, halo_r = ty.halo * per_m;
         float rad = std::max(glow_r, halo_r);
         if (rad < 0.5f || px + rad < rect.x || px - rad > rect.x + rect.w || py + rad < rect.y || py - rad > rect.y + rect.h)
@@ -198,11 +197,10 @@ void CarLampGlows::load(SDL_Renderer* r, ByteSpan env) {
 }
 
 void CarLampGlows::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Vec3& eye,
-                        float fovy, const std::vector<Car>& cars,
+                        const render::Frustum& fr, const std::vector<Car>& cars,
                         const std::function<bool(const render::Vec3&, const render::Vec3&)>& blocked) const {
     if (!active_) return;
     const LampType& ty = type_;
-    float t = std::tan(fovy * 0.5f), aspect = rect.w / rect.h;
     auto c8 = [](float v) { return u8(std::clamp(v, 0.0f, 1.0f) * 255.0f); };
     auto xform = [](const render::Mat4& m, const render::Vec3& p) { return m.transform_point(p); };
     auto xdir = [](const render::Mat4& m, const render::Vec3& d) {
@@ -230,9 +228,8 @@ void CarLampGlows::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Ma
         // Pulled towards the camera by -0.5 x the viewing axis' view-space z (0.5 m head-on).
         float az = view.at(2, 0) * axis.x + view.at(2, 1) * axis.y + view.at(2, 2) * axis.z;
         float zz = std::max(0.3f, z + 0.5f * az);
-        float sx = (vx / zz) / (t * aspect), sy = (vy / zz) / t;
-        float px = rect.x + (sx * 0.5f + 0.5f) * rect.w, py = rect.y + (0.5f - sy * 0.5f) * rect.h;
-        float per_m = rect.h * 0.5f / (t * zz);
+        float px = fr.screen_x(vx, zz, rect.x, rect.w), py = fr.screen_y(vy, zz, rect.y, rect.h);
+        float per_m = fr.per_metre(zz, rect.h);
         bool bar = std::fabs(l.a - l.b) > 1e-4f;
         float glow_r = bar || kind == 2 ? 0.0f : ty.glow * l.a * 1.17f * per_m;
         float hx = ty.halo * l.a * per_m, hy = hx;

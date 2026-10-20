@@ -68,6 +68,9 @@ struct GtModeHooks {
     // Touch on code-drawn lists (garage rows): 0 = not handled, 1 = handled
     // (e.g. the cursor moved), 2 = handled and the focused item is confirmed.
     std::function<int(MenuController& ctl, float x, float y)> tap;
+    // A hovering pointer over those lists (and the wheel shop's tiles): 0 = not over one, 1 = over
+    // the current one, 2 = the cursor moved to the one under it.
+    std::function<int(MenuController& ctl, float x, float y)> hover;
     // A popup page to open after a consumed Finish action rebuilt its page
     // (e.g. "load_warning" after loading settings), or "".
     std::function<std::string()> take_popup;

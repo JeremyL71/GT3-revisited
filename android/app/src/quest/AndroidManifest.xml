@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Meta Quest APK's manifest (./gradlew assembleDebug -Pquest; docs/dev/VR.md): the phone
+     manifest's app as an immersive OpenXR app, plus what the Quest needs to launch it in VR. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:installLocation="auto">
+
+    <!-- OpenXR: an immersive app, head tracking, Vulkan -->
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1" />
+    <uses-feature android:name="android.hardware.vulkan.level" android:required="true" android:version="1" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:required="true" android:version="0x00401000" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <!-- Hands (no Touch controllers, e.g. a Bluetooth gamepad) may launch it: without this the
+         system asks for controllers first -->
+    <uses-feature android:name="oculus.software.handtracking" android:required="false" />
+
+    <!-- Talking to the OpenXR runtime (the Khronos loader's broker) -->
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+    <!-- Controller vibration -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Online battle (UDP; docs/dev/ONLINE.md) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+    </queries>
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="true"
+        android:theme="@style/AppTheme"
+        android:hardwareAccelerated="true"
+        android:isGame="true"
+        android:appCategory="game">
+
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3|quest3s" />
+        <!-- The system menu opens over the game (the race pauses) instead of closing it -->
+        <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+        <meta-data android:name="com.oculus.handtracking.version" android:value="V2.0" />
+
+        <activity
+            android:name=".GT3Activity"
+            android:label="@string/app_name"
+            android:alwaysRetainTaskState="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:resizeableActivity="false"
+            android:excludeFromRecents="false"
+            android:configChanges="density|layoutDirection|locale|fontScale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- Launch in VR, not as a 2D panel -->
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

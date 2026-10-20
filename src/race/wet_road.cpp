@@ -60,9 +60,8 @@ WetRoad::~WetRoad() = default;
 bool WetRoad::load(render::GpuContext& ctx, const Vfs& vfs, ByteSpan course, ByteSpan env) {
     ctx_ = &ctx;
     reflection_.reset(), mask_.reset(), streaks_.reset();
-    clear_quad_.reset(), frame_quad_.reset();
+    for (FrameQuads& q : quads_) q = FrameQuads{};
     for (auto& q : blur_quad_) q.reset();
-    quad_fovy_ = quad_aspect_ = 0;
     p_ = {};
     if (env.size() < 0xE80 || std::memcmp(env.data(), "Env0", 4) != 0) return false;
     try {
@@ -236,33 +235,47 @@ SDL_GPUTexture* WetRoad::render(render::View3D& v, const render::Mat4& view, con
     return t;
 }
 
-void WetRoad::build_quads(float fovy, float aspect) {
-    quad_fovy_ = fovy, quad_aspect_ = aspect;
-    // Camera space (x right, y up, looking down -z), just past the 0.1 m near plane.
-    const float d = 0.105f, hh = d * std::tan(fovy * 0.5f) * 1.01f, hw = hh * aspect;
-    const std::array<render::Vec3, 4> pos = {render::Vec3{-hw, hh, -d}, {hw, hh, -d}, {hw, -hh, -d}, {-hw, -hh, -d}};
-    // The composite's net -0.5 texel shift.
-    float du = -0.5f / float(p_.width), dv = -0.5f / float(p_.height);
-    clear_quad_ = make_quad(*ctx_, pos, {{{0, 0}, {1, 0}, {1, 1}, {0, 1}}}, 0x00FFFFFFu, scene::kAlphaOnly | kQuadFlags);
-    frame_quad_ = make_quad(*ctx_, pos, {{{du, dv}, {1 + du, dv}, {1 + du, 1 + dv}, {du, 1 + dv}}}, 0xFFFFFFFFu,
-                            scene::kAlphaBlend | kQuadFlags);
+WetRoad::FrameQuads& WetRoad::frame_quads(const render::Frustum& fr) {
+    auto same = [&](const render::Frustum& a) {
+        return std::fabs(a.left - fr.left) < 1e-5f && std::fabs(a.right - fr.right) < 1e-5f &&
+               std::fabs(a.down - fr.down) < 1e-5f && std::fabs(a.up - fr.up) < 1e-5f;
+    };
+    FrameQuads* q = nullptr;
+    for (FrameQuads& c : quads_)
+        if (c.clear && same(c.fr)) q = &c;
+    if (!q) { // the least recently used pair
+        q = quads_[0].used <= quads_[1].used ? &quads_[0] : &quads_[1];
+        q->fr = fr;
+        // Camera space (x right, y up, looking down -z), just past the 0.1 m near plane.
+        const float d = 0.105f * 1.01f;
+        const float l = fr.left * d, r = fr.right * d, b = fr.down * d, t = fr.up * d;
+        const std::array<render::Vec3, 4> pos = {render::Vec3{l, t, -0.105f}, {r, t, -0.105f}, {r, b, -0.105f},
+                                                 {l, b, -0.105f}};
+        // The composite's net -0.5 texel shift.
+        float du = -0.5f / float(p_.width), dv = -0.5f / float(p_.height);
+        q->clear = make_quad(*ctx_, pos, {{{0, 0}, {1, 0}, {1, 1}, {0, 1}}}, 0x00FFFFFFu, scene::kAlphaOnly | kQuadFlags);
+        q->frame = make_quad(*ctx_, pos, {{{du, dv}, {1 + du, dv}, {1 + du, 1 + dv}, {du, 1 + dv}}}, 0xFFFFFFFFu,
+                             scene::kAlphaBlend | kQuadFlags);
+    }
+    q->used = ++quad_uses_;
+    return *q;
 }
 
-void WetRoad::add_frame_items(std::vector<render::DrawItem>& items, const render::Mat4& view, float fovy, float aspect,
+void WetRoad::add_frame_items(std::vector<render::DrawItem>& items, const render::Mat4& view, const render::Frustum& fr,
                               SDL_GPUTexture* buffer) {
     if (!reflection_ || !buffer || !ctx_) return;
-    if (!clear_quad_ || std::fabs(fovy - quad_fovy_) > 1e-5f || std::fabs(aspect - quad_aspect_) > 1e-5f)
-        build_quads(fovy, aspect);
+    FrameQuads& q = frame_quads(fr);
+    if (!q.clear || !q.frame) return;
     render::Mat4 cam = render::inverse(view); // camera -> world
     if (mask_) { // (without slot 13 the frame alpha the scenery left is the weight)
-        render::DrawItem clr{clear_quad_.get(), cam, 0};
+        render::DrawItem clr{q.clear.get(), cam, 0};
         clr.in_order = clr.frame_alpha = true;
         items.push_back(clr);
         render::DrawItem mk{mask_.get(), {}, 0};
         mk.in_order = mk.frame_alpha = true;
         items.push_back(mk);
     }
-    render::DrawItem comp{frame_quad_.get(), cam, 0};
+    render::DrawItem comp{q.frame.get(), cam, 0};
     comp.in_order = true;
     comp.texture = buffer;
     comp.dest_alpha_blend = p_.mode == 0x54 ? 1 : 2;

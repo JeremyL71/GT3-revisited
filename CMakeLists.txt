@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(GT3Revisited VERSION 0.1.0 LANGUAGES C CXX)
+project(GT3Revisited VERSION 0.2.0 LANGUAGES C CXX)
 
 # GT3 Revisited: an open reimplementation of the Gran Turismo 3 engine.
 # No game data is part of this project; everything is read at runtime from
@@ -36,6 +36,11 @@ target_include_directories(gt3r_engine PUBLIC src)
 target_link_libraries(gt3r_engine PUBLIC SDL3::SDL3 ZLIB::ZLIB)
 if(APPLE)
   target_link_libraries(gt3r_engine PUBLIC objc) # platform/mac_layer.cpp
+endif()
+# VR headsets (src/xr, docs/dev/VR.md). The code compiles to nothing without GT3R_XR.
+if(GT3R_XR)
+  target_compile_definitions(gt3r_engine PUBLIC GT3R_XR=1)
+  target_include_directories(gt3r_engine SYSTEM PUBLIC ${GT3R_OPENXR_INCLUDE_DIR})
 endif()
 # Online play (src/net): Winsock on Windows.
 if(WIN32)

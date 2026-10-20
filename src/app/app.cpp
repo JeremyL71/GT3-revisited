@@ -46,6 +46,11 @@ void SDLCALL on_dialog(void* user, const char* const* files, int) {
 
 bool App::init(int argc, char** argv) {
     SDL_SetAppMetadata("GT3 Revisited", GT3R_VERSION, "org.gt3revisited.gt3r");
+#if GT3R_XR
+    // In a headset the (invisible) window never has keyboard focus, and SDL drops joystick
+    // input without it: the controllers' virtual gamepad and Bluetooth pads alike.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK | SDL_INIT_SENSOR)) {
         LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
         return false;
@@ -114,7 +119,27 @@ bool App::init(int argc, char** argv) {
     SDL_GetWindowSizeInPixels(window_, &win_pw, &win_ph);
     gpu_opts.render_scale = render_scale ? *render_scale
                                          : platform::auto_render_scale(win_pw, win_ph, platform::is_mobile());
+#if GT3R_XR
+    // A headset when there is one ([vr] enabled = off or --no-vr: the window, as on a phone).
+    gpu_opts.xr = to_lower(config_.get("vr", "enabled").value_or("on")) != "off";
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--no-vr") gpu_opts.xr = false;
+#endif
     if (use_gpu) gpu_ = render::GpuContext::create(window_, gpu_opts);
+#if GT3R_XR
+    if (gpu_ && gpu_->xr()) {
+        xr_ = xr::Session::create(gpu_->device(), gpu_->renderer2d(), gpu_->xr_request(), xr::Settings::load(config_));
+        if (xr_) {
+            gpu_->set_render_scale(1.0f); // eyes are sized by [vr] resolution; the canvas is small
+        } else { // a headset runtime but no working session: the window after all
+            LOG_WARN("VR: session setup failed; using the window");
+            gpu_.reset();
+            gpu_opts.xr = false;
+            gpu_ = render::GpuContext::create(window_, gpu_opts);
+        }
+    }
+    if (xr_) touch_ui_ = false;
+#endif
     if (gpu_) {
         renderer_ = gpu_->renderer2d();
         // macOS switches a fullscreen window between direct-to-display and composited now and
@@ -162,6 +187,12 @@ bool App::init(int argc, char** argv) {
         else if (a == "--screen" && has_value) screen = args[++i];
         else if ((a == "--msaa" || a == "--render-scale") && has_value) ++i;
         else if (a == "--hub") hub = true;
+        else if (a == "--env" && has_value) { // NAME=value: the testing variables on platforms without them (Android)
+            const std::string& kv = args[++i];
+            size_t eq = kv.find('=');
+            if (eq != std::string::npos && eq > 0)
+                SDL_SetEnvironmentVariable(SDL_GetEnvironment(), kv.substr(0, eq).c_str(), kv.substr(eq + 1).c_str(), true);
+        }
         else if (!a.empty() && a[0] != '-') disc_path = a;
     }
     if (!disc_path.empty()) last_error_ = open_disc(disc_path);
@@ -286,8 +317,36 @@ void App::apply_screen_changes() {
 }
 
 SDL_AppResult App::iterate() {
+#if GT3R_XR
+    // A headset paces the frames: wait for its next one (nothing to draw while its session is
+    // not running, e.g. the headset is off).
+    if (xr_) {
+        xr_->poll();
+        if (xr_->exit_requested()) return SDL_APP_SUCCESS;
+        if (xr_->take_focus_lost() && !screens_.empty()) { // the system menu: races pause
+            SDL_Event bg{};
+            bg.type = SDL_EVENT_DID_ENTER_BACKGROUND;
+            screens_.back()->on_event(*this, bg);
+        }
+        if (!xr_->begin_frame()) {
+            SDL_Delay(10);
+            last_ticks_ = SDL_GetTicksNS();
+            xr_last_display_ = 0;
+            return quit_ ? SDL_APP_SUCCESS : SDL_APP_CONTINUE;
+        }
+    }
+#endif
     Uint64 now = SDL_GetTicksNS();
-    double dt = double(now - last_ticks_) / 1e9;
+    double frame_s = double(now - last_ticks_) / 1e9;
+#if GT3R_XR
+    // Step by the headset's display times: even steps however the frame's work varies.
+    if (xr_) {
+        const s64 t = xr_->display_time();
+        if (xr_last_display_ > 0 && t > xr_last_display_) frame_s = double(t - xr_last_display_) / 1e9;
+        xr_last_display_ = t;
+    }
+#endif
+    double dt = frame_s;
     last_ticks_ = now;
     if (dt > 0.1) dt = 0.1;
     // --shot: step exactly one 60 Hz frame per iteration, so a shot of frame N shows the same
@@ -313,7 +372,18 @@ SDL_AppResult App::iterate() {
     Screen* top = screens_.empty() ? nullptr : screens_.back().get();
     updates().frame(*this, top && top->update_prompts());
     const bool modal = updates().modal(); // the update dialog takes the input
-    touch_.update(dt, modal ? TouchLayout::None : top ? top->touch_layout() : TouchLayout::None, *input_);
+    TouchLayout touch_layout = modal ? TouchLayout::None : top ? top->touch_layout() : TouchLayout::None;
+#if GT3R_XR
+    if (xr_) {
+        // The menus' pointer, except while driving (the right trigger is the throttle there).
+        const bool pointer = modal || (top && top->touch_layout() != TouchLayout::Driving);
+        touch_layout = TouchLayout::None; // the controllers, never on-screen controls
+        xr_->update_input(dt, pointer);
+        SDL_UpdateJoysticks(); // the virtual gamepad's new state, this frame
+        xr_pointer();
+    }
+#endif
+    touch_.update(dt, touch_layout, *input_);
     input_->update(dt);
     if (modal || (top && top->wants_menu_input())) menu_.update(input_->pad(0), dt);
     else menu_.update(PadState{}, dt);
@@ -334,6 +404,9 @@ SDL_AppResult App::iterate() {
             LOG_INFO("Display cutout %d,%d,%d,%d px, corner radius %d px", display_insets_->left, display_insets_->top,
                      display_insets_->right, display_insets_->bottom, display_insets_->corner_radius);
     }
+#if GT3R_XR
+    if (xr_) SDL_SetRenderTarget(renderer_, xr_->canvas()); // the frame goes into the canvas
+#endif
     layout_ui(!screens_.empty() && screens_.back()->adaptive_ui());
     ui_->clear();
     Uint64 h_r0 = SDL_GetTicksNS();
@@ -343,6 +416,15 @@ SDL_AppResult App::iterate() {
     touch_.set_safe_area(safe_area_window());
     touch_.render(*ui_);
     if (phone_sim_) draw_phone_mask();
+#if GT3R_XR
+    if (xr_ && xr_pointer_on_) { // the pointer's dot on the virtual screen
+        SDL_SetRenderDrawColor(renderer_, 255, 255, 255, 230);
+        SDL_FRect dot{xr_pointer_x_ - 2, xr_pointer_y_ - 2, 4, 4};
+        SDL_RenderFillRect(renderer_, &dot);
+        SDL_SetRenderDrawColor(renderer_, 20, 90, 200, 255);
+        SDL_RenderRect(renderer_, &dot);
+    }
+#endif
     ++frame_;
     // --shot: the 30th frame, or GT3R_SHOT_FRAME=<n> (e.g. into a race started from the menus).
     static const int shot_frame = [] {
@@ -371,6 +453,9 @@ SDL_AppResult App::iterate() {
         save_screenshot(dir + "/gt3r-" + std::to_string(SDL_GetTicks()) + ".png");
     }
     SDL_RenderPresent(renderer_);
+#if GT3R_XR
+    if (xr_) xr_->end_frame();
+#endif
     {
         static const double thr = [] { const char* e = SDL_getenv("GT3R_HITCH"); return e ? std::atof(e) : 0.0; }();
         static Uint64 h_prev_end = 0;
@@ -419,6 +504,9 @@ SDL_AppResult App::event(const SDL_Event& e) {
 SDL_FRect App::safe_area_window() const {
     int ww = 0, wh = 0;
     SDL_GetWindowSize(window_, &ww, &wh);
+#if GT3R_XR
+    if (xr_) return {0, 0, float(xr_->canvas_width()), float(xr_->canvas_height())};
+#endif
     SDL_FRect r{0, 0, float(ww), float(wh)};
     SDL_Rect sa{};
     float corner = 0; // rounded-corner radius, window units
@@ -453,10 +541,19 @@ void App::layout_ui(bool adaptive) {
     int pw = 0, ph = 0, ww = 0, wh = 0;
     SDL_GetRenderOutputSize(renderer_, &pw, &ph);
     SDL_GetWindowSize(window_, &ww, &wh);
+#if GT3R_XR
+    if (xr_) { // the canvas stands in for the window
+        SDL_GetCurrentRenderOutputSize(renderer_, &pw, &ph);
+        ww = pw, wh = ph;
+    }
+#endif
+    // (Compared with the current target's own presentation: a VR canvas keeps its own.)
+    int cur_w = 0, cur_h = 0;
+    SDL_RendererLogicalPresentation cur_mode = SDL_LOGICAL_PRESENTATION_DISABLED;
+    SDL_GetRenderLogicalPresentation(renderer_, &cur_w, &cur_h, &cur_mode);
     if (!adaptive || pw < 160 || ph < 90 || ww <= 0 || wh <= 0) {
-        if (ui_lw_ != Ui::kWidth || ui_lh_ != Ui::kHeight)
+        if (cur_w != Ui::kWidth || cur_h != Ui::kHeight || cur_mode != SDL_LOGICAL_PRESENTATION_LETTERBOX)
             SDL_SetRenderLogicalPresentation(renderer_, Ui::kWidth, Ui::kHeight, SDL_LOGICAL_PRESENTATION_LETTERBOX);
-        ui_lw_ = Ui::kWidth, ui_lh_ = Ui::kHeight;
         if (ui_) ui_->set_layout(Ui::kWidth, Ui::kHeight, {0, 0, Ui::kWidth, Ui::kHeight}, touch_ui_);
         return;
     }
@@ -474,12 +571,11 @@ void App::layout_ui(bool adaptive) {
     const float safe_w = sa.w * px_per_window, safe_h = sa.h * px_per_window;
     while (s > 1 && (safe_w / float(s) < 480 || safe_h / float(s) < 250)) --s;
     const int lw = pw / s, lh = ph / s;
-    if (lw != ui_lw_ || lh != ui_lh_) {
+    if (lw != cur_w || lh != cur_h || cur_mode != SDL_LOGICAL_PRESENTATION_LETTERBOX) {
         SDL_SetRenderLogicalPresentation(renderer_, lw, lh, SDL_LOGICAL_PRESENTATION_LETTERBOX);
         LOG_INFO("UI layout %dx%d (x%d), safe area %.0f,%.0f %.0fx%.0f px", lw, lh, s, sa.x * px_per_window,
                  sa.y * px_per_window, safe_w, safe_h);
     }
-    ui_lw_ = lw, ui_lh_ = lh;
     const float k = px_per_window / float(s); // window units -> UI units
     float x0 = std::ceil(sa.x * k), y0 = std::ceil(sa.y * k);
     float x1 = std::floor((sa.x + sa.w) * k), y1 = std::floor((sa.y + sa.h) * k);
@@ -534,7 +630,98 @@ void App::save_screenshot(const std::string& path) {
     Bytes png = encode_png(u32(rgba->w), u32(rgba->h), px);
     SDL_DestroySurface(rgba);
     if (write_host_file(path, png)) LOG_INFO("Screenshot saved: %s", path.c_str());
+#if GT3R_XR
+    // A stereo frame: the two eyes side by side as <path>-eyes.png (the shot above is the HUD).
+    if (xr_ && xr_->stereo_submitted()) {
+        SDL_Texture* prev = SDL_GetRenderTarget(renderer_);
+        const xr::Eye& e0 = xr_->eye(0);
+        const int w = e0.width, h = e0.height;
+        std::vector<u32> both(size_t(w) * 2 * size_t(h));
+        for (int i = 0; i < 2; ++i) {
+            SDL_SetRenderTarget(renderer_, xr_->eye(i).canvas);
+            SDL_Surface* s = SDL_RenderReadPixels(renderer_, nullptr);
+            SDL_Surface* c = s ? SDL_ConvertSurface(s, SDL_PIXELFORMAT_RGBA32) : nullptr;
+            if (s) SDL_DestroySurface(s);
+            if (!c) continue;
+            for (int y = 0; y < std::min(h, c->h); ++y)
+                std::memcpy(&both[size_t(y) * size_t(w) * 2 + size_t(i) * size_t(w)],
+                            static_cast<u8*>(c->pixels) + size_t(y) * size_t(c->pitch), size_t(std::min(w, c->w)) * 4);
+            SDL_DestroySurface(c);
+        }
+        SDL_SetRenderTarget(renderer_, prev);
+        size_t dot = path.rfind('.');
+        std::string eyes = (dot == std::string::npos ? path : path.substr(0, dot)) + "-eyes.png";
+        if (write_host_file(eyes, encode_png(u32(w) * 2, u32(h), both))) LOG_INFO("Eyes saved: %s", eyes.c_str());
+    }
+#endif
 }
+
+#if GT3R_XR
+void App::set_xr_settings(const xr::Settings& s) {
+    if (!xr_) return;
+    xr_->set_settings(s);
+    s.save(config_);
+    save_config();
+}
+
+// The right controller points at the virtual screen (menus, movies; not while racing in 3D):
+// a dot follows it and the trigger clicks, as mouse events in UI coordinates.
+void App::xr_pointer() {
+    // Already in UI coordinates: routed like App::event's pointer events after their conversion.
+    auto dispatch = [this](const SDL_Event& e) {
+        if (updates().dialog_open()) updates().dialog_event(*this, e);
+        else if (!screens_.empty()) screens_.back()->on_event(*this, e);
+    };
+    float u = 0, v = 0;
+    bool pressed = false;
+    const bool on = xr_->pointer(u, v, pressed);
+    if (!on) {
+        if (xr_pointer_down_) { // released off the screen
+            SDL_Event e{};
+            e.type = SDL_EVENT_MOUSE_BUTTON_UP;
+            e.button.button = SDL_BUTTON_LEFT;
+            e.button.x = xr_pointer_x_, e.button.y = xr_pointer_y_;
+            dispatch(e);
+        }
+        xr_pointer_on_ = xr_pointer_down_ = false;
+        return;
+    }
+    // Canvas pixels -> UI units through the canvas's logical presentation (layout_ui).
+    float x = u * float(xr_->canvas_width()), y = v * float(xr_->canvas_height());
+    SDL_Texture* prev = SDL_GetRenderTarget(renderer_);
+    SDL_SetRenderTarget(renderer_, xr_->canvas());
+    int lw = 0, lh = 0;
+    SDL_RendererLogicalPresentation mode = SDL_LOGICAL_PRESENTATION_DISABLED;
+    SDL_FRect lr{};
+    if (SDL_GetRenderLogicalPresentation(renderer_, &lw, &lh, &mode) && mode != SDL_LOGICAL_PRESENTATION_DISABLED &&
+        lw > 0 && lh > 0 && SDL_GetRenderLogicalPresentationRect(renderer_, &lr) && lr.w > 0 && lr.h > 0) {
+        x = (x - lr.x) * float(lw) / lr.w;
+        y = (y - lr.y) * float(lh) / lr.h;
+    }
+    SDL_SetRenderTarget(renderer_, prev);
+    if (!xr_pointer_on_ || x != xr_pointer_x_ || y != xr_pointer_y_) {
+        SDL_Event e{};
+        e.type = SDL_EVENT_MOUSE_MOTION;
+        e.motion.x = x, e.motion.y = y;
+        e.motion.xrel = xr_pointer_on_ ? x - xr_pointer_x_ : 0;
+        e.motion.yrel = xr_pointer_on_ ? y - xr_pointer_y_ : 0;
+        e.motion.state = xr_pointer_down_ ? SDL_BUTTON_LMASK : 0;
+        dispatch(e);
+    }
+    xr_pointer_on_ = true;
+    xr_pointer_x_ = x, xr_pointer_y_ = y;
+    if (pressed != xr_pointer_down_) {
+        SDL_Event e{};
+        e.type = pressed ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+        e.button.button = SDL_BUTTON_LEFT;
+        e.button.down = pressed;
+        e.button.clicks = 1;
+        e.button.x = x, e.button.y = y;
+        dispatch(e);
+        xr_pointer_down_ = pressed;
+    }
+}
+#endif
 
 void App::shutdown() {
     if (input_) save_config();
@@ -545,6 +732,9 @@ void App::shutdown() {
     input_.reset();
     ui_.reset();
     if (dialog_mutex_) SDL_DestroyMutex(dialog_mutex_);
+#if GT3R_XR
+    xr_.reset(); // its canvases and swapchains before the renderer and the device
+#endif
     if (gpu_) gpu_.reset(); // destroys the 2D renderer too
     else if (renderer_) SDL_DestroyRenderer(renderer_);
     renderer_ = nullptr;

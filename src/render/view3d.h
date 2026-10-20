@@ -166,6 +166,9 @@ struct DrawItem {
     // Blended primitives weighted by the frame-buffer alpha instead (PS2 ALPHA): 1 = 0x54,
     // (Cs - Cd) Ad + Cd; 2 = 0x58, Cs Ad + Cd. The frame alpha is kept.
     u8 dest_alpha_blend = 0;
+    // Double-sided primitives culled like the rest (back faces): a car body seen from inside
+    // (VR's in-car view) shows its bonnet, not the inside of its roof and windows.
+    bool single_sided = false;
 };
 
 class View3D {
@@ -182,6 +185,11 @@ public:
         draw(renderer, rect, camera.view(), camera.projection(rect.w / std::max(rect.h, 1.0f)), camera.eye(), items,
              options);
     }
+
+    // Renders straight into `target` (`w` x `h`, the context's colour format: a VR eye's canvas),
+    // the multisampled picture resolved into it; no composite pass. False on failure.
+    bool draw_to(SDL_GPUTexture* target, int w, int h, const Mat4& view, const Mat4& proj, const Vec3& eye,
+                 const std::vector<DrawItem>& items, const DrawOptions& options);
 
     // Renders `items` into a cube map (six 90-degree views from `pos`, `size` pixels per face)
     // for the car reflection passes (DrawOptions::env_cube). `faces` = bit mask of the faces to
@@ -238,6 +246,7 @@ private:
         int w = 0, h = 0, samples = 0;
     };
     Offscreen offscreen_[4];
+    Offscreen direct_; // draw_to's multisampled colour and depth (no colour of its own)
     void release_offscreen();
     struct Capture {
         int first = 0, count = 0, frame = 0, w = 0, h = 0;

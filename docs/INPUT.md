@@ -244,6 +244,13 @@ no on-screen controls (`TouchLayout::None`). `App::touch().safe_area()`
 returns the part of the 640×360 game area that the visible controls leave
 free (the whole area when they are hidden), so HUDs can inset themselves.
 
+In GT3's own menus a tap on an item moves the cursor there and a second tap chooses it; a
+mouse (or a VR controller's pointer) focuses the item it hovers over, so one click chooses
+(a scrolling row such as the tune shop's parts holds still meanwhile; vertical scrolling
+lists, which centre the cursor's item, still take a tap to move and one to choose). In the arcade course, class and
+car pickers, tap an icon of the strip to move there and tap it again to choose; taps elsewhere
+on the left / right third step through the entries.
+
 Screens choose their layout by overriding `Screen::touch_layout()`
 (`TouchLayout::Menu`, `Driving` or `None`). On desktop, `GT3R_PHONE=1`
 opens a window shaped like a 20:9 phone (cutout, rounded corners, phone UI

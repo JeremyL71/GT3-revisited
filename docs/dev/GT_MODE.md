@@ -120,15 +120,28 @@ hooks, `intercept` / `enabled`, and the widget hooks on `ar/goodies`
   (`user_money`, `user_day`, `user_day_unit`, `user_carname`), dealer
   (`goods_car_price`, `car_buy_price`, `focused_carname`), garage
   (`car_sell_price`, `car_max_power`, `car_kilometrage`, `car_drive_type`),
-  tune shop (`price_<item>`, `disp_ps_befor/after`), wheel shop / wash / oil
+  tune shop (`price_<item>`, `disp_ps_befor/after`; on the engine parts'
+  "Installed successfully" pages `car_previous_torque` / `car_current_torque`,
+  which despite their names show the power before the part, kept by
+  `fit_parts` / `buy_fit_parts`, and now, "%d %s"), wheel shop / wash / oil
   prices, licenses (`disp_time_gold/silver/bronze`, `license_car_name`,
   `license_launch_speed`), race info (`race_prize_1..6`, `regulation_*`),
   status page (`status_*`), spec pages (`spec_*`). This needed a text
   override in `menu::ElementDraw` (renderer).
 - `extra_draws` / `on_frame`: the code-drawn garage list (`hm/hm_gr`,
-  Up/Down), the status bar day number (hidden-layer widget), and the wheel
+  Up/Down), the race information's Cars Permitted list (popup
+  `00cmn/car_reguration`: `permitted_car_names`, each car of the event's
+  regulation as name + second name, a string once at its last place, rows of
+  the `link_menu` template in `menu_regulated_car`, Up/Down; "No Limitations"
+  without a list), the status bar day number (hidden-layer widget), and the wheel
   inventory cursor. Dealer car lists use the controller's scrolling window
   (`menu_car_goods` was added to its window widgets).
+- Popups: one level. A popup item confirmed inside a popup replaces it
+  (`MenuController::build`), so the tune shop's Purchase? → Install parts
+  now? → Installed (and the trade's Buy? → Bought) close back to the page
+  they were opened from. A part is bought once per car (`can_buy_part`:
+  `ts/already_you_have`); owned parts are swapped in the settings' Change
+  Parts pages.
 - `prepare_request` → `GameRequest`: `event`, `race_code`, the garage car
   as `car_spec` (+ `car`, `car_model`, `car_color`) and `opponents`
   (championship field or a fresh draw). License tests drive the event's

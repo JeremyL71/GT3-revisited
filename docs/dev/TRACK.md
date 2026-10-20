@@ -208,6 +208,15 @@ direction of travel; this was checked on every course.
   reversing over the line, or crossing it backwards and forwards again, never
   counts a lap. Cutting the infield cannot skip progress either, because of
   the ±150 m search window.
+- **Clock.** Times follow the original's race clock (presentation spec "Race
+  order and finish"): `time` is the clock after the tick (0 = GO); a crossing is
+  timed at the clock before the tick plus trunc(f × the tick's 1/3000 s units),
+  f the tick's fraction at the line on progress, ms = floor(units / 3), so every
+  time is whole milliseconds (60 Hz: exactly the original's and
+  `LicenseRun::event_ms`). `set_lap1_from_go()`: races (every car of a field)
+  and standing licence tests time lap 1 from GO instead of the first crossing,
+  and a race's current lap time runs from GO before the line.
+  `freeze()` stops a finished car's laps (its lap time runs on).
 - **Sectors.** By default the lap is split into 3 equal parts of track
   distance; `set_sector_distances()` changes the split. The timer records
   `sector_times()` for the current lap and `last_sector_times()`,

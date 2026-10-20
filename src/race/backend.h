@@ -79,6 +79,9 @@ public:
     virtual double best_lap_time() const = 0; // < 0 when none
     virtual float lap_progress() const = 0;   // 0..1
     virtual bool wrong_way() const = 0;
+    // track::LapTimer::set_lap1_from_go (races: lap 1 from GO) and freeze (after the finish).
+    virtual void lap_set_lap1_from_go(bool from_go, bool before_line) { (void)from_go, (void)before_line; }
+    virtual void lap_freeze() {}
 };
 
 // What the race scene knows about the chosen car; filled from the database.

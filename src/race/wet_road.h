@@ -82,17 +82,28 @@ public:
     // The frame's items, after the scenery: the alpha clear, the slot 13 mask and the composite of
     // `buffer` (a camera-space quad just past the near plane; `fovy` vertical, `aspect` w / h).
     void add_frame_items(std::vector<render::DrawItem>& items, const render::Mat4& view, float fovy, float aspect,
+                         SDL_GPUTexture* buffer) {
+        add_frame_items(items, view, render::Frustum::symmetric(fovy, aspect), buffer);
+    }
+    // Any frustum (VR eyes: one quad pair per eye is kept).
+    void add_frame_items(std::vector<render::DrawItem>& items, const render::Mat4& view, const render::Frustum& fr,
                          SDL_GPUTexture* buffer);
 
 private:
-    void build_quads(float fovy, float aspect);
+    struct FrameQuads {
+        render::Frustum fr;
+        std::unique_ptr<render::GpuModel> clear, frame;
+        u64 used = 0;
+    };
+    FrameQuads& frame_quads(const render::Frustum& fr);
     render::GpuContext* ctx_ = nullptr;
     WetRoadParams p_;
     std::unique_ptr<render::GpuModel> reflection_, mask_;
-    std::unique_ptr<render::GpuModel> clear_quad_, frame_quad_, blur_quad_[2]; // blur: -0.5 / +0.5 texel
+    FrameQuads quads_[2];                       // the frame's alpha clear and composite, per view frustum
+    u64 quad_uses_ = 0;
+    std::unique_ptr<render::GpuModel> blur_quad_[2]; // blur: -0.5 / +0.5 texel
     std::unique_ptr<render::GpuModel> streaks_;
     std::vector<scene::Vertex> streak_verts_;
-    float quad_fovy_ = 0, quad_aspect_ = 0;
     static constexpr int kMaxStreaks = 128;
 };
 

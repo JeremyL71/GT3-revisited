@@ -81,8 +81,10 @@ struct Profile {
 // "racing" and "classic" are the DualShock 2 layout 1:1 (triggers -> L2/R2; "racing" also
 // binds the back paddles); "wheel" is a typical USB wheel; "keyboard" is keyboard only. All
 // presets also include keyboard bindings so a pad is never required.
+// "quest" (VR builds' default) is "racing" with B as back (Triangle) and Y as Circle.
 Profile make_preset(std::string_view name);
 const std::vector<std::string_view>& preset_names();
+std::string_view default_preset(); // "racing"; "quest" in VR builds
 
 // Race controls. While driving, the race reads a second virtual pad per player whose buttons
 // always mean what they meant in GT3 (Cross accelerate, Square brake, Triangle reverse, R2/L2

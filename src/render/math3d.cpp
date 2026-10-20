@@ -76,6 +76,19 @@ Mat4 perspective(float fovy, float aspect, float zn, float zf) {
     return r;
 }
 
+Mat4 frustum(float tl, float tr, float td, float tu, float zn, float zf) {
+    Mat4 r;
+    r.m.fill(0);
+    r.at(0, 0) = 2.0f / (tr - tl);
+    r.at(0, 2) = (tr + tl) / (tr - tl);
+    r.at(1, 1) = 2.0f / (tu - td);
+    r.at(1, 2) = (tu + td) / (tu - td);
+    r.at(2, 2) = zf / (zn - zf);
+    r.at(2, 3) = zn * zf / (zn - zf);
+    r.at(3, 2) = -1;
+    return r;
+}
+
 Mat4 look_at(const Vec3& eye, const Vec3& target, const Vec3& up) {
     Vec3 f = normalize(target - eye);
     Vec3 s = normalize(cross(f, up));

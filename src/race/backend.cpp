@@ -89,6 +89,8 @@ public:
     double best_lap_time() const override { return lap_.best_lap_time(); }
     float lap_progress() const override { return lap_.lap_progress(); }
     bool wrong_way() const override { return lap_.wrong_way(); }
+    void lap_set_lap1_from_go(bool from_go, bool before_line) override { lap_.set_lap1_from_go(from_go, before_line); }
+    void lap_freeze() override { lap_.freeze(); }
     const track::Track& track() const { return *t_; }
     const track::Track* runtime() const override { return t_.get(); }
     double race_distance() const override { return lap_.race_distance(); }

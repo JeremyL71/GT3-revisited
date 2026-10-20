@@ -219,6 +219,25 @@ TEST(menu_flow_navigation) {
     CHECK(c.finished() && c.result() == 0);
 }
 
+// One popup level: a popup opened over a popup replaces it, and closing it returns to
+// the base page (the tune shop's Purchase? -> Install parts now? -> Installed chain).
+TEST(menu_flow_popup_replaces_popup) {
+    MenuSet set(map_reader(synthetic_files()), "test", "US");
+    MenuController c(set);
+    c.open("top");
+    settle(c);
+    c.set_focus(2);
+    CHECK(c.popup("opt"));
+    settle(c);
+    CHECK(c.depth() == 1 && c.page_name() == "opt");
+    CHECK(c.popup("status"));
+    settle(c);
+    CHECK(c.depth() == 1 && c.page_name() == "status");
+    press(c, MenuKey::Cancel);
+    settle(c);
+    CHECK(c.depth() == 0 && c.page_name() == "top" && c.focus() == 2);
+}
+
 TEST(menu_flow_return_and_import) {
     MenuSet set(map_reader(synthetic_files()), "test", "US");
     MenuController c(set);

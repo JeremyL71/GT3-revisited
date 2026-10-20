@@ -233,6 +233,149 @@ TEST(gtmode_menu_disc_championship_resume) {
     CHECK(r->opponents == s->gt().state().championship.entrants);
 }
 
+// Tune shop: Purchase? -> Install parts now? -> Installed are popups, and a popup item
+// confirmed inside a popup replaces it (the page manager keeps one popup level), so every
+// end of the chain lands back on the part's page. The Installed page shows the power before
+// and with the part.
+TEST(gtmode_menu_disc_tune_shop_flow) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::install_gt_mode_menu();
+    Vfs vfs(&disc->volume());
+    GameFlow f(vfs_reader(vfs), "US");
+    f.start();
+    settle(f);
+    game::GtModeSession* s = game::gt_mode_session();
+    CHECK(s != nullptr);
+    if (!s) return;
+    game::GtMode& gt = s->gt();
+    gt.state().credits = 1000000;
+    CHECK(gt.buy_car("altezza_rs200_98") == 0);
+    choose(f, "gt_mode");
+    settle(f);
+    choose(f, "ts_ts");
+    CHECK(f.controller()->page_name() == "ts/ts");
+    choose(f, "bg2");
+    CHECK(f.controller()->page_name() == "ts/ts_eg");
+
+    // Bought and installed (muf_sports, goods 37).
+    choose(f, "item1");
+    CHECK(f.controller()->page_name() == "ts/ts_eg_muf_sp");
+    CHECK(gt.can_buy_part(37) == game::Check::Ok);
+    const float before = gt.ride_power_ps();
+    choose(f, "muf_sports");
+    CHECK(f.controller()->depth() == 1 && f.controller()->page_name() == "ts/ts_buy_sure1");
+    choose(f, "yes1");
+    CHECK(gt.owns(37));
+    CHECK(f.controller()->depth() == 1 && f.controller()->page_name() == "ts/ts_fit_sure1");
+    choose(f, "yes1");
+    CHECK(f.controller()->depth() == 1 && f.controller()->page_name() == "ts/ts_fit_end1");
+    CHECK(gt.ride_power_ps() > before);
+    // (The widgets' classes say torque; the original prints the power in both, "%d %s".)
+    CHECK(widget_text(f, "car_previous_torque") == gt.power_text(before, " "));
+    CHECK(widget_text(f, "car_current_torque") == gt.power_text(gt.ride_power_ps(), " "));
+    choose(f, "yes1");
+    CHECK(f.controller()->depth() == 0 && f.controller()->page_name() == "ts/ts_eg_muf_sp");
+    CHECK(widget_text(f, "price_muf_sports") == "Purchased");
+    // Bought again: refused.
+    choose(f, "muf_sports");
+    CHECK(f.controller()->depth() == 1 && f.controller()->page_name() == "ts/already_you_have");
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->depth() == 0 && f.controller()->page_name() == "ts/ts_eg_muf_sp");
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->page_name() == "ts/ts_eg");
+
+    // Bought, not installed: No on "Install parts now?" also returns to the part's page.
+    choose(f, "item2");
+    CHECK(f.controller()->page_name() == "ts/ts_eg_muf_semi");
+    const float fitted = gt.ride_power_ps();
+    choose(f, "muf_semi_racing");
+    choose(f, "yes1");
+    CHECK(gt.owns(38));
+    CHECK(f.controller()->depth() == 1 && f.controller()->page_name() == "ts/ts_fit_sure1");
+    choose(f, "no1");
+    CHECK(f.controller()->depth() == 0 && f.controller()->page_name() == "ts/ts_eg_muf_semi");
+    CHECK(gt.ride_power_ps() == fitted);
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->page_name() == "ts/ts_eg");
+}
+
+// Race information -> Cars Permitted: the event's regulation list (car name and second
+// name, each string once), a cursor row scrolling through it; "No Limitations" without one.
+TEST(gtmode_menu_disc_permitted_cars) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::install_gt_mode_menu();
+    Vfs vfs(&disc->volume());
+    GameFlow f(vfs_reader(vfs), "US");
+    f.start();
+    settle(f);
+    game::GtModeSession* s = game::gt_mode_session();
+    CHECK(s != nullptr);
+    if (!s) return;
+    game::GtMode& gt = s->gt();
+    std::vector<std::string> names = game::permitted_car_names(gt, "G_80sports_e_0001");
+    CHECK(names.size() >= 10);
+    CHECK(std::find(names.begin(), names.end(), std::string()) == names.end());
+    for (size_t i = 0; i < names.size(); ++i)
+        CHECK(std::count(names.begin(), names.end(), names[i]) == 1);
+    CHECK(game::permitted_car_names(gt, "Gsunday_e_0001").empty());
+
+    auto rows = [&] {
+        std::vector<std::string> out;
+        for (const menu::ElementDraw& d : f.draw_list())
+            if (d.element && d.text && (d.element->name == "link_menu" || d.element->name == "active_menu"))
+                out.push_back(*d.text);
+        return out;
+    };
+    auto focused_row = [&] {
+        for (const menu::ElementDraw& d : f.draw_list())
+            if (d.element && d.text && d.element->name == "active_menu") return *d.text;
+        return std::string("<none>");
+    };
+    choose(f, "gt_mode");
+    settle(f);
+    choose(f, "r_r");
+    choose(f, "beginner");
+    choose(f, "G_80sports_e_0001");
+    CHECK(f.controller()->page_name() == "r/beginner/g_80sports_e");
+    choose(f, "G_80sports_e_0001_info");
+    CHECK(f.controller()->page_name() == "00cmn/race_info");
+    choose(f, "car_regulation");
+    CHECK(f.controller()->depth() == 1 && f.controller()->page_name() == "00cmn/car_reguration");
+    std::vector<std::string> shown = rows();
+    CHECK(!shown.empty() && shown.size() < names.size()); // the box holds fewer rows than the list
+    CHECK(shown.size() >= 1 && shown[0] == names[0]);
+    CHECK(focused_row() == names[0]);
+    for (size_t i = 1; i < names.size() + 2; ++i) press(f, MenuKey::Down);
+    CHECK(focused_row() == names.back()); // clamped at the end
+    shown = rows();
+    CHECK(!shown.empty() && shown.back() == names.back());
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->depth() == 0 && f.controller()->page_name() == "00cmn/race_info");
+
+    // A race without a list.
+    press(f, MenuKey::Cancel);
+    settle(f);
+    press(f, MenuKey::Cancel);
+    settle(f);
+    choose(f, "Gsunday_e_0001");
+    choose(f, "Gsunday_e_0001_info");
+    CHECK(f.controller()->page_name() == "00cmn/race_info");
+    choose(f, "car_regulation");
+    CHECK(f.controller()->page_name() == "00cmn/car_reguration");
+    shown = rows();
+    CHECK(shown.empty());
+    bool none = false;
+    for (const menu::ElementDraw& d : f.draw_list())
+        none = none || (d.element && d.element->name == "no_regulated_car");
+    CHECK(none);
+}
+
 TEST(gtmode_menu_disc_touch_taps) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
@@ -253,6 +396,7 @@ TEST(gtmode_menu_disc_touch_taps) {
         for (float x = 0; x < 640 && hit != c->focus(); x += 4)
             if (c->hit_test(x, y) == c->focus()) {
                 hit = c->focus();
+                CHECK(!f.hover(x + 1, y + 1)); // (no hover focus on a scrolling selector)
                 CHECK(f.tap(x + 1, y + 1));
             }
     CHECK(hit == c->focus());
@@ -268,12 +412,103 @@ TEST(gtmode_menu_disc_touch_taps) {
     float x = e->x + e->w / 2, y = e->y + e->h / 2;
     CHECK(c->hit_test(x, y) == dealer);
     CHECK(c->hit_test(-10, -10) == -1);
+    // A hovering pointer (mouse, VR controller) focuses the item it is over at once (the map's
+    // items stay put); then the taps below work as before.
+    const int other = dealer == 0 ? 1 : 0;
+    const menu::Element* eo = c->items()[size_t(other)].element;
+    const float ox = eo->x + eo->w / 2, oy = eo->y + eo->h / 2;
+    if (c->hit_test(ox, oy) == other) {
+        CHECK(f.hover(ox, oy));
+        CHECK(c->focus() == other);
+    }
     CHECK(f.tap(x, y));
     settle(f);
     CHECK(f.controller()->focus() == dealer && f.controller()->page_name() == "map");
     CHECK(f.tap(x, y));
     settle(f);
     CHECK(f.controller()->page_name() == "cd/cd");
+}
+
+// A hovering pointer in the shops: the tune shop's parts and the wheel shop's makers are
+// scrolling rows (they hold still while the pointer moves the cursor, so one click chooses);
+// the wheel shop's tiles are drawn by GT-mode code (their own hit test).
+TEST(gtmode_menu_disc_pointer_shops) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::install_gt_mode_menu();
+    Vfs vfs(&disc->volume());
+    GameFlow f(vfs_reader(vfs), "US");
+    f.start();
+    settle(f);
+    game::GtModeSession* s = game::gt_mode_session();
+    CHECK(s != nullptr);
+    if (!s) return;
+    s->gt().state().credits = 1000000;
+    CHECK(s->gt().buy_car("altezza_rs200_98") == 0);
+    choose(f, "gt_mode");
+    settle(f);
+    auto centre = [&](int i, float& x, float& y) {
+        SDL_FRect b{};
+        if (!f.controller()->item_box(i, b)) return false;
+        x = b.x + b.w / 2, y = b.y + b.h / 2;
+        return true;
+    };
+    // Tune shop, engine parts: a horizontal row in a window.
+    choose(f, "ts_ts");
+    choose(f, "bg2");
+    CHECK(f.controller()->page_name() == "ts/ts_eg");
+    float x = 0, y = 0;
+    CHECK(centre(6, x, y));
+    CHECK(f.hover(x, y));
+    CHECK(f.controller()->focus() == 6);
+    for (int i = 0; i < 30; ++i) f.tick(0);
+    float x2 = 0, y2 = 0;
+    CHECK(centre(6, x2, y2) && x2 == x && y2 == y); // the row held still (it scrolls for 6 by key)
+    // One click chooses, with the row still held (the choice's feedback must not wait for a
+    // scroll that never comes: it hung the menu).
+    CHECK(f.tap(x, y));
+    f.tick(0);
+    settle(f);
+    CHECK(f.controller()->page_name() == "ts/ts_eg_port" && !f.controller()->busy());
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->page_name() == "ts/ts_eg");
+    CHECK(centre(1, x, y) && f.hover(x, y) && f.controller()->focus() == 1); // (the row came back scrolled)
+    CHECK(f.tap(x, y)); // the semi-racing muffler
+    f.tick(0);
+    settle(f);
+    CHECK(f.controller()->page_name() == "ts/ts_eg_muf_semi");
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->page_name() == "ts/ts_eg");
+    press(f, MenuKey::Cancel);
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->page_name() == "map");
+    // Wheel shop: the makers' row, then a maker's wheels.
+    choose(f, "at_at");
+    choose(f, "sl");
+    CHECK(f.controller()->page_name() == "at/ws/ws");
+    CHECK(centre(0, x, y) && f.hover(x, y) && f.controller()->focus() == 0);
+    CHECK(f.tap(x, y));
+    f.tick(0);
+    settle(f);
+    CHECK(f.controller()->page_name() == "at/ws/ws_bridgestone");
+    for (int i = 0; i < 30; ++i) f.tick(0);
+    auto tile = [&](const char* wheel, float& tx, float& ty) {
+        for (const menu::ElementDraw& d : f.draw_list())
+            if (d.element && d.has_box && d.element->name == wheel) {
+                tx = d.box.x + d.box.w / 2, ty = d.box.y + d.box.h / 2;
+                return true;
+            }
+        return false;
+    };
+    CHECK(tile("brw002_s", x, y));
+    CHECK(f.hover(x, y));
+    CHECK(f.controller()->focus() == 2);
+    CHECK(f.tap(x, y)); // one click: the purchase question
+    f.tick(0);
+    settle(f);
+    CHECK(f.controller()->depth() == 1);
 }
 
 TEST(gtmode_menu_disc_settings_sliders) {
@@ -568,7 +803,29 @@ TEST(gtmode_menu_disc_arcade_progression) {
     // New game: the six courses of group 0, in the game's order.
     const std::vector<std::string> group0 = {"super", "midfield", "smtnorth", "smtsouth", "trialmt", "r_midfield"};
     CHECK(f.carousel() && f.carousel()->entries == group0);
-    press(f, MenuKey::Confirm); // Super Speedway
+    // Pointer: a tap on another icon of the strip moves there, a tap on the focused one chooses it.
+    auto icon_centre = [&](int k, float& x, float& y) {
+        const std::string name = group0[size_t(k)] + "_mini";
+        for (const menu::ElementDraw& d : f.draw_list()) {
+            if (!d.element || !d.has_box || d.additive || d.element->name != name) continue;
+            x = d.box.x + d.box.w / 2, y = d.box.y + d.box.h / 2;
+            return true;
+        }
+        return false;
+    };
+    float ix = 0, iy = 0;
+    for (int i = 0; i < 40; ++i) f.tick(0); // the strip glides in
+    CHECK(icon_centre(2, ix, iy) && f.tap(ix, iy));
+    f.tick(0);
+    CHECK(f.carousel() && f.carousel()->index == 2 && f.controller()->page_name() == "ar/select_course");
+    for (int i = 0; i < 40; ++i) f.tick(0);
+    CHECK(icon_centre(0, ix, iy) && f.tap(ix, iy));
+    f.tick(0);
+    CHECK(f.carousel() && f.carousel()->index == 0);
+    for (int i = 0; i < 40; ++i) f.tick(0);
+    CHECK(icon_centre(0, ix, iy) && f.tap(ix, iy)); // Super Speedway
+    f.tick(0); // (the tap's Confirm is applied on this tick)
+    settle(f);
     CHECK(f.controller()->page_name() == "ar/select_class");
     CHECK(f.carousel() && f.carousel()->entries.size() > 1 && f.carousel()->entries[1] == "class_b");
     press(f, MenuKey::Right);

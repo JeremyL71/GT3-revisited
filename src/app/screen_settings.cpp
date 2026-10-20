@@ -27,8 +27,13 @@ namespace gt3r {
 
 namespace {
 
+#if GT3R_XR
+enum Tab { kDisplay, kAudio, kControls, kFfb, kTouch, kDisc, kOnline, kVr, kTabCount };
+const char* const kTabNames[kTabCount] = {"Display", "Audio", "Controls", "Force feedback", "Touch", "Game disc", "Online", "VR"};
+#else
 enum Tab { kDisplay, kAudio, kControls, kFfb, kTouch, kDisc, kOnline, kTabCount };
 const char* const kTabNames[kTabCount] = {"Display", "Audio", "Controls", "Force feedback", "Touch", "Game disc", "Online"};
+#endif
 
 struct Row {
     enum class Kind { Toggle, Choice, Slider, Action, Info, Heading, Preview };
@@ -412,6 +417,9 @@ private:
         case kTouch: build_touch(app); break;
         case kDisc: build_disc(app); break;
         case kOnline: build_online(app); break;
+#if GT3R_XR
+        case kVr: build_vr(app); break;
+#endif
         default: break;
         }
         if (sel_ < 0 || sel_ >= int(rows_.size()) || !rows_[sel_].selectable()) sel_ = first_selectable();
@@ -485,6 +493,111 @@ private:
         if (app.gpu()) info("Graphics driver", app.gpu()->driver_name());
         info("2D renderer", SDL_GetRendererName(app.renderer()));
     }
+
+#if GT3R_XR
+    // [vr]: the headset (xr::Settings).
+    void build_vr(App& app) {
+        App* a = &app;
+        xr::Session* x = app.xr();
+        if (!x) {
+            info("Headset", "Not in use", "No VR headset found when the game started; it runs in a window.");
+            return;
+        }
+        const xr::Settings s = x->settings();
+        auto apply = [a](const xr::Settings& n) { a->set_xr_settings(n); };
+        toggle("Races in 3D", "Drive in stereo from the car's seat or behind it. Off: races on the screen, like menus.",
+               s.stereo, [apply, s](bool v) {
+                   xr::Settings n = s;
+                   n.stereo = v;
+                   apply(n);
+               });
+        toggle("Level horizon", "In-car view: follow the car's heading only, not its pitch and roll (gentler).",
+               s.level_horizon, [apply, s](bool v) {
+                   xr::Settings n = s;
+                   n.level_horizon = v;
+                   apply(n);
+               });
+        toggle("Car body in the in-car view", "See your car's bonnet and body around you. Off: GT3's camera alone.",
+               s.show_car, [apply, s](bool v) {
+                   xr::Settings n = s;
+                   n.show_car = v;
+                   apply(n);
+               });
+        choice("Steering", "Wheel: squeeze both grips and turn the controllers like a steering wheel.",
+               {"Thumbstick", "Wheel"}, s.wheel ? 1 : 0, [apply, s](int i) {
+                   xr::Settings n = s;
+                   n.wheel = i == 1;
+                   apply(n);
+               });
+        static const int kDegrees[] = {180, 270, 360, 540, 900};
+        int di = 0;
+        for (int i = 0; i < 5; ++i)
+            if (s.wheel_degrees >= kDegrees[i]) di = i;
+        choice("Wheel rotation", "Degrees from full left to full right lock.", {"180", "270", "360", "540", "900"},
+               di, [apply, s](int i) {
+                   xr::Settings n = s;
+                   n.wheel_degrees = kDegrees[i];
+                   apply(n);
+               }).enabled = s.wheel;
+        auto metres = [](float v) {
+            char b[16];
+            std::snprintf(b, sizeof(b), "%.1f m", double(v));
+            return std::string(b);
+        };
+        slider("Screen size", "Width of the virtual screen for menus and replays.", s.screen_width, 1.2f, 6.0f, 0.2f,
+               metres(s.screen_width), [apply, s](float v) {
+                   xr::Settings n = s;
+                   n.screen_width = v;
+                   apply(n);
+               });
+        slider("Screen distance", "How far away the virtual screen is.", s.screen_distance, 1.0f, 6.0f, 0.2f,
+               metres(s.screen_distance), [apply, s](float v) {
+                   xr::Settings n = s;
+                   n.screen_distance = v;
+                   apply(n);
+               });
+        slider("HUD size", "Width of the race display panel in front of the car.", s.hud_width, 0.6f, 3.0f, 0.1f,
+               metres(s.hud_width), [apply, s](float v) {
+                   xr::Settings n = s;
+                   n.hud_width = v;
+                   apply(n);
+               });
+        slider("HUD distance", "How far ahead the race display panel floats.", s.hud_distance, 0.6f, 3.0f, 0.1f,
+               metres(s.hud_distance), [apply, s](float v) {
+                   xr::Settings n = s;
+                   n.hud_distance = v;
+                   apply(n);
+               });
+        const std::vector<float>& rates = x->refresh_rates();
+        if (!rates.empty()) {
+            std::vector<std::string> names;
+            int ri = 0;
+            for (size_t i = 0; i < rates.size(); ++i) {
+                names.push_back(std::to_string(int(std::lround(rates[i]))) + " Hz");
+                if (std::fabs(rates[i] - float(s.refresh_hz)) < std::fabs(rates[size_t(ri)] - float(s.refresh_hz))) ri = int(i);
+            }
+            std::vector<float> rv = rates;
+            choice("Refresh rate", "Higher is smoother and needs more from the headset.", names, ri, [apply, s, rv](int i) {
+                xr::Settings n = s;
+                n.refresh_hz = int(std::lround(rv[size_t(i)]));
+                apply(n);
+            });
+        }
+        static const float kScales[] = {0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f};
+        int si = 0;
+        for (int i = 0; i < 6; ++i)
+            if (std::fabs(kScales[i] - s.eye_scale) < std::fabs(kScales[si] - s.eye_scale)) si = i;
+        Row& res = choice("3D resolution", "Of the headset's recommended size. Takes effect after a restart.",
+                          {"70%", "80%", "90%", "100%", "110%", "120%"}, si, [apply, s](int i) {
+                              xr::Settings n = s;
+                              n.eye_scale = kScales[i];
+                              apply(n);
+                          });
+        (void)res;
+        action("Recentre view", "Puts the seat and the screen where you are looking now.", "", [x] { x->recenter(); });
+        info("Eyes", std::to_string(x->eye(0).width) + " x " + std::to_string(x->eye(0).height) + " pixels");
+    }
+#endif
 
     void build_audio(App& app) {
         App* a = &app;

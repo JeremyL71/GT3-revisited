@@ -60,6 +60,7 @@ them, then the state.
 | `screen_race_analyzer.cpp` | The Analyzer: the quick menu's data logger and the theater's logger mode |
 | `screen_race_online.cpp` | Online battle glue (field from the grid, events, synchronised start, prediction, ghosting); its state is `RaceScreen::net_` |
 | `screen_race_license.cpp` | Licence tests (the judge every tick, medals) and the disc's demonstration runs (DEMO, preview box) |
+| `screen_race_vr.cpp` | VR builds only: the stereo race (`vr_stereo`, `vr_base`, `render_vr_eyes`); see [VR](VR.md) |
 
 ## Loop
 
@@ -571,9 +572,14 @@ Courses without a script fall back to placeholder trackside cameras every
 `ai::AiDriver` with the event's parameters and rubber band) in one
 `sim::World` (car-to-car contact, slipstream, time scale). The player's
 `RaceVehicle` steps the whole field, so the fixed-tick loop, replays and HUD
-are unchanged; the player starts on the last grid slot. The race ends after
-the event's laps (position from race distance), or for time-limited events
-when the clock reaches the limit (order by distance covered). Replays of races store the event
+are unchanged; the player starts on the last grid slot. A car finishes at a line
+crossing (`race::finishes_at_line`, presentation spec "Race order and finish"): after the
+event's laps, or once the leader has finished (a lapped car, the player included, finishes at
+its next crossing: "+1 lap"), or at its first crossing after a time limit (nothing ends at the
+limit itself); its laps stop counting there. The race order (`race::ranks_ahead`, kept every
+tick, ties keep their places) is the HUD position and the player's place: more laps first,
+then running cars by distance, a running car ahead of a finished one, finished cars by finish
+time. Replays of races store the event
 and opponents (format v2) and re-run the whole field: a 40 s race replay
 reproduces the player's final position exactly. `GT3R_RACE="event=AEAT0001"`
 starts one directly.
@@ -988,10 +994,13 @@ behaviour (presentation spec §A):
   every row) -> the prize page (cup with the prize money counting into the credits, or the
   consolation prize; `game::queue_race_prize`, shown by `make_presentation_screen()` over the
   race) -> the race's replay starts by itself -> its end or EXIT -> the GT result quick menu
-  (finished cars with their own race times). `GameResult::prize_shown` tells GT mode not to
+  (finished cars with their own race times, `--'--.---` for a car still racing when the race
+  ended). `GameResult::prize_shown` tells GT mode not to
   show the page again. The result is latched when the live race ends (`RaceResultLatch`, as the
   original records the place and prize before the replay) and is what every exit posts: quick
-  menu EXIT, replay pause EXIT, leaving from a replay; Retry drops it. A finished GT single race
+  menu EXIT, replay pause EXIT, leaving from a replay; Retry drops it. The result menu's rows
+  are kept with it (`latched_rows_`): the replay re-runs the whole field, so the standings
+  after it are the replay's, not the race's. A finished GT single race
   is also written to the save at that moment (`game::save_race_run`). Screenshots: `gt3r --screen gtprize` (`GT3R_PRIZE=<event>:<place>`,
   `GT3R_GTMODE_PRIZE_FRAME=<n>`), `GT3R_RACE="...,quick=1,gtq=1"` for the GT result menu.
 

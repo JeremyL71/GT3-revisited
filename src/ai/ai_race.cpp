@@ -55,6 +55,7 @@ AiRace::AiRace(const track::Track& track, const data::CarDatabase& db, const std
         c.driver = std::make_unique<AiDriver>(course_, entries[i].params, int(cars_.size()));
         c.driver->reset(c.vehicle->state());
         c.timer = std::make_unique<track::LapTimer>(track);
+        c.timer->set_lap1_from_go(true); // a race: lap 1 from GO
         c.timer->update(pose.position, 0);
         cars_.push_back(std::move(c));
     }

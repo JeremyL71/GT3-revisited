@@ -249,8 +249,20 @@ void Profile::remove_target(const PadTarget& target) {
 }
 
 const std::vector<std::string_view>& preset_names() {
+#if GT3R_XR
+    static const std::vector<std::string_view> names = {"quest", "racing", "classic", "wheel", "keyboard"};
+#else
     static const std::vector<std::string_view> names = {"racing", "classic", "wheel", "keyboard"};
+#endif
     return names;
+}
+
+std::string_view default_preset() {
+#if GT3R_XR
+    return "quest";
+#else
+    return "racing";
+#endif
 }
 
 namespace {
@@ -280,13 +292,15 @@ void add_keyboard(Profile& p) {
     p.add("RY+", "key.K");
 }
 
-void add_pad_common(Profile& p) {
+// `b_back`: the right face button (B on Xbox and Quest controllers) is Triangle (back) and the
+// top one Circle, as Quest players expect; otherwise the DualShock 2's positions.
+void add_pad_common(Profile& p, bool b_back = false) {
     p.add("Up", "pad.dpup");
     p.add("Down", "pad.dpdown");
     p.add("Left", "pad.dpleft");
     p.add("Right", "pad.dpright");
-    p.add("Circle", "pad.east");
-    p.add("Triangle", "pad.north");
+    p.add("Circle", b_back ? "pad.north" : "pad.east");
+    p.add("Triangle", b_back ? "pad.east" : "pad.north");
     p.add("L1", "pad.leftshoulder");
     p.add("R1", "pad.rightshoulder");
     p.add("L3", "pad.leftstick");
@@ -366,9 +380,9 @@ Profile make_preset(std::string_view name) {
     p.name = std::string(name);
     if (name == "wheel") {
         add_wheel(p);
-    } else if (name != "keyboard") { // "racing" (default), "classic"
+    } else if (name != "keyboard") { // "racing" (default), "classic", "quest" (VR headsets)
         // The DualShock 2 1:1: analog triggers drive the pressure-sensitive L2/R2.
-        add_pad_common(p);
+        add_pad_common(p, name == "quest");
         p.add("Cross", "pad.south");
         p.add("Square", "pad.west");
         p.add("L2", "pad.lefttrigger");

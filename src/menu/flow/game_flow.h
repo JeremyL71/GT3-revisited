@@ -42,10 +42,14 @@ public:
     void tick(MenuKeys held);
     // Touch: a tap at a point in menu layout coordinates (640x448, x right, y up
     // from the bottom-left). Tapping an item focuses it, tapping the focused
-    // item confirms it; on code-drawn pickers (arcade course/car carousels) the
-    // left / right thirds step the entry and the middle confirms. Returns true
-    // when the tap was used (the caller should then not treat it as a key).
+    // item confirms it; on code-drawn pickers (arcade course/car carousels) an
+    // icon of the strip is chosen the same way, elsewhere the left / right
+    // thirds step the entry and the middle confirms. Returns true when the tap
+    // was used (the caller should then not treat it as a key).
     bool tap(float x, float y);
+    // A hovering pointer (mouse, VR controller) at a point: focuses the item under it where
+    // items stay put (MenuController::hover, the GT Mode garage rows), so a click confirms.
+    bool hover(float x, float y);
 
     std::vector<ElementDraw> draw_list() const;
     // Text width in menu units for a pmb font spec ("sw_20") at its own size: places the
@@ -167,7 +171,10 @@ private:
     void arcade_back();
     void arcade_start_race();
     void build_carousel(const std::string& page);
-    void animate_carousel(int move);        // one frame; move = -1 / 0 / +1 (an accepted move)
+    // One frame; move = -1 / 0 / +1 (an accepted move), `prev` = the entry moved from (-1: the
+    // neighbour behind the move).
+    void animate_carousel(int move, int prev = -1);
+    int carousel_icon_at(float x, float y) const; // the strip icon under a point, or -1
     std::vector<std::string> carousel_parts(const std::string& id) const; // the entry's art (moves with the cross)
     // The hidden picture of a car page entry (GtModeHooks::arcade_image; a label that
     // starts with a digit is named "_<label>" in the layout), else the id itself.
@@ -282,6 +289,7 @@ private:
     bool presenting_ = false;  // a GT-mode presentation control is open
     bool standalone_shows_ = false; // start_presentations(): exit when the queue is empty
     MenuKeys injected_ = 0;    // keys pressed by a tap, applied on the next tick
+    int carousel_jump_ = -1;   // a tapped strip icon, moved to on the next tick
     bool exited_ = false;      // a control started with start(set, page) was left
     bool standalone_save_ = false; // started with start_save_game()
     // Attract mode: idle frames on the title, demos run.

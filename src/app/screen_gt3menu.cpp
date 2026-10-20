@@ -109,6 +109,10 @@ public:
     // touch controls into left-button events). A press and release close
     // together is a tap; update() hands it to the menu.
     void on_event(App&, const SDL_Event& e) override {
+        // A pointer that hovers (a mouse or a VR controller, not a finger: SDL marks the mouse
+        // events it makes from touches) focuses what it is over; update() hands it to the menu.
+        if (e.type == SDL_EVENT_MOUSE_MOTION && e.motion.which != SDL_TOUCH_MOUSEID && !e.motion.state)
+            hover_ = SDL_FPoint{e.motion.x, e.motion.y};
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) {
             press_ = SDL_FPoint{e.button.x, e.button.y};
         } else if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_LEFT && press_) {
@@ -142,7 +146,12 @@ public:
         }
         if (frozen_) {
             taps_.clear();
+            hover_.reset();
             return;
+        }
+        if (hover_) {
+            if (float mx, my; ui_to_menu(*hover_, mx, my)) flow_->hover(mx, my);
+            hover_.reset();
         }
         const bool title = on_title();
         for (SDL_FPoint p : taps_) {
@@ -549,6 +558,7 @@ private:
     MenuKeys prev_keys_ = 0;
     std::optional<SDL_FPoint> press_; // left button / finger down, UI units
     std::vector<SDL_FPoint> taps_;    // taps since the last update()
+    std::optional<SDL_FPoint> hover_; // the hovering pointer's last move since the last update()
     bool in_game_ = false;
     bool frozen_ = false;
     std::deque<MenuKeys> script_;

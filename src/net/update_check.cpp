@@ -93,12 +93,13 @@ CpuArch this_arch() {
 #endif
 }
 
-std::string release_asset(RvPlatform platform, CpuArch arch) {
+std::string release_asset(RvPlatform platform, CpuArch arch, bool vr) {
     switch (platform) {
     case RvPlatform::Windows: return arch == CpuArch::X64 ? "gt3r-windows-x64.zip" : "";
     case RvPlatform::MacOS: return arch == CpuArch::Arm64 ? "gt3r-macos-arm64.zip" : "";
     case RvPlatform::Linux: return arch == CpuArch::X64 ? "gt3r-linux-x86_64.tar.gz" : "";
-    case RvPlatform::Android: // one APK for arm64-v8a and x86_64
+    case RvPlatform::Android: // one APK for arm64-v8a and x86_64; the Quest APK is arm64 only
+        if (vr) return arch == CpuArch::Arm64 ? "gt3r-quest.apk" : "";
         return arch == CpuArch::Other ? "" : "gt3r-android.apk";
     default: return "";
     }
@@ -118,7 +119,11 @@ std::string this_release_asset() {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     p = RvPlatform::Other; // no iOS package
 #endif
+#if GT3R_XR
+    return release_asset(p, this_arch(), true);
+#else
     return release_asset(p, this_arch());
+#endif
 }
 
 UpdateLinks update_links(const std::string& url, const std::string& asset) {

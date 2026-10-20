@@ -15,6 +15,7 @@
 // nullptr and the app runs 2D-only.
 
 #include "base/bytes.h"
+#include "xr/xr_session.h" // VR builds (GT3R_XR)
 
 #include <SDL3/SDL.h>
 
@@ -59,6 +60,9 @@ struct GpuOptions {
     bool vsync = true;
     bool debug = false; // backend validation layers
     float render_scale = 1.0f; // 3D resolution relative to the display (0.5..1); the UI stays native
+    // VR builds (GT3R_XR): create the device through the headset's OpenXR runtime when there is
+    // one; the 2D renderer then draws offscreen (canvases of xr::Session) instead of the window.
+    bool xr = false;
 };
 
 class GpuContext {
@@ -71,6 +75,11 @@ public:
 
     SDL_GPUDevice* device() const { return device_; }
     SDL_Renderer* renderer2d() const { return renderer_; }
+#if GT3R_XR
+    // Set when the device was created for a headset (see GpuOptions::xr).
+    bool xr() const { return xr_; }
+    const xr::Session::DeviceRequest& xr_request() const { return xr_request_; }
+#endif
     const char* driver_name() const { return SDL_GetGPUDeviceDriver(device_); }
 
     // Offscreen 3D formats.
@@ -97,6 +106,10 @@ private:
 
     SDL_GPUDevice* device_ = nullptr;
     bool anisotropy_ = true; // the device was created with anisotropic filtering
+#if GT3R_XR
+    bool xr_ = false;
+    xr::Session::DeviceRequest xr_request_;
+#endif
     float render_scale_ = 1.0f;
     SDL_Renderer* renderer_ = nullptr;
     SDL_GPUShader* vs_ = nullptr;

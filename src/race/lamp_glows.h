@@ -42,6 +42,11 @@ public:
     void tick(double seconds) { time_ += seconds; }
     // `blocked(from, to)`: true if the segment is occluded.
     void draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Vec3& eye, float fovy,
+              const std::function<bool(const render::Vec3&, const render::Vec3&)>& blocked) const {
+        draw(r, rect, view, eye, render::Frustum::symmetric(fovy, rect.w / rect.h), blocked);
+    }
+    void draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Vec3& eye,
+              const render::Frustum& fr,
               const std::function<bool(const render::Vec3&, const render::Vec3&)>& blocked) const;
 
 private:
@@ -83,6 +88,11 @@ public:
     };
     void draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Vec3& eye, float fovy,
               const std::vector<Car>& cars,
+              const std::function<bool(const render::Vec3&, const render::Vec3&)>& blocked) const {
+        draw(r, rect, view, eye, render::Frustum::symmetric(fovy, rect.w / rect.h), cars, blocked);
+    }
+    void draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Vec3& eye,
+              const render::Frustum& fr, const std::vector<Car>& cars,
               const std::function<bool(const render::Vec3&, const render::Vec3&)>& blocked) const;
 
 private:
