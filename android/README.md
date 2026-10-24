@@ -1,8 +1,9 @@
 # Android build
 
-Requirements: Android SDK with NDK 27 and CMake 3.22 or later (install both
-from the SDK Manager), and **JDK 17 or 21**. Newer JDKs are not yet supported
-by Gradle 8.
+Requirements: Android SDK with NDK 27.0.12077973 (the version `app/build.gradle`
+pins) and CMake 3.22.1 or later (install both from the SDK Manager), and
+**JDK 17 or 21**. The Gradle wrapper (8.12) does not run on JDK 24 or later.
+The APK runs on Android 7.0 (API 24) and later.
 
 ```bash
 android/fetch-sdl.sh
@@ -22,7 +23,7 @@ library, so the two always match. The engine's root `CMakeLists.txt` builds
 ## Using it
 
 1. Copy your GT3 `.iso` to the device (or keep it on an SD card or USB drive).
-2. Launch the app and tap **Open disc image...**. Android's file picker
+2. Launch the app and tap **Open disc image**. Android's file picker
    opens and the app reads the image through the Storage Access Framework, so
    no storage permission is needed.
 3. Bluetooth and USB controllers (DualSense, Xbox, Switch Pro, 8BitDo and
@@ -34,11 +35,18 @@ on-screen touch controls appear: a D-pad and face buttons in menus, and a
 steering zone (drag, or tilt with `[touch] steering = tilt`), pressure
 pedals and shift buttons while racing. They hide when a controller is used.
 See [docs/INPUT.md](../docs/INPUT.md#touch-controls-phones-and-tablets).
+**Settings → Controls → Phone vibration** (off by default) sends player 1's
+rumble to the device's own motor while the controls in use have none (touch,
+or a controller without rumble).
+
+Phones and tablets start with dynamic resolution on and 2× MSAA
+(**Settings → Display**).
 
 Tested on the Pixel emulators (API 36, arm64): Vulkan renderer, boot →
 opening movie → title → Arcade → Time Trial → driving with touch controls
 and tilt, back button, home and resume (the race pauses), rotation,
-and the system file picker. Status and testing tips:
+and the system file picker. On real devices: menus and races on a Galaxy A15
+5G (the low-end baseline) and other Android devices. Status and testing tips:
 [docs/dev/PLATFORMS.md](../docs/dev/PLATFORMS.md).
 
 ## Meta Quest (VR)

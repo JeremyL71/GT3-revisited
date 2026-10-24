@@ -253,7 +253,9 @@ std::unique_ptr<Track> Track::from_course_file(ByteSpan data, std::string label)
     course::AiLines ai;
     ByteSpan lines = file.section(data, course::kSlotAiLines);
     if (!lines.empty()) ai = course::AiLines::parse(lines);
-    return std::make_unique<Track>(course::Road::parse(road), std::move(ai), std::move(label));
+    auto t = std::make_unique<Track>(course::Road::parse(road), std::move(ai), std::move(label));
+    t->set_driver_sets(course::DriverSets::parse(data, file));
+    return t;
 }
 
 Track::Track(course::Road road, course::AiLines ai, std::string label)
@@ -779,9 +781,20 @@ WallContact Track::wall_contact(const sim::Vec3& centre, float radius) const {
 
 // --- lap timing -------------------------------------------------------------------
 
+std::vector<float> display_checkpoints(const course::Road& road) {
+    std::vector<float> out;
+    for (const course::RoadMarker& m : road.markers) {
+        if ((m.flags & 0xFFFF) != 2 || (m.flags >> 16) != 0) continue;
+        out.push_back(m.distance);
+        if (out.size() == 3) break;
+    }
+    return out;
+}
+
 LapTimer::LapTimer(const Track& track, int sector_count) : track_(track), sector_count_(std::max(1, sector_count)) {
     float L = track_.length();
     for (int i = 1; i <= sector_count_; ++i) sector_ends_.push_back(L * float(i) / float(sector_count_));
+    checkpoints_ = display_checkpoints(track_.road());
     reset();
 }
 
@@ -821,6 +834,8 @@ void LapTimer::reset(double time) {
     sector_ = 0;
     sector_times_.clear();
     last_sectors_.clear();
+    next_cp_ = 0;
+    crossings_.clear();
     progress_ = 0;
     distance_ = 0;
     backwards_ = 0;
@@ -842,6 +857,7 @@ void LapTimer::teleport(const sim::Vec3& position) {
 }
 
 bool LapTimer::update(const sim::Vec3& position, double time) {
+    crossings_.clear();
     float L = track_.length();
     if (L <= 0) return false;
     if (!located_) {
@@ -881,10 +897,24 @@ bool LapTimer::update(const sim::Vec3& position, double time) {
             lap_start_ms_ = sector_start_ms_ = from_go_ ? 0 : crossing_ms(before, progress_, 0.0, t_prev, time);
             sector_ = 0;
             sector_times_.clear();
+            next_cp_ = 0;
         }
         return false;
     }
     if (frozen_) return false;
+    // The next split point only, crossed forwards within this lap (the original's per-lap
+    // checkpoint counter; presentation §D6).
+    {
+        const double lap_base = double(laps_) * L;
+        if (size_t(next_cp_) < checkpoints_.size()) {
+            const double d = lap_base + double(checkpoints_[size_t(next_cp_)]);
+            if (before < d && progress_ >= d) {
+                long long ms = crossing_ms(before, progress_, d, t_prev, time);
+                crossings_.push_back({next_cp_, false, laps_, ms, ms - lap_start_ms_});
+                ++next_cp_;
+            }
+        }
+    }
     // Sectors (except the last, which ends with the lap).
     const double lap0 = double(laps_) * L;
     while (sector_ + 1 < sector_count_ && progress_ - lap0 >= sector_ends_[size_t(sector_)]) {
@@ -900,9 +930,11 @@ bool LapTimer::update(const sim::Vec3& position, double time) {
         sector_times_.clear();
         last_lap_ = double(ms - lap_start_ms_) / 1000.0;
         if (best_lap_ < 0 || last_lap_ < best_lap_) best_lap_ = last_lap_;
+        crossings_.push_back({next_cp_, true, laps_, ms, ms - lap_start_ms_});
         ++laps_;
         lap_start_ms_ = sector_start_ms_ = last_cross_ms_ = ms;
         sector_ = 0;
+        next_cp_ = 0;
         return true;
     }
     return false;

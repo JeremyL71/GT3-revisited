@@ -6,7 +6,8 @@ layout(location = 0) in vec3 v_normal;
 layout(location = 1) in vec2 v_uv;
 layout(location = 2) in vec4 v_color;
 layout(location = 3) in vec3 v_world;
-layout(location = 4) in vec3 v_lit; // GT3 lighting factor, per vertex (model.vert)
+layout(location = 4) in noperspective vec3 v_lit; // GT3 lighting factor, per vertex (model.vert)
+layout(location = 5) in noperspective float v_fog; // GT3 fog amount, per vertex (model.vert)
 
 layout(set = 2, binding = 0) uniform sampler2D u_tex;
 layout(set = 2, binding = 1) uniform samplerCube u_env; // car reflections (env_ground.w = 1: valid)
@@ -19,13 +20,14 @@ layout(set = 3, binding = 0) uniform FragmentUniforms {
                       // w: 1 = flat colour override, 2 = specular sheen layer (additive),
                       //    3 = environment reflection layer (additive, untextured: car paint/glass)
                       //    4 = sphere map from the bound texture (prize scenes)
+                      //    5 = the post pass (View3D: a picture over the frame, gt3_grade)
     vec4 flat_color;  // used when params.w > 0 (wireframe overlay)
     vec4 fog_color;   // rgb: fog colour, w: 1 = fog enabled for this draw
     vec4 fog_params;  // x: start distance, y: 1 / (end - start), z: max fog amount
     vec4 tint;        // multiplies the final colour (DrawItem::alpha for ghosts)
     vec4 view_row0;   // view matrix rows 0 and 1 (world -> view x / y), for params.w = 4
     vec4 view_row1;
-    vec4 grade;       // course colour grade: rgb curve g per channel, w saturation (0 = off)
+    vec4 grade;       // the post pass's grade (params.w = 5): rgb curve g per channel, w saturation
     vec4 light_ambient; // rgb; w = 1: GT3 car lighting (texel x min(ambient + diffuse N.L, 2))
     vec4 light_diffuse; // rgb
     vec4 env_sky;       // environment for car reflections: rgb above the horizon; w = Fresnel C1
@@ -47,7 +49,7 @@ layout(set = 3, binding = 0) uniform FragmentUniforms {
     vec4 light4_dir;
     vec4 light4_diffuse;
     vec4 light4_specular;
-    vec4 grade2;         // x black, y white (curve input levels), z 1 = saturation first,
+    vec4 grade2;         // the post pass: x black, y white (levels), z 1 = grade on;
                          // w 1 = write alpha 1 (coverage) for this opaque primitive
     vec4 env_c0;         // GT3 reflection weight rows: c0 + c1 min(V.N, 0) per channel;
     vec4 env_c1;         // env_c0.w = 1: valid (else the scalar env_sky.w term)
@@ -73,32 +75,50 @@ vec3 env_color(vec3 dir) {
 }
 
 // Fog amount at distance d. fog_params.w < 0.5: linear (x start, y 1/(end-start), z max);
-// otherwise GT3's per-vertex curve (course Env0): visibility = b + (1 - b) min(1, A / d) with
-// x = A and z = 1 - b, i.e. no fog up to A, then a 1/d approach to 1 - b.
-// GT3's colour-grade pass (course Env0 flag 0x80), applied per fragment: per channel
-// x^2 + 2 g x (1 - x) (g = 0.5: identity), then saturation around luma (0.30, 0.59, 0.11).
-vec3 grade(vec3 c) {
-    if (u.grade.w <= 0.0) return c;
-    vec3 x = clamp(c, 0.0, 1.0);
-    if (u.grade2.z > 0.5) { // replay filter: saturation first (luma 0.30 0.59 0.11), then levels
-        float l0 = dot(x, vec3(0.30, 0.59, 0.11));
-        x = mix(vec3(l0), x, min(u.grade.w, 1.0));
-        float d = u.grade2.y - u.grade2.x;
-        x = clamp((x - u.grade2.x) / (abs(d) < 1e-3 ? 1e-3 : d), 0.0, 1.0);
-    }
-    vec3 g2 = 2.0 * clamp(u.grade.rgb, 0.0, 1.0);
-    vec3 y = clamp(x * x + g2 * x * (1.0 - x), 0.0, 1.0);
-    if (u.grade2.z > 0.5) return y;
-    float l = dot(y, vec3(0.30, 0.59, 0.11));
-    return mix(vec3(l), y, u.grade.w);
+// otherwise GT3's curve (course Env0), v_fog from model.vert: visibility = b + (1 - b) min(1, A / W)
+// per vertex, W the view depth, i.e. no fog up to A, then a 1/W approach to 1 - b.
+// GT3's grade pass over the finished picture (presentation §G6), in its 8-bit arithmetic. A
+// 256-entry table per output channel c: t = clamp((i / 255 - black) / (white - black), 0, 1)
+// (entry 0 unclamped), L_c[i] = trunc(255 (t^2 + 2 g_c t (1 - t))) clamped; a saturation
+// matrix M[c][k] = trunc(s' + m w_k) for c = k, trunc(m w_k) otherwise (s' = min(128 s, 255),
+// m = max(128 - s', 0), w = 0.30 0.59 0.11); out_c = min(255, sum_k (L_c[in_k] M[c][k]) >> 7).
+vec3 grade_table(float i, float inv) {
+    float t = (i / 255.0 - u.grade2.x) * inv;
+    if (i > 0.5) t = clamp(t, 0.0, 1.0);
+    vec3 g = clamp(u.grade.rgb, 0.0, 1.0);
+    return floor(clamp(255.0 * (t * t + 2.0 * g * t * (1.0 - t)), 0.0, 255.0));
+}
+
+vec3 gt3_grade(vec3 c) {
+    vec3 b = floor(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+    float d = u.grade2.y - u.grade2.x;
+    float inv = d == 0.0 ? 0.0 : 1.0 / d;
+    vec3 lr = grade_table(b.r, inv), lg = grade_table(b.g, inv), lb = grade_table(b.b, inv);
+    float sp = min(128.0 * u.grade.w, 255.0);
+    float m = max(128.0 - sp, 0.0);
+    vec3 w = vec3(0.30, 0.59, 0.11);
+    vec3 off = floor(m * w), diag = floor(clamp(sp + m * w, 0.0, 255.0));
+    // Lane k (input channel k) weights output c by diag_k when c == k, else off_k.
+    vec3 r = floor(lr * vec3(diag.r, off.r, off.r) / 128.0);
+    vec3 gg = floor(lg * vec3(off.g, diag.g, off.g) / 128.0);
+    vec3 bb = floor(lb * vec3(off.b, off.b, diag.b) / 128.0);
+    return min(r + gg + bb, vec3(255.0)) / 255.0;
 }
 
 float fog_amount(float d) {
-    if (u.fog_params.w > 0.5) return u.fog_params.z * (1.0 - min(1.0, u.fog_params.x / max(d, 1e-3)));
+    if (u.fog_params.w > 0.5) return v_fog; // GT3: per vertex from the view depth (model.vert)
     return clamp((d - u.fog_params.x) * u.fog_params.y, 0.0, 1.0) * u.fog_params.z;
 }
 
 void shade() {
+    if (u.params.w > 4.5) {
+        // The post pass (View3D): a finished picture drawn over the frame, graded when asked,
+        // at the weight tint.a (the dissolve's frozen picture, the trail's previous one).
+        vec3 c = texture(u_tex, v_uv).rgb;
+        if (u.grade2.z > 0.5) c = gt3_grade(c);
+        o_color = vec4(c, u.tint.a);
+        return;
+    }
     if (u.params.w > 0.5 && u.params.w < 1.5) {
         o_color = u.flat_color;
         return;
@@ -164,16 +184,10 @@ void shade() {
     }
     vec4 c = texture(u_tex, v_uv) * v_color;
     if (u.params.w > 1.5) {
-        // Road sheen: texture x mirror-like highlight of the light, masked by vertex alpha.
-        vec3 n = normalize(v_normal);
-        if (!gl_FrontFacing) n = -n;
-        vec3 view = normalize(v_world - u.camera_pos.xyz);
-        float s = max(dot(reflect(view, n), normalize(u.light_dir.xyz)), 0.0);
-        s = pow(s, 16.0);
-        // Grey highlight: the texture only modulates its brightness (its hue depends on
-        // run-time GS state we do not decode yet).
-        float lum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
-        c.rgb = vec3(lum * s * u.params.z);
+        // Road sheen: the texel modulated by its VU program's lit colour (model.vert), fogged
+        // to black (the node program sets the fog colour to 0 for this pass); added weighted by
+        // the frame-buffer alpha (Cs * Ad + Cd) or, without one, by its own alpha.
+        c.rgb = texture(u_tex, v_uv).rgb * v_lit;
         if (u.fog_color.w > 0.0) {
             float d = length(v_world - u.camera_pos.xyz);
             c.rgb *= 1.0 - fog_amount(d);
@@ -213,7 +227,6 @@ void shade() {
         c.rgb = mix(c.rgb, u.fog_color.rgb, f);
     }
     o_color = c * u.tint;
-    o_color.rgb = grade(o_color.rgb);
     if (u.grade2.w > 0.5) o_color.a = 1.0;
 }
 

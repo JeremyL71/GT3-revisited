@@ -16,6 +16,7 @@ constexpr float kW = 640.0f;
 constexpr float kH = 360.0f;
 constexpr float kMargin = 14.0f;
 constexpr float kGap = 10.0f;
+constexpr float kHitScale = 1.2f; // circles take touches out to 1.2 x their radius: fingers are bigger
 
 float parse_float(const std::optional<std::string>& s, float def, float lo, float hi) {
     if (!s) return def;
@@ -204,16 +205,23 @@ void TouchControls::set_insets(float left, float top, float right, float bottom)
     build_layout(); // same widgets in the same order: held fingers stay valid
 }
 
+std::vector<TouchRect> TouchControls::control_bounds() const {
+    std::vector<TouchRect> out;
+    if (!visible()) return out;
+    for (const Widget& w : widgets_) {
+        if (w.kind == Widget::Kind::Steering) continue; // invisible zone, only a hint
+        if (w.shape == Widget::Shape::Circle) out.push_back({w.x - w.w, w.y - w.h, 2 * w.w, 2 * w.h});
+        else out.push_back({w.x, w.y, w.w, w.h});
+    }
+    return out;
+}
+
 TouchRect TouchControls::safe_area() const {
     TouchRect full{0, 0, kW, kH};
     if (!visible()) return full;
     float left = 0, right = kW, top = 0;
-    for (const Widget& w : widgets_) {
-        if (w.kind == Widget::Kind::Steering) continue; // invisible zone, only a hint
-        float x0 = w.shape == Widget::Shape::Circle ? w.x - w.w : w.x;
-        float x1 = w.shape == Widget::Shape::Circle ? w.x + w.w : w.x + w.w;
-        float y0 = w.shape == Widget::Shape::Circle ? w.y - w.h : w.y;
-        float y1 = w.shape == Widget::Shape::Circle ? w.y + w.h : w.y + w.h;
+    for (const TouchRect& b : control_bounds()) {
+        float x0 = b.x, x1 = b.x + b.w, y0 = b.y, y1 = b.y + b.h;
         float cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
         if (cy < kH * 0.25f) top = std::max(top, y1);
         else if (cx < kW / 2) left = std::max(left, x1);
@@ -223,11 +231,31 @@ TouchRect TouchControls::safe_area() const {
     return {left, top, right - left, kH - top};
 }
 
+TouchRect TouchControls::clear_above(TouchRect r) const {
+    if (!visible()) return r;
+    // Each move goes up, so once above a control `r` stays above it.
+    for (bool moved = true; moved;) {
+        moved = false;
+        for (const Widget& w : widgets_) {
+            if (w.kind == Widget::Kind::Steering) continue;
+            const bool round = w.shape == Widget::Shape::Circle;
+            const float hr = w.w * kHitScale;
+            const float x0 = round ? w.x - hr : w.x, x1 = round ? w.x + hr : w.x + w.w;
+            const float y0 = round ? w.y - hr : w.y, y1 = round ? w.y + hr : w.y + w.h;
+            if (r.x < x1 && x0 < r.x + r.w && r.y < y1 && y0 < r.y + r.h) {
+                r.y = y0 - kGap - r.h;
+                moved = true;
+            }
+        }
+    }
+    return r;
+}
+
 int TouchControls::widget_at(float x, float y) const {
     for (int i = int(widgets_.size()) - 1; i >= 0; --i) {
         const Widget& w = widgets_[size_t(i)];
         if (w.shape == Widget::Shape::Circle) {
-            float r = w.w * 1.2f; // fingers are bigger than the drawn circle
+            float r = w.w * kHitScale;
             float dx = x - w.x, dy = y - w.y;
             if (dx * dx + dy * dy <= r * r) return i;
         } else if (x >= w.x && x < w.x + w.w && y >= w.y && y < w.y + w.h) {

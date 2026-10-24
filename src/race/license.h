@@ -107,7 +107,7 @@ private:
     long long start_ms_ = 0;  // 0, or the time of the first crossing (flying)
 };
 
-// Course-out (spec §11, Time Trial and License): all four wheels on grass / gravel / sand
+// Course-out (physics §11, Time Trial and License): all four wheels on grass / gravel / sand
 // (materials 2, 3, 4, 6) or a wall hit changing the speed by more than 10 m/s; car-car
 // hits never count. Returns "course_out" / "wall", or nullptr.
 const char* course_out(const LicenseRun::Step& s);

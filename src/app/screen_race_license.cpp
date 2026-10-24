@@ -23,15 +23,16 @@ void RaceScreen::start_demo() {
     demo_off_ = false;
     drive_camera_ = camera_.mode() == CameraMode::Tv ? drive_camera_ : camera_.mode();
     camera_.set_mode(CameraMode::Tv);
-    director_.reset();
+    restart_director();
 }
 
 // Licence quick menu: the demonstration runs live in the preview box behind the menu.
 void RaceScreen::start_preview() {
     if (!track_ || !vehicle_ || preview_) return;
     // After a run, GT3's licence menu replays that run in the box, looping
-    // (presentation.md A7); with no run, the disc's demonstration.
-    if (finish_menu_shown_ && recorder_.tick() > 0) {
+    // (presentation.md A7); with no run, or after one left with EXIT (the driver loads the
+    // demonstration in its place, §A8), the disc's demonstration.
+    if (finish_menu_shown_ && recorder_.tick() > 0 && last_run_ended_) {
         pre_demo_run_ = finished_recording();
         preview_ = run_preview_ = true;
         start_playback(*pre_demo_run_);
@@ -47,7 +48,7 @@ void RaceScreen::start_preview() {
     demo_off_ = false;
     drive_camera_ = camera_.mode() == CameraMode::Tv ? drive_camera_ : camera_.mode();
     camera_.set_mode(CameraMode::Tv);
-    director_.reset();
+    restart_director();
 }
 
 void RaceScreen::stop_preview(App& app) {
@@ -151,6 +152,7 @@ void RaceScreen::update_license(const sim::VehicleState& s, double dt) {
     if (r == LicenseRun::State::Finished) {
         int medal = license_medal(license_times_, license_.time());
         LOG_INFO("Licence %s: finished in %.3f s, medal %d", license_event_.c_str(), license_.time(), medal);
+        rank_finish(license_.time(), false, medal >= 0 ? medal + 1 : 0); // a record with a medal locks RETRY (presentation §E3)
         // The session's best judged run is what GT mode records (a retry or a replay
         // afterwards must not lose a medal already earned).
         // (Not the demonstration: its run is judged through the same code, swapped in.)

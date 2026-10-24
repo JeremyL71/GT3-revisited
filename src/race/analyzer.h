@@ -54,14 +54,34 @@ struct AnalyzerTrack {
     size_t index_at_distance(float d) const; // first sample at or past d
 };
 
-// Re-simulates a replay and keeps its best lap (the whole run when it has no lap).
-// `make` returns a fresh RaceVehicle-like object (reset / step / state), `distance_of`
-// maps a position to the track distance (0..lap_length).
-template <class Make, class DistanceOf>
-AnalyzerTrack analyze_replay(const Replay& r, Make&& make, DistanceOf&& distance_of, float lap_length);
+// The part of a replay the Analyzer shows: its best lap, or the whole run when it has none
+// (ticks [begin, end)).
+struct AnalyzerLap {
+    u32 begin = 0, end = 0;
+    bool whole = true;
+};
+AnalyzerLap analyzer_lap(const Replay& r);
+
+// Builds a track from a run's states, one per tick of the lap (the state before the tick's
+// step and that tick's inputs). Distances (`d`: 0..lap_length on the track) are unwrapped
+// from the lap's first sample: a lap counts from the line, a whole run from 0.
+class LapSampler {
+public:
+    LapSampler(double hz, float lap_length, bool whole);
+    void add(const sim::VehicleState& s, const sim::ControlInputs& in, float d);
+    // `lap_time` < 0: the whole run (its length).
+    AnalyzerTrack take(double lap_time);
+
+private:
+    AnalyzerTrack t_;
+    float lap_length_;
+    bool whole_;
+    float prev_ = -1, base_ = 0;
+};
 
 // The course's data-logger map (logger/<course>, "LGM0"): the 192 x 128 picture, its
-// world -> picture transform (as the HUD map's GTCM) and the sector points.
+// world -> picture transform (the HUD map's GTCM fields, applied differently: see project())
+// and the sector points.
 struct LoggerMap {
     float ox = 0, oz = 0, scale = 1, rot = 0; // rot in radians
     int width = 0, height = 0;
@@ -135,53 +155,5 @@ private:
 public:
     ~Analyzer();
 };
-
-// --- implementation of the template ---------------------------------------------------
-
-template <class Make, class DistanceOf>
-AnalyzerTrack analyze_replay(const Replay& r, Make&& make, DistanceOf&& distance_of, float lap_length) {
-    AnalyzerTrack t;
-    t.hz = r.tick_hz;
-    auto v = make();
-    if (!v) return t;
-    if (r.start_speed > 0) v->reset_moving(r.start, r.start_speed);
-    else v->place(r.start);
-    ReplayPlayer p(&r);
-    const double dt = 1.0 / r.tick_hz;
-    const bool whole = r.best_lap < 0 || r.best_lap_end <= r.best_lap_begin;
-    const u32 begin = whole ? 0 : r.best_lap_begin, end = whole ? r.ticks() : r.best_lap_end;
-    float prev = -1, base = 0;
-    while (!p.done()) {
-        while (const ReplayEvent* e = p.pending_event())
-            if (e->kind == ReplayEvent::Respawn) v->reset(e->pose);
-        const u32 tick = p.tick();
-        sim::ControlInputs in = p.next_inputs();
-        if (tick >= begin && tick < end) {
-            const sim::VehicleState& s = v->state();
-            float d = distance_of(s.position);
-            // A lap starts on the line: a first sample just short of it counts from -0.
-            if (prev < 0 && !whole && lap_length > 0 && d > lap_length * 0.5f) base = -lap_length;
-            // Unwrapped distance from the lap's first sample (the line for a lap).
-            if (prev >= 0 && lap_length > 0) {
-                if (d < prev - lap_length * 0.5f) base += lap_length;
-                else if (d > prev + lap_length * 0.5f) base -= lap_length;
-            }
-            prev = d;
-            float u = d + base;
-            if (t.trace.dist.empty() && whole) base -= u, u = 0;
-            t.trace.dist.push_back(std::max(0.0f, u));
-            t.trace.speed_kmh.push_back(s.speed_kmh);
-            t.trace.throttle.push_back(in.throttle);
-            t.trace.brake.push_back(in.brake);
-            t.trace.x.push_back(s.position.x);
-            t.trace.z.push_back(s.position.z);
-            t.ghost.add(s);
-        }
-        v->step(in, dt);
-        if (tick + 1 >= end) break;
-    }
-    t.trace.time = whole ? double(t.trace.size()) * dt : r.best_lap;
-    return t;
-}
 
 } // namespace gt3r::race

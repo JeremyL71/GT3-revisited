@@ -4,8 +4,10 @@
 #include "audio/bgm.h"
 #include "audio/car_sound_model.h"
 #include "race/car_sfx.h"
+#include "base/game_random.h"
 #include "base/log.h"
 #include "formats/bgm_index.h"
+#include "formats/db/gt_db.h"
 #include "vfs/vfs.h"
 
 #include <SDL3/SDL_timer.h>
@@ -37,41 +39,48 @@ void ReverbAmbience::reset(VoiceMixer& mixer) {
 }
 
 void RaceMusic::stop(AudioEngine& audio) {
-    if (active_) audio.bgm().stop(audio);
+    if (active_) {
+        audio.bgm().stop(audio);
+        level_.stop();
+    }
     active_ = false;
     seen_ = false;
+    race_piece_ = marked_request_ = false;
+    follow_piece(audio);
 }
 
 std::vector<RaceMusic::Action> RaceMusic::decide(const Cues& c, bool music_playing) {
     using Op = Action::Op;
     std::vector<Action> out;
-    if (!c.music_on) {
-        if (!seen_ || was_on_) out.push_back({Op::Stop});
-        seen_ = true;
-        was_on_ = false;
-        return out;
-    }
-    bool first = !seen_ || !was_on_;
-    if (first) { // a new run (or music switched on): no jingle state carried over
+    // A new run: no jingle state carried over. (The run's BGM switch does not change the
+    // requests: off, they are made at level 0, RaceMusicLevel.)
+    const bool first = !seen_;
+    if (first) {
         jingle_ = start_jingle_ = medal_played_ = demo_played_ = false;
         was_finished_ = c.finished;
         was_holding_ = false;
     }
-    seen_ = was_on_ = true;
-    // Quick menus: their music, looping; closing one stops the BGM.
+    seen_ = true;
+    // Quick menus: their music at the menu level, looping, when the Menu BGM switch is
+    // on (the race switch does not apply); closing one stops the BGM.
     if (c.menu != was_menu_ || (first && c.menu != Menu::None)) {
-        if (c.menu == Menu::None) {
+        if (c.menu == Menu::None || !c.menu_music_on) {
             out.push_back({Op::Stop});
         } else {
-            out.push_back({Op::PlayIfDifferent, c.menu == Menu::Result ? bgm::kResult : bgm::kQuickMenu, true});
+            out.push_back({Op::PlayIfDifferent, c.menu == Menu::Result ? bgm::kResult : bgm::kQuickMenu, true,
+                           bgm::kMenuVolume});
         }
         was_menu_ = c.menu;
         jingle_ = start_jingle_ = false;
         was_finished_ = c.finished;
         was_paused_ = c.paused;
-        was_holding_ = c.holding;
         medal_played_ = false;
-        return out;
+        // The run starts when its menu closes (the pre-race menu's Start, the result menu's
+        // Retry): a hold already on behind the menu is the start of the run, so the start
+        // jingle plays now, after the stop (music §2.2, §3.3).
+        was_holding_ = false;
+        if (c.menu != Menu::None || !c.holding) return out;
+        music_playing = false;
     }
     if (c.menu != Menu::None) return out;
     if (c.paused != was_paused_) {
@@ -79,6 +88,10 @@ std::vector<RaceMusic::Action> RaceMusic::decide(const Cues& c, bool music_playi
         was_paused_ = c.paused;
     }
     if (c.paused) return out;
+    // Race songs: 0.5 in a live run, 0.7 in a replay; none in licence tests or when the
+    // playlist has no song in the list.
+    const bool songs = c.songs && c.kind != Kind::License && c.kind != Kind::LicenseReplay;
+    const Action song{Op::Play, bgm::kRace, false, c.replay ? bgm::kReplaySongVolume : bgm::kRaceSongVolume};
     // The start: standing starts play a jingle while the cars are held (type 1,
     // the 4 s hold: "jg04e"; type 2, the 10 s hold: "jg11"); the race music
     // replaces it at the signal (licence tests: the music stops instead).
@@ -87,8 +100,8 @@ std::vector<RaceMusic::Action> RaceMusic::decide(const Cues& c, bool music_playi
         jingle_ = start_jingle_ = true;
     } else if (!c.holding && was_holding_ && start_jingle_) {
         start_jingle_ = jingle_ = false;
-        if (c.kind == Kind::License || c.kind == Kind::LicenseReplay) out.push_back({Op::Stop});
-        else out.push_back({Op::Play, bgm::kRace, false}), music_playing = true;
+        if (!songs) out.push_back({Op::Stop});
+        else out.push_back(song), music_playing = true;
     }
     was_holding_ = c.holding;
     if (c.finished && !was_finished_) {
@@ -112,29 +125,96 @@ std::vector<RaceMusic::Action> RaceMusic::decide(const Cues& c, bool music_playi
         out.push_back({Op::Play, kMedal[std::min(c.medal, 2)], false});
         medal_played_ = true;
     }
-    // Race tracks from the start signal (none in licence tests; the demo track in
-    // attract races), one after another.
-    if (!jingle_ && !music_playing && !c.holding && c.kind != Kind::License && c.kind != Kind::LicenseReplay) {
+    // Race songs from the start signal (the demo track in attract races), one after another.
+    if (!jingle_ && !music_playing && !c.holding) {
         if (c.kind == Kind::Demo) {
             if (!demo_played_) out.push_back({Op::Play, bgm::kDemo, false}), demo_played_ = true;
-        } else {
-            out.push_back({Op::Play, bgm::kRace, false});
+        } else if (songs) {
+            out.push_back(song);
         }
     }
     return out;
 }
 
+void RaceMusic::load_playlist(AudioEngine& audio, Vfs& vfs, const std::optional<std::string>& stored) {
+    song_ids_.clear();
+    for (const std::string& f : audio.bgm().files(vfs, bgm::kRace)) song_ids_.push_back(db::id_hash(f));
+    if (stored && !RacePlaylist::from_text(*stored))
+        LOG_WARN("race music: the stored playlist is not valid; a new one is made");
+    playlist_ = RacePlaylist::stored_or_new(stored, song_ids_);
+    playlist_changed_ = false;
+}
+
+std::optional<std::string> RaceMusic::take_playlist_change() {
+    if (!playlist_changed_) return std::nullopt;
+    playlist_changed_ = false;
+    return playlist_.to_text();
+}
+
+void RaceMusic::play_race_song(AudioEngine& audio, Vfs& vfs, float volume) {
+    std::optional<size_t> k = playlist_.next();
+    if (!k) { // no song in the list: no race music
+        audio.bgm().stop(audio);
+        level_.stop();
+        return;
+    }
+    playlist_changed_ = true;
+    int track = RacePlaylist::track_index(playlist_.songs()[*k].id, song_ids_);
+    audio.bgm().play(audio, vfs, bgm::kRace, track, false, volume);
+}
+
 void RaceMusic::cues(AudioEngine& audio, Vfs& vfs, const Cues& c) {
-    active_ = c.music_on;
+    active_ = true;
     for (const Action& a : decide(c, audio.bgm().playing(audio))) {
         switch (a.op) {
-        case Action::Op::Play: audio.bgm().play(audio, vfs, a.id, -1, a.loop); break;
-        case Action::Op::PlayIfDifferent: audio.bgm().play_if_different(audio, vfs, a.id, 0, a.loop); break;
-        case Action::Op::Stop: audio.bgm().stop(audio); break;
+        case Action::Op::Play: {
+            const float v = level_.request(c.music_on, a.volume);
+            // The race songs and the attract demo's track (the game's race-song request,
+            // turned into demo_a01 in the demo) carry markers; the jingles none.
+            marked_request_ = a.id == bgm::kRace || (a.id == bgm::kDemo && c.kind == Kind::Demo);
+            race_piece_ = true;
+            if (a.id == bgm::kRace) play_race_song(audio, vfs, v);
+            else audio.bgm().play(audio, vfs, a.id, -1, a.loop, v);
+            break;
+        }
+        case Action::Op::PlayIfDifferent: // the quick menus (the menu path, not the race's level)
+            race_piece_ = marked_request_ = false;
+            audio.bgm().play_if_different(audio, vfs, a.id, 0, a.loop, a.volume);
+            break;
+        case Action::Op::Stop:
+            race_piece_ = marked_request_ = false;
+            audio.bgm().stop(audio);
+            level_.stop();
+            break;
         case Action::Op::Pause: audio.pause_music(); break;
         case Action::Op::Resume: audio.resume_music(); break;
         }
+        follow_piece(audio);
     }
+    // Every frame the race's stream plays at the base level: the switch silences it at once.
+    if (race_piece_ && c.menu == Menu::None) audio.set_stream_level(level_.base(c.music_on));
+}
+
+void RaceMusic::follow_piece(AudioEngine& audio) {
+    const u32 g = audio.bgm().generation();
+    if (g == generation_) return;
+    generation_ = g;
+    const sound::MadsTrack* t = audio.bgm().current_track();
+    markers_.start(marked_request_ && t ? &t->markers : nullptr);
+}
+
+void RaceMusic::step_markers(AudioEngine& audio) {
+    follow_piece(audio);
+    markers_.step(audio.music_audible_position());
+}
+
+bool FinishCue::update(const std::vector<bool>& finished, int followed) {
+    for (size_t i = 0; i < finished.size(); ++i) {
+        const bool was = i < last_.size() && last_[i];
+        if (finished[i] && !was && int(i) == followed) heard_ = true;
+    }
+    last_ = finished;
+    return heard_;
 }
 
 float OpponentEngines::attenuation(float d) { return std::min(1.0f, 32.0f / std::max(d, 0.25f)); }

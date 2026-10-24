@@ -25,7 +25,7 @@ namespace gt3r::race_screen {
 
 LastView g_last_view[2];
 
-// The menus' logical keys from a pad (menus spec §2): confirm = Circle or Cross,
+// The menus' logical keys from a pad (menus §2): confirm = Circle or Cross,
 // cancel = Triangle or Square, the left stick doubles the D-pad.
 u16 menu_keys(const PadState& pad) {
     using menu::flow::MenuKey;
@@ -48,6 +48,7 @@ u16 menu_keys(const PadState& pad) {
 
 RaceScreen::RaceScreen(MenuLaunch l) : preset_(read_preset()), launch_(std::move(l)) {
     from_menu_ = true;
+    loading_ = menu::flow::race_loading_picture(); // what the menu left on screen (menus §6)
     scripted_ = preset_.have; // GT3R_RACE given (screenshots / tests)
     preset_.have = true;
     // Replay Theater (docs/dev/RACE.md "Replay Theater"): a saved replay, or the disc's
@@ -91,16 +92,34 @@ RaceScreen::RaceScreen(const OnlineLaunch& l) : preset_(read_preset()) {
 }
 
 RaceScreen::~RaceScreen() {
+    if (loading_own_) SDL_DestroyTexture(loading_own_);
     if (!app_) return;
+    app_->remember_race_scale();
     silence(*app_);
     music_.stop(app_->audio());
     ambience_.reset(app_->audio().voices());
 }
 
 void RaceScreen::update(App& app, double dt) {
-    if (!init_) init(app);
+    // Launched from the menus or online: the loading picture is drawn before each blocking
+    // part of the load, the set-up and then the course and cars (menus §6).
+    if (!init_) {
+        if ((from_menu_ || online_) && !loading_drawn_) return; // the first frame: the picture only
+        init(app);
+        if (begin_pending_) return;
+    } else if (begin_pending_) {
+        begin_pending_ = false;
+        begin(app);
+        return;
+    }
     if (stage_ == Stage::Select) update_select(app);
     else if (stage_ == Stage::Drive) update_drive(app, dt);
+    // Screenshots: the pause menu's Exit in a live run once it has driven exit_laps laps.
+    if (preset_.exit_laps > 0 && stage_ == Stage::Drive && !replaying_ && !paused_ && !quick_ && exit_transition_ < 0 &&
+        track_ && track_->laps_completed() >= preset_.exit_laps) {
+        preset_.exit_laps = 0;
+        pause_exit();
+    }
     // Tests: leave for the menus a set time after the finish, as the quick menu's Exit.
     if (preset_.leave > 0 && from_menu_ && stage_ == Stage::Drive && finished_ && !replaying_) {
         leave_clock_ += dt;
@@ -124,14 +143,49 @@ void RaceScreen::on_event(App& app, const SDL_Event& e) {
     if (e.type == SDL_EVENT_DID_ENTER_BACKGROUND && stage_ == Stage::Drive && !paused_) open_pause(app);
 }
 
-// Phones: driving touch controls while racing, menu controls otherwise.
+// Phones: driving touch controls while racing, menu controls otherwise (the quick menus
+// run over the race stage: a GT race's field behind them is not a replay).
 TouchLayout RaceScreen::touch_layout() const {
-    return stage_ == Stage::Drive && !paused_ && !replaying_ ? TouchLayout::Driving : TouchLayout::Menu;
+    return stage_ == Stage::Drive && !paused_ && !replaying_ && !quick_ ? TouchLayout::Driving : TouchLayout::Menu;
 }
 
 void RaceScreen::render(App& app, Ui& ui) {
-    if (stage_ == Stage::Select) render_select(app, ui);
-    else render_drive(app, ui);
+    if (stage_ == Stage::Drive) render_drive(app, ui);
+    else if ((from_menu_ || online_) && error_.empty()) render_loading(app, ui);
+    else render_select(app, ui);
+}
+
+// The loading screen (menus §6): the game keeps drawing the transition it left the menu with
+// over the menu's last frame, every frame however long the load takes (with the "still
+// loading" square from 3 s after the menu was left); the race then appears as a cut. Ours
+// catches up the frames our blocking load took.
+void RaceScreen::render_loading(App& app, Ui& ui) {
+    SDL_Renderer* r = app.renderer();
+    if (!loading_.valid() && !loading_own_) { // nothing handed over: the Fadeout on black
+        loading_own_ = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, 640, 448);
+        if (loading_own_) {
+            SDL_Texture* prev = SDL_GetRenderTarget(r);
+            SDL_SetRenderTarget(r, loading_own_);
+            SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
+            SDL_RenderClear(r);
+            SDL_SetRenderTarget(r, prev);
+            loading_.frame = loading_own_;
+            loading_.transition.start(menu::flow::TransitionType::Fadeout);
+        }
+    }
+    const u64 now = SDL_GetTicksNS();
+    const int frames = loading_drawn_ ? menu::flow::LoadingPicture::frames_for(now - loading_ns_) : 1;
+    loading_ns_ = now;
+    loading_drawn_ = true;
+    ui.fill(0, 0, float(Ui::kWidth), float(Ui::kHeight), Color{0, 0, 0, 255});
+    if (!loading_.valid()) return;
+    SDL_Texture* prev = SDL_GetRenderTarget(r);
+    SDL_SetRenderTarget(r, loading_.frame);
+    for (int i = 0; i < frames; ++i) loading_.transition.draw_frame(r, SDL_FRect{0, 0, 640, 448});
+    SDL_SetRenderTarget(r, prev);
+    const float h = Ui::kHeight, w = h * 4.0f / 3.0f; // the menu's 4:3 picture in the middle
+    const SDL_FRect dst{(Ui::kWidth - w) / 2, 0, w, h};
+    SDL_RenderTexture(r, loading_.frame, nullptr, &dst);
 }
 
 void RaceScreen::init(App& app) {
@@ -173,7 +227,8 @@ void RaceScreen::init(App& app) {
         if (const data::Event* te = db_.event(preset_.tt_event)) { // the event's own layout (licence sections)
             preset_.course = te->course;
             if (license_times(*te).valid()) license_event_ = preset_.tt_event;
-            machine_mark_m_ = preset_.tt_event == "M400" ? 400.0 : preset_.tt_event == "M1000" ? 1000.0 : 0.0;
+            if (preset_.tt_event == "M400" || preset_.tt_event == "M1000" || preset_.tt_event == "MMAX")
+                machine_.emplace(int(te->laps)); // the event's test byte (presentation §B7)
             if (preset_.car.empty() && !te->entries.empty()) { // licence tests: the event's car
                 const std::string& e0 = te->entries[0];
                 if (license_times(*te).valid() && te->bytes.size() >= 0x114) event_paint_id_ = rd32(te->bytes, 0x110);
@@ -191,12 +246,16 @@ void RaceScreen::init(App& app) {
     controls_.config().automatic = !preset_.manual;
     // Title Options menu ([options]): Race BGM and 1P vibration.
     music_on_ = preset_.music && menu::flow::option_value(&app.config(), "race_bgm") != "off";
+    // The quick menus' music follows the Menu BGM switch (music §3.3).
+    menu_music_on_ = preset_.music && menu::flow::option_value(&app.config(), "menu_bgm") != "off";
+    // The race playlist (the options' music list, music §2.3), kept in [options].
+    music_.load_playlist(app.audio(), *app.vfs(), app.config().get("options", "music_playlist"));
     rumble_on_ = menu::flow::option_value(&app.config(), "vib1") != "off";
     rumble2_on_ = menu::flow::option_value(&app.config(), "vib2") != "off";
     // Options (the original's options record): race / replay SE, ghost, wide mode (2P split).
     race_se_ = menu::flow::option_value(&app.config(), "race_se") != "off";
     replay_se_ = menu::flow::option_value(&app.config(), "replay_se") != "off";
-    // REPLAY OPTIONS (view mode, target, HUD items, sound; presentation.md §G).
+    // REPLAY OPTIONS (view mode, target, HUD items, sound; presentation §G).
     replay_settings_ = ReplaySettings::load(app.config());
     replay_se_ = replay_settings_.se;
     ghost_on_ = menu::flow::option_value(&app.config(), "ghost") != "off";
@@ -212,6 +271,11 @@ void RaceScreen::init(App& app) {
     camera2_.set_view(g_last_view[1].mode, g_last_view[1].mirror);
     drive_camera_ = g_last_view[0].mode;
     if (preset_.cam >= 0) camera_.set_mode(CameraMode(std::clamp(preset_.cam, 0, int(CameraMode::Count) - 1)));
+    if (from_menu_ || online_) begin_pending_ = true; // the course and cars on the next frame
+    else begin(app);
+}
+
+void RaceScreen::begin(App& app) {
     if (!preset_.replay.empty()) {
         std::vector<ReplayFile> files = list_replays(replay_dir(app));
         for (const ReplayFile& f : files)

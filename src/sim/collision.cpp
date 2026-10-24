@@ -6,12 +6,12 @@
 namespace gt3r::sim::collide {
 
 namespace {
-constexpr double kMaxYawRate = 62.83185307179586; // commit clamp, 20 pi rad/s [spec §5.3]
+constexpr double kMaxYawRate = 62.83185307179586; // commit clamp, 20 pi rad/s [physics §5.3]
 // "Early hit" threshold of the near-stopped end-pose recompute
-// [spec §5.3, draft 16c]: |vx| < 1 and |vy| < 1 and last hit t < 0.1, all strict.
+// [physics §5.3]: |vx| < 1 and |vy| < 1 and last hit t < 0.1, all strict.
 constexpr double kEarlyHit = 0.1;
 constexpr double kOnLine = 1e-5; // m
-constexpr double kStuckYaw = 20; // rad/s^2 at full steer [spec §5.3 step 4]
+constexpr double kStuckYaw = 20; // rad/s^2 at full steer [physics §5.3]
 } // namespace
 
 std::array<V2, 8> octagon(double a, double b, double w) {
@@ -92,10 +92,10 @@ namespace {
 
 V2 unit(const V2& d) {
     double l = std::sqrt(d.dot(d));
-    return l > 1e-9 ? d * (1.0 / l) : V2{1, 0}; // a zero-length segment gives (1, 0) [spec §5.3]
+    return l > 1e-9 ? d * (1.0 / l) : V2{1, 0}; // a zero-length segment gives (1, 0) [physics §5.3]
 }
 
-// [spec §5.3] Persistence of flagged wall contacts on the pose (pos, heading): each
+// [physics §5.3] Persistence of flagged wall contacts on the pose (pos, heading): each
 // flagged point walks to the neighbouring segment once if it slid past an end; the flag drops
 // when the centre velocity points away from the wall or the point is on the track side.
 // Otherwise the body moves so that the point lies on the wall line, the velocity is projected
@@ -200,6 +200,7 @@ std::vector<WallHit> collide_walls(Body& b, const V2& start_pos, double start_he
         wh.point = hit;
         wh.normal = n;
         wh.sensor = w.sensor;
+        wh.body_point = best_k;
         if (!w.sensor) {
             b.pos = pos_t;
             b.heading = head_t;
@@ -334,7 +335,7 @@ PB pb_from(const Body& u, const V2& start, double start_heading) {
     return b;
 }
 
-// Static separation [spec §5.3] of o's points out of t's outline along the line of
+// Static separation [physics §5.3] of o's points out of t's outline along the line of
 // centres t -> o: for each point of o inside t, the vector to where that line through the point
 // meets t's boundary; the deepest (largest component along the centre line) decides, and both
 // bodies move half of it.
@@ -376,7 +377,7 @@ void pb_separate(PB& t, PB& o) {
     }
 }
 
-// Contact persistence [spec §5.3] for the flagged points of bd[i] (start-world points):
+// Contact persistence [physics §5.3] for the flagged points of bd[i] (start-world points):
 // left the edge span -> flag drops; outside the edge line -> flag drops; else both bodies move half
 // way onto the line. In the last two cases, when the centres approach through the edge
 // (v_rel x edge < 0, v_rel = v_hitter - v_other), the relative normal velocity is removed half
@@ -420,7 +421,7 @@ struct PHit {
     double cpx = 0, cpy = 0; // crossing point in A's frame
 };
 
-// Pair sweep [spec §5.3]: each point of B on a straight chord in A's frame, from the
+// Pair sweep [physics §5.3]: each point of B on a straight chord in A's frame, from the
 // start-pose frame to the end-pose frame; a hit when it goes from outside (>= 0) to inside (<= 0)
 // of A's edge e with the chord passing between the edge's end points. ts = the current start time.
 void pb_sweep(const PB bd[2], int A, double ts, PHit& best) {
@@ -467,8 +468,8 @@ void pb_sweep(const PB bd[2], int A, double ts, PHit& best) {
 } // namespace
 
 double collide_pair_swept(Body& ua, const V2& a0, double ah0, Body& ub, const V2& b0, double bh0, double dt, int iterations,
-                          V2* point, V2* normal, const float* steer, double* first_t) {
-    // [spec §5.3] From the committed (start) poses; end pose = start + v dt (1 - t). At
+                          V2* point, V2* normal, const float* steer, double* first_t, unsigned* sides) {
+    // [physics §5.3] From the committed (start) poses; end pose = start + v dt (1 - t). At
     // most two rounds of: static separation (both orderings), persistence, end pose, pair sweep
     // (both orderings, earliest wins, ties to body 0), advance to the hit, response.
     PB bd[2] = {pb_from(ua, a0, ah0), pb_from(ub, b0, bh0)};
@@ -532,6 +533,10 @@ double collide_pair_swept(Body& ua, const V2& a0, double ah0, Body& ub, const V2
         b.flag[best.k] = true;
         b.fe[best.k] = best.e;
         total += std::fabs(j);
+        if (sides) { // [ai §7] the edge body by the hit edge, the vertex body by its vertex
+            sides[best.A] |= edge_side(best.e);
+            sides[1 - best.A] |= point_side(best.k);
+        }
         if (first) {
             if (point) *point = {px, -py};
             if (first_t) *first_t = best.t;
@@ -562,7 +567,7 @@ double collide_pair_swept(Body& ua, const V2& a0, double ah0, Body& ub, const V2
 
 namespace {
 
-// Impulse response [spec §5.3] of x's edge against y's vertex: rx = the contact point,
+// Impulse response [physics §5.3] of x's edge against y's vertex: rx = the contact point,
 // ry = y's vertex; j = -1.5 (v_rel . n) / K, not clamped for separating contact; no friction.
 double respond(Body& x, Body& y, const V2& nw, const V2& contact, const V2& vertex) {
     V2 rx = contact - x.pos, ry = vertex - y.pos;

@@ -1,10 +1,12 @@
 #include "race/lamp_glows.h"
 
 #include "base/log.h"
+#include "formats/ps2/vif.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 
 namespace gt3r::race {
 
@@ -47,15 +49,168 @@ SDL_Texture* make_sprite(SDL_Renderer* r, bool streaks) {
     return t;
 }
 
+using Blocked = std::function<bool(const render::Vec3&, const render::Vec3&)>;
+
+// View-space x / y / z of a world point (camera looks down -z).
+render::Vec3 to_view(const render::Mat4& v, const render::Vec3& p) {
+    return {v.at(0, 0) * p.x + v.at(0, 1) * p.y + v.at(0, 2) * p.z + v.at(0, 3),
+            v.at(1, 0) * p.x + v.at(1, 1) * p.y + v.at(1, 2) * p.z + v.at(1, 3),
+            v.at(2, 0) * p.x + v.at(2, 1) * p.y + v.at(2, 2) * p.z + v.at(2, 3)};
+}
+
+// The original's occlusion test for a lamp glow: a depth test of a 10 x 10 pixel box (of the
+// PS2's 448-line frame) around the screen point (px, py) at depth z - 0.2 m, worth 2 x the
+// passing fraction, capped at 1. Here a 3 x 3 grid of rays to that depth against `blocked`.
+float box_visibility(float px, float py, float z, const SDL_FRect& rect, const render::Frustum& fr,
+                     const render::Mat4& view, const render::Vec3& eye, const Blocked& blocked) {
+    float zt = z - 0.2f;
+    if (zt <= 0) return 1; // tested at the near plane: everything is behind it
+    const render::Vec3 ax{view.at(0, 0), view.at(0, 1), view.at(0, 2)}, ay{view.at(1, 0), view.at(1, 1), view.at(1, 2)},
+        az{view.at(2, 0), view.at(2, 1), view.at(2, 2)};
+    const float step = 10.0f / 3.0f * rect.h / 448.0f;
+    int open = 0;
+    for (int gy = -1; gy <= 1; ++gy)
+        for (int gx = -1; gx <= 1; ++gx) {
+            float sx = px + float(gx) * step, sy = py + float(gy) * step;
+            float rx = fr.left + (sx - rect.x) / rect.w * (fr.right - fr.left);
+            float ry = fr.up - (sy - rect.y) / rect.h * (fr.up - fr.down);
+            open += blocked(eye, eye + ax * (rx * zt) + ay * (ry * zt) - az * zt) ? 0 : 1;
+        }
+    return std::min(1.0f, 2.0f * float(open) / 9.0f);
+}
+
+// d^n for the directional factors, as the original: n = 0 gives 1, n <= 1 gives d itself.
+float directional_power(float d, int n) {
+    if (n == 0) return 1;
+    float D = d;
+    for (int i = 1; i < n; ++i) D *= d;
+    return D;
+}
+
 } // namespace
+
+// --- Flare mesh ---------------------------------------------------------------------
+
+std::vector<Flare::Mesh> Flare::parse(ByteSpan f) {
+    // +0x0A u16 mesh count; at +0x10 per mesh {u32 offset, u16 qwc, u16 texture}. A mesh is a
+    // VIF packet as GTM1 chunks (docs/formats/car_model.md "VIF packets"): positions V3-32 at
+    // 0x00, the strip table S-8 at 0x40 (count, then (vertices - 2) x 3 per strip), colours
+    // V4-8 at 0x80; triangle strips, untextured, alpha-blended.
+    std::vector<Mesh> out;
+    if (f.empty()) return out;
+    try {
+        u32 n = rd16(f, 0x0A);
+        for (u32 m = 0; m < n; ++m) {
+            u32 off = rd32(f, 0x10 + 8 * m), qwc = rd16(f, 0x14 + 8 * m);
+            if (off > f.size() || size_t(qwc) * 16 > f.size() - off) throw FormatError("flare mesh out of range");
+            std::vector<std::array<float, 4>> pos;
+            std::vector<std::array<u32, 4>> col, strip;
+            for (const ps2::VifCommand& c : ps2::parse_vif(f.subspan(off, size_t(qwc) * 16))) {
+                if (!c.is_unpack()) continue;
+                ps2::VifUnpack u = c.unpack();
+                if (u.addr == 0x00 && u.vn == 2 && u.vl == 0) pos = ps2::unpack_floats(u);
+                else if (u.addr == 0x40 && u.vn == 0 && u.vl == 2) strip = ps2::unpack_words(u);
+                else if (u.addr == 0x80 && u.vn == 3 && u.vl == 2) col = ps2::unpack_words(u);
+            }
+            if (pos.empty() || col.size() != pos.size() || strip.empty()) throw FormatError("flare mesh incomplete");
+            Mesh mesh;
+            for (size_t i = 0; i < pos.size(); ++i) {
+                Vertex v{pos[i][0], pos[i][1], pos[i][2], {}};
+                for (int k = 0; k < 4; ++k) v.rgba[k] = u8(col[i][size_t(k)]);
+                mesh.verts.push_back(v);
+            }
+            size_t first = 0;
+            for (u32 s = 1; s <= strip[0][0] && s < strip.size(); ++s) {
+                size_t len = strip[s][0] / 3 + 2;
+                if (first + len > mesh.verts.size()) throw FormatError("flare strip past the vertices");
+                for (size_t i = 0; i + 2 < len; ++i)
+                    for (size_t k = 0; k < 3; ++k) mesh.tris.push_back(int(first + i + k));
+                first += len;
+            }
+            out.push_back(std::move(mesh));
+        }
+    } catch (const FormatError& e) {
+        LOG_WARN("Lamp glows: race/flare.bin: %s", e.what());
+        out.clear();
+    }
+    return out;
+}
+
+void Flare::add(std::vector<SDL_Vertex>& verts, std::vector<int>& idx, const render::Frustum& fr, const SDL_FRect& rect,
+                float x, float y, float d, float s, const std::array<float, 3>& col, float vis) const {
+    const float q = std::floor(std::clamp(vis, 0.0f, 1.0f) * 255.0f) / 255.0f;
+    for (const Mesh& m : meshes_) {
+        int base = int(verts.size());
+        for (const Vertex& v : m.verts) {
+            float vx = x + v.x * s, vy = y + v.y * s, vd = d - v.z * s;
+            SDL_Vertex sv{};
+            sv.position = {fr.screen_x(vx, vd, rect.x, rect.w), fr.screen_y(vy, vd, rect.y, rect.h)};
+            sv.color = {std::floor(std::min(255.0f, float(v.rgba[0]) * col[0])) / 255.0f,
+                        std::floor(std::min(255.0f, float(v.rgba[1]) * col[1])) / 255.0f,
+                        std::floor(std::min(255.0f, float(v.rgba[2]) * col[2])) / 255.0f,
+                        std::floor(std::min(255.0f, float(v.rgba[3]) * q)) / 255.0f};
+            verts.push_back(sv);
+        }
+        for (int t : m.tris) idx.push_back(base + t);
+    }
+}
+
+Flare::~Flare() {
+    if (layer_) SDL_DestroyTexture(layer_);
+}
+
+void Flare::submit(SDL_Renderer* r, const SDL_FRect& rect, float lines, std::vector<SDL_Vertex>& verts,
+                   const std::vector<int>& idx) const {
+    if (idx.empty()) return;
+    SDL_BlendMode prev_blend = SDL_BLENDMODE_NONE;
+    SDL_GetRenderDrawBlendMode(r, &prev_blend);
+    auto draw_batch = [&] {
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_ADD);
+        for (int pass = 0; pass < 2; ++pass)
+            SDL_RenderGeometry(r, nullptr, verts.data(), int(verts.size()), idx.data(), int(idx.size()));
+        SDL_SetRenderDrawBlendMode(r, prev_blend);
+    };
+    // The layer: `lines` rows over the rectangle, columns at the PS2 frame's pixel aspect
+    // (640 pixels across a 4:3 picture 448 lines high).
+    const int lh = int(std::lround(lines));
+    const int lw = rect.h > 0 ? int(std::lround(lines * rect.w / rect.h * (640.0f / 448.0f) * 0.75f)) : 0;
+    if (lh < 1 || lw < 1) {
+        draw_batch();
+        return;
+    }
+    if (!layer_ || layer_w_ != lw || layer_h_ != lh) {
+        if (layer_) SDL_DestroyTexture(layer_);
+        layer_ = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, lw, lh);
+        layer_w_ = lw, layer_h_ = lh;
+        if (layer_) {
+            SDL_SetTextureScaleMode(layer_, SDL_SCALEMODE_LINEAR);
+            SDL_SetTextureBlendMode(layer_, SDL_BLENDMODE_ADD_PREMULTIPLIED); // dst RGB += layer RGB
+        }
+    }
+    SDL_Texture* prev = SDL_GetRenderTarget(r);
+    if (!layer_ || !SDL_SetRenderTarget(r, layer_)) {
+        draw_batch();
+        return;
+    }
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 0);
+    SDL_RenderClear(r);
+    const float sx = float(lw) / rect.w, sy = float(lh) / rect.h;
+    for (SDL_Vertex& v : verts) v.position = {(v.position.x - rect.x) * sx, (v.position.y - rect.y) * sy};
+    draw_batch(); // the layer's alpha stays 0 (SDL's additive mode keeps the destination alpha)
+    SDL_SetRenderTarget(r, prev);
+    SDL_RenderTexture(r, layer_, nullptr, &rect);
+}
+
+// --- Course lamps -------------------------------------------------------------------
 
 LampGlows::~LampGlows() {
     if (glow_) SDL_DestroyTexture(glow_);
     if (disc_) SDL_DestroyTexture(disc_);
 }
 
-void LampGlows::load(SDL_Renderer* r, ByteSpan g, ByteSpan env) {
-    lamps_.clear();
+void LampGlows::load(SDL_Renderer* r, ByteSpan g, ByteSpan env, ByteSpan vls0, ByteSpan flare) {
+    lists_.clear();
+    count_ = 0;
     if (env.size() < 0xE60 || std::memcmp(env.data(), "Env0", 4) != 0 || !(rd32(env, 0x10) & 0x200000)) return;
     for (int i = 0; i < 8; ++i) {
         size_t o = 0xC60 + 0x40 * size_t(i);
@@ -68,7 +223,7 @@ void LampGlows::load(SDL_Renderer* r, ByteSpan g, ByteSpan env) {
         t.exponent = rdf(env, o + 0x1C);
         t.att_c = rdf(env, o + 0x20), t.att_l = rdf(env, o + 0x24), t.att_q = rdf(env, o + 0x28);
         t.max_dist = rdf(env, o + 0x2C);
-        t.box = rdf(env, o + 0x30) * 128.0f;
+        t.box = rdf(env, o + 0x30) * 128.0f; // passed to the occlusion test, which uses 10 px instead
         t.blink = rdf(env, o + 0x34);
     }
     if (g.size() < 0x18 || std::memcmp(g.data(), "GTFX", 4) != 0 || !rd32(g, 0x10)) return;
@@ -76,6 +231,7 @@ void LampGlows::load(SDL_Renderer* r, ByteSpan g, ByteSpan env) {
     if (table + 4 > g.size()) return;
     u32 lists = rd32(g, table);
     for (u32 i = 0; i < lists && table + 8 + 4ull * i <= g.size(); ++i) {
+        std::vector<Lamp>& list = lists_.emplace_back();
         u32 lp = rd32(g, table + 4 + 4 * i);
         if (!lp || lp + 4 > g.size()) continue;
         u32 n = rd32(g, lp);
@@ -86,68 +242,103 @@ void LampGlows::load(SDL_Renderer* r, ByteSpan g, ByteSpan env) {
             l.pos = {rdf(g, o + 4), rdf(g, o + 8), rdf(g, o + 12)};
             l.dir = {rdf(g, o + 16), rdf(g, o + 20), rdf(g, o + 24)};
             l.phase = rdf(g, o + 28);
-            lamps_.push_back(l);
+            list.push_back(l);
         }
+        count_ += list.size();
     }
-    if (!lamps_.empty()) {
-        if (!glow_) glow_ = make_sprite(r, true);
-        if (!disc_) disc_ = make_sprite(r, false);
-        LOG_INFO("Lamp glows: %zu lamps", lamps_.size());
+    if (!count_) {
+        lists_.clear();
+        return;
     }
+    vis_ = course::Visibility::parse(vls0);
+    flare_.load(flare);
+    if (flare_.empty() && !glow_) glow_ = make_sprite(r, true);
+    if (!disc_) disc_ = make_sprite(r, false);
+    LOG_INFO("Lamp glows: %zu lamps in %zu lists, visibility lists %s, flare %s", count_, lists_.size(),
+             vis_.empty() ? "absent" : "on", flare_.empty() ? "missing" : "loaded");
 }
 
 void LampGlows::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Vec3& eye,
-                     const render::Frustum& fr,
-                     const std::function<bool(const render::Vec3&, const render::Vec3&)>& blocked) const {
-    if (lamps_.empty() || !glow_) return;
-    int drawn = 0;
-    for (const Lamp& l : lamps_) {
-        if (drawn >= 100) break;
+                     const render::Frustum& fr, const Blocked& blocked, float lines) const {
+    if (lists_.empty() || (flare_.empty() && !glow_)) return;
+    // The lamps the original keeps this frame: the lists of the nodes visible from the
+    // camera, in that order (every list without visibility data), at most 100 that pass the
+    // screen test, whether or not they face the camera.
+    struct Kept {
+        const Lamp* lamp;
+        render::Vec3 v; // view space
+        float px, py;
+    };
+    std::vector<Kept> kept;
+    auto visit = [&](const std::vector<Lamp>& list) {
+        for (const Lamp& l : list) {
+            if (kept.size() >= 100) return;
+            const LampType& ty = types_[size_t(l.type)];
+            render::Vec3 v = to_view(view, l.pos);
+            float z = -v.z;
+            if (z <= 0 || z > ty.max_dist) continue;
+            // On screen: the square of the halo size around the lamp (not the glow size).
+            float px = fr.screen_x(v.x, z, rect.x, rect.w), py = fr.screen_y(v.y, z, rect.y, rect.h);
+            float hr = ty.halo * fr.per_metre(z, rect.h);
+            if (px - hr > rect.x + rect.w || px + hr < rect.x || py - hr > rect.y + rect.h || py + hr < rect.y) continue;
+            kept.push_back({&l, v, px, py});
+        }
+    };
+    if (const std::vector<u16>* nodes = vis_.visible(eye.x, eye.y, eye.z)) {
+        for (u16 n : *nodes)
+            if (n < lists_.size()) visit(lists_[n]);
+    } else {
+        for (const std::vector<Lamp>& list : lists_) visit(list);
+    }
+
+    auto c8 = [](float v) { return u8(std::clamp(v, 0.0f, 1.0f) * 255.0f); };
+    std::vector<SDL_Vertex> verts;
+    std::vector<int> idx;
+    for (const Kept& k : kept) {
+        const Lamp& l = *k.lamp;
         const LampType& ty = types_[size_t(l.type)];
-        // View space (camera looks down -z).
-        float vx = view.at(0, 0) * l.pos.x + view.at(0, 1) * l.pos.y + view.at(0, 2) * l.pos.z + view.at(0, 3);
-        float vy = view.at(1, 0) * l.pos.x + view.at(1, 1) * l.pos.y + view.at(1, 2) * l.pos.z + view.at(1, 3);
-        float vz = view.at(2, 0) * l.pos.x + view.at(2, 1) * l.pos.y + view.at(2, 2) * l.pos.z + view.at(2, 3);
-        float z = -vz;
-        if (z <= 0.5f || (ty.max_dist > 0 && z > ty.max_dist)) continue;
-        // Directional factor (lamp facing vs the direction to the camera).
+        const float z = -k.v.z;
+        // Directional factor. n = int(exponent + 0.5) on the EE's round-toward-zero FPU equals
+        // lround for exponent >= 0 (Route 11's 0.49999997 gives 0, i.e. no directional factor).
         float D = 1;
+        bool facing = true;
         int n = int(std::lround(ty.exponent));
-        if (n > 0) {
-            // dot(facing, camera->lamp), as the original (dir_view . normalize(p_view)): a lamp
-            // stored facing up lights the road below it as seen from the cars.
-            render::Vec3 cl = normalize(l.pos - eye);
-            D = std::pow(std::max(0.0f, dot(normalize(l.dir), cl)), float(n));
-            if (D <= 0) continue;
+        if (n != 0) {
+            render::Vec3 cl = l.pos - eye;
+            float len = std::sqrt(dot(cl, cl));
+            float d = len > 0 ? dot(l.dir, cl) / len : 0; // the facing as stored, not renormalised
+            facing = d >= 0;
+            if (facing) D = directional_power(d, n);
         }
-        float I = ty.intensity / std::max(1e-3f, ty.att_c + ty.att_l * z + ty.att_q * z * z);
-        if (ty.blink > 0) I *= 0.5f + 0.5f * float(std::sin(2 * 3.14159265 * (time_ / ty.blink + l.phase)));
-        float zz = z - 0.5f; // pulled 0.5 m towards the camera
-        float px = fr.screen_x(vx, zz, rect.x, rect.w), py = fr.screen_y(vy, zz, rect.y, rect.h);
-        float per_m = fr.per_metre(zz, rect.h); // pixels per metre at the lamp
-        float glow_r = ty.glow * 1.17f * per_m, halo_r = ty.halo * per_m;
-        float rad = std::max(glow_r, halo_r);
-        if (rad < 0.5f || px + rad < rect.x || px - rad > rect.x + rect.w || py + rad < rect.y || py - rad > rect.y + rect.h)
-            continue;
-        ++drawn;
-        // Visibility: occlusion between the camera and a point 0.2 m in front of the lamp.
-        // (The original tests 0.2 m in front in depth; our ray test stops 1 m short so the lamp
-        // fixture the light sits in does not hide it.)
-        float V = blocked(eye, l.pos + normalize(eye - l.pos) * 1.0f) ? 0.0f : 1.0f;
-        auto c8 = [](float v) { return u8(std::clamp(v, 0.0f, 1.0f) * 255.0f); };
-        if (glow_r > 0.5f && V > 0) {
-            float k = I * D * V;
-            SDL_SetTextureColorMod(glow_, c8(ty.rgb[0] * k), c8(ty.rgb[1] * k), c8(ty.rgb[2] * k));
-            SDL_FRect d{px - glow_r, py - glow_r, 2 * glow_r, 2 * glow_r};
-            SDL_RenderTexture(r, glow_, nullptr, &d);
+        float att = 1.0f / (ty.att_q * z * z + ty.att_l * z + ty.att_c);
+        if (ty.blink > 0) att *= 0.5f + 0.5f * float(std::sin(2 * 3.14159265 * (time_ / ty.blink + l.phase)));
+        const float zp = z - 0.5f; // pulled 0.5 m towards the camera along the view ray
+        if (facing && zp > 0) {
+            float vis = box_visibility(k.px, k.py, z, rect, fr, view, eye, blocked);
+            const float c = ty.intensity * att * D;
+            if (vis > 0 && !flare_.empty()) {
+                const float f = zp / z;
+                flare_.add(verts, idx, fr, rect, k.v.x * f, k.v.y * f, zp, ty.glow,
+                           {ty.rgb[0] * c, ty.rgb[1] * c, ty.rgb[2] * c}, vis);
+            } else if (vis > 0 && glow_) { // stand-in sprite
+                float glow_r = ty.glow * 1.17f * fr.per_metre(zp, rect.h);
+                SDL_SetTextureColorMod(glow_, c8(ty.rgb[0] * c * vis), c8(ty.rgb[1] * c * vis), c8(ty.rgb[2] * c * vis));
+                SDL_FRect dst{k.px - glow_r, k.py - glow_r, 2 * glow_r, 2 * glow_r};
+                SDL_RenderTexture(r, glow_, nullptr, &dst);
+            }
         }
-        if (halo_r > 0.5f && ty.halo_gain > 0 && z > 1 && V > 0) { // the original's halo is depth-tested
-            float k = I * ty.halo_gain * 0.5f;
-            SDL_SetTextureColorMod(disc_, c8(ty.rgb[0] * k), c8(ty.rgb[1] * k), c8(ty.rgb[2] * k));
-            SDL_FRect d{px - halo_r, py - halo_r, 2 * halo_r, 2 * halo_r};
-            SDL_RenderTexture(r, disc_, nullptr, &d);
+        // Halo: depth-tested at the pulled point (a ray here), not scaled by D or visibility.
+        if (ty.halo > 0 && ty.halo_gain > 0 && z > 1 && disc_) {
+            float halo_r = ty.halo * fr.per_metre(zp, rect.h);
+            if (halo_r > 0.5f && !blocked(eye, eye + (l.pos - eye) * (zp / z))) {
+                float c = ty.intensity * att * ty.halo_gain * 0.5f;
+                SDL_SetTextureColorMod(disc_, c8(ty.rgb[0] * c), c8(ty.rgb[1] * c), c8(ty.rgb[2] * c));
+                SDL_FRect dst{k.px - halo_r, k.py - halo_r, 2 * halo_r, 2 * halo_r};
+                SDL_RenderTexture(r, disc_, nullptr, &dst);
+            }
         }
     }
+    flare_.submit(r, rect, lines, verts, idx);
 }
 
 // --- Car lamps --------------------------------------------------------------------
@@ -180,7 +371,7 @@ CarLampGlows::~CarLampGlows() {
     if (disc_) SDL_DestroyTexture(disc_);
 }
 
-void CarLampGlows::load(SDL_Renderer* r, ByteSpan env) {
+void CarLampGlows::load(SDL_Renderer* r, ByteSpan env, ByteSpan flare) {
     active_ = false;
     if (env.size() < 0xA1C || std::memcmp(env.data(), "Env0", 4) != 0 || !(rd32(env, 0x10) & 0x8000)) return;
     LampType& t = type_;
@@ -191,84 +382,107 @@ void CarLampGlows::load(SDL_Renderer* r, ByteSpan env) {
     t.halo_gain = rdf(env, 0xA08);
     t.att_c = rdf(env, 0xA0C), t.att_l = rdf(env, 0xA10), t.att_q = rdf(env, 0xA14);
     t.max_dist = rdf(env, 0xA18);
-    if (!glow_) glow_ = make_sprite(r, true);
+    flare_.load(flare);
+    if (flare_.empty() && !glow_) glow_ = make_sprite(r, true);
     if (!disc_) disc_ = make_sprite(r, false);
-    active_ = glow_ && disc_;
+    active_ = disc_ && (glow_ || !flare_.empty());
 }
 
 void CarLampGlows::draw(SDL_Renderer* r, const SDL_FRect& rect, const render::Mat4& view, const render::Vec3& eye,
-                        const render::Frustum& fr, const std::vector<Car>& cars,
-                        const std::function<bool(const render::Vec3&, const render::Vec3&)>& blocked) const {
+                        const render::Frustum& fr, const std::vector<Car>& cars, const Blocked& blocked,
+                        float lines) const {
     if (!active_) return;
     const LampType& ty = type_;
     auto c8 = [](float v) { return u8(std::clamp(v, 0.0f, 1.0f) * 255.0f); };
-    auto xform = [](const render::Mat4& m, const render::Vec3& p) { return m.transform_point(p); };
     auto xdir = [](const render::Mat4& m, const render::Vec3& d) {
         return render::Vec3{m.at(0, 0) * d.x + m.at(0, 1) * d.y + m.at(0, 2) * d.z,
                             m.at(1, 0) * d.x + m.at(1, 1) * d.y + m.at(1, 2) * d.z,
                             m.at(2, 0) * d.x + m.at(2, 1) * d.y + m.at(2, 2) * d.z};
     };
-    int drawn = 0;
-    // kind 0 headlamp, 1 brake lamp, 2 tail lamp
-    auto lamp = [&](const Car& car, const CarLampRecord& l, int kind, float I) {
-        if (drawn >= 100) return;
-        render::Vec3 tp = xform(car.model, l.test), gp = xform(car.model, l.pos);
-        render::Vec3 axis = normalize(xdir(car.model, l.view_axis));
-        float vx = view.at(0, 0) * gp.x + view.at(0, 1) * gp.y + view.at(0, 2) * gp.z + view.at(0, 3);
-        float vy = view.at(1, 0) * gp.x + view.at(1, 1) * gp.y + view.at(1, 2) * gp.z + view.at(1, 3);
-        float vz = view.at(2, 0) * gp.x + view.at(2, 1) * gp.y + view.at(2, 2) * gp.z + view.at(2, 3);
-        float z = -vz;
-        if (z <= 0.5f || (ty.max_dist > 0 && z > ty.max_dist)) return;
-        // Directional factor at the test point: dot(viewing axis, camera -> lamp)^n.
-        float D = 1;
-        if (kind != 2 && l.exponent > 0) {
-            D = std::pow(std::max(0.0f, dot(axis, normalize(tp - eye))), float(l.exponent));
+    std::vector<SDL_Vertex> verts;
+    std::vector<int> idx;
+    int kept = 0;
+    // `glow`: head and brake lamps (tail lamps only ever get the halo); `I` the brake factor.
+    auto lamp = [&](const Car& car, const CarLampRecord& l, bool glow, float I) {
+        if (kept >= 100) return;
+        // Screen test at the test point: in front, within the max distance, the square of
+        // halo x max(a, b) on screen.
+        render::Vec3 tp = car.model.transform_point(l.test);
+        render::Vec3 tv = to_view(view, tp);
+        float tz = -tv.z;
+        if (tz <= 0 || tz > ty.max_dist) return;
+        float tpx = fr.screen_x(tv.x, tz, rect.x, rect.w), tpy = fr.screen_y(tv.y, tz, rect.y, rect.h);
+        float hr = ty.halo * std::max(l.a, l.b) * fr.per_metre(tz, rect.h);
+        if (tpx - hr > rect.x + rect.w || tpx + hr < rect.x || tpy - hr > rect.y + rect.h || tpy + hr < rect.y) return;
+        ++kept;
+        const bool bar = std::fabs(l.a - l.b) >= 0.01f;
+        render::Vec3 axis = xdir(car.model, l.view_axis);
+        // Directional factor at the test point (round head and brake lamps only).
+        float D = -1;
+        if (glow && !bar && l.exponent == 0) {
+            D = 1; // n = 0: no directional factor, whatever the side
+        } else if (glow && !bar) {
+            float len = std::sqrt(dot(tv, tv));
+            render::Vec3 av{dot(render::Vec3{view.at(0, 0), view.at(0, 1), view.at(0, 2)}, axis),
+                            dot(render::Vec3{view.at(1, 0), view.at(1, 1), view.at(1, 2)}, axis),
+                            dot(render::Vec3{view.at(2, 0), view.at(2, 1), view.at(2, 2)}, axis)};
+            float d = len > 0 ? dot(av, tv) / len : 0;
+            D = d < 0 ? -1.0f : directional_power(d, l.exponent);
         }
-        float att = 1.0f / std::max(1e-3f, ty.att_c + ty.att_l * z + ty.att_q * z * z);
-        // Pulled towards the camera by -0.5 x the viewing axis' view-space z (0.5 m head-on).
+        // The glow and halo sit at the lamp position, pulled along the view ray to depth
+        // z + 0.5 x the viewing axis' view-space z.
+        render::Vec3 gv = to_view(view, car.model.transform_point(l.pos));
+        float z = -gv.z;
+        if (z <= 0) return;
         float az = view.at(2, 0) * axis.x + view.at(2, 1) * axis.y + view.at(2, 2) * axis.z;
-        float zz = std::max(0.3f, z + 0.5f * az);
-        float px = fr.screen_x(vx, zz, rect.x, rect.w), py = fr.screen_y(vy, zz, rect.y, rect.h);
-        float per_m = fr.per_metre(zz, rect.h);
-        bool bar = std::fabs(l.a - l.b) > 1e-4f;
-        float glow_r = bar || kind == 2 ? 0.0f : ty.glow * l.a * 1.17f * per_m;
+        float zp = z + 0.5f * az;
+        float att = 1.0f / (ty.att_q * z * z + ty.att_l * z + ty.att_c);
+        const std::array<float, 3> col{ty.rgb[0] * ty.intensity * l.rgb[0] * att, ty.rgb[1] * ty.intensity * l.rgb[1] * att,
+                                       ty.rgb[2] * ty.intensity * l.rgb[2] * att};
+        if (zp <= 0) return;
+        const float f = zp / z;
+        float px = fr.screen_x(gv.x, z, rect.x, rect.w), py = fr.screen_y(gv.y, z, rect.y, rect.h);
+        float per_m = fr.per_metre(zp, rect.h);
+        if (D >= 0) {
+            float vis = box_visibility(tpx, tpy, tz, rect, fr, view, eye, blocked);
+            float k = D * I;
+            if (vis > 0 && k > 0 && !flare_.empty()) {
+                flare_.add(verts, idx, fr, rect, gv.x * f, gv.y * f, zp, ty.glow * l.a, {col[0] * k, col[1] * k, col[2] * k},
+                           vis);
+            } else if (vis > 0 && k > 0 && glow_) { // stand-in sprite
+                float glow_r = ty.glow * l.a * 1.17f * per_m;
+                SDL_SetTextureColorMod(glow_, c8(col[0] * k * vis), c8(col[1] * k * vis), c8(col[2] * k * vis));
+                SDL_FRect dst{px - glow_r, py - glow_r, 2 * glow_r, 2 * glow_r};
+                SDL_RenderTexture(r, glow_, nullptr, &dst);
+            }
+        }
+        // Halo (depth-tested at the pulled point; a ray here), not scaled by D or I. Bar lamps:
+        // an ellipse along the lamp's projected x axis.
         float hx = ty.halo * l.a * per_m, hy = hx;
-        if (bar) { // stretched lamps: an elliptical halo along the lamp's projected x axis
+        if (bar) {
             render::Vec3 xa = normalize(xdir(car.model, l.xaxis));
             float pxv = view.at(0, 0) * xa.x + view.at(0, 1) * xa.y + view.at(0, 2) * xa.z;
             hx = ty.halo * ((l.a - l.b) * std::fabs(pxv) + l.b) * per_m;
             hy = ty.halo * l.b * per_m;
         }
-        float rad = std::max(glow_r, std::max(hx, hy));
-        if (rad < 0.5f || px + rad < rect.x || px - rad > rect.x + rect.w || py + rad < rect.y || py - rad > rect.y + rect.h)
-            return;
-        if (blocked(eye, tp + normalize(eye - tp) * 0.2f)) return;
-        ++drawn;
-        float base[3] = {ty.rgb[0] * ty.intensity * l.rgb[0], ty.rgb[1] * ty.intensity * l.rgb[1],
-                         ty.rgb[2] * ty.intensity * l.rgb[2]};
-        if (glow_r > 0.5f && D > 0) {
-            float k = att * I * D;
-            SDL_SetTextureColorMod(glow_, c8(base[0] * k), c8(base[1] * k), c8(base[2] * k));
-            SDL_FRect d{px - glow_r, py - glow_r, 2 * glow_r, 2 * glow_r};
-            SDL_RenderTexture(r, glow_, nullptr, &d);
-        }
-        if (ty.halo_gain > 0 && z > 1 && (hx > 0.5f || hy > 0.5f)) { // not scaled by I or D
-            float k = att * ty.halo_gain * 0.5f;
-            SDL_SetTextureColorMod(disc_, c8(base[0] * k), c8(base[1] * k), c8(base[2] * k));
-            SDL_FRect d{px - hx, py - hy, 2 * hx, 2 * hy};
-            SDL_RenderTexture(r, disc_, nullptr, &d);
+        if (ty.halo_gain > 0 && z > 1 && (hx > 0.5f || hy > 0.5f) && !blocked(eye, eye + (car.model.transform_point(l.pos) - eye) * f)) {
+            float k = ty.halo_gain * 0.5f;
+            SDL_SetTextureColorMod(disc_, c8(col[0] * k), c8(col[1] * k), c8(col[2] * k));
+            SDL_FRect dst{px - hx, py - hy, 2 * hx, 2 * hy};
+            SDL_RenderTexture(r, disc_, nullptr, &dst);
         }
     };
     for (const Car& car : cars) {
         if (!car.lamps) continue;
-        for (const CarLampRecord& l : car.lamps->head) lamp(car, l, 0, 1.0f);
+        for (const CarLampRecord& l : car.lamps->head) lamp(car, l, true, 1.0f);
         if (car.k > 0)
             for (const CarLampRecord& l : car.lamps->brake) {
                 float I = l.fade ? car.k : (car.brake_now ? 1.0f : 0.0f);
-                if (I > 0) lamp(car, l, 1, I);
+                if (I > 0) lamp(car, l, true, I);
             }
-        for (const CarLampRecord& l : car.lamps->tail) lamp(car, l, 2, 1.0f);
+        for (const CarLampRecord& l : car.lamps->tail) lamp(car, l, false, 1.0f);
     }
+    flare_.submit(r, rect, lines, verts, idx);
 }
 
 } // namespace gt3r::race

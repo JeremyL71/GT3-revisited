@@ -61,7 +61,7 @@ void TireSpec::default_curves() {
 
 namespace {
 
-// [spec §6.5] Spec tyre block (0x70 bytes) from a compound record c (table 27)
+// [physics §6.5] Spec tyre block (0x70 bytes) from a compound record c (table 27)
 // and force-vol record f (table 26), before defaults/zeroing.
 std::array<u8, 0x70> tire_block(const ByteSpan* c, const ByteSpan* f) {
     std::array<u8, 0x70> B{};
@@ -99,22 +99,21 @@ std::array<u8, 0x70> tire_block(const ByteSpan* c, const ByteSpan* f) {
     return B;
 }
 
-// [spec §6.5] Runtime record from a finished block (after defaults/zeroing).
+// [physics §6.5] Runtime record from a finished block (after defaults/zeroing).
 TireSpec tire_record(std::array<u8, 0x70> B, float width) {
-    const float kPi = 3.14159265f;
     // The game zeroes the first point of each curve.
     for (size_t o : {0x03, 0x0B, 0x14, 0x1A, 0x27, 0x2D, 0x3A, 0x5F, 0x65}) B[o] = 0;
     B[0x20] = B[0x33];
     TireSpec t;
     t.width = width;
     t.mu = B[0x00] * 0.01f;
-    t.wear_rate = B[0x6B] * 0.01f; // [spec §8.2] compound wear rate
+    t.wear_rate = B[0x6B] * 0.01f; // [physics §8.2] compound wear rate
     for (int s = 0; s < 16; ++s) {
         u8 pct = B[size_t(0x4B + s)];
         t.surface_mu[size_t(s)] = pct ? t.mu * pct * 0.01f : t.mu;
     }
     t.surface_mu[11] = std::min(1.0f, 1.25f / t.mu);
-    float th = std::min((B[0x01] ? B[0x01] : 90) * kPi / 180.0f, kPi / 2);
+    float th = std::min((B[0x01] ? B[0x01] : 90) * model::kPiF / 180.0f, model::kPiF / 2);
     for (int i = 0; i < 8; ++i) {
         t.slip_a.x.push_back(B[size_t(0x03 + i)] * th / 255.0f);
         t.slip_a.y.push_back(B[size_t(0x0B + i)] / 200.0f);
@@ -127,7 +126,7 @@ TireSpec tire_record(std::array<u8, 0x70> B, float width) {
         t.slip_b = d.slip_b; // [placeholder] the static default curve bytes are not in the spec
     } else {
         for (int j = 0; j < 6; ++j) {
-            t.slip_b.x.push_back(B[size_t(0x5F + j)] * (kPi / 2) / 255.0f);
+            t.slip_b.x.push_back(B[size_t(0x5F + j)] * (model::kPiF / 2) / 255.0f);
             t.slip_b.y.push_back(B[size_t(0x65 + j)] / 200.0f);
         }
     }
@@ -211,7 +210,7 @@ float showroom_top_speed(const CarSpec& c) {
         const float drive = model::curve_torque(c.engine, w / model::kRpmToRadS) * per_metre(gear);
         const float resist = model::rolling_curve(v) * rr * (weight + down * v * v) + drag * v * v;
         if (resist < drive) top = v;
-        if (gear < n && up < float(int(w * 60.0f / 6.2831855f))) ++gear;
+        if (gear < n && up < float(int(w * 60.0f / model::kTwoPiF))) ++gear;
     }
     return top;
 }
@@ -226,7 +225,7 @@ void CarSpec::finalize() {
         AxleSpec& ax = axle[size_t(a)];
         float corner = mass * share[a] * 0.5f;
         if (ax.spring_rate <= 0) {
-            float w = 2 * 3.14159265f * ax.ride_frequency;
+            float w = 2 * model::kPiF * ax.ride_frequency;
             ax.spring_rate = corner * w * w;
         }
         if (ax.damper <= 0) ax.damper = 2 * ax.damping_ratio * std::sqrt(ax.spring_rate * corner);
@@ -266,14 +265,14 @@ void CarSpec::finalize() {
     if (rear_extent <= 0.3f) rear_extent = length * 0.5f;
     if (cg_height <= 0) cg_height = std::max(0.35f, height * 0.37f);
     if (aero.c_drag <= 0) aero.c_drag = 0.5f * aero.air_density * aero.drag_area;
-    if (yaw_inertia <= 0) yaw_inertia = 6000; // [spec §6.4] default
+    if (yaw_inertia <= 0) yaw_inertia = 6000; // [physics §6.4] default
 }
 
 CarSpec CarSpec::test_car(Drive drive) {
     CarSpec s;
     s.label = "test_car";
     s.name = "Test car (R34 GT-R-like)";
-    s.mass = 1680; // 1560 kg + 120 kg [spec §6.4]
+    s.mass = 1680; // 1560 kg + 120 kg [physics §6.4]
     s.front_weight = 0.55f;
     s.wheelbase = 2.665f;
     s.length = 4.6f;
@@ -300,7 +299,7 @@ CarSpec CarSpec::test_car(Drive drive) {
     s.gearbox.reverse = 3.28f;
     s.drivetrain.drive = drive;
     s.drivetrain.front_share = drive == Drive::AWD ? 0.35f : 0;
-    if (drive == Drive::AWD) { // [placeholder] a 50:50 coupled AWD (spec §2.7 system 1, L3)
+    if (drive == Drive::AWD) { // [placeholder] a 50:50 coupled AWD (physics §2.7 system 1, L3)
         s.drivetrain.awd_system = 1;
         s.drivetrain.awd_share_byte = 50;
     }
@@ -333,7 +332,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
 }
 
 namespace {
-int interp_setting(int steps, int mn, int mx, int set) { // [spec §6.1]
+int interp_setting(int steps, int mn, int mx, int set) { // [physics §6.1]
     return steps < 2 ? mn : mn + (mx - mn) * (set - 1) / (steps - 1);
 }
 } // namespace
@@ -372,7 +371,7 @@ CarSettings stock_settings(const data::CarDatabase& db, const std::string& car_l
         for (int i = 0; i < 7; ++i) c.gears[size_t(i + 1)] = int(s16(rd16(*g, size_t(0x14 + 2 * i))));
         c.final_drive = rd16(*g, 0x22);
         c.gear_slider = (*g)[0x29];
-        if ((*g)[0x28]) apply_gear_slider(db, parts, c); // [spec §6.7] computed gearbox: generated default words
+        if ((*g)[0x28]) apply_gear_slider(db, parts, c); // [physics §6.7] computed gearbox: generated default words
     }
     if (const ByteSpan* d = rec(kDrivetrain); d && d->size() > 0x13) c.front_torque = (*d)[0x13];
     if (const ByteSpan* bc = rec(1); bc && bc->size() > 0x14) c.brake_front = c.brake_rear = (*bc)[0x14];
@@ -422,7 +421,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     auto ch = db.chassis(parts[kChassis]);
     auto body = db.body(parts[kBody]);
     if (!ch || ch->weight_kg == 0 || ch->wheelbase_mm == 0) return fail("missing chassis record");
-    // [spec §6.2/6.4] weight x lightweight(+0x12 per mille) x body(+0x30 per mille), integer maths, + 120 kg.
+    // [physics §6.2/6.4] weight x lightweight(+0x12 per mille) x body(+0x30 per mille), integer maths, + 120 kg.
     int weight = ch->weight_kg;
     const ByteSpan* lw = part_record(db, parts, kLightweight);
     if (lw && lw->size() >= 0x14 && rd16(*lw, 0x12)) weight = weight * rd16(*lw, 0x12) / 1000;
@@ -448,7 +447,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         if (body->rear_tread_mm) s.axle[1].track = (body->rear_tread_mm - 2 * off_r) * 0.001f;
     }
     if (body) {
-        // [spec §6.2] collision extents (body f32 +0x20 / +0x24, mm, truncated).
+        // [physics §6.2] collision extents (body f32 +0x20 / +0x24, mm, truncated).
         // Extents default to length / 2 in integer mm; width/height are the collision
         // extents = body f32 +0x28 / +0x2C.
         int half = int(ch->length_mm) / 2;
@@ -458,10 +457,10 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         if (int(body->inertia[2]) > 0) s.width = float(int(body->inertia[2])) * 0.001f;
         if (int(body->inertia[3]) > 0) s.height = float(int(body->inertia[3])) * 0.001f;
     }
-    // Steering lock [spec §6.4]: steer record +0x11 degrees.
+    // Steering lock [physics §6.4]: steer record +0x11 degrees.
     if (const ByteSpan* st = part_record(db, parts, kSteer); st && st->size() > 0x11 && (*st)[0x11])
-        s.steering.max_angle = (*st)[0x11] * 3.14159265f / 180.0f;
-    // Suspension [spec §4.2 / §6.2 / §6.6]: stock settings -> spec bytes -> axle blocks.
+        s.steering.max_angle = (*st)[0x11] * model::kPiF / 180.0f;
+    // Suspension [physics §4.2 / physics §6.2 / physics §6.6]: stock settings -> spec bytes -> axle blocks.
     if (const ByteSpan* su = part_record(db, parts, kSuspension); su && su->size() >= 0x7C) {
         auto B = [&](size_t o) -> int { return (*su)[o]; };
         auto interp = interp_setting;
@@ -494,7 +493,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
             p.bump_damping = b13 * 98.0f;
             p.bump = model::fit_damper(v_b1 * 0.01f * sc, f_b1 * 49.0f, v_b2 * 0.01f * sc, f_b2 * 49.0f);
             p.rebound = model::fit_damper(v_r1 * 0.01f * sc, f_r1 * 49.0f, v_r2 * 0.01f * sc, f_r2 * 49.0f);
-            // [spec §4.2/§6] q = the front ride height for BOTH blocks: the rear block reads the front byte again, not
+            // [physics §4.2/physics §6] q = the front ride height for BOTH blocks: the rear block reads the front byte again, not
             // the rear one (verified on the rear bump-stop limit of 4 cars whose rear ride height differs)
             p.ride_height = set.ride_height[0] * 0.001f;
             p.bump_room = B(size_t(0x1D + a)) * 0.001f;
@@ -502,19 +501,19 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
             p.knee_gap = g1 * 0.001f;
             p.valid = p.k > 0;
             if (p.valid) s.axle[size_t(a)].spring_rate = p.k;
-            // [spec §4.2] CoG-height parameter X = 0.5 (chassis +0x1D x 0.001 + front ride height).
+            // [physics §4.2] CoG-height parameter X = 0.5 (chassis +0x1D x 0.001 + front ride height).
             if (p.valid && a == 0) s.cg_height = 0.5f * (ch->unknown_1d * 0.001f + p.ride_height);
         }
     }
-    // [spec §3.1/4.4, draft 16] axle factor, camber offset and toe from the settings.
+    // [physics §3.1/4.4] axle factor, camber offset and toe from the settings.
     for (int a = 0; a < 2; ++a) {
         const ByteSpan* cr = part_record(db, parts, kChassis);
         int b = cr && cr->size() > 0x1E ? (((*cr)[size_t(a ? 0x1E : 0x12)] + 124) & 0xFF) : 100;
         s.axle[size_t(a)].axle_factor = (b + 900) * 0.001f;
-        s.axle[size_t(a)].camber_offset = -set.camber[size_t(a)] * 0.1f * 3.14159265f / 180.0f;
+        s.axle[size_t(a)].camber_offset = -set.camber[size_t(a)] * 0.1f * model::kPiF / 180.0f;
         s.axle[size_t(a)].toe_byte = set.toe[size_t(a)] ? set.toe[size_t(a)] : 128;
     }
-    // Camber curves [spec §3.1/6.4]: suspension +0x60.. angle codes, +0x64.. multiplier codes (front), +0x68/+0x6C rear.
+    // Camber curves [physics §3.1/6.4]: suspension +0x60.. angle codes, +0x64.. multiplier codes (front), +0x68/+0x6C rear.
     if (const ByteSpan* su = part_record(db, parts, kSuspension); su && su->size() >= 0x70) {
         for (int a = 0; a < 2; ++a) {
             std::vector<std::pair<float, float>> pts;
@@ -550,7 +549,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
                 s.axle[size_t(a)].tire_radius = rim_in * 0.0254f * 0.5f + width_mm * 0.001f * aspect * 0.01f;
             }
         }
-        // [spec §6.5] three records per axle from compounds/force-vols 0..2.
+        // [physics §6.5] three records per axle from compounds/force-vols 0..2.
         std::array<std::array<u8, 0x70>, 3> blocks;
         const ByteSpan* tr = part_record(db, parts, tire_slot[a]);
         for (int k = 0; k < 3; ++k) {
@@ -583,7 +582,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     s.power_ps = en->power_ps;
     const ByteSpan* er = part_record(db, parts, kEngine);
     if (!er || er->size() < 0x58) return fail("short engine record");
-    // [spec §2.1 / §6.2] raw spec values plus the part adders/multipliers
+    // [physics §2.1 / physics §6.2] raw spec values plus the part adders/multipliers
     // (docs/formats/database.md "runtime car spec"); integer percent maths.
     u8 axis[16];
     u16 torque[16];
@@ -594,7 +593,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     }
     int limit = (*er)[0x45], limit2 = (*er)[0x46], idle = (*er)[0x44];
     u32 hi = 1000, lo = 100;
-    // [spec §6.2] the game runs one helper per parts table in its own order;
+    // [physics §6.2] the game runs one helper per parts table in its own order;
     // the factors are integer percent steps, so the order matters, and it runs the port
     // polish helper twice (its factors apply squared: 102 % -> 1000 * 1.02 * 1.02 = 1040).
     auto engine_part = [&](int slot) {
@@ -611,7 +610,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
             if (u8 p = (*r)[0x1B]) lo = lo * p / 100;
             limit += (*r)[0x18];
             limit2 += (*r)[0x19];
-            // [spec §2.3, draft 14c field map] stock boost settings = turbo +0x12..+0x17 (peak, knee,
+            // [physics §2.3 field map] stock boost settings = turbo +0x12..+0x17 (peak, knee,
             // rate of stage 0, then stage 1), cap = 1 + 0.1 x +0x11.
             TurboSpec& t = s.engine.turbo;
             u8 cap = (*r)[0x11];
@@ -627,8 +626,8 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     };
     for (int slot : {kPortPolish, kEngineBalance, kDisplacement, kComputer, kNaTune, kTurbo, kPortPolish, kMuffler, kIntercooler})
         engine_part(slot);
-    s.engine.launch_rpm = (*er)[0x43] ? (*er)[0x43] * 10.0f : 2500.0f; // [spec §2.4]
-    s.engine.upshift_rpm = limit2 * 100.0f;                            // [spec §2.6] UP
+    s.engine.launch_rpm = (*er)[0x43] ? (*er)[0x43] * 10.0f : 2500.0f; // [physics §2.4]
+    s.engine.upshift_rpm = limit2 * 100.0f;                            // [physics §2.6] UP
     float rpm[16], nm[16];
     n = model::build_torque_curve(torque, axis, n, u16((*er)[0x42] * 10), u16(std::min<u32>(hi, 65535)),
                                   u8(std::min<u32>(lo, 255)), rpm, nm, &s.engine.turbo);
@@ -638,7 +637,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         s.engine.curve_torque.push_back(nm[i]);
     }
     if (s.engine.curve_rpm.empty()) return fail("empty torque curve");
-    // [spec §2.1] rev limit = +0x45 x100 (last axis point if 0), at least +0x46 x100 + 200; idle = +0x44 x10.
+    // [physics §2.1] rev limit = +0x45 x100 (last axis point if 0), at least +0x46 x100 + 200; idle = +0x44 x10.
     float lim = limit > 0 ? limit * 100.0f : s.engine.curve_rpm.back();
     s.engine.rev_limit_rpm = std::max(lim, limit2 * 100.0f + 200.0f);
     s.engine.idle_rpm = idle ? idle * 10.0f : 900.0f;
@@ -652,14 +651,14 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
 
     // --- gearbox ---
     if (auto ge = db.gearbox(parts[kGear])) {
-        // User gear words [spec §6.6]: reverse, gears 1..7 (x1000, -999 = none), final drive.
+        // User gear words [physics §6.6]: reverse, gears 1..7 (x1000, -999 = none), final drive.
         std::vector<float> ratios;
         for (int i = 1; i <= 7; ++i) ratios.push_back(set.gears[size_t(i)] * 0.001f);
         s.gearbox.ratios = fill_ratios(ratios, ge->gears ? ge->gears : 5);
         if (set.final_drive > 0) s.gearbox.final_drive = set.final_drive * 0.001f;
         if (set.gears[0] != 0) s.gearbox.reverse = std::fabs(set.gears[0] * 0.001f);
         if (ge->adjustable) {
-            // [spec §6.7] computed gearbox: the game regenerates from the slider.
+            // [physics §6.7] computed gearbox: the game regenerates from the slider.
             CarSettings g = set;
             if (apply_gear_slider(db, parts, g)) {
                 int gear_count = ge->gears;
@@ -678,7 +677,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         s.drivetrain.awd_system = dt->awd_system;
         s.drivetrain.awd_coupling = f * 0.01f;
         s.drivetrain.awd_share_byte = f;
-        // [spec §2.2/2.4/6.2] engine inertia (+0x20 x flywheel +0x12 % x clutch +0x12 %) and
+        // [physics §2.2/2.4/6.2] engine inertia (+0x20 x flywheel +0x12 % x clutch +0x12 %) and
         // friction (+0x16 x flywheel/clutch/shaft +0x11 %), integer percent maths.
         const ByteSpan* fw = part_record(db, parts, kFlywheel);
         const ByteSpan* cl = part_record(db, parts, kClutch);
@@ -689,7 +688,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         for (const ByteSpan* r : {fw, cl, ps})
             if (u8 p = byte_at(r, 0x11)) fric = fric * p / 100;
         if (inertia) s.engine.inertia = inertia * 0.001f;
-        // [spec §2.7/6.2] axle inertia words: 0xD2/0xD4 = +0x18/+0x1A x flywheel(+0x13/+0x14)% x
+        // [physics §2.7/6.2] axle inertia words: 0xD2/0xD4 = +0x18/+0x1A x flywheel(+0x13/+0x14)% x
         // clutch(+0x13/+0x14)% x prop(+0x12/+0x13)%; 0xCE/0xD0 = +0x1C/+0x1E x prop(+0x14/+0x15)%.
         for (int a = 0; a < 2; ++a) {
             u32 spin = dt->params[size_t(1 + a)], shaft = dt->params[size_t(3 + a)];
@@ -701,12 +700,12 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
             s.axle[size_t(a)].shaft_inertia = float(u16(shaft)) * 0.01f;
         }
         // k_f = u16 +0x16 x 0.98 / omega_last (last rpm-axis point in rad/s): engine braking at the
-        // top of the curve = u16 x 0.98 N*m [spec §2.2, verified against the original game].
+        // top of the curve = u16 x 0.98 N*m [physics §2.2, verified against the original game].
         if (fric && !s.engine.curve_rpm.empty())
             s.engine.friction_coeff = fric * 0.98f / (s.engine.curve_rpm.back() * model::kRpmToRadS);
     }
 
-    // --- differentials [spec §2.7]: LSD type +0x11 / +0x1B, front initial/accel/decel
+    // --- differentials [physics §2.7]: LSD type +0x11 / +0x1B, front initial/accel/decel
     // +0x12/+0x15/+0x18, rear +0x1C/+0x1F/+0x22.
     if (const ByteSpan* ls = part_record(db, parts, kLsd); ls && ls->size() > 0x22) {
         for (int a = 0; a < 2; ++a) {
@@ -722,14 +721,14 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         }
     }
 
-    // --- brakes [spec §4.5]: front/rear torque per wheel, handbrake ---
+    // --- brakes [physics §4.5]: front/rear torque per wheel, handbrake ---
     if (const ByteSpan* br = part_record(db, parts, kBrake); br && br->size() > 0x13) {
         if ((*br)[0x11]) s.axle[0].max_brake_torque = (*br)[0x11] * 98.0f;
         if ((*br)[0x12]) s.axle[1].max_brake_torque = (*br)[0x12] * 98.0f;
         s.aids.handbrake_torque = (*br)[0x13] * 98.0f;
     }
 
-    // --- aero [spec §4.7]: A from body f32 +0x44 (m^2), Cd = body +0x39 %, rho = 1.2 ---
+    // --- aero [physics §4.7]: A from body f32 +0x44 (m^2), Cd = body +0x39 %, rho = 1.2 ---
     if (body) {
         const ByteSpan* br = part_record(db, parts, kBody);
         // the stored area = int(body f32 +0x44 x 10000): the area is quantised to 1e-4 m^2.
@@ -739,18 +738,18 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         s.aero.air_density = 1.2f;
         s.aero.drag_area = area * cd;
         float af = 0.5f * 1.2f * area;
-        // Stock downforce settings [spec §6.6]: body +0x13 front, +0x3C rear (percent of A_f).
+        // Stock downforce settings [physics §6.6]: body +0x13 front, +0x3C rear (percent of A_f).
         s.aero.c_front = af * set.downforce_front * 0.01f; // setting 0x124
         s.aero.c_rear = af * set.downforce_rear * 0.01f;   // setting 0x128
         s.aero.c_drag = af * cd + 0.1f * (s.aero.c_front + s.aero.c_rear);
     }
 
-    // --- steering [spec §4.4/6.4]: pad curve B, steer +0x1E.. (6 x km/h, 6 x 0.2 deg) ---
+    // --- steering [physics §4.4/6.4]: pad curve B, steer +0x1E.. (6 x km/h, 6 x 0.2 deg) ---
     if (const ByteSpan* st = part_record(db, parts, kSteer); st && st->size() > 0x29) {
         Curve c;
         for (int i = 0; i < 6; ++i) {
             c.x.push_back((*st)[size_t(0x1E + i)] / 3.6f);
-            c.y.push_back((*st)[size_t(0x24 + i)] * 0.2f * 3.14159265f / 180.0f);
+            c.y.push_back((*st)[size_t(0x24 + i)] * 0.2f * model::kPiF / 180.0f);
         }
         bool ok = c.y[0] > 0;
         for (int i = 1; i < 6; ++i) ok = ok && c.x[size_t(i)] >= c.x[size_t(i - 1)];
@@ -758,7 +757,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     }
 
     // --- aids ---
-    // [spec §4.6/6.2/6.6] TCS: level = interp(TCSC +0x15, +0x16 / steps +0x12 /
+    // [physics §4.6/6.2/6.6] TCS: level = interp(TCSC +0x15, +0x16 / steps +0x12 /
     // index +0x11); gain = +0x13 (x 0.1, 0 when the level is 100);
     // lateral a = +0x14 (x 0.1), b = +0x17 (x 0.01).
     if (const ByteSpan* tc = db.record(data::TableId::Tcsc, parts[25]); tc && tc->size() > 0x17) {
@@ -773,7 +772,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     } else {
         s.aids.tcs = false;
     }
-    // [spec §4.6/6.2/6.6] ASCC channels (indices default +0x12, +0x1B, +0x21, +0x26).
+    // [physics §4.6/6.2/6.6] ASCC channels (indices default +0x12, +0x1B, +0x21, +0x26).
     if (const ByteSpan* as = db.record(data::TableId::Ascc, parts[24]); as && as->size() > 0x26) {
         auto A = [&](size_t o) -> int { return (*as)[o]; };
         auto interp = interp_setting;
@@ -785,7 +784,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         s.aids.ascc_c_thr = A(0x22) * 0.01f;
         s.aids.ascc_e_gain = interp(A(0x23), A(0x24), A(0x25), set.ascc[3]) * 0.01f;
     }
-    // ABS gain G = brake-controller setting x 0.1 (index = +0x14) [spec §4.5/6.6].
+    // ABS gain G = brake-controller setting x 0.1 (index = +0x14) [physics §4.5/6.6].
     if (const ByteSpan* bc = part_record(db, parts, 1); bc && bc->size() > 0x17) {
         // front = interp(+0x12, +0x13 / steps +0x11 / front index), rear = interp(+0x16, +0x17 / +0x15 / rear).
         s.aids.abs_gain = interp_setting((*bc)[0x11], (*bc)[0x12], (*bc)[0x13], set.brake_front) * 0.1f;
@@ -794,6 +793,14 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
 
     s.finalize();
     return s;
+}
+
+void apply_aid_options(AidsSpec& aids, bool asm_on, bool tcs_on) {
+    if (!asm_on) {
+        aids.ascc_flags = 0;
+        aids.ascc_a_gain = aids.ascc_c_gain = aids.ascc_d_gain = aids.ascc_e_gain = 0;
+    }
+    if (!tcs_on) aids.tcs_gain = 0;
 }
 
 } // namespace gt3r::sim

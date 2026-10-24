@@ -12,7 +12,7 @@ namespace gt3r {
 class Screen;
 
 // The relay server players use unless [online] server says otherwise (the project's public
-// relay; docs/dev/ONLINE.md "Running the server"). The update check asks it too.
+// relay; docs/dev/ONLINE.md "Running your own relay"). The update check asks it too.
 inline constexpr const char* kDefaultServer = "gt3r.gameversions.com";
 
 struct OnlineLaunch {

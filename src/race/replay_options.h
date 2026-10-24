@@ -11,8 +11,10 @@
 // Up / Down choose the row, Left / Right move the cursor along it (TARGET skips the targets
 // the mode does not allow), Circle / Cross apply the focused value (MODE, TARGET, SCREEN) or
 // toggle it (ITEM, SOUND); Triangle / Square close the panel. SE "cursor" on a move, "ok" on
-// a change. The mode table (per mode: allowed targets, the target taken when the stored one
-// is not allowed, and whether BGM is forced on) is the original's:
+// a change. The panel is the only way to change the view mode (the replay pad has no mode
+// buttons); applying the avant-garde mode also stores BGM on. The mode table (per mode:
+// allowed targets, the target taken when the stored one is not allowed, and whether BGM is
+// forced on) is the original's:
 //   0 traditional: MANUAL         (default MANUAL)
 //   1 avant-garde: AUTO           (default AUTO, BGM forced on, the BGM button disabled)
 //   2 broadcast:   MANUAL TOP AUTO (default AUTO)
@@ -51,20 +53,32 @@ struct ReplaySettings {
     u8 items = 0;                       // Item bits shown in replays (the original's default: none)
     bool bgm = true, se = true;
     bool split = true;                  // 2P replays: split screen (false = player 1 only)
+    // View mode 1's pad (presentation §G3; stored in the PS2 save's options block): Up / Down
+    // the race-sound level in the music's marked sections (0..1, a new game 0.1), Right / Left
+    // the music-timed cuts (0 off / 1 on, a new game off).
+    float level = 0.1f, music_cuts = 0.0f;
 
     static bool target_allowed(int mode, int target);
     static int default_target(int mode);
     static bool bgm_forced(int mode) { return mode == 1; }
     int current_target() const; // the mode's stored target, or its default when not allowed
     bool bgm_on() const { return bgm || bgm_forced(mode); }
-    // Next / previous view mode (L1 / R1 during a replay), wrapping 0..3.
-    void cycle_mode(int dir);
 
     // [options] replay_mode, replay_targets ("0,2,2,0"), replay_items, replay_bgm, replay_se,
-    // replay_screen.
+    // replay_screen, replay_level ("0.1"), replay_music_cuts ("on" / "off").
     static ReplaySettings load(const IniDocument& cfg);
     void save(IniDocument& cfg) const;
 };
+
+// The title attract demo's view (presentation §G13): not the stored REPLAY OPTIONS but a pick
+// from r in [0, 1): r < 0.33 mode 0 (MANUAL), r < 0.66 mode 2 with the target
+// int(100 r) mod 3, else mode 1 (AUTO). `since_avant_garde` counts the demos since the last
+// mode-1 one (0 at start-up): mode 1 is forced once it reaches 3, i.e. after two demos
+// without it (three after start-up). Updates the count.
+struct AttractView {
+    int mode = 0, target = 0;
+};
+AttractView pick_attract_view(float r, int& since_avant_garde);
 
 class ReplayOptions {
 public:

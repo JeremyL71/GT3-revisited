@@ -25,8 +25,8 @@ All values little endian.
 | `paramstr{,_us,_eu}.db` | STDB | `paramstr_us.db` | ASCII strings: labels, `"2568cc"` |
 | `paramunistr{,_us,_eu}.db` | STDB | `paramunistr_us.db` | display strings in game text encoding (ASCII + EUC-JP, see text.md): car names, makers, `"6800rpm"`, `"TURBO"` |
 | `.id_db_idx*.db` / `.id_db_str*.db` | IDDB / STDB | **not loaded** | id code → label, for every label used anywhere |
-| `racemode.db` | GTDT (standalone) | yes | 16 race modes |
-| `racedetail.db` | GTDT (standalone) | yes | 228 race-rule records (labels not in any IDDB) |
+| `racemode.db` | GTDT (standalone) | yes | 16 race modes, each with its display layout |
+| `racedetail.db` | GTDT (standalone) | yes | 228 race display (HUD) layout rows (labels not in any IDDB) |
 | `carcolor.db` / `carcolor.sdb` | GT2K / STDB | yes | paint colours per car model |
 
 This disc (PBPX-955.03) loads the `_us` set. The three regional sets have
@@ -296,7 +296,7 @@ Other fields (front / rear pairs) [spec]:
 | 0x110 | 32 × u32 | per-entry paint: carcolor.db colour id, 0xFFFFFFFF = chosen at race start (36 events set some) [spec+data; race workstream, docs/dev/RACE.md] |
 | 0x190 | u64 | regulation (table 33) or `-` [data] |
 | 0x198 | u8 | initial speed in km/h for rolling/flying starts (0 = from rest; 50–220 on license tests, 80 on endurance rolling starts) [spec; race workstream] |
-| 0x199 | u8 | laps [spec] |
+| 0x199 | u8 | laps [spec]; machine tests: the test, 1 = 0-400 m (M400), 2 = 0-1000 m (M1000), 3 = top speed (MMAX) [spec+data] |
 | 0x19A | u8 | license test kind: 1 stop test, 2 section, 3 full lap(s); rally 6 [spec] |
 | 0x19B | u8 | **required license**: 0 none, 1 B, 2 A, 3 IB, 4 IA, 5 S, 6 R (rally) [spec] |
 | 0x19C | 20 × u8 | percentages (100 × 8, then groups of 4) copied to the race-rule block [spec; meaning: AI side] |
@@ -338,10 +338,16 @@ not decoded).
 ## Standalone files
 
 **racemode.db** (GTDT, 16 × 272): u64 mode label (`RACE_MODE_*`, hashed),
-u8 mode number, 7 × u8 1, 32 × u64 racedetail ids [data].
+u8 +0x08 mode number (the race display mode, `race::HudMode`), 7 × u8 1,
+then at +0x10 32 × u64 racedetail ids, `(Null)` = end [data].
 
-**racedetail.db** (GTDT, 228 × 40): u64 id (label unknown — not in any IDDB
-and not a string in CORE.GT3), then rule parameters (u16s) [not decoded].
+**racedetail.db** (GTDT, 228 × 40): u64 id (label unknown — not in any IDDB), then one row of the race display's layout:
+u16 +0x08 HUD part (0 = none), u16 +0x0A sub-part, u8 +0x0C vertical and
+u8 +0x12 horizontal alignment, s16 +0x18 view (0 in-car, 1 outside, 127
+both), s16 +0x1A / +0x1C x / y and +0x1E / +0x20 w / h in the 640 × 448
+frame [data]. A mode shows only the parts it has rows for. The engine's
+layout table (`src/race/hud_layout.*`) is these rows; test
+`race_hud_layout_disc` checks it against the disc.
 
 **carcolor.db** (`"GT2K"`): u32 0, u32 288 (= model count), u32 three
 section offsets (0x1218, 0x26C0) and the file size; at 0x18, 288 × {u64

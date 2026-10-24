@@ -136,7 +136,7 @@ std::optional<sim::CarSpec> online_car_spec(const data::CarDatabase& db, const O
     return s;
 }
 
-PowerPeak spec_power_peak(const sim::CarSpec& s) {
+PowerPeak spec_power_peak(const sim::CarSpec& s, float condition) {
     const sim::EngineSpec& e = s.engine;
     const size_t n = std::min(e.curve_rpm.size(), e.curve_torque.size());
     PowerPeak best;
@@ -153,7 +153,8 @@ PowerPeak spec_power_peak(const sim::CarSpec& s) {
     for (int rpm = first; rpm <= last; rpm += 100) {
         if (rpm > limit) continue;
         float omega = ps2::mul(float(rpm), sim::model::kRpmToRadS);
-        float kgfm = sim::model::table_lookup(w.data(), e.curve_torque.data(), int(n), omega) / 9.8f;
+        float t = sim::model::table_lookup(w.data(), e.curve_torque.data(), int(n), omega);
+        float kgfm = ps2::mul(t, condition) / 9.8f; // the looked-up torque x the condition factor
         float ps = ps2::mul(kgfm, float(rpm)) / 716.2f; // PS2 multiply (rounds towards zero)
         if (ps > best.ps) {
             best.ps = ps;
@@ -163,7 +164,7 @@ PowerPeak spec_power_peak(const sim::CarSpec& s) {
     return best;
 }
 
-float spec_power_ps(const sim::CarSpec& s) { return spec_power_peak(s).ps; }
+float spec_power_ps(const sim::CarSpec& s, float condition) { return spec_power_peak(s, condition).ps; }
 
 int display_power(float ps, bool imperial) { return ps2::to_int(imperial ? ps2::mul(ps, std::bit_cast<float>(0x3F7C76F3u)) : ps); }
 

@@ -3,6 +3,7 @@
 #include "base/log.h"
 #include "formats/menu/mbl.h"
 #include "menu/menu_text.h"
+#include "race/machine_test.h"
 #include "vfs/vfs.h"
 
 #include <algorithm>
@@ -163,26 +164,50 @@ void ResultsOverlay::draw(SDL_Renderer* r, text::GameFonts& fonts, const std::ve
 
 // --- TimeTrialOverlay -------------------------------------------------------------------
 
-void TimeTrialOverlay::draw(SDL_Renderer* r, text::GameFonts& fonts, double t, double best_lap, int record_rank,
-                            bool speed_record, const SDL_FRect& dst) {
-    if (t < 5.0) return;
+int record_rank(const std::vector<double>& table, double value, bool higher_is_better) {
+    for (int i = 0; i < kRecordPlaces; ++i) {
+        if (size_t(i) >= table.size()) return i;
+        const double e = table[size_t(i)];
+        if (higher_is_better ? e <= value : e >= value) return i;
+    }
+    return -1;
+}
+
+bool sets_record(const RecordFinish& f) {
+    if (!f.player || f.replay || f.failed || f.time < 0) return false;
+    return f.session_best < 0 || std::llround(f.time * 1000.0) <= std::llround(f.session_best * 1000.0);
+}
+
+bool locks_retry(const RecordFinish& f) { return sets_record(f) && f.result != 0; }
+
+const char* TimeTrialOverlay::record_label(int rank, bool speed) {
+    if (rank < 0 || rank >= kRecordPlaces) return nullptr;
+    return rank == 0 ? "NEW RECORD" : speed ? "RECORD SPEED" : "RECORD TIME";
+}
+
+void TimeTrialOverlay::draw(SDL_Renderer* r, text::GameFonts& fonts, double t, const Data& d, const SDL_FRect& dst) {
+    if (t < kShowDelay) return;
     Frame f{dst};
     SDL_Color amber{208, 128, 24, 255}, shadow{0, 0, 0, 255}; // GS 0x801880D0
     auto both = [&](float x, float y, const std::string& s, const char* font, float sc, SDL_Color c, text::HAlign a) {
         text(r, fonts, f, x + 2, y + 2, s, font, sc, sc, shadow, a);
         text(r, fonts, f, x, y, s, font, sc, sc, c, a);
     };
-    if (record_rank >= 0 && record_rank < 12) {
+    if (const char* label = record_label(d.rank, d.speed)) {
         static const char* const kRank[] = {"1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th", "11th", "12th"};
-        both(320, 150, kRank[record_rank], "rank", 1, amber, text::HAlign::Center);
+        both(320, 150, kRank[d.rank], "rank", 1, amber, text::HAlign::Center);
         // The label flickers every frame between orange and light grey.
         bool odd = int(t * 60) & 1;
         SDL_Color flick = odd ? SDL_Color{204, 102, 0, 255} : SDL_Color{208, 208, 208, 255};
-        both(320, 200, record_rank == 0 ? "NEW RECORD" : (speed_record ? "RECORD SPEED" : "RECORD TIME"), "sw_20", 1,
-             flick, text::HAlign::Center);
+        both(320, 200, label, "sw_20", 1, flick, text::HAlign::Center);
+    }
+    if (d.speed) { // the top-speed test: "Max Speed" further left, the speed further right
+        both(160, 270, "Max Speed", "sw_16#1", 1, amber, text::HAlign::Left);
+        both(480, 266, record_speed_text(d.value, d.imperial), "sw_20#1", 1.3f, amber, text::HAlign::Right);
+        return;
     }
     both(200, 270, "Lap", "sw_16#1", 1, amber, text::HAlign::Left);
-    both(440, 266, best_lap >= 0 ? fmt_time(best_lap) : "-'--.---", "sw_20#1", 1.3f, amber, text::HAlign::Right);
+    both(440, 266, d.value >= 0 ? fmt_time(d.value) : "-'--.---", "sw_20#1", 1.3f, amber, text::HAlign::Right);
 }
 
 // --- LicenseResultOverlay ------------------------------------------------------------
@@ -281,6 +306,11 @@ QuickMenu::~QuickMenu() = default;
 
 bool QuickMenu::load(const Vfs& vfs, SDL_Renderer* r, text::GameFonts& fonts, const std::string& pmb,
                      const std::string& lang) {
+    return load(menu::flow::vfs_reader(vfs), r, fonts, pmb, lang);
+}
+
+bool QuickMenu::load(const menu::flow::FileReader& read, SDL_Renderer* r, text::GameFonts& fonts,
+                     const std::string& pmb, const std::string& lang) {
     ctl_.reset();
     set_.reset();
     texts_.clear();
@@ -296,12 +326,17 @@ bool QuickMenu::load(const Vfs& vfs, SDL_Renderer* r, text::GameFonts& fonts, co
     if (!set.empty() && set.back() == '1') set.pop_back();
     set_name_ = set;
     try {
-        set_ = std::make_unique<menu::flow::MenuSet>(menu::flow::vfs_reader(vfs), set, lang);
+        set_ = std::make_unique<menu::flow::MenuSet>(read, set, lang);
     } catch (const std::exception& e) {
         LOG_WARN("Quick menu %s: %s", pmb.c_str(), e.what());
         return false;
     }
     ctl_ = std::make_unique<menu::flow::MenuController>(*set_);
+    // The root page's items by name (menus §11); dialog pages have no rule.
+    items_->reset();
+    ctl_->enabled = [items = items_](const std::string& page, const menu::MblItem& it) {
+        return page != "root" || !*items || (*items)->enabled(it.name);
+    };
     if (!ctl_->open("root")) {
         ctl_.reset();
         set_.reset();
@@ -335,11 +370,20 @@ void QuickMenu::reopen_root(const std::string& focus_item) {
     if (!focus_item.empty()) ctl_->set_focus(focus_item);
 }
 
+// The page's EXIT item (action qm_exit) as a choice (a menu ended without a choice reports
+// Exit, whether the page has the item or not).
+QuickMenu::Choice QuickMenu::exit_choice(const std::string& page_name) const {
+    const menu::MblFile& mbl = set_->flow();
+    if (int mp = mbl.find_page(page_name); mp >= 0)
+        for (const menu::MblItem& it : mbl.pages[size_t(mp)].items)
+            if (quick_menu_action(it.action) == QmAction::Exit) return {it.name, page_name, it.action};
+    return {"exit", page_name, "qm_exit"};
+}
+
 QuickMenu::Choice QuickMenu::tick(u16 held) {
     Choice out;
     if (!ctl_) return out;
     ignore_ &= held; // a key held from before the menu opened counts once released
-    std::string focus_before = focused();
     ctl_->tick(menu::flow::MenuKeys(held & ~ignore_));
     for (std::string& s : ctl_->take_sounds()) sounds_.push_back(std::move(s));
     for (const menu::flow::MenuEvent& e : ctl_->take_events()) {
@@ -352,7 +396,9 @@ QuickMenu::Choice QuickMenu::tick(u16 held) {
         } else if (e.kind == K::Action && e.page != "root" && !e.item.empty()) {
             out = {e.item, e.page, e.action}; // dialog yes / no (kind 3 closes the popup)
         } else if (e.kind == K::Exit) {
-            reopen_root(focus_before); // Triangle on the root page: nothing to go back to
+            // Triangle / Square on a page that allows it (flag 0x100: every race quick menu's
+            // root but the championship ones): the menu ends at once, as EXIT (menus §11).
+            out = exit_choice(e.page);
         }
     }
     return out;
@@ -383,6 +429,10 @@ const std::string& QuickMenu::focused() const {
 }
 
 bool QuickMenu::focus(const std::string& item) { return ctl_ && ctl_->set_focus(item); }
+
+bool QuickMenu::item_enabled(const std::string& item) const {
+    return page() != "root" || !*items_ || (*items_)->enabled(item);
+}
 
 bool QuickMenu::open_page(const std::string& name) {
     if (!ctl_) return false;

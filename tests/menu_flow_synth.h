@@ -38,7 +38,15 @@ struct SynElement {
     std::string text;
     bool has_alt = false;
     u32 alt_rgba = 0xFF00FFFF;
+    // Where the alt sits in the layout, relative to the element (the game's files often place
+    // it elsewhere: shifted, parked off-screen, at 0, 0), and its z relative to the element's.
+    float alt_dx = 0, alt_dy = 0, alt_dz = 1;
+    u16 focus_style = 0; // element type bits 12-15: 0x2000 pulsing highlight, 0x1000 static
     u16 flags = 0x0C;
+    std::string widget_class; // bound to game code by class name ("" = none)
+    bool widget = false;      // in a layer: written to the layer's widget table, not its elements
+    bool image = false;       // an image part (image 0; the file has no images, so nothing decodes)
+    u16 align = 4;            // text anchor (3x3, 0 = top-left)
 };
 
 struct SynLayer {
@@ -55,21 +63,28 @@ struct SynPage {
 inline size_t write_element(Buf& w, const SynElement& e, bool alt) {
     size_t o = w.alloc(0x6C);
     w.str(o, e.name);
-    u16 type = 2 | (e.text.empty() ? 0 : 4) | (e.has_alt && !alt ? 8 : 0);
+    u16 type = u16(2 | (e.text.empty() ? 0 : 4) | (e.has_alt && !alt ? 8 : 0) | (e.image ? 1 : 0) |
+                   (alt ? 0 : e.focus_style));
     w.u16_(o + 0x40, type);
     w.u16_(o + 0x42, alt ? 0x0F : e.flags);
-    w.f32_(o + 0x44, e.x);
-    w.f32_(o + 0x48, e.y);
-    w.f32_(o + 0x4C, alt ? e.z + 1 : e.z);
+    w.f32_(o + 0x44, alt ? e.x + e.alt_dx : e.x);
+    w.f32_(o + 0x48, alt ? e.y + e.alt_dy : e.y);
+    w.f32_(o + 0x4C, alt ? e.z + e.alt_dz : e.z);
     w.f32_(o + 0x50, e.w);
     w.f32_(o + 0x54, e.h);
     size_t c = w.alloc(16);
     for (int i = 0; i < 4; ++i) w.u32_(c + i * 4, alt ? e.alt_rgba : e.rgba);
     w.u32_(o + 0x64, u32(c));
+    if (!e.widget_class.empty()) {
+        size_t p = w.alloc(4);
+        w.u32_(p, u32(w.cstr(e.widget_class)));
+        w.u32_(o + 0x58, u32(p));
+    }
+    if (e.image) w.u32_(o + 0x60, u32(w.alloc(36))); // image 0, zero UVs
     if (!e.text.empty()) {
         size_t t = w.alloc(16);
         w.u16_(t, 1);
-        w.u16_(t + 2, 4);
+        w.u16_(t + 2, e.align);
         w.u32_(t + 4, 0x80FFFFFF);
         w.u32_(t + 8, u32(w.cstr(e.text)));
         w.u32_(t + 12, u32(w.cstr("sw_16")));
@@ -103,11 +118,11 @@ inline Bytes write_pmb(const std::vector<SynPage>& pages) {
         for (const SynLayer& l : pg.layers) {
             size_t lo = w.alloc(0x50);
             w.str(lo, l.name);
-            std::vector<size_t> els;
-            for (const SynElement& e : l.elements) els.push_back(write_element(w, e, false));
+            std::vector<size_t> els, widgets;
+            for (const SynElement& e : l.elements)
+                (e.widget ? widgets : els).push_back(write_element(w, e, false));
             write_list(w, lo + 0x40, els);
-            write_list(w, lo + 0x48, {});
-            w.u32_(lo + 0x48, 0);
+            write_list(w, lo + 0x48, widgets);
             layers.push_back(lo);
         }
         write_list(w, po + 0x40, items);

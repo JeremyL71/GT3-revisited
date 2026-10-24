@@ -1,11 +1,13 @@
 #pragma once
 
-// GPU-side scene of a time trial: the course (scenery, extras, distant
-// backdrop, camera-centred sky domes) and the player's car (body LODs plus
+// GPU-side scene of a time trial: the course (scenery, the licence course line,
+// distant backdrop, camera-centred sky domes) and the player's car (body LODs plus
 // four separately transformed wheels).
 
 #include "formats/model/car_model.h"
+#include "race/clut_animations.h"
 #include "race/occluder.h"
+#include "race/procedural_cameras.h"
 #include "scene/model.h"
 #include "render/gpu_model.h"
 #include "race/lamp_glows.h"
@@ -30,8 +32,12 @@ public:
     // `sheen`: draw the road sheen passes (gtm1::Options::road_sheen).
     CourseScene(render::GpuContext& ctx, ByteSpan course_file, const std::string& name, bool sheen = true);
 
-    // Appends draw items for a camera at `eye`.
-    void add_items(std::vector<render::DrawItem>& items, const render::Vec3& eye) const;
+    // Appends draw items for a camera at `eye`: sky, backdrop, scenery and, on courses that
+    // have one, the licence course line right after the scenery. The game draws that line in
+    // every view of the course: live runs, demonstrations and replays in any replay mode
+    // (course.md "Course line"). `mirror`: the rear-view mirror's pass (GT3 draws the
+    // low-resolution sky, slot 24, then slot 1: no backdrop).
+    void add_items(std::vector<render::DrawItem>& items, const render::Vec3& eye, bool mirror = false) const;
     const CourseStats& stats() const { return stats_; }
     // Fog/clear colour picked from the sky (average horizon colour).
     const float* horizon_color() const { return horizon_; }
@@ -45,15 +51,42 @@ public:
                        const render::Mat4& sky_rotation) const;
     // Opaque scenery and backdrop triangles for ray tests (sun visibility).
     const Occluder& occluder() const { return occluder_; }
+    // The lights of the course's own lit packets (Env0 scene lights: SunParams::course_lights),
+    // given to every course item; none = the draw options' lights.
+    void set_lights(const render::ItemLights& lights) { lights_ = lights, has_lights_ = true; }
+
+    // The course's animations: the CLUT animations of the scenery, backdrop and slot 5 texture
+    // sets (flashing lights, the start-signal lights) and the nodes the +0x3C animators move
+    // (flags, spinning parts, flip-book crowds and screens; gtm1::AnimatedNodes), as the game
+    // plays them. A run's start: back to their start, then the start signal for a countdown of
+    // `countdown` seconds (0 without one).
+    void restart_animations(float countdown);
+    // Advances them (seconds of race steps: 1/60 each; not while paused).
+    void animate(float seconds);
+    // Uploads what changed since the last call (once per drawn frame).
+    void upload_animations();
 
 private:
+    // Moving nodes, rebuilt every frame into a model sharing `textures`' textures.
+    struct Moving {
+        std::vector<gtm1::AnimatedNodes> nodes;
+        std::unique_ptr<render::GpuModel> gpu;
+    };
+    void set_moving(Moving& m, render::GpuContext& ctx, const render::GpuModel* textures,
+                    std::vector<gtm1::AnimatedNodes>&& nodes);
+
+    ClutAnimations cluts_;
+    Moving scenery_moving_, backdrop_moving_;
+    bool moving_changed_ = true;
     bool frame_alpha_ = false; // the scenery draws with the PS2's frame alpha (sheen masks)
     Occluder occluder_;
-    std::unique_ptr<render::GpuModel> scenery_, backdrop_, sky_;
+    std::unique_ptr<render::GpuModel> scenery_, line_, backdrop_, sky_, sky_low_;
     CourseStats stats_;
     float horizon_[3] = {0.62f, 0.70f, 0.80f};
     float sky_rgb_[3] = {0.35f, 0.55f, 0.85f};
     std::unique_ptr<render::GpuModel> env_scenery_, env_sky_; // slots 5 and 23
+    render::ItemLights lights_;
+    bool has_lights_ = false;
     float ground_[3] = {0.18f, 0.17f, 0.16f};
 };
 
@@ -80,6 +113,8 @@ struct CarLook {
     float shadow = 1;
     float lamp = 0; // brake-lamp factor k/4 (lamp materials' emission)
     bool brake_now = false; // the brake pedal is pressed this frame (the lit-lens geometry)
+    // Which drawing of the car this is, 0 the car, 1 its ghost: each has its own morph geometry.
+    int instance = 0;
     // Point-light courses: the car's own lights, and one node 1 shadow per lamp (world shear,
     // alpha) instead of the sun shadow.
     const render::ItemLights* lights = nullptr;
@@ -109,6 +144,8 @@ public:
     // The GTCI lamp lists (headlamps, tail and brake lamps) in the model frame, and the
     // model frame -> world for a state (the body as drawn).
     const CarLampSet& lamps() const { return lamps_; }
+    // The car's camera mounts (GTCI): view mode 1's car-mounted shots.
+    const std::vector<CarMount>& mounts() const { return mounts_; }
     render::Mat4 body_matrix(const sim::VehicleState& s, const sim::VehicleSetup& setup) const;
     void set_shadow(const CarShadowParams& p);
     bool shadow_set() const { return shadow_set_; }
@@ -117,8 +154,20 @@ private:
     void add_body_items(std::vector<render::DrawItem>& items, const sim::VehicleState& s, const sim::VehicleSetup& setup,
                         const CarLook& look, const render::Mat4& pre, int lod) const;
     std::unique_ptr<render::GpuModel> body_, body_brake_;
+    // The draws the car's callback morphs (mud flaps, aerials, steering), per LOD, drawn from
+    // models sharing morph_base_'s textures, one per CarLook::instance, rebuilt when the values
+    // change.
+    std::vector<gtm1::MorphDraws> morphs_;
+    std::unique_ptr<render::GpuModel> morph_base_;
+    struct Morph {
+        std::unique_ptr<render::GpuModel> gpu;
+        std::array<float, 5> values{};
+    };
+    mutable std::array<Morph, 2> morph_;
     CarLampSet lamps_;
+    std::vector<CarMount> mounts_;
     std::array<std::unique_ptr<render::GpuModel>, 4> wheels_;
+    std::array<std::unique_ptr<render::GpuModel>, 4> bands_; // the tyres' arch shade (does not spin)
     std::array<render::Vec3, 4> wheel_center_{}; // where the decoder placed each wheel (car frame)
     // Shadow nodes 1 (light) and 6 (contact), and node 5 (headlamp pool); all LODs; CPU copies
     // to recolour.
@@ -136,5 +185,9 @@ bool car_camera_points(ByteSpan car_file, render::Vec3& p0, render::Vec3& p1);
 
 // Car frame -> world matrix for a vehicle state.
 render::Mat4 car_matrix(const sim::VehicleState& s);
+
+// The car callback's morph values for a state (gtm1::RunParams::callback): ids 1-4 the flaps,
+// 0.5 + 0.5 x (physics §8.8); id 5 the steering, 0.5 + 0.5 steer / lock (0.5 straight ahead).
+std::array<float, 5> car_callback_values(const sim::VehicleState& s, const sim::VehicleSetup& setup);
 
 } // namespace gt3r::race

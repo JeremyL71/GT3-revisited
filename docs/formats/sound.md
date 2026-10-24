@@ -33,7 +33,7 @@ each) driven with SPU2-style register values:
 |---|---|---|---|
 | `sound/engine/<id>` | `ENGN` | 135 | engine ("mechanical") bank per engine sound id |
 | `sound/normal0..3/<id>`, `sound/turbo0..3/<id>` | `ENGN` | 8 x 134 | exhaust bank per id and variant |
-| `sound/rn_01.es` | `ENGN` | 1 | 3 layers (2500/5000/7500); loaded with the SE banks, probably road/wind noise (unconfirmed) |
+| `sound/rn_01.es` | `ENGN` | 1 | 3 layers (2500/5000/7500); loaded with the SE banks: the wind / road noise unit (below) |
 | `sound/gt3sys.ins`, `gt3se01.ins`, `gt3se02.ins` | `INST` | 3 | menu sounds, race effects, ambience (named by `se.inf`) |
 | `sound/menu.ins`, `sys.ins`, `se01.ins` | `INST` | 3 | not used by the game; older revisions (`sys`, `se01` share samples with `gt3sys`/`gt3se01`) and a standalone `menu` bank |
 | `sound/se.inf` | `GTSE` | 1 | effect name index |
@@ -206,9 +206,9 @@ disc's CORE.GT3 (bytes `B[i]`, read once at race start):
   view only): armed while the throttle is above 90 %; when the throttle
   drops under 75 % it fires once with strength `max(load - 0.8, 0) / 256`,
   scaled by 2.5, times the channel gain and `32/d`.
-- **Other per-car slots**: four tyres x seven surface loops (race
-  workstream), `body_noiz` (wired but always gain 0), and one-shots
-  `clash`, `clash2`, `clash3` by collision type.
+- **Other per-car slots**: four tyres x six surface loops
+  ([sound §7.6](../behaviour/sound.md#76-tyres)), `body_noiz` (wired but
+  always gain 0), and one-shots `clash`, `clash2`, `clash3` by collision type.
 
 `EngineUnit` plays the wind bank with the same layer player as
 `EngineSound`; `car_sound::wind/in_car/whine` and `car_sound::Turbo` give
@@ -252,7 +252,8 @@ the larger value and the pitch is 1.
 
 Tunnels: under each listener, road surface flags `& 0x18 == 0x08` turn on
 the `tunnel` stereo pair (regions 2/3 of gt3se02), `0x10` turns on
-`tunnel2` (4/5); `0x18` only raises the reverb (see the reverb spec).
+`tunnel2` (4/5); `0x18` only raises the reverb
+([sound §3.2](../behaviour/sound.md#32-race-reverb-ambience)).
 
 ## INST instrument bank ✅
 
@@ -273,7 +274,7 @@ region, 24 bytes:
            sample plays at 44.1 kHz (game pitch 0x1000) when keyed at center
   0x0A u16 duration: one-shot length in 1/960 s at 44.1 kHz (0 for loops);
            only feeds the game's voice bookkeeping
-  0x0C u8  voice-stealing priority (0 in every bank; see the spec)
+  0x0C u8  voice-stealing priority (0 in every bank; behaviour sound §2.1)
   0x0D u8  pan: 0 left, 0x40 centre, 0x7F right (stereo pairs are L/R
            regions); the sequencer adds it to the channel and program pans
   0x0E u8  flags: bit 0 = reverb send (the voice command sets the SPU2
@@ -348,12 +349,15 @@ then NUL-terminated strings
 The file name is always `music.seq`, the artist "Isamu Ohira". "loop" is
 where the endless loop starts, "length" where it jumps back. The game's BGM
 ids 0..0x11 select these names (alphabetically: 0 arcade01 ... 17
-wheelshop01); 0x12..0x22 are the streamed `.ads` groups of `bgm/ads.inf`.
+wheelshop01); 0x12..0x22 are the streamed `.ads` groups of `bgm/ads.inf`
+(MADS: groups, track records and the race songs' markers, in
+[../FORMATS.md](../FORMATS.md) "bgm/ads.inf").
 
 Which music plays when (BGM ids, race jingles, result and presentation
 music) is implemented in `src/audio/bgm.h` (the BGM layer: ids, restart
 rules), `src/race/race_audio.h` (race music cues) and
-`src/menu/flow/game_flow.cpp` (menu music by page).
+`src/menu/flow/game_flow.cpp` (menu music by page), and described in
+[behaviour/music.md](../behaviour/music.md).
 
 ## SEQG sequences (`music/music.seq`) ✅
 
@@ -410,7 +414,10 @@ counter model; voices with the reverb send feed the SPU2 reverb unit
 (libsd effect presets; the game uses "studio C" with EVOL 0x0FFF); voice
 stealing follows the game's priority rule. Volume changes are slewed over
 ~5 ms (the SPU2 applies them at once), and a 0.5 output trim gives
-headroom. Details and an accuracy table are in the spec.
+headroom. Voices play on two buses, music (the sequenced menu music) and
+effects (every other voice), scaled by the Music and Sound effects volumes;
+the streamed music takes the same 0.5 trim, so the two meet at equal weight
+([sound §1.1, §2.4](../behaviour/sound.md#24-volume-and-output)).
 
 ## Verification
 

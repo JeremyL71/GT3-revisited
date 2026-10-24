@@ -3,6 +3,8 @@
 
 #include "ai/ai_driver.h"
 
+#include "ai/ai_rules.h"
+#include "sim/collision.h"
 #include "sim/models.h"
 #include "sim/vehicle.h"
 #include "track/track.h"
@@ -22,10 +24,6 @@ constexpr float kDeg = kPi / 180.0f;
 constexpr float kKmh = 1.0f / 3.6f;
 constexpr float kG = 9.8f;
 
-// [placeholder] Our tyre model is not GT3's yet (physics spec §3 pending);
-// this scales the grip the planner assumes so lap times stay plausible.
-constexpr float kGripCalibration = 1.0f;
-
 Vec3 rotate(const sim::Quat& q, const Vec3& v) {
     Vec3 u{q.x, q.y, q.z};
     Vec3 t = u.cross(v) * 2.0f;
@@ -38,18 +36,17 @@ Vec3 flat(Vec3 v) {
     return l > 1e-6f ? v * (1.0f / l) : Vec3{0, 0, -1};
 }
 
-// Zone bytes (spec §8.1), as bits.
+// Zone bytes (ai §8.1), as bits.
 enum Zone : u8 { kFront = 1, kFrontLeft = 2, kFrontRight = 4, kLeft = 8, kRight = 16, kRearLeft = 32, kRearRight = 64, kRear = 128 };
 
 } // namespace
 
 struct AiDriver::Impl {
-    // Countdown blipper (spec §10): pedal and hysteresis state.
+    // Countdown blipper (ai §10): pedal and hysteresis state.
     float countdown_throttle = 0;
     bool blip_up = false;
     // Car-derived constants (first update).
     bool car_ready = false;
-    float mu_front = 10, mu_rear = 10; // grip acceleration scale (m/s^2), includes g
     float alpha_peak = 0.14f;          // front tyre peak slip angle (rad)
     float k_down = 0;                  // downforce per mass, relative to g, per (m/s)^2
     float brake_floor = 0.04f;         // s^2/m: minimum braking-distance coefficient
@@ -66,14 +63,13 @@ struct AiDriver::Impl {
     int status = 0;                // braking/throttle status used by the traffic logic
     int arc_ticks = 0;
     int cooldown = 0;
-    int state = 0;                 // recovery state machine (spec §7)
+    int state = 0;                 // recovery state machine (ai §7)
+    int kind = 0;                  // driver kind (ai §1)
+    bool pit_limit = false;        // on the stop line or in the pit lane's limit section (last tick)
     float steer = 0;               // road-wheel angle command (rad)
     float throttle = 0;            // applied throttle (slew in arcs)
-    int pinned = 0;
-    int state_ticks = 0;
-    bool reverse = false;           // reverse-gear request
-    int backout = 0;               // ticks left of a forced reverse
-    float last_follow = 0;                // ticks spent not moving with the throttle open
+    float brake = 0;               // last brake output (the stop driver's kind 5 keeps it)
+    bool reverse = false;          // reverse-gear request
 };
 
 AiDriver::AiDriver(std::shared_ptr<const AiCourse> course, DriverParams params, int start_offset)
@@ -86,12 +82,14 @@ void AiDriver::reset(const sim::VehicleState& st) {
     const track::Track& t = course_->track();
     progress_ = t.locate(st.position).distance;
     m.state = 0;
-    m.backout = m.pinned = m.state_ticks = 0;
     m.steer = 0;
     m.throttle = 0;
+    m.brake = 0;
+    m.reverse = false;
     m.countdown_throttle = 0, m.blip_up = false;
     m.cooldown = 0;
     m.blend = 0;
+    m.pit_limit = false;
     m.placed = true;
     // Initial line: nearest of 6, 2, 1 at the car's progress within 100 m.
     int best = course_->resolve(AiCourse::kMain);
@@ -109,35 +107,34 @@ void AiDriver::reset(const sim::VehicleState& st) {
 
 bool AiDriver::reverse_request() const { return m_->reverse; }
 
-void AiDriver::set_line(int game_line) {
+void AiDriver::set_line(int game_line, bool blend) {
     int l = course_->resolve(game_line);
     if (l < 0) return;
-    m_->prev_line = m_->line;
+    m_->prev_line = blend ? m_->line : l;
     m_->line = l;
-    m_->blend = 1;
+    m_->blend = blend ? 1.0f : 0.0f;
     m_->next = -1;
 }
+
+void AiDriver::reset_recovery() { m_->state = 0; }
+
+void AiDriver::set_kind(int kind) { m_->kind = kind; }
+
+int AiDriver::kind() const { return m_->kind; }
 
 sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ctx, double dt_d) {
     Impl& m = *m_;
     const float dt = float(dt_d);
     const sim::VehicleState& st = car.state();
     const sim::CarSpec& spec = car.spec();
+    const sim::VehicleTelemetry& tel = car.telemetry();
     const AiCourse& course = *course_;
     const track::Track& trk = course.track();
     if (!m.placed) reset(st);
 
     if (!m.car_ready) {
         m.car_ready = true;
-        for (int a = 0; a < 2; ++a) {
-            const sim::TireSpec& tire = spec.tire[size_t(a)];
-            float peak = 0;
-            for (float y : tire.slip_a.y) peak = std::max(peak, y);
-            float fz = tire.fz_ref > 0 ? tire.fz_ref : 4000;
-            float mu = sim::model::tire_peak_force(tire, fz, 1, 1.0f) / fz * std::max(peak, 0.1f);
-            (a ? m.mu_rear : m.mu_front) = mu * kG * kGripCalibration * p_.grip_scale;
-        }
-        // Peak slip angle: argmax over whole degrees 0..45 (spec §6.1), <= 0.8 rad.
+        // Peak slip angle: argmax over whole degrees 0..45 (ai §6.1), <= 0.8 rad.
         const sim::TireSpec& tf = spec.tire[0];
         float best = -1;
         for (int d = 0; d <= 45; ++d) {
@@ -155,29 +152,71 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
     // --- own state ------------------------------------------------------------
     Vec3 fwd = flat(rotate(st.orientation, {0, 0, -1}));
     Vec3 right{-fwd.z, 0, fwd.x};
-    float v = st.velocity.dot(fwd);                  // forward speed (spec physics.md §10.1)
+    float v = st.velocity.dot(fwd);                  // speed along the flattened heading
     float speed = std::hypot(st.velocity.x, st.velocity.z);
     float yaw_r = -st.angular_velocity.y;            // yaw rate, + = turning right
     progress_ = trk.locate(st.position, progress_).distance;
     const float s = progress_;
+    // The tyre wear factors scale the planned grip except on the pit surface (ai §4.2, ai §13).
+    const bool live_wear = !tel.on_pit_surface;
 
-    // Corner speed of the arc starting at point i (spec §4.2).
-    auto corner_speed = [&](const AiCourse::Point& pt) {
-        float w = p_.grip_front_weight;
-        float mu = (w * m.mu_front + (1 - w) * m.mu_rear) * pt.grip;
-        float a = mu * std::fabs(pt.radius);
-        if (pt.bank > 0) a /= std::max(1.0f - std::sin(pt.bank), 0.2f);
-        float vc = std::sqrt(a);
-        for (int k = 0; k < 3; ++k) vc = std::sqrt(a * (1 + m.k_down * vc * vc));
-        vc = vc * p_.speed_scale + p_.speed_offset + 2.7778f * float(p_.speed_trim) + float(pt.speed_adjust) * kKmh * p_.boost_scale;
-        return std::clamp(vc, 20.0f * kKmh, m.v_top);
+    // Front-wheel velocity angle and the steering slew (ai §6), shared with the stop driver.
+    auto slew_steer = [&](float target) {
+        float max_step = p_.steer_rate * dt;
+        m.steer += std::clamp(target - m.steer, -max_step, max_step);
     };
+    auto outputs = [&](float thr, float brk) {
+        sim::ControlInputs in;
+        in.automatic = true;
+        in.throttle = std::clamp(thr, 0.0f, 1.0f);
+        in.brake = brk;
+        float lock = sim::model::steer_target(spec.steering, 1.0f, std::fabs(v));
+        in.steer = lock > 1e-4f ? std::clamp(m.steer / lock, -1.0f, 1.0f) : 0.0f; // for displays
+        in.steer_angle = m.steer; // CPU cars set the road-wheel angle directly (ai §1)
+        m.brake = brk;
+        dbg_.steer_angle = m.steer;
+        dbg_.throttle = in.throttle;
+        dbg_.brake = in.brake;
+        dbg_.kind = m.kind;
+        dbg_.state = m.state;
+        dbg_.line = m.line;
+        dbg_.progress = s;
+        return in;
+    };
+    // Parked (kind 8, ai §1.1): wheels back to straight, no pedals (the physics opens the clutch).
+    if (m.kind == kKindParked && ctx.race_time >= 0) {
+        m.blend = std::max(0.0f, m.blend - dt);
+        slew_steer(0);
+        m.throttle = 0, m.reverse = false;
+        return outputs(0, 0);
+    }
+    // The stop driver (kinds 5, 6, 7; ai §1.1): no throttle, the brake on (kind 5 keeps the last
+    // brake), the wheels steered to `target`; once the car stands still it is parked (kind 8) and
+    // the brake comes off.
+    auto stop_driver = [&](float target) {
+        slew_steer(target);
+        m.throttle = 0, m.reverse = false;
+        float brk = m.kind == kKindStopFree ? m.brake : 1.0f;
+        if (parked(st)) m.kind = kKindParked, brk = 0;
+        return outputs(0, brk);
+    };
+    if (m.kind == kKindStopStraight && ctx.race_time >= 0) {
+        m.blend = std::max(0.0f, m.blend - dt);
+        return stop_driver(0);
+    }
+
+    // Corner speed of the arc starting at a point (ai §4.2): the record grip of its surface with
+    // the live wear factors, the downforce fixed point, the set's scale, offset and the point's
+    // km/h adjustment.
     const AiCourse::Line* L = course.line(m.line);
     auto segment_target = [&](int idx) {
         const auto& pt = L->points[size_t(idx)];
-        return pt.kind ? corner_speed(pt) : m.v_top;
+        if (!pt.kind) return m.v_top;
+        float mu = corner_grip(spec, pt.surface, p_.grip_front_weight, tel.wear_grip, live_wear);
+        dbg_.grip = mu;
+        return corner_speed(mu, pt.radius, pt.bank, pt.speed_adjust, p_, m.k_down, m.v_top);
     };
-    // Point index change (spec §4.1).
+    // Point index change (ai §4.1).
     auto shift_points = [&]() {
         int n = int(L->points.size());
         m.v_cur = m.v_next;
@@ -222,7 +261,7 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
     }
     m.blend = std::max(0.0f, m.blend - dt);
 
-    // --- traffic inputs (spec §8.1) ----------------------------------------------
+    // --- traffic inputs (ai §8.1) ----------------------------------------------
     u8 zones = 0;
     float contact = 0;
     if (ctx.self >= 0 && size_t(ctx.self) < ctx.cars.size()) {
@@ -232,7 +271,7 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
             const CarSnapshot& o = ctx.cars[j];
             Vec3 d = o.position - me.position; // CoG to CoG (the snapshots hold the CoG)
             float d2 = d.dot(d);
-            if (d2 >= 400 || std::fabs(d.y) > 5) continue; // only pairs within 20 m (centre distance, physics.md §5.1)
+            if (d2 >= 400 || std::fabs(d.y) > 5) continue; // only pairs within 20 m (centre distance, ai §14)
             float u = d.dot(fwd), lat = d.dot(right);
             // Combined extents: ahead = own front + other's rear, behind = own rear + other's front.
             float lf = me.front + o.rear, lr = me.rear + o.front, W = me.half_width + o.half_width;
@@ -252,7 +291,7 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
                 }
             }
             // Contact intensity: closing on a car ahead within the combined half widths, bumper to
-            // bumper gap p, forward closing speed q (spec §14).
+            // bumper gap p, forward closing speed q (ai §8.1).
             float gap = u - lf;
             float closing = (st.velocity * me.time_scale - o.velocity * o.time_scale).dot(fwd);
             if (gap > 0 && std::fabs(lat) <= W && closing > 0) {
@@ -265,7 +304,7 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
         }
     }
 
-    // --- braking point (spec §4.3) --------------------------------------------------
+    // --- braking point (ai §4.3) --------------------------------------------------
     float throttle_mult = 1;
     m.status = 0;
     int n_pts = int(L->points.size());
@@ -274,7 +313,7 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
     float dist_np = std::hypot(np.pos.x - st.position.x, np.pos.z - st.position.z);
     float brake_d = 0;
     if (m.line != AiCourse::kPitStop && m.mode != 3 && m.mode != 4 && m.next_kind != 0 && v > m.v_next) {
-        float mu_f = m.mu_front * np.grip;
+        float mu_f = braking_grip(spec, np.surface, tel.wear_grip, live_wear);
         float coef = std::max(m.brake_floor, 1.0f / (2.0f * std::max(mu_f, 1.0f)));
         brake_d = (v * v - m.v_next * m.v_next) * coef * (1 - std::sin(np.slope)) *
                   std::max(0.1f, 1 + 0.01f * float(np.brake_adjust));
@@ -292,9 +331,11 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
     }
     if (m.line != AiCourse::kPitLane) throttle_mult *= p_.throttle_scale;
 
-    // --- target point (spec §3) ----------------------------------------------------
+    // --- target point (ai §3) ----------------------------------------------------
     float look;
-    if (m.state == 1) look = 10;
+    if (m.kind == kKindPitStop) look = 5;                        // on the stop line
+    else if (m.kind == kKindPitLeave && m.pit_limit) look = 20;  // leaving, in the pit-lane limit
+    else if (m.state == 1) look = 10;
     else if (m.state == 2) look = 40;
     else {
         float f = v <= 0 ? 0 : std::min(1.0f, v / std::max(p_.lookahead_full_speed, 1.0f));
@@ -317,75 +358,20 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
     float eps = std::atan2(pv.dot(right), pv.dot(fwd)); // + = target to the right
     float aeps = std::fabs(eps);
 
-    // --- drive decision and recovery (spec §7) -------------------------------------
-    float theta = 60 * kDeg;
-    if (m.state == 1) {
-        if (v >= 0) theta = 10 * kDeg;
-        else if (v > -30 * kKmh) theta = 10 * kDeg - v * (50 * kDeg) / (30 * kKmh);
-    }
-    int drive = 0;
-    bool brake_flag = false;
-    if (aeps < theta || m.state == 2) {
-        if (v > -2 * kKmh) drive = 1;
-        else brake_flag = true;
-    } else {
-        if (v > 2 * kKmh) brake_flag = true;
-        else drive = -1;
-    }
-    // Collision flags A/B [placeholder]: the game reads two words of the
-    // collision body (spec §7); we use "touching a wall".
-    // "touching a wall" (spheres at the nose, centre and tail) or "pinned":
-    // asking for drive but not moving for 1.5 s.
-    bool wall = false;
-    {
-        float hl = car.setup().length * 0.5f;
-        float rad = car.setup().width * 0.5f + 0.4f;
-        for (float k : {-1.0f, 0.0f, 1.0f})
-            wall = wall || trk.wall_contact(st.position + fwd * (k * (hl - rad * 0.5f)) + Vec3{0, 0.5f, 0}, rad).hit;
-        m.pinned = std::fabs(v) < 1.0f && m.throttle > 0.3f ? m.pinned + 1 : 0;
-        if (m.pinned > 90) wall = true;
-        if (ctx.body_contact) wall = true; // a car-car hit sets the same flags (spec §14)
-    }
-    // [placeholder] Our "wall" flag stands for both of the game's collision
-    // flags; a minimum dwell (3 s reversing, 1.5 s turning) between states 1 and 2 keeps it from
-    // flipping the car between reversing and turning every tick.
-    ++m.state_ticks;
-    int prev_state = m.state;
-    bool dwell = m.state_ticks > (m.state == 1 ? 180 : 90);
-    switch (m.state) {
-    case 1:
-        if (aeps < theta) {
-            if (v > 3 * kKmh) m.state = 0;
-        } else if (wall && dwell) m.state = 2;
-        break;
-    case 2:
-        if (aeps < 40 * kDeg && v > 30 * kKmh) m.state = 0;
-        else if (wall && dwell && aeps > 60 * kDeg) m.state = 1, m.backout = 150;
-        break;
-    default:
-        if (aeps > 80 * kDeg || (wall && aeps > 45 * kDeg)) m.state = 2;
-        break;
-    }
-    if (m.state != prev_state) m.state_ticks = 0;
-    // [placeholder] backing out of a wall: reverse for 2.5 s whatever the
-    // heading error says (the spec's angle test flips between forward and
-    // reverse when the car sits against a wall nearly aligned with the road).
-    if (m.backout > 0) {
-        --m.backout;
-        brake_flag = v > 3 * kKmh;
-        drive = brake_flag ? 0 : -1;
-        if (m.backout == 0) m.state = 2, m.state_ticks = 0;
-    }
-    int moving = v > 2 * kKmh ? 1 : v < -2 * kKmh ? -1 : 0;
-    // [placeholder] pinned against something: steer as if moving (GT3 keeps
-    // the wheels straight below 2 km/h).
-    if (moving == 0 && m.pinned > 30) moving = drive;
+    // --- drive decision and recovery (ai §7) -------------------------------------
+    // The collision sides of the last step (the front and rear impulse flags) drive the state
+    // machine; there are no timers.
+    const float theta = recovery_threshold(m.state, v);
+    const int drive = drive_decision(m.state, aeps, theta, v);
+    const bool brake_flag = drive == kDriveBrake;
+    m.state = recovery_next(m.state, aeps, theta, v, tel.hit_sides);
+    // Below 2 km/h either way the wheels are steered straight.
+    const int moving = v > 2 * kKmh ? 1 : v < -2 * kKmh ? -1 : 0;
 
-
-    // --- steering (spec §6) ------------------------------------------------------------
+    // --- steering (ai §6) ------------------------------------------------------------
     float steer_t = 0, saturation = 0, r_des = 0, alpha = 0;
     if (moving != 0) {
-        if (drive == 1) {
+        if (drive == kDriveForward) {
             if (m.state != 0 && aeps > 80 * kDeg) {
                 alpha = eps > 0 ? m.alpha_peak : -m.alpha_peak;
             } else {
@@ -407,56 +393,58 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
             float vf = vw.dot(fwd);
             float beta = std::fabs(vf) > 0.5f ? std::atan2(vw.dot(right), std::fabs(vf)) : 0.0f;
             steer_t = std::clamp(alpha + beta, -45 * kDeg, 45 * kDeg);
-            // [placeholder] turning round slowly: full lock (GT3 asks for the
-            // peak slip angle only, which turns our cars too wide near walls).
-            if (m.state != 0 && aeps > 80 * kDeg && speed < 30 * kKmh) steer_t = eps > 0 ? 45 * kDeg : -45 * kDeg;
         } else {
             steer_t = eps < -20 * kDeg ? -30 * kDeg : eps > 20 * kDeg ? 30 * kDeg : eps * 1.5f;
             if (moving < 0) steer_t = -steer_t;
         }
     }
-    float max_step = p_.steer_rate * dt;
-    m.steer += std::clamp(steer_t - m.steer, -max_step, max_step);
+    // The stop driver along the line (kind 6; kind 5 without its brake): this steering, then stop.
+    if ((m.kind == kKindStopLine || m.kind == kKindStopFree) && ctx.race_time >= 0) {
+        dbg_.heading_error = eps;
+        dbg_.target = target;
+        return stop_driver(steer_t);
+    }
+    slew_steer(steer_t);
 
-    // --- throttle and brake (spec §4.4, §5) ----------------------------------------
+    // --- throttle and brake (ai §4.4, ai §5) ----------------------------------------
     float thr = 0, brk = 0;
-    auto speed_control = [&](float target_v, float gain) {
-        float e = std::clamp(v - (target_v - 2 * kKmh), -10 * kKmh, 10 * kKmh);
-        thr = std::clamp(0.75f + gain * e, 0.0f, 1.0f);
-        brk = (thr == 0 && v > target_v) ? 1.0f : 0.0f;
-    };
-    if (drive == 1) {
-        if (m.line == AiCourse::kPitStop) {
-            speed_control(20 * kKmh, -2.0f);
-        } else if (m.line == AiCourse::kPitLane && n_pts > 5 && m.next >= 3 && m.next <= n_pts - 3) {
-            speed_control(p_.pit_speed + 2 * kKmh, -0.5f);
+    if (drive == kDriveForward) {
+        const SpeedPlan plan = plan_speed(m.line, m.state, m.mode, m.v_cur, m.v_next, p_.pit_speed,
+                                          m.line == AiCourse::kPitLane ? pit_lane_section(course, s) : 0);
+        m.pit_limit = plan.pit_limit;
+        Pedals pd;
+        if (plan.turning) { // turning round (state 2): 50 km/h, gain -0.5 (ai §7)
+            pd = speed_controller(v, plan.target, -0.5f);
+            m.arc_ticks = 0;
         } else {
-            switch (m.mode) {
-            case 3: speed_control(m.v_next, -2.0f); m.arc_ticks = 0; break;
-            case 4: speed_control(m.v_next, -1.0f); m.arc_ticks = 0; break;
+            switch (plan.mode) {
+            case 3: pd = speed_controller(v, plan.next, -2.0f); m.arc_ticks = 0; break;
+            case 4: // braking inside an arc: the ticks in the arc keep counting
+                pd = speed_controller(v, plan.next, -1.0f);
+                m.arc_ticks = std::min(m.arc_ticks + 1, 6000);
+                break;
             case 1:
             case 2: {
-                float tv = m.v_cur;
-                if (m.arc_ticks >= p_.corner_bonus_ticks) tv += p_.corner_bonus * p_.boost_scale;
-                speed_control(tv, -0.5f);
-                m.status = thr == 1.0f ? (m.mode == 1 ? 4 : 3) : 5;
+                pd = speed_controller(v, arc_target(plan.target, m.arc_ticks, p_, tel.on_pit_surface), -0.5f);
+                if (m.status == 0) m.status = pd.throttle == 1.0f ? (plan.mode == 1 ? 4 : 3) : 5;
                 m.arc_ticks = std::min(m.arc_ticks + 1, 6000);
                 break;
             }
-            default: thr = 1; m.arc_ticks = 0; break;
+            default: pd.throttle = 1; m.arc_ticks = 0; break;
             }
         }
-        thr *= throttle_mult;
+        thr = pd.throttle * throttle_mult;
+        brk = pd.brake;
     } else {
-        thr = drive == -1 ? 1.0f : 0.0f;
+        thr = drive == kDriveReverse ? 1.0f : 0.0f;
         brk = brake_flag ? 1.0f : 0.0f;
         m.arc_ticks = 0;
     }
 
-    // --- traffic decisions (spec §8.2) ---------------------------------------------
+    // --- traffic decisions (ai §8.2) ---------------------------------------------
     if (m.cooldown > 0) --m.cooldown;
     bool traffic_on = ctx.race_time * 1000.0 > double(start_offset_ + 1) * 100.0 + 5000.0; // 5 s + 0.1 s (index + 1)
-    if (drive == 1 && traffic_on && m.line != AiCourse::kPitStop && m.cooldown == 0) {
+    if (drive == kDriveForward && traffic_on && m.line != AiCourse::kPitStop && m.cooldown == 0) {
         bool allowed = !(m.status == 1 || m.status == 2 || m.status == 5);
         if (m.line == AiCourse::kPitLane) {
             if (((zones & kLeft) && (zones & kFrontLeft)) || ((zones & kRight) && (zones & kFrontRight))) thr *= 0.5f;
@@ -479,7 +467,7 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
         }
         if (chosen < 0) {
             thr *= 1 - contact;
-            // Statuses 1, 2, 5 and the pit lane stop here (spec §14.1 step 6); else the
+            // Statuses 1, 2, 5 and the pit lane stop here (ai §14.1 step 6); else the
             // alongside / back-to-main moves (step 9).
             if (allowed) {
                 u8 near = zones & (kFront | kRight | kFrontRight | kFrontLeft | kLeft);
@@ -494,29 +482,27 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
         }
     }
 
-    // Steering saturation (spec §5).
+    // Steering saturation (ai §5).
     if (saturation > 0 && st.gear >= 2) {
         thr *= std::max(0.0f, 1 - p_.sat_throttle_cut * (saturation - 1));
         brk = std::min(1.0f, brk + p_.sat_brake * (saturation - 1));
     }
-    // No following brake or speed matching (spec §14): only throttle x (1 - c) above and the
+    // No following brake or speed matching (ai §14): only throttle x (1 - c) above and the
     // braking distance + 20 c.
     dbg_.follow = 0;
-    m.last_follow = 0;
 
-    // Applied throttle: slew-limited in arcs (spec §1).
+    // Applied throttle: slew-limited in arcs (ai §1).
     if (m.mode == 1 || m.mode == 2) {
         m.throttle += std::clamp(thr - m.throttle, -dt, dt);
     } else {
         m.throttle = thr;
     }
 
-    // Countdown (spec §10): no brake, no steer, the clutch held open by the
+    // Countdown (ai §10): no brake, no steer, the clutch held open by the
     // caller (Vehicle::set_clutch_hold); the throttle blips around the reference rpm R
     // (the upshift rpm UP) with hysteresis, rank-dependent rates, and holds proportionally
     // in the last 12 frames. At GO the speed controller's pedal applies at once (no ramp).
-    sim::ControlInputs in;
-    in.automatic = true;
+    float out_thr = m.throttle, out_brk = brk;
     if (ctx.race_time < 0) {
         const float R = spec.engine.upshift_rpm > 0 ? spec.engine.upshift_rpm : spec.engine.rev_limit_rpm - 500;
         const float rpm = st.engine_rpm, r = float(ctx.rank);
@@ -529,31 +515,24 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
         } else {
             t = std::clamp(0.625f - 0.002f * r - 2.0f * (rpm - R) / std::max(1.0f, spec.engine.rev_limit_rpm), 0.0f, 1.0f);
         }
-        in.brake = 0;
-        in.throttle = t;
+        out_brk = 0;
+        out_thr = t;
         m.throttle = 0;
         m.steer = 0;
-    } else {
-        in.throttle = std::clamp(m.throttle, 0.0f, 1.0f);
-        in.brake = brk;
     }
-    float lock = sim::model::steer_target(spec.steering, 1.0f, std::fabs(v));
-    in.steer = lock > 1e-4f ? std::clamp(m.steer / lock, -1.0f, 1.0f) : 0.0f; // for displays
-    in.steer_angle = m.steer; // CPU cars set the road-wheel angle directly (spec §1)
-    // Gears: automatic (spec §1). The reverse request (spec §7) is read by the caller through reverse_request().
-    m.reverse = drive == -1;
-    if (drive == -1 && st.gear >= 1 && std::fabs(v) > 1.0f) in.throttle = 0; // stop before reversing
+    // Gears: automatic (ai §1). The reverse request (ai §7) is read by the caller through reverse_request().
+    m.reverse = drive == kDriveReverse;
+    if (drive == kDriveReverse && st.gear >= 1 && std::fabs(v) > 1.0f) out_thr = 0; // stop before reversing
     dbg_.gear_want = m.reverse ? -1 : std::max(st.gear, 1);
 
     // Debug.
-    dbg_.line = m.line;
     dbg_.prev_line = m.prev_line;
     dbg_.blend = m.blend;
     dbg_.next_point = m.next;
     dbg_.mode = m.mode;
-    dbg_.state = m.state;
     dbg_.drive = drive;
-    dbg_.progress = s;
+    dbg_.hits = tel.hit_sides;
+    dbg_.status = m.status;
     dbg_.lookahead = look;
     dbg_.target_speed = m.v_cur;
     dbg_.next_speed = m.v_next;
@@ -563,15 +542,11 @@ sim::ControlInputs AiDriver::update(const sim::Vehicle& car, const AiContext& ct
     dbg_.desired_yaw = r_des;
     dbg_.slip_wanted = alpha;
     dbg_.saturation = saturation;
-    dbg_.steer_angle = m.steer;
-    dbg_.throttle = in.throttle;
-    dbg_.brake = in.brake;
     dbg_.contact = contact;
-    dbg_.grip = m.mu_front;
     dbg_.alpha_peak = m.alpha_peak;
     dbg_.zones = zones;
     dbg_.target = target;
-    return in;
+    return outputs(out_thr, out_brk);
 }
 
 } // namespace gt3r::ai

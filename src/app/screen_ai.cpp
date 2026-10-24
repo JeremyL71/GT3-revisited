@@ -142,9 +142,8 @@ private:
         std::vector<ai::AiRace::Entry> entries;
         for (const auto& label : ev->entries) {
             if (label.empty() || label == "-") continue;
-            ai::DriverParams p = ai::DriverParams::builtin(0);
-            ai::apply_event(p, *ev, 0);
-            entries.push_back({label, p});
+            // The course's set for the car's driveline class and the event's overrides (ai §9.1, ai §9.2).
+            entries.push_back({label, ai::race_params(db_, label, *track_, ev)});
             if (entries.size() == 8) break;
         }
         // Car 0 stands in for the player (rubber-band reference).

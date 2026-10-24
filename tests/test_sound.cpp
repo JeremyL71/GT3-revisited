@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <utility>
 
 using namespace gt3r;
 using namespace gt3r::sound;
@@ -91,6 +92,46 @@ TEST(sound_mixer_loop_and_end) {
     m.set_pitch(a, 0x2000);
     m.stop(b);
     CHECK(m.active_voices() == 0);
+}
+
+TEST(sound_mixer_bus_gains) {
+    // The Sound effects volume is the effects bus's gain and never scales the music bus
+    // (the sequenced menu music); the Music volume scales only the music bus (sound §2.4).
+    // A constant looping sample on each bus: effects hard left, music hard right.
+    Bytes loop;
+    put_frame(loop, 1, 0x06);
+    put_frame(loop, 1, 0x03);
+    auto levels = [&](float effects, float music) {
+        VoiceMixer m;
+        m.set_master_volume(1.0f);
+        m.set_bus_gain(VoiceBus::Effects, effects);
+        m.set_bus_gain(VoiceBus::Music, music);
+        VoiceParams p;
+        p.data = std::make_shared<const Bytes>(loop);
+        p.vol_l = 0x3FFF;
+        p.vol_r = 0;
+        m.key_on(p);
+        p.vol_l = 0;
+        p.vol_r = 0x3FFF;
+        p.bus = VoiceBus::Music;
+        m.key_on(p);
+        std::vector<s16> out(2 * 2000);
+        m.mix(out.data(), 2000);
+        return std::pair<int, int>{out[2 * 1500], out[2 * 1500 + 1]};
+    };
+    auto [l1, r1] = levels(1, 1);
+    CHECK(std::abs(l1 - 4076) <= 3 && std::abs(r1 - 4076) <= 3); // unity gains change nothing
+    auto [l2, r2] = levels(0, 1);
+    CHECK(l2 == 0 && r2 == r1);
+    auto [l3, r3] = levels(0.25f, 1);
+    CHECK(std::abs(l3 - l1 / 4) <= 1 && r3 == r1);
+    auto [l4, r4] = levels(1, 0.5f);
+    CHECK(l4 == l1 && std::abs(r4 - r1 / 2) <= 1);
+    auto [l5, r5] = levels(1, 0);
+    CHECK(l5 == l1 && r5 == 0);
+    VoiceMixer m;
+    m.set_bus_gain(VoiceBus::Music, 2.0f); // clamped to 0..1
+    CHECK(m.bus_gain(VoiceBus::Music) == 1.0f && m.bus_gain(VoiceBus::Effects) == 1.0f);
 }
 
 TEST(sound_mixer_pitch) {

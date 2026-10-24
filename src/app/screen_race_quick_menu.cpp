@@ -32,7 +32,7 @@ void RaceScreen::end_free_run(App& app) {
 
 // The quick-menu layout of this run, as the original picks it per mode (arcade
 // race, free run, time trial, machine test, licence, GT race, championship, 2P;
-// menus spec §11).
+// menus §11).
 // `before`: the menu before the first run (licence, machine test, GT race, time trial,
 // free run); the arcade race and 2P battle run first.
 std::string RaceScreen::quick_menu_layout(bool before) const {
@@ -69,23 +69,105 @@ void RaceScreen::fill_license_menu(App& app) {
         if (license_times_.ms[size_t(i)] > 0) quick_menu_.set_text(kW[i], Hud::format_time(license_times_.ms[size_t(i)] / 1000.0));
 }
 
-// The GT Mode ranking this run's records go to (licence, machine test, arcade time trial),
-// or "" (free run, Quick race practice, races).
+// The menus' free runs on a course (the arcade time attack, GT Mode's free run): the original's
+// free-run driver, whose runs go into the course's time-trial ranking.
+bool RaceScreen::course_time_trial() const {
+    const std::string& m = launch_.request.mode;
+    return from_menu_ && !field_ && (m == "free_run" || m == "go_free_run");
+}
+
+// The GT Mode ranking this run's records go to (licence, machine test, arcade time trial, the
+// course's time trial for the arcade time attack and GT Mode's free run), or "" (Quick race
+// practice, races).
 std::string RaceScreen::records_key() const {
     const menu::flow::GameRequest& rq = launch_.request;
     if (!from_menu_ || rq.practice) return {};
     if (!license_event_.empty()) return "lic:" + license_event_;
     if (rq.mode == "go_machine_test") return "mt:" + rq.race_code;
-    if (rq.mode == "time_trial" && !rq.race_code.empty()) return "at:" + rq.race_code;
+    if (course_time_trial()) return "ct:" + courses_[size_t(course_sel_)].label;
+    if (rq.mode == "time_trial") {
+        // Arcade time trials: the challenge's code, or the one of its course ("tt01" -> AT010001).
+        std::string code = rq.race_code;
+        if (game::GtMode::time_trial_index(code) < 0)
+            if (int i = game::GtMode::time_trial_index(rq.course); i >= 0) {
+                char b[16];
+                std::snprintf(b, sizeof b, "AT%02d0001", i + 1);
+                code = b;
+            }
+        if (!code.empty()) return "at:" + code;
+    }
     return {};
 }
 
-// Time trial / machine test quick menus: "Top 3" = entries 0..2 of the ranking (name and
-// time, the top speed for MMAX), before and after every run (time trial and machine test
-// read the record again before each quick menu).
+std::vector<double> RaceScreen::stored_records() const {
+    std::vector<double> out;
+    const std::string key = records_key();
+    game::GtModeSession* gs = game::gt_mode_session();
+    if (key.empty() || !gs) return out;
+    for (const game::RankEntry& e : gs->gt().ranking_top(key, size_t(kRecordPlaces))) out.push_back(e.value);
+    return out;
+}
+
+// At the finish (presentation §B7, §E3): time trials and machine tests take their place
+// in the stored records for the result overlay (a run without stored records ranks as in an
+// empty table; ours: debug runs and Quick race practice keep none). The session record check:
+// a time at or under the session's best lap before it greys RETRY out until the next run
+// (licence tests only with a medal); licence and machine-test times then count as the
+// session's laps (time trials' come with their laps, lap_events). `result`: licence tests
+// 1..3 the medal, 0 none; other runs -2.
+void RaceScreen::rank_finish(double value, bool speed, int result) {
+    const bool license = !license_event_.empty();
+    if (!license) finish_record_rank_ = record_rank(stored_records(), value, speed);
+    RecordFinish rf;
+    rf.replay = replaying_ || demo_;
+    rf.failed = tt_failed_;
+    rf.time = speed ? -1.0 : value; // the top-speed test is never checked
+    rf.session_best = best_splits_.best_lap() >= 0 ? double(best_splits_.best_lap()) / 1000.0 : -1.0;
+    rf.result = result;
+    if (locks_retry(rf)) retry_locked_ = true;
+    // The quick menu's SAVE GHOST / DATA LOGGER (menus §11; a free run's laps count in
+    // lap_events: its EXIT as the finish checks nothing).
+    if (sets_record(rf) && run_kind() != RunKind::FreeRun) run_session_record_ = true;
+    if ((license || machine_) && !rf.replay && rf.time >= 0) best_splits_.lap_done(std::llround(rf.time * 1000.0));
+    LOG_INFO("Race: finish %.3f, record place %d%s%s", value, finish_record_rank_ + 1,
+             sets_record(rf) ? ", session record" : "", retry_locked_ ? ", RETRY locked" : "");
+}
+
+bool RaceScreen::record_run() {
+    const menu::flow::GameRequest& rq = launch_.request;
+    if (!from_menu_ || rq.practice || run_recorded_ || replaying_ || demo_) return false;
+    int rank = -1;
+    if (!license_event_.empty()) { // a licence run with a medal (presentation §A5)
+        if (rq.mode != "go_license" || license_.state() != LicenseRun::State::Finished || shown_medal_ < 0) return false;
+        rank = game::add_license_record(rq.race_code, license_.time());
+    } else if (machine_ && rq.mode == "go_machine_test") { // the value rank_finish placed
+        // (The top-speed test also when its pause EXIT was the finish: no time to the goal.)
+        const double v = machine_->timed() ? machine_time_ : double(top_speed_kmh_);
+        if (!finished_ || v <= 0 || (machine_time_ <= 0 && !exit_finished_)) return false;
+        rank = game::add_machine_test_record(rq.race_code, v);
+    } else if (rq.mode == "time_trial" && !field_ && race_laps_ > 0) { // a challenge: its best lap
+        const std::string key = records_key();
+        if (!finished_ || tt_failed_ || track_->best_lap_time() <= 0 || key.rfind("at:", 0) != 0) return false;
+        rank = game::add_time_trial_record(key.substr(3), track_->best_lap_time());
+    } else if (course_time_trial()) { // a free run, however it ended: its best lap, if any (gt_mode §17)
+        if (track_->best_lap_time() <= 0) return false;
+        rank = game::add_course_time_trial_record(courses_[size_t(course_sel_)].label, track_->best_lap_time(),
+                                                  cars_[size_t(car_sel_)].label);
+    } else {
+        return false;
+    }
+    run_recorded_ = any_run_recorded_ = true;
+    return rank >= 0;
+}
+
+// Time trial / machine test quick menus: "Top 3" = entries 0..2 of the ranking, read again
+// before every quick menu, so the list shows before the first run and after each (menus §11).
+// The three rows are always filled: a ranking with fewer entries shows empty ones (no name,
+// no time, a speed of 0), as the original's tables hold 12 entries from a new game.
 void RaceScreen::fill_top3() {
     const menu::flow::GameRequest& rq = launch_.request;
-    if (!license_event_.empty() || (rq.mode != "go_machine_test" && rq.mode != "time_trial")) return;
+    if (!license_event_.empty() || (rq.mode != "go_machine_test" && rq.mode != "time_trial" && !course_time_trial()))
+        return;
     std::string key = records_key();
     game::GtModeSession* gs = game::gt_mode_session();
     if (key.empty() || !gs) return;
@@ -93,18 +175,29 @@ void RaceScreen::fill_top3() {
     std::vector<game::RankEntry> top = gt.ranking_top(key, 3);
     for (size_t k = 0; k < 3; ++k) {
         const std::string n = std::to_string(k + 1);
-        std::string name, value;
-        if (k < top.size()) {
-            name = gt.ranking_name(top[k]);
-            char b[32];
-            if (key == "mt:MMAX") std::snprintf(b, sizeof b, "%.1f km/h", top[k].value);
-            value = key == "mt:MMAX" ? std::string(b) : Hud::format_time(top[k].value);
-        }
-        quick_menu_.set_class_text("qm_rank_name" + n, name);
-        quick_menu_.set_class_text("qm_list_car_name" + n, name);
-        quick_menu_.set_class_text("qm_rank_time" + n, value);
-        quick_menu_.set_class_text("qm_rank_speed" + n, value);
+        const game::RankEntry* e = k < top.size() ? &top[k] : nullptr;
+        // Speed: "%4.1f %s" in the Options unit (rounded; " 0.0 km/h" for an empty entry).
+        const float kmh = e ? float(e->value) : 0.0f;
+        char speed[32];
+        std::snprintf(speed, sizeof speed, "%4.1f %s", double(imperial_ ? kmh * 0.62139f : kmh), imperial_ ? "mph" : "km/h");
+        quick_menu_.set_class_text("qm_rank_name" + n, e ? gt.ranking_name(*e) : std::string());
+        // (The free time trial's list: the entry's car, "---" without one.)
+        quick_menu_.set_class_text("qm_list_car_name" + n, e && !e->car.empty() ? car_display_name(e->car) : "---");
+        quick_menu_.set_class_text("qm_rank_time" + n, e ? Hud::format_time(e->value) : "--'--.---");
+        quick_menu_.set_class_text("qm_rank_speed" + n, speed);
     }
+}
+
+bool RaceScreen::dirt_course() const {
+    for (const data::Course& c : db_.courses())
+        if (c.label == courses_[size_t(course_sel_)].label) return c.surface == 2;
+    return false;
+}
+
+void RaceScreen::update_quick_menu_items() {
+    race::QuickMenuItems q = qm_items_;
+    q.visit(run_kind(), launch_.request.car_spec != nullptr, dirt_course());
+    quick_menu_.set_items(q);
 }
 
 void RaceScreen::open_prerace_menu(App& app) {
@@ -116,6 +209,7 @@ void RaceScreen::open_prerace_menu(App& app) {
         quick_ = prerace_ = false; // no layout: straight to the race
         return;
     }
+    update_quick_menu_items();
     if (!license_event_.empty()) {
         fill_license_menu(app);
         return;
@@ -128,6 +222,7 @@ void RaceScreen::open_prerace_menu(App& app) {
     }
     if (race_laps_ > 0) quick_menu_.set_text("laps", std::to_string(race_laps_) + (race_laps_ == 1 ? " Lap" : " Laps"));
     fill_top3();
+    start_menu_backdrop(true);
 }
 
 void RaceScreen::open_quick_menu(App& app) {
@@ -137,6 +232,7 @@ void RaceScreen::open_quick_menu(App& app) {
     silence(app);
     std::string pmb = quick_menu_layout(false);
     if (!quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), pmb)) quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), "qm_arc_result1.pmb");
+    update_quick_menu_items();
     // The live race's rows: after a replay (a GT race's own, or the 2P one) the field is the
     // replay's.
     std::vector<ResultRow> rows = latched_rows_ ? *latched_rows_ : result_menu_rows();
@@ -144,6 +240,7 @@ void RaceScreen::open_quick_menu(App& app) {
     quick_menu_.set_rows(std::move(rows));
     if (!license_event_.empty()) fill_license_menu(app); // the test's name and target times
     fill_top3();
+    start_menu_backdrop(false);
 }
 
 void RaceScreen::update_quick_menu(App& app, double dt) {
@@ -151,6 +248,9 @@ void RaceScreen::update_quick_menu(App& app, double dt) {
         update_panel(app);
         return;
     }
+    // Back from an item that kept the menu (save, load ghost, a dialog): the original's driver
+    // loop starts the race behind it again.
+    if (!backdrop_ && !preview_) start_menu_backdrop(prerace_);
     if (!quick_sounds_tried_) {
         quick_sounds_tried_ = true;
         quick_sounds_.load(*app.vfs());
@@ -158,15 +258,22 @@ void RaceScreen::update_quick_menu(App& app, double dt) {
     }
     QuickMenu::Choice choice = quick_menu_.update(menu_keys(app.input().pad(0)), dt);
     for (const std::string& se : quick_menu_.take_sounds()) quick_sounds_.play(app.audio().voices(), se);
-    if (!preset_.qm.empty() && quick_menu_.focus(preset_.qm)) // scripted (screenshots)
-        choice = {preset_.qm, "root", quick_menu_.action(preset_.qm)};
+    if (!preset_.qm.empty() && quick_menu_.focus(preset_.qm)) { // scripted (screenshots)
+        if (quick_menu_.item_enabled(preset_.qm)) {
+            choice = {preset_.qm, "root", quick_menu_.action(preset_.qm)};
+        } else { // refused as a confirm on it would be (menus §11)
+            quick_sounds_.play(app.audio().voices(), "disable");
+            LOG_INFO("Quick menu: %s is disabled", preset_.qm.c_str());
+        }
+    }
     preset_.qm.clear();
     if (choice.empty()) return;
     const std::string& a = choice.item;
     const QmAction act = quick_menu_action(choice.action);
-    if (preview_ && choice.page == "root" && act != QmAction::Option && act != QmAction::Records &&
-        act != QmAction::Logger)
-        stop_preview(app);
+    if (choice.page == "root" && act != QmAction::Option && act != QmAction::Records && act != QmAction::Logger) {
+        if (preview_) stop_preview(app);
+        stop_backdrop(app); // the race behind the menu
+    }
     if (choice.page != "root") { // yes/no dialogs (the popup has closed itself)
         if (choice.page == "exit_sure" && act == QmAction::Exit) { // "Retire from championship?" Yes
             abandoned_ = true;
@@ -188,10 +295,14 @@ void RaceScreen::update_quick_menu(App& app, double dt) {
     case QmAction::Replay:
         quick_ = false;
         watch_replay();
-        replay_from_quick_ = replaying_;
+        replay_to_menu_ = replaying_; // its end (or EXIT): the transition, then this menu again
         if (!replaying_) quick_ = true;
         break;
-    case QmAction::Demo: start_demo(); break;
+    case QmAction::Demo: // its run replaces the last one: no REPLAY until the next run
+        qm_items_.after_demonstration();
+        update_quick_menu_items();
+        start_demo();
+        break;
     case QmAction::SaveReplay:
     case QmAction::SaveGhost: save_current_replay(); break;
     case QmAction::LoadGhost:

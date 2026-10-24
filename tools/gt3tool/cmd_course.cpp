@@ -5,7 +5,7 @@
 //   course-shot   <vol-path> <out.png> [opts]      software-rendered preview
 //   course-survey [prefix]                         decode every course file, report coverage
 //
-// Options: top | persp (shot view), road, lines, sky, scenery2, reflections, size=N.
+// Options: top | persp (shot view), road, lines, sky, scenery2, reflections, noscenery, courseline, size=N.
 
 #include "tool.h"
 
@@ -44,7 +44,8 @@ CourseModelOptions model_opts(const Args& a, size_t from) {
     o.sky = has_opt(a, from, "sky");
     o.scenery2 = has_opt(a, from, "scenery2");
     o.reflections = has_opt(a, from, "reflections");
-    if (has_opt(a, from, "noscenery")) o.scenery = o.backdrop = o.extras = false;
+    if (has_opt(a, from, "noscenery")) o.scenery = o.backdrop = o.course_line = false;
+    if (has_opt(a, from, "courseline")) o.course_line = true; // with noscenery: the licence line alone
     return o;
 }
 

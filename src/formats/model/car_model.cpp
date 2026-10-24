@@ -1,6 +1,7 @@
 #include "formats/model/car_model.h"
 #include "formats/model/gltf.h"
 
+#include "formats/model/tyre_model.h"
 #include "formats/model/wheel_model.h"
 
 #include <algorithm>
@@ -12,49 +13,6 @@ namespace gt3r {
 namespace {
 
 const char* const kSectionMagic[4] = {"GTCI", "GTM1", "GTTR", "GTTW"};
-
-// Procedural tyre (the game does not store tyre geometry): a tread band and
-// two sidewalls around the X axis, centred at the origin. The GTTR texture
-// has the tread in its top half and the sidewall lettering in the bottom.
-scene::Mesh make_tyre(float radius, float rim_radius, float width, int texture, float repeat) {
-    constexpr int kSegments = 32;
-    constexpr float kPi = 3.14159265f;
-    scene::Mesh m;
-    m.name = "tyre";
-    auto add = [&](float x, float ang, float r, float nx, float ny_scale, float u, float v) {
-        scene::Vertex vt;
-        float c = std::cos(ang), s = std::sin(ang);
-        vt.pos[0] = x, vt.pos[1] = r * c, vt.pos[2] = r * s;
-        float n[3] = {nx, ny_scale * c, ny_scale * s};
-        float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-        for (int k = 0; k < 3; ++k) vt.normal[k] = n[k] / l;
-        vt.uv[0] = u, vt.uv[1] = v;
-        m.vertices.push_back(vt);
-        return u32(m.vertices.size() - 1);
-    };
-    float hw = width * 0.5f;
-    for (int i = 0; i < kSegments; ++i) {
-        float a0 = 2 * kPi * i / kSegments, a1 = 2 * kPi * (i + 1) / kSegments;
-        float u0 = repeat * i / kSegments, u1 = repeat * (i + 1) / kSegments;
-        // tread (normal outwards)
-        u32 a = add(-hw, a0, radius, 0, 1, u0, 0.0f), b = add(hw, a0, radius, 0, 1, u0, 0.5f);
-        u32 c = add(-hw, a1, radius, 0, 1, u1, 0.0f), d = add(hw, a1, radius, 0, 1, u1, 0.5f);
-        m.indices.insert(m.indices.end(), {a, c, b, b, c, d});
-        // sidewalls (normals -X / +X)
-        for (int side = -1; side <= 1; side += 2) {
-            float x = side * hw;
-            u32 o0 = add(x, a0, radius, float(side), 0, u0, 0.55f), i0 = add(x, a0, rim_radius, float(side), 0, u0, 0.95f);
-            u32 o1 = add(x, a1, radius, float(side), 0, u1, 0.55f), i1 = add(x, a1, rim_radius, float(side), 0, u1, 0.95f);
-            if (side < 0) m.indices.insert(m.indices.end(), {o0, i0, o1, o1, i0, i1});
-            else m.indices.insert(m.indices.end(), {o0, o1, i0, o1, i1, i0});
-        }
-    }
-    scene::Primitive p;
-    p.index_count = u32(m.indices.size());
-    p.texture = texture;
-    m.primitives.push_back(p);
-    return m;
-}
 
 // Body-based guess used when no database spec is available.
 WheelSpec estimate_wheels(const scene::Model& car) {
@@ -75,8 +33,10 @@ WheelSpec estimate_wheels(const scene::Model& car) {
 // The wheel GTM1 is unit-sized with its outer face at x = 0 pointing -X (a
 // left wheel). The game scales it by R - 0.75 * sidewall and puts the face at
 // the tyre's outer sidewall; right wheels are rotated 180 degrees about Y.
-void add_wheels(scene::Model& car, const scene::Model& wheel, int tyre_texture, float tyre_repeat,
-                const WheelSpec& ws) {
+// Each wheel gets its tyre (tyre_model.h): "wheel_<x>_tyre" and, at the highest
+// detail, "wheel_<x>_band", the arch shade, which does not turn with the wheel.
+void add_wheels(scene::Model& car, const scene::Model& wheel, int tyre_texture, const TyreShape& tyre,
+                const TyreDetail& detail, const WheelSpec& ws) {
     static const char* names[4] = {"wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"};
     int tex_base = int(car.textures.size());
     car.textures.insert(car.textures.end(), wheel.textures.begin(), wheel.textures.end());
@@ -101,10 +61,16 @@ void add_wheels(scene::Model& car, const scene::Model& wheel, int tyre_texture, 
                 if (p.texture >= 0) p.texture += tex_base;
             car.meshes.push_back(std::move(m));
         }
-        scene::Mesh t = make_tyre(r, rim, w, tyre_texture, tyre_repeat);
-        t.name = std::string(names[i]) + "_tyre";
-        for (scene::Vertex& v : t.vertices) place(v, 1.0f, 0.0f);
-        car.meshes.push_back(std::move(t));
+        TyreShape shape = tyre;
+        shape.radius = r, shape.width = w, shape.sidewall = sw;
+        // Where the texture starts round each tyre: the game draws it at random; a fixed
+        // spread here (fractions of the golden ratio).
+        const float phase = std::fmod(0.618034f * float(i + 1), 1.0f);
+        for (scene::Mesh& t : build_tyre(shape, detail, tyre_texture, right, phase)) {
+            t.name = std::string(names[i]) + (t.name == "band" ? "_band" : "_tyre");
+            for (scene::Vertex& v : t.vertices) place(v, 1.0f, 0.0f);
+            car.meshes.push_back(std::move(t));
+        }
     }
 }
 
@@ -148,10 +114,12 @@ void merge(scene::Model& dst, scene::Model&& src) {
 }
 
 scene::Model car_lod(const CarFile& f, const gtm1::Gtm1& g, const CarModelOptions& opt, int lod,
-                     const std::string& name) {
+                     const std::string& name, gtm1::MorphDraws* morphs) {
     gtm1::Options o;
     o.run.lod = lod;
     o.run.brake = opt.brake;
+    o.run.callback = gtm1::kCarCallbackDefaults.data();
+    o.morphs = morphs;
     o.reflection = opt.reflection;
     o.node = opt.effects ? -1 : 0;
     o.paint = opt.paint;
@@ -169,12 +137,22 @@ scene::Model car_lod(const CarFile& f, const gtm1::Gtm1& g, const CarModelOption
         wo.weighted_reflection = true;
         scene::Model wheel = load_wheel_model(opt.wheel_override.empty() ? f.wheel : opt.wheel_override, wo, "wheel");
         int tyre_tex = -1;
-        float repeat = 2;
+        TyreShape tyre;
         if (f.tire.size() > 0x20 && rd32(f.tire, 0x1C) < f.tire.size()) {
+            size_t first = m.textures.size();
             tyre_tex = gtm1::decode_texture_set(f.tire.subspan(rd32(f.tire, 0x1C)), m.textures, "tyre_");
-            repeat = float(std::clamp<u32>(rd32(f.tire, 0x10), 1, 8)); // texture repeats around the tread
+            // The game samples it repeating round the tyre, clamped across, without mipmaps.
+            for (size_t t = first; t < m.textures.size(); ++t) {
+                m.textures[t].clamp_u = false, m.textures[t].clamp_v = true;
+                m.textures[t].no_mips = true;
+            }
+            tyre.repeats = float(std::clamp<u32>(rd32(f.tire, 0x10), 1, 8));
+            tyre.flags = rd32(f.tire, 0x14);
+            u32 s = rd32(f.tire, 0x18);
+            std::memcpy(&tyre.shininess, &s, 4);
         }
-        add_wheels(m, wheel, tyre_tex, repeat, opt.wheel_spec ? *opt.wheel_spec : estimate_wheels(m));
+        const TyreDetail detail = opt.menu_tyres ? menu_tyre_detail() : race_tyre_detail(lod);
+        add_wheels(m, wheel, tyre_tex, tyre, detail, opt.wheel_spec ? *opt.wheel_spec : estimate_wheels(m));
     }
     for (scene::Mesh& mesh : m.meshes) mesh.lod = lod;
     return m;
@@ -258,16 +236,29 @@ void apply_body_mod(scene::Model& m, const CarBodyMod& mod, const std::string& n
 scene::Model load_car_model(ByteSpan data, const CarModelOptions& opt, const std::string& name) {
     CarFile f = CarFile::parse(data);
     gtm1::Gtm1 g = gtm1::Gtm1::parse(f.body);
+    // (Mod bodies keep the morph draws in place: their parts would not follow the new body.)
+    const bool morphs = opt.morphs && !opt.body_mod.active();
+    if (morphs) opt.morphs->clear();
     if (opt.lod >= 0) {
-        scene::Model m = car_lod(f, g, opt, opt.lod, name);
+        gtm1::MorphDraws md;
+        scene::Model m = car_lod(f, g, opt, opt.lod, name, morphs ? &md : nullptr);
         if (opt.body_mod.active()) apply_body_mod(m, opt.body_mod, name);
         m.compute_bounds();
+        if (!md.empty()) opt.morphs->push_back(std::move(md));
         return m;
     }
     scene::Model all;
     all.name = name;
     int n = g.nodes.empty() ? 0 : gtm1_lod_count(g, 0);
-    for (int lod = 0; lod < n; ++lod) merge(all, car_lod(f, g, opt, lod, name));
+    for (int lod = 0; lod < n; ++lod) {
+        gtm1::MorphDraws md;
+        const int base = int(all.textures.size());
+        merge(all, car_lod(f, g, opt, lod, name, morphs ? &md : nullptr));
+        if (!md.empty()) {
+            md.rebase_textures(base);
+            opt.morphs->push_back(std::move(md));
+        }
+    }
     if (opt.body_mod.active()) apply_body_mod(all, opt.body_mod, name);
     all.compute_bounds();
     return all;

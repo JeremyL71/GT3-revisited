@@ -24,7 +24,7 @@ std::unique_ptr<Screen> make_gt_setting_screen(std::string event);
 
 // The records menu (menu/records.mbl, the quick menus' "Records") for a ranking:
 // "lic:<license test>", "mt:M400" / "mt:M1000" / "mt:MMAX", "at:<arcade time
-// trial code>". Pops itself when left.
+// trial code>", "ct:<course>" (a free run's course). Pops itself when left.
 std::unique_ptr<Screen> make_records_screen(std::string key);
 
 // The GT-mode presentations queued so far (e.g. a licence run's record name entry,

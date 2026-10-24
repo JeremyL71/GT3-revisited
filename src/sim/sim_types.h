@@ -45,7 +45,7 @@ struct ControlInputs {
     // AI drivers set the road-wheel angle directly (radians, + = right); when
     // finite it replaces steer × lock and the pad steering curve.
     float steer_angle = std::numeric_limits<float>::quiet_NaN();
-    // Steering device kind (spec §4.4): 2 analog, 3 digital pad; 0 = keep the
+    // Steering device kind (physics §4.4): 2 analog, 3 digital pad; 0 = keep the
     // previous kind. Selects the steering follow rates.
     u8 controller_kind = 0;
     float throttle = 0; // 0..1 (e.g. Cross pressure / 255)
@@ -54,6 +54,18 @@ struct ControlInputs {
     bool shift_up = false;   // edge-triggered requests (manual gearbox)
     bool shift_down = false;
     bool automatic = true;
+};
+
+// [physics §4.6, ai §9.1] The driving-aid block CPU cars and scripted drivers (driver kind != 0)
+// read instead of the car's own, filled from the AI driver parameter set
+// (ai::DriverParams::from_bytes): TCS gain, lateral a / b and slip scale; ASCC channel gains and
+// thresholds with the channel flag byte (bits 0..7 = A-front, A-rear, D-front, D-rear, C-front,
+// C-rear, E-front, E-rear; a channel acts only when a flag of it is set and its gain is
+// non-zero). The defaults are the built-in sets' block: TCS 6.0 / 1.0 / 0 / 1.0, no ASCC.
+struct ScriptedAids {
+    float tcs_gain = 6.0f, tcs_lat_a = 1.0f, tcs_lat_b = 0.0f, tcs_scale = 1.0f;
+    float ascc_a_gain = 0, ascc_a_thr = 0, ascc_d_gain = 0, ascc_c_gain = 0, ascc_c_thr = 0, ascc_e_gain = 0;
+    u8 ascc_flags = 0;
 };
 
 // Result of probing the track surface below a point.
@@ -85,6 +97,7 @@ struct WheelState {
     float load = 0;          // vertical load in N
     bool grounded = false;
     u32 surface = 0;
+    float flap = 0;          // [physics §8.8] flap pendulum, -1..1 (car models' morph phase 0.5 + 0.5 flap)
 };
 
 // Snapshot published by physics after each tick. Rendering, camera, HUD and
@@ -100,6 +113,18 @@ struct VehicleState {
     float throttle = 0;      // effective throttle after aids/limiter (for audio)
     float speed_kmh = 0;
     bool rev_limiter = false;
+    float steer = 0;         // steering command (rad, + = right) before Ackermann and toe [physics §4.4]
+};
+
+// [physics §10.3] The engine condition a car carries through a run: the odometer in 2 m
+// units and the running-in / wear (E) and oil (O) counters in metres. All zero is a fresh
+// engine (torque factor exactly 1); a GT-mode garage car starts a run with its own values
+// and takes the advanced ones back afterwards.
+struct EngineCondition {
+    u32 odometer = 0; // 2 m units
+    float wear_m = 0; // E
+    float oil_m = 0;  // O
+    bool operator==(const EngineCondition&) const = default;
 };
 
 } // namespace gt3r::sim

@@ -6,8 +6,8 @@ Status: geometry, UVs, normals/colours, LODs, texture binding, paint colours
 and wheel placement are decoded for every car and wheel: `gt3tool model-survey`
 decodes 2073/2073 files (859 `cars/*` files at 3 LODs, 287 `menu/cars`, 464
 `wheel`, 463 `menu/wheel`; 4 empty placeholders skipped). Tyres are generated,
-as the game does. Open: the render-state ops, chunk flag high byte, time-of-day
-differences.
+as the game does. Open: the render-state ops, the rest of the chunk flag high
+byte, time-of-day differences.
 
 Sources: own analysis of the disc data, rendering comparisons with the original, and the course format work
 (opcode table).
@@ -17,9 +17,9 @@ All values are little endian. Positions are IEEE floats in metres.
 ## Car file: `cars/{day,eve,night}/<id>` (gzip)
 
 The ids are listed one per line in `cars/.list` (287 lines). `ho0100` is an
-empty (0-byte) placeholder in all three folders (the C++ `Volume` fails to
-inflate these 0-byte gzip members; see the final report). `day`, `eve` and
-`night` share the layout. The race picks the folder by time of day.
+empty (0-byte) placeholder in all three folders (it reads as an empty file;
+the tools skip it). `day`, `eve` and `night` share the layout. The race picks
+the folder by time of day (the course's Env0 flags, [course.md](course.md)).
 `eve`/`night` GTM1s are identical to each other for 285 cars and differ from
 `day` (re-baked darker palettes, one more texture per set, more materials).
 `menu/cars/<id>` is the same container with a smaller, single-texture-set
@@ -53,13 +53,16 @@ Wheel positions were **not** found here.
 
 ```
 0x00 "GTTR"  0x0C u32 size  0x10 u32 texture repeats around the tread (2 or 1)
-0x14 u32 flags (0, 1, 3)  0x18 f32 8.0  0x1C u32 0x20 (Tex1 offset)
-0x20 Tex1 set (one 128x64 T4 texture: tread in the top half, sidewall lettering below)
+0x14 u32 flags  0x18 f32 the tyre material's shininess (8.0)  0x1C u32 0x20 (Tex1 offset)
+0x20 Tex1 set (one T4 texture, 128x64 in cars/, 256x128 in menu/cars/: tread in
+     the top half, sidewall lettering below)
 ```
-The `tire/n1..n49` files have the same structure; the embedded one equals
-`tire/n1`. There is no tyre geometry: the game builds a ring mesh (18/12/8
-segments for LOD 0-2, a disc for LOD 3) from the size parameters. The decoder
-generates a 32-segment tread band + sidewalls.
+Flags: bit 0 the race's spin blur (the texture redrawn as shifted copies while
+the wheel turns; not reproduced), bit 1 a symmetric tyre (below). On the disc
+(repeats, flags) are (2, 0) on 227 cars, (1, 1) on 52 and (1, 3) on 7. The
+`tire/n1..n49` files have the same structure; the embedded one equals
+`tire/n1`. There is no tyre geometry: the game builds it (see "Tyres" below,
+`tyre_model.*`).
 
 ### GTTW (wheel) — also `wheel/<id>`
 
@@ -92,7 +95,7 @@ place by the game (header `+0x04` holds the relocation base at run time).
 0x18 u16 texture LOD count     0x30 u32 -> bounding spheres, 16 bytes per node (centre xyz, radius)
 0x1A u16 count for 0x38        0x34 u32 -> per-texture-LOD tables of Tex1 offsets (0 for cars)
                                0x38 u32 -> ? (cars: 0x1E0, small table)
-                               0x3C u32 -> texture animation list (0 for cars)
+                               0x3C u32 -> animation list (0 for cars; course.md)
 ```
 
 Car bodies have 7 nodes. Node 0 is the body (3 LODs, or 4 for a few cars).
@@ -124,7 +127,7 @@ the node is drawn. Operand sizes (bytes after the opcode); all
 | 01 | 0 | no-op |
 | 02 / 03 | u8 / u16 | call node |
 | 04 / 05 | u8 / u16 | draw chunk |
-| 06 | s16, u8 n, s16 rel[n] | switch on a runtime selector (e.g. lamp on/off variants); out of range = skip |
+| 06 | u16 id, u8 n, s16 rel[n] | switch on the model's callback value `id` (out of range = skip). Cars: id 0 = the brake pedal (branch 1: lit lenses); ids 1-5 set the phase of the next op 0x35 (below) and give 0 |
 | 07 | 16 B sphere, u8 n, s16 rel[n] | LOD switch, branch = min(lod, n-1) |
 | 08 / 09 | s8 / s16 | relative jump |
 | 0A | u8 n, n×12 B points, s16 skip | bounding-box cull; skip if fully outside |
@@ -138,12 +141,13 @@ the node is drawn. Operand sizes (bytes after the opcode); all
 | 17, 18, 1A, 1B, 1D, 1E, 22, 23, 25, 26, 2D, 2E, 30 | 0 | render state toggles |
 | 19, 1F, 29, 2A, 2F | u8 | render state |
 | 1C, 20 | u8 u8 | render state |
-| 21, 24, 32, 36 | 4 B | render state (24: inverted u32 colour; 32 / 36: f32 reflection rows C1 / C0, below) |
+| 21, 24, 32, 36 | 4 B | render state (24: FBMSK, below; 32 / 36: f32 reflection rows C1 / C0, below) |
 | 27, 34 | f32 | |
 | 28, 33, 37 | 16 B | (33 / 37: vec4 reflection rows C1 / C0, e.g. 0.8,0.8,0.8,0) |
 | 31 | 12 B | |
 | 2B / 2C | u8 / u16 | select texture set (index into 0x2C, or the 0x34 table of the active texture LOD) |
-| 35 | u16 base, u16 count | draw an animated chunk range (morphing parts, e.g. pop-up lamps) |
+| 34 | f32 | phase (clamped 0..1) of the next op 0x35 |
+| 35 | u16 base, u16 count | draw an animated chunk range: chunk base + min(phase x count, count - 1), morphed by the fraction (course.md "+0x3C") |
 
 Render-state ops that matter for cars (each sets GS drawing state):
 
@@ -155,16 +159,34 @@ Render-state ops that matter for cars (each sets GS drawing state):
 | 20 m, f | ALPHA = m (A\|B<<2\|C<<4\|D<<6), FIX = f | 0x44 = (Cs-Cd)·As+Cd for glass/decals, 0x58 = Cs·Ad+Cd for reflections |
 | 24 v | FRAME.FBMSK = v | 0xFF000000 = colour only (glass, decals keep the reflectivity alpha), 0xFFFFFFFF = depth only, 0 = all |
 | 17 / 18 | depth test on / off (17 only when depth testing is enabled globally) | |
+| 19 f | TEST.ZTST from f: 0 NEVER, 1 ALWAYS, 2 GREATER, 3 GEQUAL | not used by ml0002 (nor Laguna Seca's scenery) |
+| 27 / 28 | depth offsets: 27 adds an f32 in Z units; 28 the projected depth difference of two points from its operands | not used by ml0002 (nor Laguna Seca's scenery); not decoded |
 | 25 / 26 | ZBUF.ZMSK on / off (depth write off / on) | shadow nodes |
 | 2D / 2E | back-face culling on / off | |
 | 2F a | TEST.AFAIL = a & 3 (0 KEEP, 1 FB_ONLY, 2 ZB_ONLY, 3 RGB_ONLY) | courses (foliage) |
 
 The entry state of a node program stream (also for course scenery) is: depth
-test per the global flag, ATE on, DATE off, culling on, ALPHA 0x44, depth write
-on, FBMSK 0, ATST GREATER AREF 0x20, DATM 1, AFAIL KEEP.
+test per the global flag, ZTST GEQUAL, ATE on, DATE off, culling on, ALPHA 0x44,
+depth write on, FBMSK 0, ATST GREATER AREF 0x20, DATM 1, AFAIL KEEP.
+
+The Z buffer is PSMZ24, written as Z = Zmax/2 · (1 − z/w) + 1 for the projected
+z/w in −1..1: its maximum at the near plane, 0 at the far plane. With every pass
+tested GEQUAL, a second pass over the same vertices passes on equal depth. Decals
+are not such passes: they are their own geometry 1-8 mm above the body (ml0002's
+sidepod and engine cover decals), so they need the depth to resolve millimetres at
+the replay cameras' 100-150 m telephoto distances (docs/dev/RENDERING.md, coordinate
+conventions).
 
 Programs leave ATE on with (GREATER, 0x20) and DATE off when they end (1581
 of 1607 car/wheel streams), so that is the entry state the decoder assumes.
+
+The game sets that state once per model draw and runs the nodes one after
+another without resetting it, so a node's state changes stay in force for the
+nodes after it (a node called with op 02 / 03 starts from the entry state
+again). The decoder starts every node from the entry state; with
+`gtm1::Options::carry_state` it carries the state from node to node instead
+(the licence course line, course slot 27, sets its state in a node of its own:
+[course.md](course.md) "Course line").
 
 **What this means for car rendering:** body textures carry a *reflectivity*
 in their alpha (texel alpha 0 = hole, otherwise 0x21..0x80). The opaque body
@@ -195,8 +217,9 @@ field that holds them. Ops 0x0C and 0x10 (matrices) appear in a few cars only
 ```
 0x00 u32 0, u32 0
 0x08 u16 flags        low byte: 0 = colour+UV (unlit), 1 = normal+UV (lit),
-                      2 = colour + normal in the UV slot (reflection pass), 4/5 = variants,
-                      0x41 = morph (2 key frames); high byte 0/1/2 = ?
+                      2 = colour + normal in the UV slot (reflection pass), 4 = specular
+                      pass, 5 = shadow, 0x41 = morph (2 key frames); high byte bit 0 =
+                      lit colour at scale 255 (below); kinds: course.md "Chunk flags"
 0x0A u16 packet count
 0x0C u16 total vertices
 0x0E u16 total triangles
@@ -243,7 +266,9 @@ The exponent p is quantised from the shininess: < 6 → 4, 6-12 → 8, ≥ 12 �
 The specular term is used only when Ms and some light's specular are non-zero.
 
 Reflection passes (texture field 0x1FF) sample a 256×256 sphere map of the
-course that the race renders every frame from the focus car (0.8 m above it).
+course that the race renders every frame from the focus car (0.8 m above it):
+the course's small sky dome (slot 23) and its reflection scenery (slot 5), see
+[course.md](course.md).
 UVs: R = reflect(V, N) in view space, m = √(Rx² + Ry² + (Rz + 1)²),
 s = 0.5 + 0.5·Rx/m, t = 0.5 − 0.5·Ry/m. Colour = vertex colour × (C0 + C1 ·
 min(V̂·N, 0)) × K per channel, with C0 set by op 0x36 (f → (f, f, f, 1)) /
@@ -332,16 +357,21 @@ car that uses the model):
 | value | source |
 |---|---|
 | wheelbase | table 3 (`ch_`) u16 mm at +0x18 |
-| front / rear track | table 5 (`rm_`) u16 mm at +0x32 / +0x34 (centreline to centreline) |
+| front / rear tread | table 5 (`rm_`) u16 mm at +0x32 / +0x34 |
+| front / rear tread offset | table 5 (`rm_`) s8 mm at +0x3D / +0x3E (per side) |
 | tyre size | tables 28/29 (`ft_`/`rt_`) u64 size id at +0x18 → table 25 (`sz…`): u8 +0x08 rim inches, +0x09 aspect/5, +0x0A width/5 mm |
 
 width W = w mm, sidewall sw = W · aspect %, outer radius R = rim · 25.4 mm / 2 + sw.
+The track (hub to hub) is the tread less twice the offset: the game draws each
+hub the offset inboard of half the tread, in the menus and in races. 71 of
+the 244 cars have an offset (front −29..40 mm, rear 0..40 mm); the SLK 230's
+1488 / 1485 mm treads with 35 / 20 mm give 1418 / 1445 mm.
 Wheel *i*: axle i >> 1, side i & 1 (left = -X). Centre = (±track/2, R,
 ∓wheelbase/2) with the front at -Z. The rim model is scaled by R - 0.75·sw and
 offset by -W/2 along X (outer face at the outer sidewall). Right wheels are
-rotated 180° about Y. Example `am0006`: wheelbase 2.611, track 1.548/1.566,
-285/45R18 → R 0.357 m, W 0.285 m. When no database entry exists, the loader
-estimates from the body bounds.
+rotated 180° about Y. Example `am0006`: wheelbase 2.611, track 1.548/1.566 (no
+offset), 285/45R18 → R 0.357 m, W 0.285 m. When no database entry exists, the
+loader estimates from the body bounds.
 
 The decoder's wheel centres (y = R over a body whose lowest point is at y = 0)
 are a static layout. GT3 itself puts the model origin at the physics body
@@ -353,9 +383,90 @@ swing arm spec 0x38/0x39 as the wheel moves), z = ∓wheelbase/2. Its showroom
 uses x′ = x_s and lifts the body by q so the tyres touch the floor. See
 docs/dev/RACE.md "Car placement".
 
+## Tyres (`tyre_model.*`)
+
+The game builds each tyre around its hub from R, W and the rim radius
+b = R − 0.75·sw, in the wheel's frame (axle along X, the outer face towards −X
+for a left wheel; right wheels turn half a turn about Y like the rim). Angle
+index i of N gives θ = 2πi/N and a point (x, r sin θ, r cos θ).
+
+| Detail | Segments N | Shoulder | Inner faces | Band | Outer face |
+|---|---|---|---|---|---|
+| menus (showroom) | 30 | yes | yes | yes | 1 mm inboard of the rim face |
+| race level 0 | 18 | yes | yes | yes | 4 mm outboard of it |
+| race level 1 | 12 | yes | yes | no | 4 mm outboard |
+| race level 2 | 8 | no | no | no | 4 mm outboard |
+
+(The race picks its level from the tyre's size on screen; a farther level 3,
+a black hexagonal drum, and level 2's hexagon in place of the rim are not
+reproduced; GT3 Revisited uses the body's level.)
+
+- **Textured pieces**, lit with the tyre material (ambient 0.3, diffuse 0.15,
+  specular 0.9, shininess GTTR +0x18), the texture modulated, repeating round
+  the tyre and clamped across, **without mipmaps**:
+  - the tread at r = R, from the shoulder (x_o + h) to the inner face (+W/2);
+  - the shoulder, a 45° chamfer from (x_o, R − h) to (x_o + h, R), with
+    h = k (R − b), k = 0.25 (0.3 for a symmetric tyre);
+  - the outer sidewall, a flat ring at x_o = −W/2 + the inset, from b to R − h.
+
+  Without a shoulder the tread starts at x_o and the sidewall reaches R.
+  Texture T (0 = the image's top): tread 0.5 at the shoulder → 0 at the inner
+  edge, shoulder 0.625 → 0.5, sidewall 1.0 at the rim → 0.625 (without a
+  shoulder both meeting edges take 1 − 0.375/(1 − k)). S = φ + i·repeats/N,
+  running up round a right wheel's tread and down round a left one's, down
+  round every sidewall; φ is drawn at random per tyre. Normals across the
+  profile (x, radial): tread (−0.383, 0.924) at the shoulder edge and (0, 1)
+  at the inner edge; shoulder (−0.924, 0.383) → (−0.383, 0.924); sidewall
+  (−0.707, −0.707) at the rim → (−0.924, 0.383) (without a shoulder 0.707s).
+- **Black, unlit faces**: a disc closing the inner face (radius R) and, with
+  the inner faces, the same disc facing out (seen between the rim's spokes)
+  and the tread seen from inside.
+- **Symmetric tyre** (flag bit 1): the shoulder and sidewall are mirrored on
+  the inner side too (the tread stops at +W/2 − h), the disc reaches only b,
+  and there is no band.
+- **Band** (the arch shade): half a ring over the top, i = 0..N/2, at
+  y = R sin θ + 0.003, z = √(R² + W²/4) cos θ, from x = −W/2 + 0.02 (alpha 0)
+  to +W/2 + 0.02 (alpha A). A = 256 − ⌊(i − s)² · 256 / s²⌋ (s = N/4 + 1,
+  whole numbers; 0 at both ends; clamped to 0..255). Black, blended
+  Cd · (1 − A/128) and clamped, so it is fully black where A passes 128;
+  depth tested, no depth write. It does not turn with the wheel.
+
+For the SLK 230's front 205/55R16 in the menus: R 0.316, b 0.231, h 0.021;
+the outer face at −0.1015 m from the hub.
+
+## Callback morphs (mud flaps, aerials, steering)
+
+Seven cars draw parts with op 0x06 ids 1-5 followed by op 0x35 `base, count`: that id's value,
+clamped to 0..1, is the phase: chunk base + min(phase x count, count - 1), morphed towards its
+second key frame by the fraction. The game's car code sets the values every frame:
+
+- ids 1-4: the four wheels' flap pendulums (FL, FR, RL, RR), 0.5 + 0.5 x. x in [-1, 1] is a damped
+  spring (stiffness 100, damping 5 per unit) driven by 5 x the longitudinal acceleration and by
+  random kicks: 2 % of steps (scaled by the room left to swing) add (1 - x) 5 u (u the hub's
+  forward speed), and on a surface whose tyre record is not tarmac's, with the wheel loaded and
+  rolling forward, another 4 % add (1 - x) 20 w (w the rim speed). It stops at +-1.
+- id 5: the steering, 0.5 + 0.5 x steering angle / full lock (0.5 = straight ahead).
+- Before a race sets them (the menus): 0 for ids 1-4, 0.5 for id 5.
+
+| model | car | ids (LOD 0; LOD 1 alike) | part |
+|---|---|---|---|
+| la0008 | Stratos Rally Car | 4 | a rear mud flap (its other morph draw keeps a fixed op 0x34 phase of 0) |
+| la0011 | Delta HF Integrale Rally Car | 3, 4 | the rear mud flaps |
+| ty0032 | Celica Rally Car | 1, 2, 3, 4 | the four mud flaps |
+| ma0095 | 787B | 1, 2 | aerials |
+| ma0099 | RX-7 LM Race Car | 3, 4 | aerials |
+| ml0003 | F090/S | 5 | the driver's arms and steering wheel |
+| pd0010 | Sample 010 | 5 | as ml0003 |
+
+Car models' +0x3C animators (type 7, mostly without targets) are never advanced by the game.
+
+Ours: `gtm1::RunParams::callback` (op 0x06 ids 1-5), `gtm1::MorphDraws` (`Options::morphs`,
+`CarModelOptions::morphs`: the draws left out of the body), `model::flap_step` and
+`sim::WheelState::flap` / `VehicleState::steer`, `race::car_callback_values` and
+`race::CarVisual`'s morph models (one per drawing of the car, rebuilt when the values change).
+
 ## Open questions
 
 - The rest of the chunk flag high byte, and the render-state ops (renderer domain).
 - What changes geometrically between `day` and `eve`/`night` models.
-- Morph chunks (op 0x35, flag 0x41/0x20: pop-up lamps, wings): only key frame
-  0 is decoded; the game blends key k and k+1 by a factor.
+

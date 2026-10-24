@@ -22,6 +22,7 @@ class Vfs;
 }
 namespace gt3r::render {
 struct DrawOptions;
+struct ItemLights;
 }
 
 namespace gt3r::race {
@@ -33,12 +34,19 @@ struct SunParams {
     int style = 0;
     float test_box = 0;
     // Env0 fog (+0x60 RGB, +0x70 distance A, +0x74 minimum visibility b; b >= 1 = none)
-    // and the colour-grade pass (flag 0x80: +0x980..988 curve g per channel, +0x994 saturation).
+    // and the colour-grade pass (flag 0x80; its values, also the replay shots' defaults,
+    // presentation §G6: +0x980..988 curve g per channel, +0x98C / +0x990 the levels' black and
+    // white, +0x994 saturation).
     bool has_env = false;
     std::array<float, 3> fog_rgb{};
     float fog_a = 0, fog_b = 1;
+    // The rear-view mirror's fog: Env0 +0xA90 RGB, +0xAA0 distance A, +0xAA4 minimum visibility b
+    // (A = 0: a constant visibility b).
+    std::array<float, 3> mirror_fog_rgb{};
+    float mirror_fog_a = 0, mirror_fog_b = 1;
     bool grade = false;
     std::array<float, 3> grade_g{0.5f, 0.5f, 0.5f};
+    float grade_black = 0, grade_white = 1;
     float saturation = 1;
     // Car lighting (Env0 car light 0 and global ambient; GT3 lights car bodies with these and the
     // car's material: see scene::Material).
@@ -56,6 +64,18 @@ struct SunParams {
     // Scene light 0's direction (Env0 +0xAD0): the course pylons' planar shadows are projected
     // along it.
     std::array<float, 3> scene_light0_dir{0, 1, 0};
+    // The scene lights (Env0 +0xAD0 + 0x50 n: direction towards the light, ambient +0x10,
+    // diffuse +0x20, specular +0x30), enabled by +0x10 bits 11..14: the lights of the course's
+    // own lit packets (docs/formats/course.md "Lighting"); the car lights above light the cars.
+    struct SceneLight {
+        std::array<float, 3> dir{}, ambient{}, diffuse{}, specular{};
+    };
+    std::array<SceneLight, 4> scene_lights{};
+    u32 scene_light_mask = 0; // bit n: scene light n enabled
+    // The panoramic environment lookup (course chunk kind 3): Env0 +0xEC0 / +0xEC4.
+    std::array<float, 2> panorama{4.0f, 0.25f};
+    // The course scenery's light set as GT3's renderer holds it while the course is drawn.
+    void course_lights(render::ItemLights& out) const;
     float sky_yaw = 0, sky_pitch = 0; // Env0 +0x28 / +0x48 (degrees): the reflection map's sky dome rotation
     // Car light scaling by the road shade (a sun, b sky): s = P2 + (1 - P2) b (1 - (1 - P1)(1 - a))
     // with (P1, P2) = +0xAC8/+0xACC ambient, +0xAB4/+0xABC diffuse, +0xAC0/+0xAC4 specular.

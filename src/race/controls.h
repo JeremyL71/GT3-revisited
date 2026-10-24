@@ -49,7 +49,7 @@ public:
     void reset();
 
     ControlConfig& config() { return cfg_; }
-    // The pad record kind of the last update (spec §4.4): 2 analog stick, 3 digital (d-pad).
+    // The pad record kind of the last update (physics §4.4): 2 analog stick, 3 digital (d-pad).
     int kind() const { return kind_; }
     // Reverse requested by the last update() (pass to RaceVehicle::set_reverse_request).
     bool reverse() const { return reverse_; }

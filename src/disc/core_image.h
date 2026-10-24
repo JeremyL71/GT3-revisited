@@ -12,8 +12,9 @@ namespace gt3r {
 //     0x100  u32[5] header: ?, segment count, entry, load address, size
 //     0x114  program image, loaded at `load_address`
 //
-// This is used only for identification and as a reverse-engineering
-// reference via gt3tool; the engine never executes it.
+// The engine never executes it. It identifies the disc, and GtData::load reads one
+// data table from it (the built-in record names, found by a pattern search). gt3tool's
+// `core` command (GT3R_PROGRAM_TOOLS builds only) writes the unpacked image.
 struct CoreImage {
     u32 entry_point = 0;
     u32 load_address = 0;

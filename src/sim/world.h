@@ -1,9 +1,9 @@
 #pragma once
 
 // Several cars stepped together in the order the spec gives
-// (§1.2: each phase runs for all cars before the
-// next): slipstream factors for every car (§5.2), then each car's tick
-// (with its own walls, §5.3), then swept car-to-car contact (§5.3: up to 2
+// (physics §1.2: each phase runs for all cars before the
+// next): slipstream factors for every car (physics §5.2), then each car's tick
+// (with its own walls, physics §5.3), then swept car-to-car contact (physics §5.3: up to 2
 // iterations, impulse with restitution 0.5, no friction, overlap split half
 // and half), only when
 // enabled (the game enables it in modes with opponents).
@@ -46,7 +46,7 @@ public:
     void set_kinematic(int i, bool on) { cars_[size_t(i)].kinematic = on; }
     bool kinematic(int i) const { return cars_[size_t(i)].kinematic; }
 
-    // Per-car time scale (spec §1.1 dt_car = scale / 60; GT3's rubber band
+    // Per-car time scale (physics §1.1 dt_car = scale / 60; GT3's rubber band
     // writes it): 1 = normal.
     void set_time_scale(int i, float scale) { cars_[size_t(i)].time_scale = scale; }
     float time_scale(int i) const { return cars_[size_t(i)].time_scale; }

@@ -136,10 +136,30 @@ Bytes Replay::serialize() const {
     w.str(car_model);
     w.str(wheel);
     w.put<s64>(saved);
-    {
-        Bytes sb = spec ? sim::serialize_car_spec(*spec) : Bytes{};
+    auto put_spec = [&](const std::shared_ptr<const sim::CarSpec>& sp) {
+        Bytes sb = sp ? sim::serialize_car_spec(*sp) : Bytes{};
         w.put<u32>(u32(sb.size()));
         w.out.insert(w.out.end(), sb.begin(), sb.end());
+    };
+    put_spec(spec);
+    w.put<u32>(condition.odometer);
+    w.put<float>(condition.wear_m);
+    w.put<float>(condition.oil_m);
+    auto rule = [](const std::optional<bool>& b) { return u8(!b ? 0 : *b ? 2 : 1); };
+    w.put<u8>(u8(rule(grid_by_power) | rule(cpu_respawn) << 2));
+    if (!car2.empty()) {
+        w.put<u8>(battle ? 1 : 0);
+        if (battle) {
+            const ReplayBattle& b = *battle;
+            w.put<u16>(u16(std::clamp(b.laps, 0, 0xFFFF)));
+            w.put<float>(b.boost_amount), w.put<float>(b.boost_start), w.put<float>(b.boost_full);
+            w.put<float>(b.handicap_m);
+            w.put<u8>(b.tyre_damage ? 1 : 0);
+            w.str(b.model2);
+            w.str(b.wheel2);
+            w.put<u8>(u8(std::clamp(b.paint2, 0, 255)));
+            put_spec(b.spec2);
+        }
     }
     for (size_t i = 0; i < inputs.size(); ++i) {
         const sim::ControlInputs& in = inputs[i];
@@ -148,7 +168,7 @@ Bytes Replay::serialize() const {
         w.put<u16>(q_pedal(in.throttle));
         w.put<u16>(q_pedal(in.brake));
         w.put<u8>(u8((in.handbrake ? 1 : 0) | (in.shift_up ? 2 : 0) | (in.shift_down ? 4 : 0) | (in.automatic ? 8 : 0) | (in.controller_kind == 2 ? 16 : 0) | (in.controller_kind == 3 ? 32 : 0) |
-                     (dk == 1 ? 64 : 0) | (dk == 5 ? 128 : 0)));
+                     (dk == 1 ? 64 : dk == 5 ? 128 : dk == 8 ? 192 : 0)));
     }
     if (!car2.empty())
         for (size_t i = 0; i < inputs.size(); ++i) {
@@ -167,6 +187,15 @@ Replay Replay::parse(ByteSpan data) {
     Replay rp;
     u32 version = r.get<u32>();
     if (version < 1 || version > kVersion) throw FormatError("unsupported replay version " + std::to_string(version));
+    auto get_spec = [&]() -> std::shared_ptr<const sim::CarSpec> {
+        u32 ns = r.get<u32>();
+        if (ns > data.size()) throw FormatError("replay truncated");
+        if (!ns) return nullptr;
+        if (std::optional<sim::CarSpec> sp = sim::parse_car_spec(r.bytes(ns)))
+            return std::make_shared<const sim::CarSpec>(std::move(*sp));
+        LOG_WARN("Replay: car spec not readable (the database car is used)");
+        return nullptr;
+    };
     u32 n = r.get<u32>();
     rp.tick_hz = r.get<double>();
     if (!(rp.tick_hz > 1 && rp.tick_hz < 10000)) throw FormatError("bad replay tick rate");
@@ -206,15 +235,31 @@ Replay Replay::parse(ByteSpan data) {
         rp.car_model = r.str();
         rp.wheel = r.str();
         rp.saved = r.get<s64>();
-        u32 ns = r.get<u32>();
-        if (ns > data.size()) throw FormatError("replay truncated");
-        if (ns) {
-            ByteSpan sb = r.bytes(ns);
-            if (std::optional<sim::CarSpec> sp = sim::parse_car_spec(sb))
-                rp.spec = std::make_shared<const sim::CarSpec>(std::move(*sp));
-            else
-                LOG_WARN("Replay: car spec not readable (the database car is used)");
+        rp.spec = get_spec();
+    }
+    if (version >= 8) {
+        rp.condition.odometer = r.get<u32>();
+        rp.condition.wear_m = r.get<float>();
+        rp.condition.oil_m = r.get<float>();
+    }
+    if (version >= 9) {
+        auto rule = [](u8 v) { return v == 0 ? std::nullopt : std::optional<bool>(v == 2); };
+        u8 f = r.get<u8>();
+        rp.grid_by_power = rule(f & 3), rp.cpu_respawn = rule((f >> 2) & 3);
+        if (!rp.car2.empty() && r.get<u8>()) {
+            ReplayBattle b;
+            b.laps = r.get<u16>();
+            b.boost_amount = r.get<float>(), b.boost_start = r.get<float>(), b.boost_full = r.get<float>();
+            b.handicap_m = r.get<float>();
+            b.tyre_damage = r.get<u8>() != 0;
+            b.model2 = r.str();
+            b.wheel2 = r.str();
+            b.paint2 = r.get<u8>();
+            b.spec2 = get_spec();
+            rp.battle = std::move(b);
         }
+    } else if (version >= 7) {
+        rp.grid_by_power = rp.kind == ReplayKind::GtRace;
     }
     if (size_t(n) * 7 > data.size()) throw FormatError("replay truncated");
     rp.inputs.reserve(n);
@@ -227,7 +272,7 @@ Replay Replay::parse(ByteSpan data) {
         in.handbrake = f & 1, in.shift_up = f & 2, in.shift_down = f & 4, in.automatic = f & 8;
             in.controller_kind = (f & 16) ? 2 : (f & 32) ? 3 : 0;
         rp.inputs.push_back(in);
-        rp.driver_kind.push_back(u8((f & 64) ? 1 : (f & 128) ? 5 : 0));
+        rp.driver_kind.push_back(u8((f & 192) == 192 ? 8 : (f & 64) ? 1 : (f & 128) ? 5 : 0));
     }
     if (!rp.car2.empty())
         for (u32 i = 0; i < n; ++i) {
@@ -266,7 +311,8 @@ sim::ControlInputs ReplayRecorder::record(const sim::ControlInputs& in) {
 void ReplayRecorder::set_driver_kind(int kind) {
     if (!active_ || replay_.inputs.empty()) return;
     replay_.driver_kind.resize(replay_.inputs.size(), 0);
-    replay_.driver_kind.back() = u8(kind == 1 || kind == 5 ? kind : 0);
+    // Kinds 5-7 (the stop driver) take the same physics path; 2-4 (the pit lane) are re-run.
+    replay_.driver_kind.back() = u8(kind == 1 || kind == 8 ? kind : kind >= 5 && kind <= 7 ? 5 : 0);
 }
 
 sim::ControlInputs ReplayRecorder::record_second(const sim::ControlInputs& in) {

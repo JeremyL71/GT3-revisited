@@ -18,16 +18,20 @@
 #include "race/ghost.h"
 #include "race/results.h"
 #include "formats/menu/mbl.h"
+#include "formats/menu/pmb.h"
 #include "race/hud.h"
 #include "race/license.h"
 #include "race/paint.h"
 #include "race/race_panels.h"
 #include "race/interp.h"
+#include "race/lamp_glows.h"
 #include "race/race_audio.h"
 #include "race/replay.h"
 #include "race/replay_cameras.h"
 #include "race/pylons.h"
 #include "race/road_shade.h"
+#include "race/sun_glare.h"
+#include "render/view3d.h"
 #include "race/tyre_smoke.h"
 #include "race/arcade_car.h"
 #include "menu/flow/game_hooks.h"
@@ -38,9 +42,11 @@
 #include "track/track.h"
 #include "vfs/vfs.h"
 
+#include <algorithm>
 #include <cmath>
 #include <set>
 #include <cstdlib>
+#include <cstring>
 
 using namespace gt3r;
 using namespace gt3r::race;
@@ -144,6 +150,15 @@ TEST(race_camera_views) {
     CHECK(!c.onboard());
     c.set_intro(false, 1.0f);
     CHECK(c.onboard());
+    // The shot by the frames left to the start signal C: from a race's 10 s hold (C 600, t 0.1)
+    // to C 60 (t 1), then the player's view; 1 s dissolves at C 180 and 120 (t 0.8 and 0.9, the
+    // shot's own cuts) and 60 (the cut away). A licence test's 4 s hold starts at t 0.7.
+    CHECK(start_shot_on(600) && start_shot_on(60) && !start_shot_on(59) && !start_shot_on(0));
+    CHECK(near(start_shot_t(600), 0.1f) && near(start_shot_t(240), 0.7f) && near(start_shot_t(180), 0.8f) &&
+          near(start_shot_t(120), 0.9f) && near(start_shot_t(60), 1.0f));
+    int dissolves = 0;
+    for (int f = 600; f > 0; --f) dissolves += start_shot_dissolve(f);
+    CHECK(dissolves == 3 && start_shot_dissolve(180) && start_shot_dissolve(120) && start_shot_dissolve(60));
     CameraRig g;
     g.set_gt3_views(true);
     g.next_mode();
@@ -203,7 +218,7 @@ TEST(race_control_mapper) {
     CHECK(m.update(pad_with(PadButton::L2, 255), dt).shift_down);
     CHECK(!m.update(pad_with(PadButton::R1, 255), dt).shift_up); // R1 is the camera
     // D-pad: the digital pad (kind 3) asks for full lock; the physics turns the wheel in at
-    // the digital rate (spec §4.4). Released: centre.
+    // the digital rate (physics §4.4). Released: centre.
     m.reset();
     float s = m.update(pad_with(PadButton::Right, 255), dt).steer;
     CHECK(s == 1.0f && m.kind() == 3);
@@ -333,7 +348,9 @@ TEST(race_course_render_state) {
         size_t sheen_prims = 0, masked = 0, total = 0;
         for (const scene::Mesh& mesh : m.meshes)
             for (const scene::Primitive& p : mesh.primitives) {
-                if (!((p.flags & scene::kAdditive) && (p.flags & scene::kEnvironmentMap))) continue;
+                if (!((p.flags & scene::kAdditive) && (p.flags & scene::kDestAlphaAdd))) continue;
+                // The sheen (chunk kind 4): lit by its specular-only program, not unlit.
+                if (p.material.specular_local) CHECK(p.material.valid && !(p.flags & scene::kUnlit));
                 ++sheen_prims;
                 for (u32 i = p.first_index; i < p.first_index + p.index_count; ++i) {
                     ++total;
@@ -342,6 +359,31 @@ TEST(race_course_render_state) {
             }
         CHECK(sheen_prims > 0);
         if (std::string(name).find("trialmt") != std::string::npos) CHECK(masked > 0 && masked < total);
+    }
+}
+
+TEST(race_course_opaque_packets_whole) {
+    // Opaque packets whose program turns the GS alpha test off draw every texel, whatever their
+    // texel alpha: Route 11's perforated wall panels (set 3 #13: alpha only on the frame, the
+    // weight of their orange kind-2 pass) and Laguna's wall banners (alpha 0x40 throughout).
+    Disc* disc = test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    for (const auto& [name, tex] : {std::pair<const char*, const char*>{"courses/US/route11", "set3_13"},
+                                    {"courses/US/laguna", "set4_7"}}) {
+        Bytes data = disc->volume().read(*disc->volume().find(name));
+        course::CourseModelOptions o;
+        o.reflections = true, o.frame_alpha = true;
+        scene::Model m = course::build_course_model(data, o, name);
+        size_t prims = 0, cut = 0;
+        for (const scene::Mesh& mesh : m.meshes)
+            for (const scene::Primitive& p : mesh.primitives) {
+                if (p.texture < 0 || m.textures[size_t(p.texture)].name != tex) continue;
+                if (p.flags & (scene::kAlphaBlend | scene::kAdditive | scene::kEnvironmentMap)) continue;
+                ++prims;
+                if (p.flags & scene::kAlphaTest) ++cut;
+            }
+        CHECK(prims > 0);
+        CHECK(cut == 0);
     }
 }
 
@@ -526,13 +568,48 @@ TEST(race_replay_cameras) {
     for (float s = 0; s < road.length; s += 20) {
         sim::Vec3 p = t->point_at(s);
         render::Vec3 car{p.x, p.y, p.z};
-        ReplayDirector::Shot shot = d.update(s, 0, car, 1.0 / 60, 16.0f / 9.0f);
+        ReplayDirector::Shot shot = d.update(s, 1, car, 1.0 / 60, 16.0f / 9.0f); // (lap 1)
         if (!shot.valid || shot.onboard) continue;
         ++shots;
         if (render::length(shot.eye - car) < 160) ++near_ok;
     }
     std::printf("replay cameras: %d shots, %d within 160 m\n", shots, near_ok);
     CHECK(shots > 150 && near_ok * 20 >= shots * 19);
+}
+
+// The arcade time-trial demonstrations' first shots (presentation §H8): a flying start before
+// the line has lap variant 0 (D = s), so the script's start records take the car once it is
+// past their start; further back the camera turns on board (the in-car view), then another lap
+// variant's record at u <= 0.6, or none.
+TEST(race_replay_demo_openings_disc) {
+    Disc* disc = test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    struct Opening {
+        const char* course;
+        float before_line; // the demo's start, metres before the line
+        int first;         // its first shot's record (-1: on board)
+        int second;        // the next frame's (-1: on board)
+    };
+    const Opening openings[] = {
+        {"laguna", 149, 0, 0},   // AT05
+        {"midfield", 199, 5, 5}, // AT01 (its start records reach 1217 m back)
+        {"akasaka", 199, -1, 25}, // AT03: variant 1's record at the lap's end
+        {"trialmt", 129, -1, 21}, // AT02
+        {"deepforest", 199, -1, -1}, // AT04: no variant's record at u <= 0.6
+    };
+    for (const Opening& o : openings) {
+        Bytes data = disc->volume().read(*disc->volume().find(std::string("courses/US/") + o.course));
+        course::CourseFile f = course::CourseFile::parse(data);
+        GtrcScript g = GtrcScript::parse(f.section(data, course::kSlotReplayCameras));
+        ReplayDirector d(&g);
+        const float s = g.lap_length - o.before_line;
+        ReplayDirector::Shot a = d.update(s, 0, {0, 0, 0}, 1.0 / 60, 16.0f / 9.0f);
+        const int first = d.on_board() ? -1 : a.record;
+        ReplayDirector::Shot b = d.update(s + 0.5f, 0, {0, 0, 0}, 1.0 / 60, 16.0f / 9.0f);
+        const int second = d.on_board() ? -1 : b.record;
+        std::printf("demo opening %s -%.0f m: %d, %d\n", o.course, o.before_line, first, second);
+        CHECK(first == o.first && second == o.second);
+    }
 }
 
 TEST(race_audio_models) {
@@ -607,15 +684,48 @@ TEST(race_license_car_paint_disc) {
     CHECK(not_first > 0);
 }
 
+// Which licence tests show the course line (course.md "Course line"): the line belongs to the course
+// file the event names, so it is on exactly when that file has one. B-3 .. B-8 and A-1, A-2,
+// A-3, A-6, A-7, A-8; none of the B-1, B-2, A-4, A-5 or IB / IA / S / rally tests.
+TEST(race_license_course_line_disc) {
+    Disc* disc = test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    Vfs vfs(&disc->volume());
+    data::CarDatabase db;
+    CHECK(db.load(vfs));
+    std::vector<std::string> with_line;
+    int tests = 0;
+    for (const data::Event& ev : db.events()) {
+        if (ev.label.size() != 7 || ev.label[0] != 'L') continue;
+        ++tests;
+        const Volume::Entry* e = disc->volume().find("courses/US/" + ev.course);
+        CHECK(e != nullptr);
+        if (!e) continue;
+        Bytes data = disc->volume().read(*e);
+        if (!course::course_line_model(data).meshes.empty()) with_line.push_back(ev.label);
+    }
+    std::sort(with_line.begin(), with_line.end());
+    const std::vector<std::string> expected = {"L0A0001", "L0A0002", "L0A0003", "L0A0006", "L0A0007", "L0A0008",
+                                               "L0B0003", "L0B0004", "L0B0005", "L0B0006", "L0B0007", "L0B0008"};
+    CHECK(tests == 48);
+    CHECK(with_line == expected);
+}
+
 TEST(race_tyre_and_collision_sounds) {
-    // Tarmac squeal: silent at small slip, louder and higher with lateral sliding.
-    TyreSound quiet = tyre_squeal(0, 0.5f, 0.0f, 20);
-    TyreSound slide = tyre_squeal(0, 9.0f, 0.0f, 20);
-    CHECK(quiet.vol == 0 && slide.vol > 1.0f && slide.pitch > quiet.pitch);
-    CHECK(tyre_squeal(0, 0, -0.3f, 20).vol > 1.0f); // wheelspin
-    CHECK(tyre_squeal(0, 0, 0.3f, 20).vol > 0.7f);  // locking
-    // Kerb rumble: nothing below 5 km/h, needs load.
-    CHECK(kerb_rumble(5000, 1.0f).vol == 0 && kerb_rumble(5000, 20).vol > 0.3f && kerb_rumble(0, 20).vol == 0);
+    // Tarmac squeal (the slip intensity, physics §8.3): silent at small slip, louder and higher
+    // (the skid pitch, idling at 0.75) with lateral sliding.
+    using sim::model::skid_pitch;
+    using sim::model::slip_intensity;
+    CHECK(slip_intensity(0, 0.5f, 0, 20, 4000) == 0 && slip_intensity(0, 9.0f, 0, 20, 4000) > 1.0f);
+    CHECK(near(skid_pitch(0, 0.4f, 0, 20), 0.75f) && skid_pitch(0, 9.0f, 0, 20) > 1.0f);
+    CHECK(slip_intensity(0, 0, -0.3f, 20, 4000) > 1.0f); // wheelspin
+    CHECK(slip_intensity(0, 0, 0.3f, 20, 4000) > 0.7f);  // locking
+    // Kerb rumble: nothing below 5 km/h, needs load; its pitch rises 0.5 -> 4.3 from 10 to 200 km/h.
+    CHECK(slip_intensity(1, 0, 0, 1.0f, 5000) == 0 && slip_intensity(1, 0, 0, 20, 5000) > 0.3f &&
+          slip_intensity(1, 0, 0, 20, 0) == 0);
+    CHECK(skid_pitch(1, 0, 0, 2) == 0.5f && near(skid_pitch(1, 0, 0, 60), 4.3f) && skid_pitch(13, 0, 0, 30) > 1.5f);
+    // Wet and loose classes add their offset even at rest (0.5).
+    CHECK(near(skid_pitch(3, 0, 0, 0), 0.5f) && near(skid_pitch(12, 0, 0, 0), 0.5f));
     CHECK(road_noise(0.25f, 50).vol > 0 && road_noise(0.25f, 50).vol <= 0.3f);
     // Collisions: below 0.2 strength nothing.
     CHECK(wall_strength(5000) == 0 && near(wall_strength(25000), 0.5f) && wall_strength(1e6f) == 1.0f);
@@ -1085,6 +1195,79 @@ TEST(race_hud_time_format) {
     CHECK(Hud::format_time(100000.0) == "999'59.999");
 }
 
+TEST(race_hud_speed_lines) {
+    // presentation §D4: the top-speed test's speed lines, "%.1f" (rounded) in km/h or mph,
+    // at most 999.9, dashes for none.
+    CHECK(Hud::speed_text(312.46f, false) == "312.5");
+    CHECK(Hud::speed_text(200.0f, true) == "124.3");
+    CHECK(Hud::speed_text(0.0f, false) == "---.-" && Hud::speed_text(-1.0f, true) == "---.-");
+    CHECK(Hud::speed_text(1200.0f, false) == "999.9");
+}
+
+TEST(race_hud_layout_disc) {
+    // presentation §D4: our HUD layout table is the disc's (database/racemode.db: a mode
+    // number and 32 racedetail ids; racedetail.db: id, part, sub, then valign at +0x0C,
+    // align at +0x12, view, x, y, w, h from +0x18), row for row, the empty rows left out.
+    Disc* disc = test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    Volume& vol = disc->volume();
+    Bytes mode_bytes = vol.read(*vol.find("database/racemode.db"));
+    Bytes detail_bytes = vol.read(*vol.find("database/racedetail.db"));
+    db::Table modes = db::Table::parse(mode_bytes), details = db::Table::parse(detail_bytes);
+    std::map<u64, ByteSpan> by_id;
+    for (size_t i = 0; i < details.size(); ++i) by_id[details.id_of(i)] = details.records[i];
+    const u64 none = db::id_hash("(Null)");
+    const HudMode ours[] = {HudMode::Race,         HudMode::Endurance, HudMode::License, HudMode::MachineTime,
+                            HudMode::FreeRun,      HudMode::Battle,    HudMode::BattleWide, HudMode::MachineSpeed,
+                            HudMode::Replay,       HudMode::Demo,      HudMode::FreePractice, HudMode::TimeTrial};
+    int matched = 0;
+    for (size_t m = 0; m < modes.size(); ++m) {
+        ByteSpan rec = modes.records[m];
+        const HudMode mode = HudMode(rec[8]);
+        bool used = false;
+        for (HudMode o : ours) used = used || o == mode;
+        if (!used) continue;
+        std::vector<HudRow> disc_rows;
+        for (size_t k = 0; k < 32; ++k) {
+            const u64 id = rd64(rec, 0x10 + 8 * k);
+            if (id == none) break;
+            auto it = by_id.find(id);
+            CHECK(it != by_id.end());
+            if (it == by_id.end()) continue;
+            ByteSpan r = it->second;
+            const u16 part = rd16(r, 8);
+            if (part == 0) continue;
+            disc_rows.push_back({HudPart(part), u8(rd16(r, 10)), u8(s16(rd16(r, 0x18))), s16(rd16(r, 0x1A)),
+                                 s16(rd16(r, 0x1C)), s16(rd16(r, 0x1E)), s16(rd16(r, 0x20)), r[0x12], r[0x0C]});
+        }
+        std::span<const HudRow> table = hud_layout(mode);
+        CHECK(table.size() == disc_rows.size());
+        for (size_t i = 0; i < std::min(table.size(), disc_rows.size()); ++i) {
+            const HudRow &a = table[i], &b = disc_rows[i];
+            const bool same = a.part == b.part && a.sub == b.sub && a.view == b.view && a.x == b.x && a.y == b.y &&
+                              a.w == b.w && a.h == b.h && a.align == b.align && a.valign == b.valign;
+            if (!same) std::printf("mode %d row %zu differs (part %d)\n", int(mode), i, int(b.part));
+            CHECK(same);
+        }
+        ++matched;
+    }
+    CHECK(matched == 12);
+
+    // The endurance layout is a races' matter: no licence, time trial, free run or machine
+    // test event has 10 laps or more or a time limit.
+    data::CarDatabase cars;
+    CHECK(cars.load(vol));
+    int endurance = 0;
+    for (const data::Event& e : cars.events()) {
+        const bool long_run = e.laps >= 10 || (e.bytes.size() > 0x1E4 && e.bytes[0x1E4] != 0);
+        const bool solo = e.label.rfind("AT", 0) == 0 || e.label.rfind("L", 0) == 0 || e.label == "M400" ||
+                          e.label == "M1000" || e.label == "MMAX";
+        if (long_run) CHECK(!solo);
+        endurance += long_run;
+    }
+    CHECK(endurance > 0);
+}
+
 TEST(race_demo_replay_decode) {
     Disc* disc = test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
@@ -1161,7 +1344,7 @@ TEST(race_wet_road_models_disc) {
     o.textures = false;
     scene::Model visible = course::build_course_model(data, o, "route5");
     for (const scene::Mesh& m : visible.meshes) CHECK(m.name.find("reflection") == std::string::npos);
-    o.scenery = o.extras = o.backdrop = false;
+    o.scenery = o.course_line = o.backdrop = false;
     o.road_reflection = true;
     scene::Model refl = course::build_course_model(data, o, "r");
     CHECK(!refl.meshes.empty());
@@ -1287,7 +1470,7 @@ TEST(race_two_player_drift_disc) {
     if (v2) CHECK(std::fabs(v2->spec().tire[0].mu - p2->spec.tire[0].mu) < 1e-6f && p2->spec.tire[0].mu < p1->spec.tire[0].mu);
 }
 
-// Run-up driver parameter set by course category (ai.md §9.1): tarmac 0, wet Route 5 1, dirt 2.
+// Run-up driver parameter set by course category (ai §9.1): tarmac 0, wet Route 5 1, dirt 2.
 TEST(race_driver_param_set_disc) {
     Disc* disc = test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
@@ -1470,6 +1653,21 @@ TEST(race_result_latch_exit_paths) {
         cur.abandoned = true;
         CHECK(l.for_leave(cur).abandoned && l.for_leave(cur).finished);
     }
+    // 7. The engine condition goes back as the live runs left it (physics §10.3), not as the
+    //    latch caught it: the race screen keeps the live words through replays.
+    {
+        gt3r::race::RaceResultLatch l;
+        GameResult at_finish = live();
+        at_finish.car_condition = true, at_finish.car_odometer = 2100, at_finish.odometer_added = 2000;
+        at_finish.car_wear_m = -296000, at_finish.garage_car = 3;
+        l.capture(at_finish);
+        GameResult cur = mid_replay();
+        cur.car_condition = true, cur.car_odometer = 2150, cur.odometer_added = 2050;
+        cur.car_wear_m = -295900, cur.car_oil_m = 4100, cur.garage_car = 3;
+        GameResult r = l.for_leave(cur);
+        CHECK(r.finished && r.position == 2 && r.car_condition && r.car_odometer == 2150 && r.odometer_added == 2050);
+        CHECK(r.car_wear_m == -295900 && r.car_oil_m == 4100 && r.garage_car == 3);
+    }
 }
 
 // Every item of the disc's race quick-menu layouts (menu/qm_*.mbl in the game's format, the
@@ -1508,4 +1706,135 @@ TEST(race_quick_menu_actions_disc) {
     std::printf("  %d layouts, %d items, %zu actions\n", layouts, items, actions.size());
     CHECK(layouts == 12);
     CHECK(actions.size() >= 16);
+}
+
+TEST(race_quick_menu_disable_disc) {
+    // menus §11, §5.3: every race quick menu's root page has the `disable` widget the disabled
+    // items are drawn under (black at alpha 0xB1, an icon-sized 88 x 76 mask); the item names
+    // the availability rules ask for are the disc's root-page items.
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    Vfs vfs(&disc->volume());
+    const char* const kLayouts[] = {"qm_arc_result", "qm_arc_2p_result", "qm_arc_tt_free", "qm_arc_tt_ltd",
+                                    "qm_gt_event",   "qm_gt_event_champ", "qm_gt_license",  "qm_gt_mt_1000",
+                                    "qm_gt_mt_400",  "qm_gt_mt_max",     "qm_gt_result",   "qm_gt_result_champ"};
+    std::set<std::string> items;
+    for (const char* l : kLayouts) {
+        std::optional<Bytes> pb = vfs.read(std::string("menu/US/") + l + "1.pmb");
+        std::optional<Bytes> mb = vfs.read(std::string("menu/") + l + ".mbl");
+        CHECK(pb && mb);
+        if (!pb || !mb) continue;
+        menu::PmbFile f = menu::PmbFile::parse(*pb);
+        const int root = f.find_page("root");
+        CHECK(root >= 0);
+        if (root < 0) continue;
+        const menu::Element* dis = nullptr;
+        for (const menu::Layer& ly : f.pages[size_t(root)].layers)
+            if (ly.name == "defaultLayer")
+                for (const menu::Element& e : ly.widgets)
+                    if (e.name == "disable") dis = &e;
+        CHECK(dis && dis->widget_class && *dis->widget_class == "disable" && dis->image && dis->colors);
+        if (dis && dis->colors)
+            for (const menu::Rgba& c : *dis->colors) CHECK(c.r == 0 && c.g == 0 && c.b == 0 && c.a == 0xB1);
+        if (dis) CHECK(dis->w == 88 && dis->h == 76);
+        menu::MblFile m = menu::MblFile::parse(*mb);
+        if (int p = m.find_page("root"); p >= 0)
+            for (const menu::MblItem& it : m.pages[size_t(p)].items) items.insert(it.name);
+    }
+    for (const char* i : {"replay", "save_replay", "save_ghost", "data_logger", "setting", "exit", "save_game",
+                          "free_session", "start", "demonstration", "next_session"})
+        CHECK(items.count(i) == 1);
+    // Of all the disc's items, before a time trial's first run: REPLAY, SAVE REPLAY, SAVE GHOST,
+    // DATA LOGGER and SETTING are disabled.
+    QuickMenuItems q;
+    q.visit(RunKind::TimeTrial, false, false);
+    std::set<std::string> disabled;
+    for (const std::string& i : items)
+        if (!q.enabled(i)) disabled.insert(i);
+    CHECK((disabled == std::set<std::string>{"data_logger", "replay", "save_ghost", "save_replay", "setting"}));
+}
+
+TEST(race_quick_menu_backdrop_disc) {
+    // menus §11.3, presentation §C5: the result menus (arcade race, 2P, GT race, championship)
+    // have no race behind them, and their root page's `bg` is the opaque, textured checker over
+    // the whole frame; the menus with the race behind them (time trial, free run, machine test,
+    // the GT pre-race menus) have no such layer.
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    Vfs vfs(&disc->volume());
+    // The root page's full-frame opaque textured element, if any.
+    auto opaque_bg = [&](const std::string& layout) -> std::optional<bool> {
+        std::optional<Bytes> b = vfs.read("menu/US/" + layout);
+        if (!b) return std::nullopt;
+        menu::PmbFile f = menu::PmbFile::parse(*b);
+        const int root = f.find_page("root");
+        if (root < 0) return std::nullopt;
+        for (const menu::Layer& l : f.pages[size_t(root)].layers)
+            for (const menu::Element& e : l.elements) {
+                if (!e.image || !e.colors || e.x != 0 || e.y != 0 || e.w < 640 || e.h < 448) continue;
+                bool opaque = true;
+                for (const menu::Rgba& c : *e.colors) opaque = opaque && c.a == 0xFF;
+                if (opaque) return true;
+            }
+        return false;
+    };
+    for (const char* l : {"qm_arc_result1.pmb", "qm_arc_2p_result1.pmb", "qm_gt_result1.pmb", "qm_gt_result_champ1.pmb"})
+        CHECK(opaque_bg(l) == std::optional<bool>(true));
+    for (const char* l : {"qm_arc_tt_ltd1.pmb", "qm_arc_tt_free1.pmb", "qm_gt_mt_4001.pmb", "qm_gt_mt_10001.pmb",
+                          "qm_gt_mt_max1.pmb", "qm_gt_event1.pmb", "qm_gt_event_champ1.pmb"})
+        CHECK(opaque_bg(l) == std::optional<bool>(false));
+}
+
+// race/flare.bin layout: one mesh of one 4-vertex strip (positions, strip table, colours).
+TEST(race_flare_mesh_parse) {
+    Bytes b(0x20 + 0x50, 0);
+    auto put32 = [&](size_t at, u32 v) { for (int i = 0; i < 4; ++i) b[at + size_t(i)] = u8(v >> (8 * i)); };
+    auto putf = [&](size_t at, float f) { u32 v; std::memcpy(&v, &f, 4); put32(at, v); };
+    b[0x0A] = 1;                           // mesh count
+    put32(0x10, 0x20), b[0x14] = 5;        // offset, qwc
+    size_t o = 0x20;
+    put32(o, 0x6202C040), b[o + 4] = 1, b[o + 5] = 6, o += 8; // S-8 at 0x40: 1 strip of 4
+    put32(o, 0x6804C000), o += 4;                             // V3-32 at 0x00: 4 positions
+    const float p[4][3] = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0.5f}};
+    for (const auto& v : p)
+        for (float c : v) putf(o, c), o += 4;
+    put32(o, 0x6E04C080), o += 4;                             // V4-8 at 0x80: 4 colours
+    for (int i = 0; i < 4; ++i) b[o + 4 * size_t(i)] = 0xFF, b[o + 4 * size_t(i) + 3] = u8(0x54 * i);
+    std::vector<race::Flare::Mesh> m = race::Flare::parse(b);
+    CHECK(m.size() == 1);
+    if (m.size() != 1) return;
+    CHECK(m[0].verts.size() == 4);
+    CHECK((m[0].tris == std::vector<int>{0, 1, 2, 1, 2, 3}));
+    CHECK(m[0].verts[3].x == 1 && m[0].verts[3].y == 1 && m[0].verts[3].z == 0.5f);
+    CHECK(m[0].verts[2].rgba[0] == 0xFF && m[0].verts[2].rgba[1] == 0 && m[0].verts[2].rgba[3] == 0xA8);
+    b[0x14] = 2; // packet cut short: the strip table points past the vertices it holds
+    CHECK(race::Flare::parse(b).empty());
+}
+
+TEST(race_course_scene_lights) {
+    // A synthetic Env0: scene lights 0..2 enabled (bits 11..13), light 1 ambient only.
+    Bytes env(0x1380, 0);
+    std::memcpy(env.data(), "Env0", 4);
+    auto put = [&](size_t o, float v) { std::memcpy(env.data() + o, &v, 4); };
+    u32 flags = (1u << 11) | (1u << 12) | (1u << 13) | 1u;
+    std::memcpy(env.data() + 0x10, &flags, 4);
+    auto light = [&](int n, std::array<float, 3> dir, float amb, float dif, float spec) {
+        size_t o = 0xAD0 + 0x50 * size_t(n);
+        for (int i = 0; i < 3; ++i) {
+            put(o + 4 * size_t(i), dir[size_t(i)]);
+            put(o + 0x10 + 4 * size_t(i), amb), put(o + 0x20 + 4 * size_t(i), dif), put(o + 0x30 + 4 * size_t(i), spec);
+        }
+    };
+    light(0, {0, 2, 0}, 0.45f, 0.9f, 0.83f);
+    light(1, {1, 0, 0}, 0.1f, 0.0f, 0.0f);
+    light(2, {0, 0, 3}, 0.0f, 0.5f, 0.0f);
+    light(3, {1, 1, 1}, 0.7f, 0.7f, 0.7f); // not enabled
+    race::SunParams p = race::SunParams::from_env0(env);
+    CHECK(p.scene_light_mask == 0x7);
+    render::ItemLights il;
+    p.course_lights(il);
+    CHECK(il.count == 2); // light 1 has no diffuse or specular: no slot
+    CHECK(std::fabs(il.dir[0][1] - 1.0f) < 1e-6f && std::fabs(il.dir[1][2] - 1.0f) < 1e-6f);
+    CHECK(std::fabs(il.specular[0][0] - 0.83f) < 1e-6f && std::fabs(il.diffuse[1][0] - 0.5f) < 1e-6f);
+    CHECK(std::fabs(il.ambient[0] - 0.55f) < 1e-5f); // the enabled lights' ambients, global ambient 0
 }

@@ -68,8 +68,11 @@ std::optional<WheelSpec> wheel_spec_of(const data::CarDatabase& db, const data::
     if (!ch || !rm || ch->size() < 0x1A || rm->size() < 0x36) return std::nullopt;
     WheelSpec w;
     w.wheelbase = rd16(*ch, 0x18) * 0.001f;
-    w.track[0] = rd16(*rm, 0x32) * 0.001f;
-    w.track[1] = rd16(*rm, 0x34) * 0.001f;
+    // The hubs sit the tread's per-side offset (s8 mm at +0x3D / +0x3E) inboard of it.
+    for (int a = 0; a < 2; ++a) {
+        int offset = rm->size() > size_t(0x3D + a) ? int(static_cast<signed char>((*rm)[size_t(0x3D + a)])) : 0;
+        w.track[a] = float(int(rd16(*rm, size_t(0x32 + 2 * a))) - 2 * offset) * 0.001f;
+    }
     const data::TableId tire_tables[2] = {data::TableId::FrontTire, data::TableId::RearTire};
     for (int a = 0; a < 2; ++a) {
         const ByteSpan* t = db.record(tire_tables[a], part_id(*car, tire_tables[a]));

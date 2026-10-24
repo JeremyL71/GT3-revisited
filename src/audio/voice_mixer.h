@@ -31,6 +31,12 @@
 
 namespace gt3r {
 
+// The output bus a voice plays on. Each bus has its own gain (the player's
+// volume settings): Music carries the sequenced menu music, Effects every other
+// voice (engine notes, effects, ambience), so the effects volume never scales
+// the music (sound §2.4).
+enum class VoiceBus : u8 { Effects, Music };
+
 // Opaque voice handle. Stale handles (voice finished or reused) are ignored.
 struct VoiceId {
     u32 value = 0;
@@ -47,6 +53,7 @@ struct VoiceParams {
     u16 adsr2 = 0x0003; // fast linear release
     bool reverb = false; // send to the reverb unit
     u8 priority = 0;     // may steal voices whose priority value is >= this
+    VoiceBus bus = VoiceBus::Effects;
 };
 
 class VoiceMixer {
@@ -55,6 +62,11 @@ public:
     // the first 46 (what the last two are kept for is not known).
     static constexpr int kVoices = 46;
     static constexpr u32 kRate = 48000;
+    // Output trim of the mix (headroom: full-level voices sum past 0 dBFS as on the SPU2).
+    // The game streams its music through SPU2 voices as well, so the music and the
+    // effects meet at equal weight; AudioEngine trims the music stream by the same
+    // factor to keep that balance (sound §2.4).
+    static constexpr float kOutputTrim = 0.5f;
 
     enum class Interpolation : u8 { Gaussian, Cubic };
 
@@ -66,6 +78,9 @@ public:
     void stop_all();
     void set_pitch(VoiceId v, u16 pitch); // game units
     void set_volume(VoiceId v, s16 l, s16 r);
+    // Stealing priority of a playing voice (VoiceParams::priority); the game re-sends a
+    // held effect's priority every frame as its loudness changes.
+    void set_priority(VoiceId v, u8 priority);
     bool playing(VoiceId v) const;
     bool releasing(VoiceId v) const;
     int active_voices() const;
@@ -77,6 +92,10 @@ public:
 
     void set_master_volume(float v);
     float master_volume() const { return master_; }
+    // Gain of one bus, 0..1 (default 1), applied to its voices' dry and reverb
+    // sends alike; changes apply from the next rendered sample.
+    void set_bus_gain(VoiceBus bus, float gain);
+    float bus_gain(VoiceBus bus) const;
     // GT3's surround cue for positional sounds (see surround_cue.h); read by
     // EngineSound / EngineUnit. Off by default.
     void set_surround_cue(bool on) { surround_cue_ = on; }
@@ -113,6 +132,7 @@ private:
         bool ended = false; // last frame had the end flag and no repeat
         bool reverb = false;
         u8 priority = 0;
+        u8 bus = 0;
         PsAdpcmDecoder dec;
         s16 block[28] = {};
         int block_pos = 28;
@@ -137,7 +157,8 @@ private:
     mutable std::mutex mutex_;
     std::array<Voice, kVoices> voices_;
     u64 clock_ = 0;
-    float master_ = 0.5f; // output trim: full-scale voices sum past 0 dBFS like on the SPU2
+    float master_ = kOutputTrim;
+    std::array<s32, 2> bus_gain_{1 << 16, 1 << 16}; // per VoiceBus, 16.16 fixed point
     Interpolation interp_ = Interpolation::Gaussian;
     std::atomic<bool> surround_cue_{false};
     SpuReverb reverb_;

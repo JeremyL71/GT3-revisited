@@ -9,15 +9,34 @@
 
 namespace gt3r::ai {
 
+namespace {
+
+// Course category of a track (course table 34 +0x08): 1 wet Route 5, 2 dirt, else 0.
+int course_category(const data::CarDatabase& db, const track::Track& t) {
+    for (const data::Course& c : db.courses())
+        if (c.label == t.label()) return c.surface;
+    return 0;
+}
+
+} // namespace
+
+DriverParams race_params(const data::CarDatabase& db, const std::string& car_label, const track::Track& track,
+                         const data::Event* ev) {
+    std::optional<sim::CarSpec> spec = sim::build_car_spec(db, car_label);
+    if (!spec) return DriverParams::builtin(0);
+    const int cls = driveline_class(*spec);
+    DriverParams p = course_params(track.driver_sets(), course_category(db, track), cls);
+    if (ev) apply_event(p, *ev, cls);
+    return p;
+}
+
 AiRace::AiRace(const track::Track& track, const data::CarDatabase& db, const std::vector<Entry>& entries,
                RubberBand rubber, int reference)
     : track_(track), course_(std::make_shared<AiCourse>(track)), world_(track), rubber_(rubber), reference_(reference) {
     sim_ = std::make_unique<sim::World>(track_, &world_);
     int slots = std::max(track.grid_count(), 1);
-    // Dirt courses (course table 34 +0x08 = 2): the physics' front-brake cut (spec §10.4).
-    bool dirt = false;
-    for (const data::Course& c : db.courses())
-        if (c.label == track.label()) dirt = c.surface == 2;
+    // Dirt courses (course table 34 +0x08 = 2): the physics' front-brake cut (physics §10.4).
+    const bool dirt = course_category(db, track) == 2;
     for (size_t i = 0; i < entries.size(); ++i) {
         Car c;
         c.label = entries[i].label;
@@ -37,7 +56,7 @@ AiRace::AiRace(const track::Track& track, const data::CarDatabase& db, const std
         if (int(cars_.size()) >= slots) pose = track.respawn_pose(track.length() - 10.0f * float(cars_.size()));
         // The grid slot marks the nose: move the car back by its front extent (as race::grid_back).
         if (int(cars_.size()) < slots) {
-            float ext = v->setup().cog_front_extent; // the CoG moved back from the slot (§9.2)
+            float ext = v->setup().cog_front_extent; // the CoG moved back from the slot (physics §9.2)
             const sim::Quat& q = pose.orientation;
             sim::Vec3 u{q.x, q.y, q.z};
             auto rot = [&](const sim::Vec3& a) {
@@ -48,6 +67,7 @@ AiRace::AiRace(const track::Track& track, const data::CarDatabase& db, const std
             pose.position = {pose.position.x - fwd.x * ext - cog.x, pose.position.y, pose.position.z - fwd.z * ext - cog.z};
         }
         v->set_cpu_driver(true);
+        v->set_scripted_aids(entries[i].params.aids); // the set's AI aid block (ai §9.1)
         v->set_dirt_course(dirt);
         v->reset(pose.position, pose.orientation);
         c.vehicle = v.get();
@@ -85,14 +105,14 @@ void AiRace::step() {
         s.half_width = v.setup().width * 0.5f;
         s.front = v.setup().cog_front_extent, s.rear = v.setup().cog_rear_extent; // front / rear extents from the CoG
         {
-                const sim::Quat& q = v.state().orientation;
-                sim::Vec3 u{q.x, q.y, q.z}, c = v.setup().cog_offset;
-                sim::Vec3 t = u.cross(c) * 2.0f;
-                s.position = v.state().position + c + t * q.w + u.cross(t); // the CoG (the car's reference point in the physics spec)
-            }
+            const sim::Quat& q = v.state().orientation;
+            sim::Vec3 u{q.x, q.y, q.z}, c = v.setup().cog_offset;
+            sim::Vec3 t = u.cross(c) * 2.0f;
+            s.position = v.state().position + c + t * q.w + u.cross(t); // the CoG (the car's reference point, ai §14)
+        }
         s.time_scale = cars_[i].time_scale;
     }
-    // Rubber band chain from the reference car (spec §14).
+    // Rubber band chain from the reference car (ai §14).
     std::vector<float> band;
     if (reference_ >= 0 && reference_ < int(cars_.size()) && rubber_.enabled()) {
         std::vector<double> dist;
@@ -103,8 +123,6 @@ void AiRace::step() {
         Car& c = cars_[i];
         AiContext ctx{time_, snaps_, int(i)};
         ctx.rank = int(i);
-        for (const auto& k : sim_->contacts())
-            if ((k.a == int(i) && k.b >= 0) || (k.b == int(i) && k.a >= 0)) ctx.body_contact = true;
         sim_->set_inputs(int(i), c.driver->update(*c.vehicle, ctx, dt));
         sim_->vehicle(int(i)).set_reverse_request(c.driver->reverse_request());
         c.time_scale = i < band.size() ? band[i] : 1.0f;
@@ -144,38 +162,17 @@ void AiRace::step() {
                 }
         last_rank_ = std::move(r);
     }
+    // The safety respawn (ai §12), the same rule as race::Field's; the race clock starts at 0 (no
+    // countdown).
     for (size_t i = 0; i < cars_.size(); ++i) {
         Car& c = cars_[i];
-        const sim::VehicleState& st = c.vehicle->state();
-        // Safety respawn when a car left the road mesh (through a wall or a gap): the centre and
-        // all four wheels off the mesh (or 5 m below it) for half a second. A single probe can
-        // fall through a hairline crack between road triangles at exact float coordinates.
-        auto off = [&](const sim::Vec3& p) {
-            sim::SurfaceHit h = track_.probe(p.x, p.z, p.y + 3.0f);
-            return !h.hit || p.y < h.height - 5.0f;
-        };
-        bool all_off = off(st.position);
-        for (const sim::WheelState& w : st.wheels) all_off = all_off && off(w.contact);
-        c.off_mesh_ticks = all_off ? c.off_mesh_ticks + 1 : 0;
-        bool lost = c.off_mesh_ticks > 30;
-        // Stuck for 12 s (no 10 m of progress): the race scene's respawn rule.
-        if (time_ - c.last_progress_time > 12.0) lost = true;
-        if (!std::isfinite(st.position.x)) lost = true;
-        if (lost) {
-            track::Pose p = track_.respawn_pose(c.timer->distance());
-            sim_->vehicle(int(i)).reset(p.position, p.orientation);
-            c.timer->teleport(p.position);
-            c.driver->reset(c.vehicle->state());
+        if (c.watch.lost(track_, c.vehicle->state(), time_) && respawn_) {
+            respawn_car(sim_->vehicle(int(i)), *c.timer, *c.driver, track_);
+            c.watch.respawned(time_);
             ++c.respawns;
-            c.off_mesh_ticks = 0;
-            c.last_progress_time = time_;
         }
         c.timer->update(c.vehicle->state().position, time_);
-        double d = c.timer->race_distance();
-        if (d > c.best_distance + 10) {
-            c.best_distance = d;
-            c.last_progress_time = time_;
-        }
+        c.watch.progress(c.timer->race_distance(), time_);
     }
 }
 

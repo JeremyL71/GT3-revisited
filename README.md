@@ -22,11 +22,11 @@ disk or redistributed.
 | | |
 |---|---|
 | **The game** | GT Mode, Arcade, licenses, 2P battle, Replay Theater, Options: the game's own menus, text (every language on the disc), fonts, movies and soundtrack |
-| **Faithful racing** | physics, AI, cameras, HUD, lighting, reflections, smoke and sounds reimplemented from the original's behaviour and compared side by side with it |
+| **Faithful racing** | physics, AI, cameras, HUD, replays, lighting, reflections, smoke and sounds reimplemented from the original's behaviour and compared side by side with it |
 | **Online battle** | the arcade's i.LINK Battle rebuilt for the internet and LANs: up to 6 players, session codes, no port forwarding |
 | **Quick race** | any of the game's events with any car, nothing to unlock |
 | **Saves** | any number of named saves; import from and export to the PS2 original |
-| **Modern display** | any resolution and aspect ratio, widescreen, high refresh rates, MSAA, or the original 640×448 look |
+| **Modern display** | any resolution and aspect ratio, widescreen, high refresh rates (or a 60 fps limit), MSAA, dynamic resolution, or the original 640×448 look |
 | **VR** | Meta Quest: the menus on a large virtual screen, races in stereo from the driver's seat, Touch controllers (sticks and analog triggers, or grab a steering wheel) |
 | **Controllers** | keyboard, any gamepad, wheels and pedals, all remappable; analog pressure buttons, DualSense adaptive triggers, Xbox impulse triggers, wheel force feedback, tilt steering, touch controls on phones and tablets |
 | **Mods** | replace any game file, add music, add new cars (electric ones too) to the dealers |
@@ -36,8 +36,9 @@ disk or redistributed.
 GT3 Revisited is an independent reimplementation written from documented
 behaviour: the disc's file formats ([FORMATS](docs/FORMATS.md),
 [docs/formats/](docs/formats/)) and how the game behaves, described per
-system in the implementation notes in [docs/dev/](docs/dev/) (race, physics,
-AI, GT Mode, rendering, movies, online). It is verified against the
+system in [docs/behaviour/](docs/behaviour/) (physics, AI, GT Mode, menus,
+race presentation, sound, music), with implementation notes in
+[docs/dev/](docs/dev/). It is verified against the
 original's observable behaviour, side by side and with automated tests. It
 contains no original code, data or assets; all game content is read from
 your own disc at runtime. The rules for contributions are in
@@ -112,7 +113,7 @@ game:
 |---|---|
 | Play | back to the game (opening movie, then the title menu) |
 | Online battle | race other players over the internet or a LAN |
-| Settings | display, audio, controls, force feedback, touch, disc |
+| Settings | display, audio, controls, force feedback, touch, disc, online |
 | Controller setup | bind keyboards, pads and wheels, per player |
 | Mods | enable or disable installed mods |
 | Music jukebox | the soundtrack from your disc |
@@ -164,8 +165,10 @@ are only there:
 | `[app] start` | `game` / `hub` | start with the game, or in Developer options |
 | `[video] fullscreen` | `on` / `off` | desktop window mode (F11) |
 | `[video] vsync` | `1` / `0` | wait for the display refresh |
-| `[video] msaa` | `1` `2` `4` `8` | 3D anti-aliasing (clamped to the GPU) |
+| `[video] limit_60fps` | `on` / `off` | on 120 Hz and faster displays, draw about 60 frames a second (every Nth refresh) |
+| `[video] msaa` | `1` `2` `4` `8` | 3D anti-aliasing (clamped to the GPU); default 4, 2 on Android (phones, tablets, Quest) |
 | `[video] render_scale` | `auto`, `0.5`..`1.0` | 3D resolution vs. the screen |
+| `[video] dynamic_resolution` | `on` / `off` | lower the 3D resolution (to 50% at most) when the GPU can't keep up and raise it while it keeps up, up to `render_scale`; with `auto`, up to the screen's full resolution (at most 1440 lines), starting where the last race ended (kept in `dynamic_start`). Default on for phones and tablets |
 | `[video] gpu` | `1` / `0` | SDL_GPU 3D renderer; `0` = 2D-only (restart required) |
 | `[video] original_res` | `on` / `off` | *(file)* races at the PS2's 640×448 in a 4:3 frame |
 | `[video] original_filter` | `nearest` / `bilinear` | *(file)* upscaling filter for `original_res` |
@@ -177,7 +180,7 @@ are only there:
 | `[race] units` | `kmh` / `mph` | *(file)* speed unit (default: the disc's) |
 | `[race] split` | `auto` / `horizontal` / `vertical` | *(file)* 2P split (default: as GT3) |
 | `[race] respawn` | `cpu` / `all` / `off` | *(file)* put stuck cars back on the road (not in the original) |
-| `[player1]`, `[player2]` | `preset`, `device`, `keyboard`, `race` | see [INPUT](docs/INPUT.md#race-controls) |
+| `[player1]`, `[player2]` | `preset`, `device`, `keyboard`, `race`; `phone_vibration` (player 1, Android) | see [INPUT](docs/INPUT.md#race-controls) |
 | `[ffb]` | see [INPUT](docs/INPUT.md) | DualSense/Xbox triggers and wheel force feedback |
 | `[touch]` | see [INPUT](docs/INPUT.md) | on-screen controls on phones and tablets |
 | `[online] server` | host name | relay server (default `gt3r.gameversions.com`; set in the lobby) |
@@ -191,7 +194,8 @@ GT Mode keeps any number of saves in `saves/` (no memory cards). The title
 menu's Load game / Save game / File Operation pages list them by name, with
 day, credits, cars and completion, and let you start a new game, save under a
 new name or over a save, rename, copy and delete. The game being played
-autosaves after every race and continues at the next launch.
+autosaves after every race and continues at the next launch. A save that
+cannot be read (damaged, or from a newer version) is never written over.
 
 **Saves from and to the PS2 original:** on the Load game and File Operation
 pages, "FROM A FILE" imports a save from anywhere (a GT3 Revisited `.sav` or
@@ -217,10 +221,11 @@ first.
 
 Carried over: credits, days, races / wins, prize money, the garage (parts,
 settings, paint, wheel, odometer, oil, dirt), the wheel inventory, license
-medals and best times, race results, prizes, trophies, arcade progress and
-time-trial records. Setting files on the card and a championship saved
-between rounds are not carried. Keep a copy of your card before writing to
-it. Details: [GT_MODE](docs/dev/GT_MODE.md#saves).
+medals and best times, race results, prizes, trophies, arcade progress,
+time-trial records (arcade and per course), machine-test rankings and the
+last name entered for a record. Setting files on the card and a championship
+saved between rounds are not carried. Keep a copy of your card before
+writing to it. Details: [GT_MODE](docs/dev/GT_MODE.md#saves).
 
 ### Online
 
@@ -280,7 +285,7 @@ arcade and online. See [MODDING](docs/MODDING.md).
 
 ## Building
 
-Requirements: CMake 3.21 or later, a C++20 compiler, and SDL3 (3.2 or
+Requirements: CMake 3.21 or later, a C++20 compiler, and SDL3 (3.4 or
 later). zlib is optional. If SDL3 or zlib is not installed, CMake fetches and
 builds it.
 
@@ -355,6 +360,8 @@ Run `gt3tool` without arguments for the full list.
 
 - [ARCHITECTURE](docs/ARCHITECTURE.md): how the engine is organized
 - [FORMATS](docs/FORMATS.md): the disc's file formats
+- [docs/behaviour/](docs/behaviour/): how the original game behaves, per
+  system (physics, AI, GT Mode, menus, race presentation, sound, music)
 - [INPUT](docs/INPUT.md): controller support and binding syntax
 - [MODDING](docs/MODDING.md): making and installing mods
 - [COMPATIBILITY](docs/COMPATIBILITY.md): tested disc versions

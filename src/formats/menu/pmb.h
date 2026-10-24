@@ -70,7 +70,7 @@ struct Element {
     float x = 0, y = 0, z = 0, w = 0, h = 0;
     std::optional<std::string> widget_class; // set for layer widgets (bound to game code by class name)
     std::optional<ImageRef> image;
-    std::optional<std::array<Rgba, 4>> colors; // corners: top-left, top-right, bottom-right, bottom-left
+    std::optional<std::array<Rgba, 4>> colors; // corners: bottom-left, bottom-right, top-right, top-left (y up)
     std::optional<TextStyle> text;
     std::vector<Element> alt; // 0 or 1 alternative state (focused/selected look)
     size_t offset = 0;        // file offset, for debugging

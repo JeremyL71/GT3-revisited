@@ -1,7 +1,7 @@
 #pragma once
 
-// Engine note model, reproducing how GT3 drives its ENGN banks (facts from
-// studying CORE.GT3, see docs/formats/sound.md "Engine sound model"):
+// Engine note model, reproducing how GT3 drives its ENGN banks (see
+// docs/formats/sound.md "Engine sound model"):
 //
 // A car plays two banks at once:
 //   engine  sound/engine/<id>             mechanical/intake note

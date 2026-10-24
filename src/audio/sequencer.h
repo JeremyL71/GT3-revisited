@@ -15,6 +15,7 @@
 //   - volume = channel volume x program volume x velocity x region volume
 //     (all Q14, linear 0..127 curves), squared, then split with the sine
 //     pan law; pan = channel + program + region pan - 0x80.
+//   - its voices play on the mixer's Music bus (VoiceBus::Music).
 //
 // Timing is sample-exact for offline renders (call update() then mix
 // kRate / update_rate frames) and in the app (AudioEngine drives update()
@@ -50,7 +51,9 @@ public:
     bool running() const; // ... and at least one of its tracks has events left
     int current() const;  // its index, or -1
 
-    // The game's global music volume (Q14, 0..0x3FFF; the options setting).
+    // The global music volume (Q14, 0..0x3FFF): each music request sets it from the
+    // request's level (bgm::sequence_volume, music §6). It enters every note's
+    // volume before the square, so it acts squared.
     void set_master_volume(int q14);
     int master_volume() const;
 

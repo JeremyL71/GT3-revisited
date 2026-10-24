@@ -10,7 +10,7 @@
 //
 // File format (little endian), ".gt3replay" in <user data>/replays/:
 //   0x00 "GT3RRPL1"
-//   u32 version (6; 1..5 are still read), u32 tick count N, f64 tick rate (Hz)
+//   u32 version (9; 1..8 are still read), u32 tick count N, f64 tick rate (Hz)
 //   string course, string car (u16 length + bytes), u8 automatic, u8 paint
 //   pose start (f32 x, y, z, qw, qx, qy, qz)
 //   u32 event count; events {u32 tick, u8 kind, pose}
@@ -28,6 +28,14 @@
 //       memory-card pages show and edit), u8 kind (ReplayKind), u16 laps completed, f64 total
 //       time (< 0 = none), f32 power (PS), string car model, string wheel, s64 saved (unix
 //       seconds, 0 = unknown), u32 n + n bytes car spec (sim/car_spec_io.h; 0 = the database car)
+//   v8 (after the v7 car spec): the engine condition the run started with (physics §10.3):
+//       u32 odometer (2 m units), f32 running-in / wear, f32 oil (older replays: a fresh engine)
+//   v9 (after the v8 condition): u8 the field's rules as the run had them: bits 0-1 the grid
+//       by power-to-weight (GT mode), bits 2-3 CPU respawn ([race] respawn); each 0 = not
+//       recorded, 1 = off, 2 = on. Then with car2, the 2P battle: u8 recorded (0 = no, nothing
+//       follows); u16 laps, f32 boost amount, boost start, boost full (m), f32 handicap (m),
+//       u8 tyre damage, string model2, string wheel2, u8 paint2, u32 n + n bytes player 2's
+//       car spec (0 = the database car)
 
 #include "base/game_random.h"
 #include "race/backend.h"
@@ -52,6 +60,19 @@ struct ReplayEvent {
     TrackPose pose;
 };
 
+// v9, 2P battle: the battle as its run had it (the Options menu's laps, catch-up boost,
+// handicap and tyre damage; player 2's car from its car page). Playback builds the battle with
+// these, not with the Options menu's settings at the time it is watched.
+struct ReplayBattle {
+    int laps = 0;
+    float boost_amount = 0, boost_start = 0, boost_full = 1; // FieldConfig's catch-up boost
+    float handicap_m = 0;                                    // FieldConfig::handicap_m
+    bool tyre_damage = false;                                // shipped wear on both cars
+    std::shared_ptr<const sim::CarSpec> spec2; // player 2's car as raced (null = the database car)
+    std::string model2, wheel2;                // its model / fitted wheel overrides ("" = its own)
+    int paint2 = 1;
+};
+
 // What kind of run a replay holds (the memory-card info panel's "Mode").
 enum class ReplayKind : u8 {
     Unknown = 0,
@@ -66,7 +87,7 @@ enum class ReplayKind : u8 {
 const char* replay_kind_name(ReplayKind k); // "Arcade", "GT", "License", ...
 
 struct Replay {
-    static constexpr u32 kVersion = 7;
+    static constexpr u32 kVersion = 9;
     std::string course, car; // database labels
     bool automatic = true;
     int paint = 0;
@@ -74,7 +95,8 @@ struct Replay {
     TrackPose start;
     std::vector<sim::ControlInputs> inputs; // one per tick (already quantised)
     // Player 1's scripted-driver kind per tick (sim::Vehicle::set_driver_kind: 0 the driver,
-    // 1 run-up, 5 stop driver; empty = all 0). Stored in input flag bits 64 / 128.
+    // 1 the AI drives, 5 the stop driver (kinds 5-7 act alike in the physics), 8 parked; empty =
+    // all 0). Stored in input flag bits 64 (1), 128 (5) and both (8).
     std::vector<u8> driver_kind;
     std::vector<ReplayEvent> events;        // sorted by tick
     double best_lap = -1;
@@ -95,6 +117,13 @@ struct Replay {
     std::string car_model, wheel;        // model / fitted wheel overrides ("" = the car's own)
     s64 saved = 0;                       // when it was saved (unix seconds)
     std::shared_ptr<const sim::CarSpec> spec; // the run's car (null = the database car)
+    sim::EngineCondition condition;      // v8: player 1's engine condition at the start (zeros = fresh)
+    // v9: the field's rules as the run had them; playback rebuilds a race's field with these
+    // (nullopt: not recorded, the playback's own). Before v9 the grid comes from the kind
+    // (GT mode's races, ReplayKind::GtRace, were the ones lined up by power-to-weight).
+    std::optional<bool> grid_by_power;   // FieldConfig::grid_by_power
+    std::optional<bool> cpu_respawn;     // FieldConfig::cpu_respawn
+    std::optional<ReplayBattle> battle;  // v9 with car2 (nullopt: not recorded, the playback's own)
 
     u32 ticks() const { return u32(inputs.size()); }
     double duration() const { return double(inputs.size()) / tick_hz; }
@@ -124,6 +153,7 @@ public:
     void set_second_car(std::string car2) { replay_.car2 = std::move(car2); }
     void set_start_speed(float mps) { replay_.start_speed = mps; }
     void set_paint_seed(u32 seed) { replay_.paint_seed = seed; }
+    void set_engine_condition(const sim::EngineCondition& c) { replay_.condition = c; }
     void respawn_second(const TrackPose& pose);
     void respawn(const TrackPose& pose); // before the next record()
     void lap(double time, u32 begin_tick, u32 end_tick); // a completed lap; keeps the best

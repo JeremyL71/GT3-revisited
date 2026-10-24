@@ -9,7 +9,7 @@
 
 namespace gt3r::render {
 
-// menu/showroom_<kind>.fbi (spec menus §9): one 0x140-byte record, key k = f32 at
+// menu/showroom_<kind>.fbi (menus §9.5): one 0x140-byte record, key k = f32 at
 // +0x10 + 4k. 0..3 global ambient; lights i = 0..2 at 4 + 16 i: ambient, diffuse,
 // specular, direction (eye space); 0x34 look-at start (x, y, z), 0x38 look-at target,
 // 0x3B / 0x3C its spring k / damping; 0x3D elevation (negative = above), 0x3E yaw start,

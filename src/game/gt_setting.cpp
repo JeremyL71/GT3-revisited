@@ -88,8 +88,8 @@ Group group_of_slider(const std::string& item) {
     return Group::None;
 }
 
-// Reference gear ratios (spec §6.7 generator at the reference final drive) and the
-// per-gear clamp ranges [lo, hi] (settings.md §2.6).
+// Reference gear ratios (physics §6.7 generator at the reference final drive) and the
+// per-gear clamp ranges [lo, hi] (gt_mode §14).
 struct GearRanges {
     int n = 0;
     std::array<int, 8> lo{}, hi{};

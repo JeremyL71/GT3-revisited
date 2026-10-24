@@ -43,6 +43,10 @@ enum PrimitiveFlags : u32 {
     kAlphaOnly = 1u << 10,
     // GS FBMSK 0xFF000000: colour only, the frame-buffer alpha is kept (DrawItem::frame_alpha).
     kKeepAlpha = 1u << 11,
+    // With kAdditive: GS ALPHA 0x58 (Cs * Ad + Cd), the colour added weighted by the frame-buffer
+    // alpha earlier passes left (course road sheen). DrawItem::frame_alpha items only; elsewhere
+    // the pass is plain additive.
+    kDestAlphaAdd = 1u << 12,
 };
 
 // Fixed-function lighting material of a lit primitive (GT3 cars: GTM1 material
@@ -61,6 +65,12 @@ struct Material {
     float shininess = 0; // specular exponent
     float scale = 1.0f;  // 255/128 for GT3 packets lit at the 255 scale (chunk flag 0x100)
     bool valid = false;
+    // GT3 chunk kind 4 (course road sheen): the VU program lights the vertex with the first
+    // light's specular term only, Phong with the reflected ray from a viewer 2 m above the
+    // camera: Ls x Ms x max(0, L.R / |D|)^exponent (D = vertex - viewer, R = D reflected about
+    // the normal), not clamped (the GS takes the low 8 bits of the scaled byte). See
+    // docs/formats/course.md "Lighting".
+    bool specular_local = false;
 };
 
 struct Primitive {
@@ -76,6 +86,14 @@ struct Primitive {
     bool env_rows = false;
     float env_c0[3] = {1, 1, 1};
     float env_c1[3] = {0, 0, 0};
+    // Course environment passes (GTM1 chunk kinds 2 and 3, gtm1::Options::course_env_maps): the VU
+    // makes the UVs per vertex from the reflected view vector (2: a sphere map in view space;
+    // 3: GT3's panoramic lookup, yawed by the node's op 0x31 point or else the camera's forward)
+    // and weights the vertex colour by env_c0 + env_c1 x min(V.N, 0) per vertex.
+    u8 env_kind = 0;
+    bool env_point = false;              // kind 3: an op 0x31 point was set before the draw
+    float env_point_pos[3] = {0, 0, 0}; // that point (model space)
+    float env_alpha[2] = {1, 0};         // the weight rows' alpha lanes (C0.w, C1.w), env_kind passes
 };
 
 struct Mesh {
@@ -92,6 +110,7 @@ struct Texture {
     u32 width = 0, height = 0;
     std::vector<u32> rgba; // RGBA8 row-major
     bool clamp_u = false, clamp_v = false;
+    bool no_mips = false; // sampled from the full-size image only (GS MXL 0), e.g. the tyres
 };
 
 struct Model {

@@ -7,6 +7,7 @@
 #include "formats/course/ai_lines.h"
 #include "formats/course/course_file.h"
 #include "formats/course/road.h"
+#include "formats/model/gtm1.h"
 #include "scene/model.h"
 
 namespace gt3r::course {
@@ -19,13 +20,16 @@ struct CourseModelOptions {
     bool sky_low = false;    // slot 24: a smaller, low-resolution dome the race draws only in a
                              // secondary view pass, never in the main view
     bool sky_object = false; // slot 23: the small dark sky dome drawn only into the car reflection map
-    bool extras = true;      // slot 27 when present
+    // Slot 27, the licence course line: a driving line on the road (13 licence course files,
+    // 12 used by B / A tests), drawn with every view of those courses. See
+    // course_line_model() for the race's own copy.
+    bool course_line = true;
     // Wet-road reflection pass (route5 / route11 families, the L_circle tests): slot 9 is the
     // pre-mirrored reflection model drawn into a small offscreen buffer, slot 13 the alpha-only
     // mask that weights it on the frame. Not part of the visible scenery.
     bool road_reflection = false;      // slot 9
     bool road_reflection_mask = false; // slot 13
-    bool reflections = false; // chunk flag 4 passes: road sheen, masked by the base pass alpha (gtm1::Options::road_sheen)
+    bool reflections = false; // chunk kind 4 passes: road sheen, masked by the base pass alpha (gtm1::Options::road_sheen)
     bool frame_alpha = false; // keep the alpha-only shadow masks (gtm1::Options::frame_alpha)
     bool textures = true;
     int lod = 0;
@@ -43,8 +47,21 @@ struct Course {
 // Parses the course container plus road and AI lines.
 Course load_course(ByteSpan data);
 
-// Merges the selected GTM1 blocks and overlays into one model.
-scene::Model build_course_model(ByteSpan data, const CourseModelOptions& opt = {}, const std::string& name = {});
+// Merges the selected GTM1 blocks and overlays into one model. `clut_sets` (when given)
+// receives the texture sets with CLUT animations, `first` indexing the merged model's textures.
+// `animated` (when given) receives each block's nodes the +0x3C animators move, left out of the
+// model (texture indices: the merged model's).
+scene::Model build_course_model(ByteSpan data, const CourseModelOptions& opt = {}, const std::string& name = {},
+                                std::vector<gtm1::ClutSet>* clut_sets = nullptr,
+                                std::vector<gtm1::AnimatedNodes>* animated = nullptr);
+
+// The licence course line (slot 27) on its own: a 0.4 m wide ribbon about 0.1 m above the
+// road along the test's section, untextured, pre-lit, coloured per dash (blue, grey, red and
+// blends between them: the demonstration's pedals). Its node 0 only sets state for node 1's
+// draw, so the primitives come out double-sided, without depth writes and keeping the frame
+// alpha (scene::kKeepAlpha). Empty when the course file has no line. docs/formats/course.md
+// "Course line".
+scene::Model course_line_model(ByteSpan data, const std::string& name = {});
 
 // Debug geometry. Colours are RGBA8 (memory order R, G, B, A).
 scene::Mesh make_road_mesh(const Road& road);

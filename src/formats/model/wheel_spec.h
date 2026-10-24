@@ -4,7 +4,8 @@
 // (database/paramdb*.db): the car files themselves have no wheel positions.
 //
 //   wheelbase    table 3  (ch_) u16 mm at +0x18
-//   front/rear track  table 5 (rm_) u16 mm at +0x32 / +0x34
+//   front/rear tread  table 5 (rm_) u16 mm at +0x32 / +0x34, less twice the
+//                per-side offset, s8 mm at +0x3D / +0x3E (the track, hub to hub)
 //   tyre size    tables 28/29 (ft_/rt_) u64 size id at +0x18 -> table 25 (sz...):
 //                u8 +0x08 rim diameter (inches), +0x09 aspect / 5, +0x0A width / 5 (mm)
 //   width = w mm, sidewall = width * aspect %, outer radius = rim * 25.4 mm / 2 + sidewall

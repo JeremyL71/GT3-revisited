@@ -20,7 +20,7 @@ fragments, see below), **51/51 .mbl**, **23/23 .imgs**; 4,374 pages,
 - The game loads a pmb by short name (`pause1`) and looks pages up by name
   (`pause_race`), then looks up **layers** (`defaultLayer`) and **elements**
   by name (`m_continue`, and `m_continue` + suffix for the selected look)
-  to bind them to C++ objects of the `gt2k_menu` classes.
+  to bind them to the game's menu objects.
 - `menu/<screen>.mbl` (language independent) describes the flow: for each
   page and each selectable item, the action string for game code and the page
   to go to.
@@ -89,31 +89,42 @@ N = 64 in every shipped file. 16 old Japanese files (`gt_mode.1.pmb`,
   backgrounds are (0, 0, 640, 448).
 - **z** orders drawing; larger is in front. The game sets the selected
   variant of a button to z + 1.
-- **Alt**: the element's other look (normally the focused button), with the
-  same box. Drawn instead of the element when focused.
+- **Alt**: the element's other look (normally the focused button). Drawn
+  instead of the element when focused, at the element's place and in the
+  element's turn of the draw order, with the alt's own w and h: the alt's x, y
+  and z in the file are not used, and many files give it other values (moved a
+  few units, parked off-screen, at 0, 0).
 - **Widget class**: elements of a layer's list B point to a class/binding
   name such as `connect_status`, `event_status`, `scroll_bar`, `mpeg` (often
   equal to the element name, sometimes empty). Game code draws them (movies,
   car pictures, gauges); their own parts, if any, are drawn normally.
 
-**ImageRef** (0x24 bytes): `u32 image index; f32 uv[4][2]`, in the same corner
-order as the colors (top-left, top-right, bottom-right, bottom-left).
-Coordinates are normalized to the texture's REGION_CLAMP rectangle (the
-`Tex1::decode` crop). 86,540 of 86,649 refs are in 0..1; all are
-axis-aligned.
+**ImageRef** (0x24 bytes): `u32 image index; f32 uv[4][2]`, one pair per
+corner. Coordinates are normalized to the texture's REGION_CLAMP rectangle
+(the `Tex1::decode` crop). 86,540 of 86,649 refs are in 0..1; all are
+axis-aligned. Every US ref is (0,0) (n,0) (n,m) (0,m) with whole n and m (the
+image, or a whole number of repeats), which draws the same whether the first
+corner is the top-left or the bottom-left; the renderer pairs it with the
+top-left.
 
-**Colors**: four `u8 r, g, b, a` corner colors, same corner order. Alpha is
+**Colors**: four `u8 r, g, b, a` corner colors, listed from the bottom-left
+(menu space is y up): bottom-left, bottom-right, top-right, top-left. Alpha is
 0..255 (0xFF opaque; pause dims use 0x7E). When an image is present, the
 colors modulate it (0xFF = unchanged). The 4 colors differ (gradient) in
-about 6% of elements.
+about 6% of elements. Evidence for the order (reference captures): the arcade
+car page's `bg2` is black at the bottom of the screen and its `mpeg` widget
+fades out at its bottom edge; the name entry's text box is lighter at the top
+and its caret brightest at its bottom. In this order the 249 vertical
+gradients of the US layouts (setting titles and buttons, memory card windows,
+scroll bars) are all lighter at the top.
 
 **TextStyle** (0x10 bytes):
 
 ```
 u16 unk (always 1)
 u16 align       low nibble: 3x3 anchor, 0 top-left, 1 top-center, ... 4 center,
-                ... 8 bottom-right. Flags 0x10 and 0x20 also occur (meaning
-                unknown; 0x10 is seen on texts that look like ids, e.g. "home_doc")
+                ... 8 bottom-right. Flags animate the text: 0x10 marquee,
+                0x20 typewriter (menus §5.5)
 u8  r, g, b, a  (a uses the GS scale: 0x7F/0x80 = opaque)
 u32 text -> char[]   (game encoding: ASCII, {0x80+N, c} = ISO-8859-N char,
                      EUC-JP pairs; may be empty: filled by code)
@@ -211,9 +222,8 @@ usually `00no_texture`.
 - `menu/IT/name_entry1.pmb`, `qm_arc_result1.pmb` and `qm_gt_license1.pmb`
   (504, 280 and 592 bytes) have no header: they are fragments (pointers point
   outside the file). Other languages have full files.
-- `menu/cars/ho0100` fails to decompress with the current gzip reader (not a
-  menu layout; noted for the car workstream).
-- Text align flags: 0x10 marquee, 0x20 typewriter (see the spec).
+- `menu/cars/ho0100` is a plain entry holding a gzip of an empty file (not a
+  menu layout; FORMATS.md).
 - Animation/transition data is not in the pmb: element fade flags select
   scripts built into the program; focus, confirm and page transitions are
   reimplemented in `src/menu/flow/` (`menu_controller.h`,
@@ -222,4 +232,4 @@ usually `00no_texture`.
   save; `language.mbl`, `launch.mbl`, `default.mbl` are unused leftovers.
 - Text is drawn with the game fonts (`src/text/game_font.h`, via
   `menu/menu_text.h`); the 3x3 anchor mapping is inferred from layouts, and
-  the align flags 0x10/0x20 are ignored.
+  the align flags 0x10/0x20 animate it (menus §5.5).

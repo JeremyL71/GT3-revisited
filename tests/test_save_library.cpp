@@ -10,6 +10,7 @@
 #include "game/save_library.h"
 #include "menu/flow/gt_mode_hooks.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <cstdlib>
 
@@ -43,6 +44,26 @@ void set_env(const char* name, const char* value) {
 
 void touch_time(const std::string& path, int seconds_ago) {
     fs::last_write_time(path, fs::file_time_type::clock::now() - std::chrono::seconds(seconds_ago));
+}
+
+std::string read_text(const std::string& path) {
+    std::optional<Bytes> b = read_host_file(path);
+    return b ? std::string(b->begin(), b->end()) : std::string("<missing>");
+}
+
+bool write_text(const std::string& path, const std::string& text) {
+    return write_host_file(path, ByteSpan(reinterpret_cast<const u8*>(text.data()), text.size()));
+}
+
+// The texts of the files set_aside_save made for `path` (beside it, "<name>.unreadable...").
+std::vector<std::string> kept_texts(const std::string& path) {
+    std::vector<std::string> out;
+    const fs::path p(path);
+    const std::string prefix = p.filename().string() + ".unreadable";
+    for (const fs::directory_entry& e : fs::directory_iterator(p.parent_path()))
+        if (e.path().filename().string().rfind(prefix, 0) == 0) out.push_back(read_text(e.path().string()));
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 } // namespace
@@ -118,6 +139,85 @@ TEST(save_library_operations) {
     // A tracked = false library (GT3R_GTMODE_SAVE) remembers nothing.
     SaveLibrary untracked(root.string(), false);
     CHECK(untracked.current().empty() && untracked.set_current(b) && lib.current() == a3);
+    fs::remove_all(root);
+}
+
+// A save that exists but cannot be read (damaged, from a newer version) is never written
+// over: the session moves it aside before its new game autosaves to the path, every failure
+// keeps its own copy, and the library does not list the copies. No disc: a session's new
+// game needs no game data (the attach hook, which loads it, is save_library_disc_unreadable_attach).
+TEST(save_library_unreadable_kept) {
+    const fs::path root = fresh_dir("gt3r_test_lib_unreadable");
+    SaveLibrary lib(root.string());
+    std::string path;
+    CHECK(lib.create(make_game(500, "CAREER"), "CAREER", &path));
+    const std::string career = read_text(path);
+    const std::string damaged = career.substr(0, career.size() / 2); // no "end"
+    const std::string newer = "GT3R-GTMODE 99\ncredits 1\nend\n";
+    set_env("GT3R_GTMODE_NOSAVE", "0");
+    const auto data = std::make_shared<const GtData>();
+    for (const std::string& text : {damaged, newer}) {
+        CHECK(write_text(path, text));
+        GtModeSession s(data, path);
+        std::string err;
+        CHECK(!s.load(&err) && !err.empty());
+        CHECK(!fs::exists(path)); // moved aside before anything can be written
+        CHECK(s.save());          // what autosave() does
+        std::optional<GameState> now = read_save(path);
+        CHECK(now && now->garage.empty() && now->day == 1);
+    }
+    std::vector<std::string> kept = kept_texts(path);
+    std::vector<std::string> want = {damaged, newer};
+    std::sort(want.begin(), want.end());
+    CHECK(kept == want); // both, byte for byte (the second one in the same second too)
+    CHECK(lib.list().size() == 1);
+    // No save at a path: a new game, nothing set aside.
+    const std::string fresh = lib.dir() + "fresh.sav";
+    {
+        GtModeSession s(data, fresh);
+        CHECK(!s.load() && kept_texts(fresh).empty());
+    }
+    // GT3R_GTMODE_NOSAVE writes nothing: the file stays where it is.
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    CHECK(write_text(path, damaged));
+    {
+        GtModeSession s(data, path);
+        CHECK(!s.load() && read_text(path) == damaged && kept_texts(path).size() == 2);
+    }
+    fs::remove_all(root);
+}
+
+// The same through the GT-mode attach hook (with the disc data) and a menu action's autosave.
+TEST(save_library_disc_unreadable_attach) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    const fs::path root = fresh_dir("gt3r_test_lib_unreadable_attach");
+    fs::create_directories(root);
+    const std::string path = (root / "gtmode.sav").string();
+    const std::string damaged = "GT3R-GTMODE 1\ncredits 900000\ncar 1 r34_gtr_v_99 0 - -\n settings 1 2 x\nend\n";
+    CHECK(write_text(path, damaged));
+    set_env("GT3R_GTMODE_SAVE", path.c_str());
+    set_env("GT3R_GTMODE_NOSAVE", "0");
+    const Volume* vol = &disc->volume();
+    install_gt_mode_menu();
+    const menu::flow::GtModeHooks& h = menu::flow::gt_mode_hooks();
+    h.attach([vol](const std::string& p) -> std::optional<Bytes> {
+        const Volume::Entry* e = vol->find(p);
+        if (!e) return std::nullopt;
+        return vol->read(*e);
+    });
+    GtModeSession* s = gt_mode_session();
+    CHECK(s && s->save_path() == path && s->gt().state().credits == 18000); // a new game
+    CHECK(!fs::exists(path) && kept_texts(path) == std::vector<std::string>{damaged});
+    // Selling with no car chosen sells nothing and autosaves.
+    menu::flow::MenuEvent ev;
+    ev.kind = menu::flow::MenuEvent::Kind::Action;
+    ev.action = "sell_car";
+    std::vector<std::string> log;
+    h.on_event(ev, log);
+    std::optional<GameState> now = read_save(path);
+    CHECK(now && now->credits == 18000 && kept_texts(path) == std::vector<std::string>{damaged});
+    set_env("GT3R_GTMODE_NOSAVE", "1");
     fs::remove_all(root);
 }
 

@@ -70,8 +70,8 @@ Mat4 perspective(float fovy, float aspect, float zn, float zf) {
     r.m.fill(0);
     r.at(0, 0) = f / aspect;
     r.at(1, 1) = f;
-    r.at(2, 2) = zf / (zn - zf);
-    r.at(2, 3) = zn * zf / (zn - zf);
+    r.at(2, 2) = zn / (zf - zn); // reversed depth: z / w = 1 at -zn, 0 at -zf
+    r.at(2, 3) = zn * zf / (zf - zn);
     r.at(3, 2) = -1;
     return r;
 }
@@ -83,8 +83,8 @@ Mat4 frustum(float tl, float tr, float td, float tu, float zn, float zf) {
     r.at(0, 2) = (tr + tl) / (tr - tl);
     r.at(1, 1) = 2.0f / (tu - td);
     r.at(1, 2) = (tu + td) / (tu - td);
-    r.at(2, 2) = zf / (zn - zf);
-    r.at(2, 3) = zn * zf / (zn - zf);
+    r.at(2, 2) = zn / (zf - zn); // reversed depth: z / w = 1 at -zn, 0 at -zf
+    r.at(2, 3) = zn * zf / (zf - zn);
     r.at(3, 2) = -1;
     return r;
 }

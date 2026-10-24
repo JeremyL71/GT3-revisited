@@ -25,7 +25,7 @@ struct GameRandom {
     static void skip(u32& x, int n) {
         for (int i = 0; i < n; ++i) next(x);
     }
-    // The GT-mode "stir" (spec §20.2): (hardware + shared.int31()) mod 13 steps, at least 1.
+    // The GT-mode "stir" (gt_mode §20.2): (hardware + shared.int31()) mod 13 steps, at least 1.
     static void stir(u32& x, u32 hardware, GameRandom& shared);
 
     u32 next() { return next(x); }
@@ -40,6 +40,22 @@ GameRandom& shared_random();
 // The race module's state: every opponent pool draw and paint-colour
 // assignment of the session consumes it (seeded kBootSeed at start).
 GameRandom& race_info_random();
+
+// The PS2 vector unit's random register R, a second generator the race draws from for car
+// effects (the flap pendulums' kicks):
+//
+//   init:  R = 1.m with the seed's mantissa
+//   next:  R = 1.m with m = (m << 1 | (bit 4 ^ bit 22)), 23 bits; output 1.m - 1, [0, 1)
+//
+// One register (`vu0_random`), seeded with 0.1 at every run start.
+struct Vu0Random {
+    static constexpr float kRunSeed = 0.1f;
+    u32 r = 0x3F800000u;
+
+    void init(float seed);
+    float next();
+};
+Vu0Random& vu0_random();
 
 // Where the game wants unpredictable input it uses a hardware value in 0..47
 // that changes every cycle. Ours derives the same range

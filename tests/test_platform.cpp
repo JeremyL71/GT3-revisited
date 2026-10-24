@@ -79,4 +79,11 @@ TEST(platform_render_scale) {
     CHECK(std::fabs(platform::auto_render_scale(2856, 1280, true) - 900.0f / 1280.0f) < 1e-4f); // 20:9 phone
     CHECK(platform::auto_render_scale(1280, 720, true) == 1.0f);
     CHECK(platform::auto_render_scale(7680, 4320, true) == 0.5f);
+    // Dynamic resolution's ceiling with Auto: full resolution up to 1440 lines of 16:9 game area.
+    CHECK(platform::dynamic_ceiling(2400, 1080) == 1.0f); // 20:9 phone
+    CHECK(platform::dynamic_ceiling(2560, 1600) == 1.0f); // 16:10 tablet: 1440 lines
+    CHECK(std::fabs(platform::dynamic_ceiling(3840, 2160) - 1440.0f / 2160.0f) < 1e-4f);
+    // MSAA when the config has none: 4x on desktop, 2x on phones and tablets.
+    CHECK(platform::default_msaa(false) == 4);
+    CHECK(platform::default_msaa(true) == 2);
 }

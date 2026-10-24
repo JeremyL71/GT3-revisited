@@ -47,8 +47,8 @@ struct GarageCar {
     int color = 0;           // paint index (carcolor.db order for the car's model)
     std::array<u64, 27> parts{}; // fitted part ids, data::Car::parts order (kCarPartTables)
     std::bitset<88> owned;   // owned goods (gt_parts.h)
-    sim::CarSettings settings; // user settings (spec §6.6), kept in step with `parts`
-    int ref_final = 0;         // car setup record +0x1AC: final drive the gear-auto-level ranges are built from (§14)
+    sim::CarSettings settings; // user settings (physics §6.6), kept in step with `parts`
+    int ref_final = 0;         // car setup record +0x1AC: final drive the gear-auto-level ranges are built from (gt_mode §14)
     std::string wheel;       // fitted wheel label (table 24), "" = stock
     CarCondition cond;
 };
@@ -81,8 +81,14 @@ struct MachineRecords {
 struct RankEntry {
     double value = 0;
     std::string car;
-    u32 day = 0;
-    std::string name; // entered on the name entry page ("" = the player name)
+    u32 day = 0;      // the GT-mode day it was set on
+    std::string name; // entered on the name entry page (shown as stored: "" shows none)
+    // When it was set, by the clock: seconds since 2000-01-01 00:00 local time, as the
+    // original stamps a record (0 = none, e.g. from a save older than the stamps).
+    u32 stamp = 0;
+    // The 30-character block the original encodes from the run with each record (I: the
+    // records page's entry code); kept from an imported PS2 save, "" for our own records.
+    std::string code;
 };
 
 // Best finishing position per GT-mode race code; 0 = 1st ... (8 = never raced).
@@ -109,12 +115,13 @@ constexpr int kArcadeCourses = 34;      // gcf tag-8 list SINGLE_RACE
 constexpr int kArcadeDifficulties = 4;  // easy, normal, hard, professional
 constexpr int kArcadeCarLevels = 12;    // car unlock flags 1..12
 constexpr int kTimeTrials = 10;         // CLASS_COMPULSORY: AT010001..AT100001
+constexpr int kCourseTimeTrials = 44;   // course time-trial rankings in the PS2 save (TIME_ATTACK list order)
 constexpr int kArcadeNoPosition = 8;    // "no result" in the arcade blocks
 
 struct ArcadeProgress {
     int course_level = 0;                         // 0..6: course groups open (level <= this)
     std::array<bool, kArcadeCarLevels> car_flags{}; // flag k (index k-1) opens cars of level k
-    // Award bits (scalar +0xC4; gt_mode.md §3): 1 << ((cup class - 5) x 3 + place) a GT cup,
+    // Award bits (scalar +0xC4; gt_mode §3.2): 1 << ((cup class - 5) x 3 + place) a GT cup,
     // 0x1000 << difficulty an arcade race won, 0x10000 a consolation prize, 0x20000 << medal
     // a license medal.
     u32 awards = 0;
@@ -139,7 +146,7 @@ struct GameState {
     u32 prize_cars = 0;       // prize cars received
     u32 trophy_flags = 0;     // prize models received (scalar +0xC0): 1 << license card (B, A, IB, IA,
                               // S, R), 0x40 << i championship trophy champ_0i
-    u32 rng = 0x87654321;     // GT-mode generator state (trophy / prize-car rolls, spec §20), saved at +0xCC
+    u32 rng = 0x87654321;     // GT-mode generator state (trophy / prize-car rolls, gt_mode §20), saved at +0xCC
     std::vector<GarageCar> garage; // list order: newest first (the original inserts at the head)
     int ride = -1;            // index of the current car in `garage`, -1 = none
     std::vector<std::string> wheels; // wheel inventory (labels)

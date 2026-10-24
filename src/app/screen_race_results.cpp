@@ -69,14 +69,15 @@ std::vector<ResultRow> RaceScreen::result_menu_rows() const {
     return rows;
 }
 
-// The live race ended (results shown / left): latch its result (RaceResultLatch) and the
-// result menu's rows; races only (licence tests keep their own best-run logic). GT single
-// races also go into the save at once, as the original records them before the replay.
+// The live run ended (results shown / left): latch its result (RaceResultLatch) and, in a
+// race, the result menu's rows; every run, as its replay and the quick menu's backdrop re-run
+// it (a licence's result still merges the visit's best run, build_result). GT single races
+// also go into the save at once, as the original records them before the replay.
 void RaceScreen::latch_result() {
-    if (!field_ || replaying_ || attract_ || demo_ || result_latch_.has()) return;
+    if (replaying_ || attract_ || demo_ || result_latch_.has()) return;
     menu::flow::GameResult r = build_result();
     result_latch_.capture(r);
-    latched_rows_ = result_menu_rows();
+    if (field_) latched_rows_ = result_menu_rows();
     LOG_INFO("Race: result latched: finished %d position %d", int(r.finished), r.position);
     if (from_menu_ && r.mode == "go_race" && r.finished && !championship() && !launch_.request.practice)
         game::save_race_run(r);
@@ -90,7 +91,15 @@ menu::flow::GameResult RaceScreen::build_result() const {
     r.event = rq.event;
     r.lap_times = lap_times_;
     r.best_lap = track_ ? track_->best_lap_time() : -1;
-    r.distance_km = odometer_m_ / 1000.0;
+    // The engine condition the live runs leave (physics §10.3), for the garage car.
+    if (has_condition_ && vehicle_ && vehicle_->sim_vehicle()) {
+        const sim::EngineCondition c = live_condition();
+        r.car_condition = true;
+        r.car_odometer = c.odometer;
+        r.odometer_added = c.odometer - start_condition_.odometer;
+        r.car_wear_m = c.wear_m, r.car_oil_m = c.oil_m;
+        r.garage_car = rq.garage_car;
+    }
     if (field_) {
         r.finished = finished_;
         r.cars = field_->opponents() + 1;
@@ -102,10 +111,12 @@ menu::flow::GameResult RaceScreen::build_result() const {
         }
     } else {
         r.cars = 1;
-        r.finished = !lap_times_.empty();
+        // Time trial: finished at the line (not a FAIL); free runs have no finish: a run with a
+        // lap. The time is the run's best lap (the one it ranks with). Licence test: the
+        // judged run.
+        r.finished = race_laps_ > 0 ? finished_ && !tt_failed_ : !lap_times_.empty();
         r.position = r.finished ? 1 : 0;
-        // Time trial / free run: the last lap. Licence test: the judged run.
-        if (r.finished) r.total_time = lap_times_.back();
+        if (r.finished && track_) r.total_time = track_->best_lap_time();
         if (!license_event_.empty()) {
             r.finished = license_.state() == LicenseRun::State::Finished;
             r.position = r.finished ? 1 : 0;
@@ -126,10 +137,11 @@ menu::flow::GameResult RaceScreen::build_result() const {
         if constexpr (requires { res.prize_shown; }) res.prize_shown = prize_shown_;
     }(r);
     if (attract_) r.finished = !attract_interrupted_;
-    if (machine_mark_m_ > 0) { // 0-400 m / 0-1000 m: the time to the mark
-        r.finished = machine_time_ > 0;
+    if (machine_) { // machine tests: finished at the goal (the top-speed test: or by its pause EXIT);
+                    // 0-400 m / 0-1000 m: the time to it
+        r.finished = machine_time_ > 0 || (exit_finished_ && machine_test_top_speed());
         r.position = r.finished ? 1 : 0;
-        r.total_time = machine_time_;
+        r.total_time = machine_time_test() ? machine_time_ : -1;
     }
     [&](auto& res) {
         if constexpr (requires { res.top_speed_kmh; }) res.top_speed_kmh = top_speed_kmh_;

@@ -66,11 +66,14 @@ bool WetRoad::load(render::GpuContext& ctx, const Vfs& vfs, ByteSpan course, Byt
     if (env.size() < 0xE80 || std::memcmp(env.data(), "Env0", 4) != 0) return false;
     try {
         course::CourseModelOptions o;
-        o.scenery = o.extras = o.backdrop = o.sky = false;
+        o.scenery = o.course_line = o.backdrop = o.sky = false;
         o.road_reflection = true;
-        scene::Model refl = course::build_course_model(course, o, "reflection");
+        std::vector<gtm1::ClutSet> cluts;
+        scene::Model refl = course::build_course_model(course, o, "reflection", &cluts);
         if (refl.meshes.empty()) return false;
         reflection_ = std::make_unique<render::GpuModel>(ctx, refl);
+        cluts_ = {};
+        cluts_.add(reflection_.get(), std::move(cluts));
         o.road_reflection = false;
         o.road_reflection_mask = true;
         o.frame_alpha = true; // its passes write only the frame alpha

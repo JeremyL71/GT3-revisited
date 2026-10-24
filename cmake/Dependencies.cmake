@@ -14,8 +14,10 @@ option(GT3R_SDL_SHARED "Build the fetched SDL3 as a shared library" OFF)
 # android/fetch-sdl.sh --xr fetches the same one); every other build stays on 3.4.
 option(GT3R_XR "OpenXR mode for VR headsets (Meta Quest); needs SDL 3.6 with SDL_GPU OpenXR" OFF)
 set(GT3R_SDL_TAG release-3.4.12)
+set(GT3R_SDL_SHALLOW TRUE)
 if(GT3R_XR)
   set(GT3R_SDL_TAG c17963b8ff64ebd51cbc0bac7389dd48a57c1786) # SDL main, 2026-10-18
+  set(GT3R_SDL_SHALLOW FALSE) # a shallow clone has only the branch tip; a pinned commit needs history
   set(GT3R_FETCH_SDL ON)
   set(SDL_GPU_OPENXR ON CACHE BOOL "" FORCE)
 endif()
@@ -34,7 +36,7 @@ if(NOT SDL3_FOUND)
   FetchContent_Declare(SDL3
     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
     GIT_TAG ${GT3R_SDL_TAG}
-    GIT_SHALLOW TRUE)
+    GIT_SHALLOW ${GT3R_SDL_SHALLOW})
   FetchContent_MakeAvailable(SDL3)
 endif()
 if(GT3R_XR)

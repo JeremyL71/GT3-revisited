@@ -14,7 +14,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 
 namespace gt3r::game {
 
@@ -130,6 +132,43 @@ std::string format_time_ms(u32 ms) {
     return b;
 }
 
+u32 record_stamp_now() {
+    const std::time_t now = std::time(nullptr);
+    const std::tm* t = std::localtime(&now);
+    if (!t) return 1;
+    // Days from 2000-01-01 to the local date (the civil-from-days inverse, March-based years).
+    const int y = t->tm_year + 1900 - (t->tm_mon < 2 ? 1 : 0);
+    const int m = t->tm_mon + 1;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const int yoe = y - era * 400;
+    const int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + t->tm_mday - 1;
+    const int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const s64 days = s64(era) * 146097 + doe - 730425; // (0000-03-01 to 2000-01-01)
+    const s64 s = days * 86400 + t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
+    return s > 0 && s < s64(0xFFFFFFFF) ? u32(s) : 1;
+}
+
+std::string record_date_text(u32 stamp) {
+    if (stamp == 0) return "--/--/--";
+    // The original's conversion: four-year cycles of 1461 days, each starting with a leap
+    // year, then the month by the days before it; it picks the leap year's month table only
+    // for the year 2000.
+    static const int kYear[4] = {0, 366, 731, 1096};
+    static const int kMonth[2][12] = {{0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334},
+                                      {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335}};
+    const u32 days = stamp / 86400, d = days % 1461;
+    int yi = 0;
+    while (yi < 3 && int(d) >= kYear[yi + 1]) ++yi;
+    const u32 year = days / 1461 * 4 + u32(yi);
+    const int doy = int(d) - kYear[yi];
+    const int* month = kMonth[year == 0 ? 1 : 0];
+    int mi = 0;
+    while (mi < 11 && doy >= month[mi + 1]) ++mi;
+    char b[32];
+    std::snprintf(b, sizeof b, "%02d/%02d/%02u", doy - month[mi] + 1, mi + 1, year % 100);
+    return b;
+}
+
 // ---------------------------------------------------------------------------
 // GtData
 
@@ -145,7 +184,7 @@ std::string GtData::ArcadeCar::image() const {
 
 namespace {
 
-// The program's table of built-in record names (the time-trial seeds, spec §16): three
+// The program's table of built-in record names (the time-trial seeds, gt_mode §16): three
 // per time trial (30) consecutive pointers to short "X.Name" strings in the program's
 // data. Found by a pattern search over the program (the same table on 1.00 and
 // 1.10); an unexpected program gives none.
@@ -204,7 +243,7 @@ bool GtData::load(const Reader& read) {
         if (auto c = read("database/carcolor.db")) {
             colors_.parse(*c);
             // Colour names: the definitions {u32 id, u32 name, u32 name (alternate), u32 rgb}
-            // index carcolor.sdb (spec §7).
+            // index carcolor.sdb (gt_mode §7).
             if (auto sdb = read("database/carcolor.sdb")) {
                 db::StringTable names = db::StringTable::parse(*sdb);
                 ByteSpan d(*c);
@@ -219,7 +258,7 @@ bool GtData::load(const Reader& read) {
         }
         builtin_names.clear();
         if (auto core = read(Vfs::kProgramFile)) builtin_names = find_builtin_names(*core);
-        // The race songs of bgm/ads.inf in index order (the options' music list, spec §12).
+        // The race songs of bgm/ads.inf in index order (the options' music list, gt_mode §12.2).
         race_songs.clear();
         if (auto ads = read("bgm/ads.inf"))
             for (const BgmTrack& t : parse_bgm_index(*ads))
@@ -392,7 +431,7 @@ std::string GtData::color_name(u32 id) const {
 
 GtMode::GtMode(std::shared_ptr<const GtData> data) : data_(std::move(data)) {
     new_game();
-    // The game's start-up seeding of the GT-mode state (spec §20.2): a hardware
+    // The game's start-up seeding of the GT-mode state (gt_mode §20.2): a hardware
     // random value, stepped once.
     state_.rng = hardware_random();
     GameRandom::next(state_.rng);
@@ -407,7 +446,7 @@ void GtMode::new_game() {
 }
 
 void GtMode::stir_random() {
-    // The trophy_get / car_get controls open with 1..12 steps (spec §20.2).
+    // The trophy_get / car_get controls open with 1..12 steps (gt_mode §20.2).
     GameRandom::stir(state_.rng, hardware_random(), shared_random());
 }
 
@@ -741,8 +780,9 @@ bool GtMode::buy_all_tires() {
 }
 
 PowerPeak GtMode::power_peak(const GarageCar& c) const {
+    // The menu figure: the built curve x the garage car's condition factor (gt_mode §5).
     std::optional<sim::CarSpec> s = car_spec(c);
-    return s ? spec_power_peak(*s) : PowerPeak{};
+    return s ? spec_power_peak(*s, engine_factor(c.cond)) : PowerPeak{};
 }
 
 float GtMode::power_ps(const GarageCar& c) const { return power_peak(c).ps; }
@@ -817,22 +857,48 @@ bool GtMode::change_oil() {
 }
 
 float GtMode::engine_factor(const CarCondition& c) {
-    // Break-in / wear and oil (physics spec §10.3; verified there): 97 % new
+    // Break-in / wear and oil (physics §10.3; verified there): 97 % new
     // (E <= -300 km), 100 % from 0 to 500 km, 98 % from 600 km; oil +5 % fading out.
     return sim::model::engine_condition_factor(c.engine_wear_m, c.oil_m);
 }
 
-void GtMode::drive(int index, double metres) {
-    if (metres <= 0) return;
-    state_.distance_m += metres;
+float GtMode::oil_age(float oil_m) {
+    constexpr float kLife = 300000; // the oil change's -300 km, the worn value +300 km
+    return std::min(oil_m < 0 ? (oil_m + kLife) / kLife : oil_m / kLife, 1.0f);
+}
+
+// --- Engine condition through a run (gt_mode §13.1, physics §10.3) -------------------
+
+bool GtMode::carries_engine_condition(const std::string& mode) {
+    return mode == "go_race" || mode == "go_machine_test" || mode == "go_free_run" || mode == "single_race" ||
+           mode == "free_run";
+}
+
+sim::EngineCondition GtMode::run_condition(const CarCondition& c) {
+    const double units = std::clamp(c.odometer_m / 2, 0.0, double(sim::model::kOdometerMax));
+    return {u32(units), c.engine_wear_m, c.oil_m};
+}
+
+sim::EngineCondition GtMode::driven(sim::EngineCondition c, float metres) {
+    if (metres <= 0) return c;
+    sim::model::odometer_step(c.odometer, metres);
+    sim::model::engine_condition_step(c.wear_m, c.oil_m, metres);
+    return c;
+}
+
+void GtMode::end_run(int index, const sim::EngineCondition& end, u32 odometer_added) {
+    state_.distance_m += 2.0 * double(odometer_added);
     if (index < 0 || index >= int(state_.garage.size())) return;
     CarCondition& c = state_.garage[size_t(index)].cond;
-    c.odometer_m = std::min(c.odometer_m + metres, 3999999910.0 * 2);
-    c.engine_wear_m = std::min(c.engine_wear_m + float(metres), 600000.0f);
-    bool was_negative = c.oil_m < 0;
-    c.oil_m += float(metres);
-    if (was_negative && c.oil_m >= 0) c.oil_m = 300000; // the bonus ran out: worn
-    c.oil_m = std::min(c.oil_m, 300000.0f);
+    c.odometer_m = 2.0 * double(end.odometer);
+    c.engine_wear_m = end.wear_m;
+    c.oil_m = end.oil_m;
+}
+
+int GtMode::garage_index(const GarageCar& c) const {
+    for (size_t i = 0; i < state_.garage.size(); ++i)
+        if (&state_.garage[i] == &c) return int(i);
+    return -1;
 }
 
 // --- Licenses -------------------------------------------------------------------
@@ -917,7 +983,7 @@ Award GtMode::record_license_medal(const std::string& code, Medal medal, double 
         if (rec.best_time < 0 || seconds < rec.best_time) rec.best_time = seconds;
     }
     a.license_obtained = !held && license_held(lic);
-    // The license card page (spec gt_mode.md §3) marks the card received: bit 1 << license of +0xC0.
+    // The license card page (gt_mode §3.2) marks the card received: bit 1 << license of +0xC0.
     if (a.license_obtained) state_.trophy_flags |= 1u << lic;
     a.all_gold = !gold && license_all_gold(lic);
     if (a.license_obtained) a.messages.push_back(std::string("License ") + license_name(License(lic)) + " obtained");
@@ -1012,11 +1078,11 @@ std::vector<std::string> GtMode::pick_opponents(const std::string& code, GameRan
     std::optional<EventRules> r = rules(code);
     const data::Event* ev = db().event(code);
     if (!r || !ev) return {};
-    // Slots 1 .. cars-1 (slot 0 is the player), spec §20.4.
+    // Slots 1 .. cars-1 (slot 0 is the player), gt_mode §20.4.
     return race::draw_opponents(db(), *ev, std::max(r->cars, 1) - 1, rng);
 }
 
-// The race prize page's bookkeeping (spec gt_mode.md §3, presentation.md §F): a GT-mode cup (prize money, places
+// The race prize page's bookkeeping (gt_mode §3.2, presentation §F): a GT-mode cup (prize money, places
 // 1-3, trophy class 5..8) adds a trophy and sets award bit 1 << ((class - 5) x 3 + place);
 // the consolation prize (places 4-6) sets bit 0x10000.
 void GtMode::note_race_prize(const EventRules& r, int place, s64 money) {
@@ -1097,7 +1163,7 @@ Award GtMode::record_round(int place, const std::vector<int>& order) {
         for (int i = 1; i < n; ++i) champion = champion && ch.points[0] > ch.points[size_t(i)];
         a.champion = champion;
         if (champion) {
-            ++state_.trophies; // the championship trophy (spec gt_mode.md §18)
+            ++state_.trophies; // the championship trophy (gt_mode §3.2)
             a.bonus = r ? r->champ_bonus : 0;
             a.money += a.bonus;
             state_.credits += a.bonus;
@@ -1132,7 +1198,7 @@ bool GtMode::league_complete(const std::string& tier) const {
 
 float GtMode::completion() const {
     // GT races won + arcade Clear Status count (max 102) + time trials cleared
-    // + license tests passed, over 364 + 102 + 10 + 48 (spec §4).
+    // + license tests passed, over 364 + 102 + 10 + 48 (gt_mode §4).
     int won = 0, tests = 0;
     for (const std::string& c : data_->race_codes) won += state_.best_position(c) == 0;
     for (const LicenseTestRecord& t : state_.license_tests) tests += t.medal != Medal::None;
@@ -1192,19 +1258,21 @@ std::vector<int> GtMode::award_prizes(const std::string& code) {
         else if (n == "gtmode_pro_complete") eligible = league_complete("pro");
         else if (n == "gtmode_dirt_complete") eligible = league_complete("dirt");
         else if (n == "gtmode_enduro_complete") eligible = league_complete("end");
+        // The whole game: checked with a GT-mode code (not arcade), every GT-mode result won.
+        else if (n == "gtmode_complete") eligible = gt_mode_code(code) && all_races_won();
         else if (n == "achieve_half") eligible = completion() >= 0.5f;
         else if (n == "achieve_3_quoter") eligible = completion() >= 0.75f;
         else if (n == "achieve_complete") eligible = completion() >= 1.0f;
         if (!eligible) continue;
         if (!multi && state_.prizes_given.count(n)) continue;
         if (multi && n != code) continue;
-        // The car_get control opens with a stir (spec §20.3), even when the garage is full.
+        // The car_get control opens with a stir (gt_mode §20.3), even when the garage is full.
         if (!stirred) stir_random(), stirred = true;
         if (int(state_.garage.size()) >= kMaxGarageCars) { // garage full: nothing given
             ++prizes_refused_;
             continue;
         }
-        // car_get (spec §20.3): per set every candidate gets its paint, then the weighted pick.
+        // car_get (gt_mode §20.3): per set every candidate gets its paint, then the weighted pick.
         std::vector<int> paint(set.cars.size());
         for (size_t i = 0; i < set.cars.size(); ++i) paint[i] = prize_paint(set.cars[i]);
         const PrizeCar& pc = set.cars[size_t(pick_prize(set))];
@@ -1218,8 +1286,31 @@ std::vector<int> GtMode::award_prizes(const std::string& code) {
     return got;
 }
 
+bool GtMode::gt_mode_code(const std::string& code) {
+    if (code.empty()) return false;
+    switch (code[0]) {
+    case 'G': // series races and championships
+    case 'E': // endurance
+    case 'D': // rally
+        return true;
+    case 'L': // licences B, A, IB, IA, S, R: the third character
+        return code.size() > 2 && (code[2] == 'A' || code[2] == 'B' || code[2] == 'R' || code[2] == 'S');
+    case 'M': // machine tests M400, M1000, MMAX: the second character
+        return code.size() > 1 && (code[1] == '4' || code[1] == '1' || code[1] == 'M');
+    default:
+        return false;
+    }
+}
+
+bool GtMode::all_races_won() const {
+    if (data_->race_codes.empty()) return false;
+    for (const std::string& c : data_->race_codes)
+        if (state_.best_position(c) != 0) return false;
+    return true;
+}
+
 int GtMode::prize_paint(const PrizeCar& pc) {
-    // A fixed colour id in the model's list, else a random paint (spec §20.3).
+    // A fixed colour id in the model's list, else a random paint (gt_mode §20.3).
     if (pc.color_id >= 0) {
         int i = data_->color_index(pc.car, pc.color_id);
         if (data_->color_id(pc.car, i) == u32(pc.color_id)) return i;
@@ -1234,7 +1325,7 @@ int GtMode::pick_prize(const PrizeSet& set) {
 }
 
 int GtMode::pick_trophy() {
-    // trophy_get (spec §18, §20.3): a stir, then the weighted pick.
+    // trophy_get (gt_mode §18, gt_mode §20.3): a stir, then the weighted pick.
     stir_random();
     int pick = pick_trophy_index(completion(), state_.rng);
     state_.trophy_flags |= 0x40u << pick;
@@ -1285,7 +1376,7 @@ bool GtMode::arcade_car_level_open(int level) const {
     return level <= kArcadeCarLevels && state_.arcade.car_flags[size_t(level - 1)];
 }
 
-// The arcade car filter's region test (spec gt_mode.md §16): the base car is the arcade-car (35)
+// The arcade car filter's region test (gt_mode §16): the base car is the arcade-car (35)
 // or car-variant (31) record's +8, else the label itself; a car missing from the car table
 // (30) is hidden (NTSC-U: the Vauxhall twins of the Opels), otherwise its region byte +0xF7
 // decides: 0 everywhere, 1 only in EU, 2 not in EU, 3 only in US, 4 not in US, 5 not in US /
@@ -1475,7 +1566,7 @@ std::vector<RankEntry> GtMode::time_trial_seed_ranking(const data::CarDatabase& 
     const int i = time_trial_index(code);
     const ByteSpan* r = db.record(data::TableId::Event, code);
     if (i < 0 || !r || r->size() < 0x1D0) return out;
-    // The original's new game (spec §16): one name byte counting down from 0xFF over the
+    // The original's new game (gt_mode §16): one name byte counting down from 0xFF over the
     // ten challenges' three records each, every time inserted before the first time that
     // is not faster. (A record without a time is left out here; the disc has none.)
     for (int k = 0; k < 3; ++k) {
@@ -1484,7 +1575,7 @@ std::vector<RankEntry> GtMode::time_trial_seed_ranking(const data::CarDatabase& 
         if (t <= 0) continue;
         size_t pos = 0;
         while (pos < out.size() && out[pos].value < t) ++pos;
-        out.insert(out.begin() + std::ptrdiff_t(pos), RankEntry{t, "", 0, time_trial_seed_name(i, k)});
+        out.insert(out.begin() + std::ptrdiff_t(pos), RankEntry{t, "", 0, time_trial_seed_name(i, k), 0, ""});
     }
     return out;
 }
@@ -1492,7 +1583,7 @@ std::vector<RankEntry> GtMode::time_trial_seed_ranking(const data::CarDatabase& 
 std::string GtMode::record_name(const std::string& stored) const {
     if (!is_record_mark(stored)) return stored;
     // The original reads the name's first byte signed and, when negative, shows entry
-    // ~byte of the program's built-in name table (spec §16): the
+    // ~byte of the program's built-in name table (gt_mode §16): the
     // seeds' marks 0xFF - 3 i - k give entries 3 i + k (30 names, none past them).
     size_t k = size_t(u8(~u8(stored[0])));
     return k < data_->builtin_names.size() ? data_->builtin_names[k] : std::string("-");
@@ -1508,7 +1599,8 @@ int GtMode::arcade_time_trial(const std::string& code, double seconds, const std
     size_t pos = 0;
     while (pos < v.size() && v[pos].value < seconds) ++pos;
     if (pos >= 12) return -1;
-    v.insert(v.begin() + std::ptrdiff_t(pos), RankEntry{seconds, car, state_.day, state_.player_name});
+    v.insert(v.begin() + std::ptrdiff_t(pos),
+             RankEntry{seconds, car, state_.day, state_.player_name, record_stamp_now(), ""});
     if (v.size() > 12) v.resize(12);
     int& best = state_.arcade.at_best_rank[size_t(i)];
     best = std::min(best, int(pos));
@@ -1527,23 +1619,48 @@ std::vector<RankEntry> GtMode::ranking_top(const std::string& key, size_t n) con
 int GtMode::add_record(const std::string& key, double value, const std::string& car, bool ascending, size_t max) {
     if (value <= 0) return -1;
     std::vector<RankEntry>& v = state_.rankings[key];
-    // A new entry goes after equal values (the earlier record keeps its place).
+    // The first place whose entry is not better: a new entry goes before equal values.
     size_t pos = 0;
-    while (pos < v.size() && (ascending ? v[pos].value <= value : v[pos].value >= value)) ++pos;
+    while (pos < v.size() && (ascending ? v[pos].value < value : v[pos].value > value)) ++pos;
     if (pos >= max) return -1;
-    v.insert(v.begin() + std::ptrdiff_t(pos), RankEntry{value, car, state_.day, state_.player_name});
+    v.insert(v.begin() + std::ptrdiff_t(pos),
+             RankEntry{value, car, state_.day, state_.player_name, record_stamp_now(), ""});
     if (v.size() > max) v.resize(max);
     return int(pos);
+}
+
+int GtMode::record_machine_test(const std::string& code, double value, const std::string& car) {
+    if (value <= 0) return -1;
+    MachineRecords& m = state_.machine;
+    if (code == "MMAX") {
+        if (value > m.top_speed) m.top_speed = value, m.car_top = car;
+        return add_record("mt:MMAX", value, car, false, 12);
+    }
+    if (code == "M400" && (m.t400 < 0 || value < m.t400)) m.t400 = value, m.car400 = car;
+    if (code == "M1000" && (m.t1000 < 0 || value < m.t1000)) m.t1000 = value, m.car1000 = car;
+    return add_record("mt:" + code, value, car, true, 12);
+}
+
+int GtMode::course_time_trial_index(const std::string& course) const {
+    auto it = data_->arcade_courses.find("TIME_ATTACK");
+    if (it == data_->arcade_courses.end()) return -1;
+    for (size_t i = 0; i < it->second.size(); ++i)
+        if (it->second[i].course == course) return i < size_t(kCourseTimeTrials) ? int(i) : -1;
+    return -1;
+}
+
+int GtMode::record_course_time_trial(const std::string& course, double best_lap, const std::string& car) {
+    // The best lap in whole ms, entered when the run has one (not the "no time" value, at most
+    // 0x3FFFFF ms).
+    const double ms = std::round(best_lap * 1000.0);
+    if (course_time_trial_index(course) < 0 || !(ms >= 1) || ms > 0x3FFFFF) return -1;
+    return add_record("ct:" + course, ms / 1000.0, car, true, 12);
 }
 
 // --- Car spec bridge -----------------------------------------------------------
 
 std::optional<sim::CarSpec> GtMode::car_spec(const GarageCar& c, std::string* error) const {
-    std::optional<sim::CarSpec> s = sim::build_car_spec(db(), c.car, c.parts, c.settings, error);
-    if (!s) return s;
-    float f = engine_factor(c.cond);
-    for (float& t : s->engine.curve_torque) t *= f;
-    return s;
+    return sim::build_car_spec(db(), c.car, c.parts, c.settings, error);
 }
 
 } // namespace gt3r::game

@@ -19,9 +19,12 @@
 
 #include <SDL3/SDL.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace gt3r::render {
@@ -47,7 +50,7 @@ struct PipelineKey {
     BlendMode blend = BlendMode::Opaque;
     CullMode cull = CullMode::Back;
     bool depth_write = true;
-    bool lines = false; // line list (wireframe overlay), depth test LESS_OR_EQUAL
+    bool lines = false; // line list (wireframe overlay)
     // Write the alpha channel as coverage (pictures composited over the 2D frame with a
     // transparent clear); otherwise alpha is never written.
     bool coverage = false;
@@ -64,6 +67,8 @@ struct GpuOptions {
     // one; the 2D renderer then draws offscreen (canvases of xr::Session) instead of the window.
     bool xr = false;
 };
+
+class Uploader;
 
 class GpuContext {
 public:
@@ -93,15 +98,40 @@ public:
     // upscaled when composited (cheaper on high-resolution phones/tablets).
     float render_scale() const { return render_scale_; }
     void set_render_scale(float s);
+    // The largest scale the views size their targets for (0: render_scale), so the dynamic scale
+    // can move under it without new targets.
+    float render_ceiling() const { return render_ceiling_; }
+    void set_render_ceiling(float s);
 
     SDL_GPUGraphicsPipeline* pipeline(const PipelineKey& key);
-    SDL_GPUSampler* sampler(bool clamp_u, bool clamp_v) const { return samplers_[(clamp_u ? 1 : 0) | (clamp_v ? 2 : 0)]; }
+    // Creates the pipelines races and menus draw with on a background thread, ahead of their
+    // first use: one takes ~65 ms on a Galaxy A15 (Mali), a stutter the first time each blend /
+    // cull / write combination appears in a session.
+    void warm_pipelines();
+    // no_mips: the full-size image only (GS MXL 0), linear, no anisotropy.
+    SDL_GPUSampler* sampler(bool clamp_u, bool clamp_v, bool no_mips = false) const {
+        return samplers_[(clamp_u ? 1 : 0) | (clamp_v ? 2 : 0) | (no_mips ? 4 : 0)];
+    }
     SDL_GPUTexture* white_texture() const { return white_; }
+
+    // Mipmapped RGBA8 textures shared by content: identical texels are one GPU texture,
+    // counted per holder (GpuModel). GT3 repeats most textures across LOD sets and models (a
+    // race: 3,674 uploads, 839 distinct), and the Galaxy A15's Mali driver spends ~185 KB of
+    // memory on every texture object besides its texels. New ones upload with `up`.
+    SDL_GPUTexture* acquire_texture(Uploader& up, u32 width, u32 height, const u32* rgba);
+    // Drops a hold from acquire_texture; other textures are released outright.
+    void release_texture(SDL_GPUTexture* texture);
+    // Before rewriting a texture's texels: takes it out of the sharing when the caller is its
+    // only holder (true; it is then the caller's own, released with release_texture as before).
+    // False when others hold it too: the caller needs a texture of its own.
+    bool take_texture(SDL_GPUTexture* texture);
 
 private:
     GpuContext() = default;
     bool init(SDL_Window* window, const GpuOptions& options);
     SDL_GPUShader* make_shader(bool vertex);
+    SDL_GPUGraphicsPipeline* create_pipeline(const PipelineKey& key);
+    void stop_warming();
     void release_pipelines();
 
     SDL_GPUDevice* device_ = nullptr;
@@ -111,38 +141,67 @@ private:
     xr::Session::DeviceRequest xr_request_;
 #endif
     float render_scale_ = 1.0f;
+    float render_ceiling_ = 0.0f;
     SDL_Renderer* renderer_ = nullptr;
     SDL_GPUShader* vs_ = nullptr;
     SDL_GPUShader* fs_ = nullptr;
-    SDL_GPUSampler* samplers_[4] = {};
+    SDL_GPUSampler* samplers_[8] = {};
     SDL_GPUTexture* white_ = nullptr;
     SDL_GPUTextureFormat depth_format_ = SDL_GPU_TEXTUREFORMAT_D16_UNORM;
     SDL_GPUSampleCount samples_ = SDL_GPU_SAMPLECOUNT_1;
     std::map<PipelineKey, SDL_GPUGraphicsPipeline*> pipelines_;
+    std::mutex pipelines_mutex_; // pipelines_ (warm_pipelines' thread adds to it)
+    std::thread warm_thread_;
+    std::atomic<bool> warm_stop_{false};
+    bool warm_ = false; // warm_pipelines was asked for (again after an MSAA change)
+    struct TextureKey {
+        u32 width, height;
+        u64 hash[2]; // two independent 64-bit hashes of the texels
+        auto operator<=>(const TextureKey&) const = default;
+    };
+    struct SharedTexture {
+        TextureKey key;
+        u32 holders;
+    };
+    std::map<TextureKey, SDL_GPUTexture*> textures_by_key_;
+    std::map<SDL_GPUTexture*, SharedTexture> shared_textures_;
 };
 
-// Batches buffer/texture uploads into one command buffer:
+// Mip chain of a w x h texture: levels down to 1 x 1, each side halving to no less than 1.
+u32 mip_levels(u32 w, u32 h);
+// The next mip level of RGBA8 texels: max(1, w / 2) x max(1, h / 2), each texel the rounded
+// mean of its 2 x 2 block (what a linear blit of the level above gives).
+std::vector<u32> half_size(const u32* rgba, u32 w, u32 h);
+
+// Batches buffer/texture uploads into one command buffer and one transfer buffer:
 //   Uploader up(device); auto* vb = up.buffer(VERTEX, data, size); ...; up.submit();
-// Created resources are owned by the caller. Textures with mipmaps get
-// their chain generated on the GPU at submit().
+// Created resources are owned by the caller. Mipmaps are built on the CPU, never with
+// SDL_GenerateMipmapsForGPUTexture: its Vulkan blits go zero-sized on non-square textures,
+// a GPU fault that loses the device on Mali (e.g. Galaxy A15).
 class Uploader {
 public:
     explicit Uploader(SDL_GPUDevice* device);
-    ~Uploader();
     SDL_GPUBuffer* buffer(SDL_GPUBufferUsageFlags usage, const void* data, u32 size);
     SDL_GPUTexture* texture_rgba(u32 width, u32 height, const u32* rgba, bool mipmaps);
+    // New texels for a texture made by texture_rgba (same size and mipmaps). cycle: frames
+    // still drawing keep the old texels.
+    void update_rgba(SDL_GPUTexture* texture, u32 width, u32 height, const u32* rgba, bool mipmaps, bool cycle);
     bool submit();
 
 private:
     struct Pending {
-        SDL_GPUTransferBuffer* transfer;
         SDL_GPUBuffer* buffer;
         SDL_GPUTexture* texture;
-        u32 size, width, height;
-        bool mipmaps;
+        u32 offset, size; // in staging_
+        u32 width, height, level;
+        bool cycle;
     };
+    u32 stage(const void* data, u32 size);
     SDL_GPUDevice* device_;
     std::vector<Pending> pending_;
+    // Every upload's data, copied into a single transfer buffer at submit(): SDL's Vulkan
+    // backend gives each transfer buffer its own device memory allocation.
+    std::vector<u8> staging_;
 };
 
 // True when this build's SDL supports the shared GPU device path.

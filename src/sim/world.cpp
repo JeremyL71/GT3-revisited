@@ -24,7 +24,7 @@ void World::step(double dt) {
 
 void World::tick(double h, bool first) {
     const int n = int(cars_.size());
-    // Phase: slipstream factors for every car from every leader [spec §5.2].
+    // Phase: slipstream factors for every car from every leader [physics §5.2].
     if (slipstream_) {
         for (int f = 0; f < n; ++f) {
             if (!cars_[size_t(f)].active || cars_[size_t(f)].kinematic) continue;
@@ -62,7 +62,7 @@ void World::tick(double h, bool first) {
         if (!first) in.shift_up = in.shift_down = false;
         c.vehicle->step_tick(in, track_, h * double(c.time_scale), world_);
     }
-    // Phase: car-car contact [spec §5.3].
+    // Phase: car-car contact [physics §5.3].
     if (!car_collisions_) return;
     // The steering input as a fraction of full lock (-1 left .. +1 right), for the stuck assist.
     auto steer_fraction = [](const Car& c) {
@@ -79,17 +79,19 @@ void World::tick(double h, bool first) {
             if (ka && kb) continue; // two remote cars: their own peers solve it
             Vehicle& va = *cars_[size_t(a)].vehicle;
             Vehicle& vb = *cars_[size_t(b)].vehicle;
-            // Same height band only (bridges): half-heights + 5 m [spec §5.1 broad phase].
+            // Same height band only (bridges): half-heights + 5 m [physics §5.1 broad phase].
             float dy = std::fabs(va.state().position.y - vb.state().position.y);
             if (dy > 0.5f * (va.spec().height + vb.spec().height) + 5.0f) continue;
             collide::Body ba = va.collision_body(), bb = vb.collision_body();
             collide::V2 p, nrm;
             float steer[2] = {steer_fraction(cars_[size_t(a)]), steer_fraction(cars_[size_t(b)])};
+            unsigned sides[2] = {0, 0};
             double j = collide::collide_pair_swept(ba, start[size_t(a)].pos, start[size_t(a)].heading, bb,
-                                                   start[size_t(b)].pos, start[size_t(b)].heading, h, 2, &p, &nrm, steer);
+                                                   start[size_t(b)].pos, start[size_t(b)].heading, h, 2, &p, &nrm, steer,
+                                                   nullptr, sides);
             if (j <= 0) continue;
-            if (!ka) va.apply_collision_body(ba);
-            if (!kb) vb.apply_collision_body(bb);
+            if (!ka) va.apply_collision_body(ba), va.add_hit_sides(sides[0]);
+            if (!kb) vb.apply_collision_body(bb), vb.add_hit_sides(sides[1]);
             Contact c;
             c.a = a;
             c.b = b;

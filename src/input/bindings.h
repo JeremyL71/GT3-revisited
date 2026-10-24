@@ -75,6 +75,8 @@ struct Profile {
 
     void add(std::string_view target, std::string_view sources);
     void remove_target(const PadTarget& target);
+    // No binding reads a controller (pad, joystick or tilt): only keys and mouse buttons drive it.
+    bool keyboard_only() const;
 };
 
 // Built-in presets for the virtual DualShock 2 (menus, and races in GT3's layout).

@@ -32,7 +32,7 @@ loss, and it scales to six cars. The cost is that contacts are approximate
 (each side sees the other car up to one-way latency late) and nothing stops a
 modified client from lying about its car.
 
-## State (protocol 2)
+## State (protocol 3)
 
 A car's state is 98 bytes on the wire, including six ticks of input history.
 A race datagram carrying it is 114 bytes (126 through the relay, plus 28 bytes
@@ -786,9 +786,10 @@ at 100–200 links are the busy desktop, not the relay.
   rate limited), `net_relay_min_online_enforced` (each state-creating request
   below / at / above min_online), `net_relay_versions_reload` (the file,
   reload keeps sessions), `net_relay_unconfigured_allows_all`,
-  `net_relay_update_required_client` and `..._at_race_start` (the game's
-  handling), `net_version_check_roundtrip` (the background check, and its
-  time-out), `net_direct_ip_needs_same_version`.
+  `net_relay_update_required_client` and
+  `net_relay_update_required_at_race_start` (the game's handling),
+  `net_version_check_roundtrip` (the background check, and its time-out),
+  `net_direct_ip_needs_same_version`.
 - The loopback tests do not depend on how fast the machine runs them (they
   used to fail now and then while other builds loaded the CPU):
   - Simulated clock: `net::set_clock` swaps `now_ms()` for the sessions, their
@@ -816,11 +817,11 @@ GT3R_RACE="auto=1,cam=1" GT3R_ONLINE="join=127.0.0.1,car=supra_rz_97,name=Two" g
    threshold.~~ (done)
 2. ~~Rendezvous / relay server (`tools/gt3r-relay`): session codes, endpoint
    exchange (no port forwarding), per-pair relay fallback.~~ (done; deploy it:
-   "Running the server")
+   "Running your own relay")
 3. ~~Cars: garage cars as descriptors; mod cars as validated, content-addressed
    packages offered for download.~~ (done; fuzz targets: "Fuzzing" above)
    - **Package validation:**
-     - allowed file types only (`.ini`, `.glb`/`.gltf`/`.bin`, `.png`);
+     - allowed file types only (`.ini`, `.glb`, `.png`);
      - a package may not replace game files;
      - relative, plain paths only;
      - size and count caps;

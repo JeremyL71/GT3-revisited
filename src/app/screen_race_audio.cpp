@@ -1,15 +1,18 @@
-// Sound glue: the race music cues, course ambience (CRSS) listeners, the inputs of the
-// per-car extra sounds (wind, whine, turbo) and silencing everything.
+// Sound glue: the race music cues, course ambience (CRSS) listeners, every car's tyre
+// loops, the inputs of the per-car extra sounds (wind, whine, turbo) and silencing everything.
 // (Race screen code map: docs/dev/RACE.md.)
 
 #include "app/screen_race_impl.h"
 
 namespace gt3r::race_screen {
 
-// The race's music cues (music spec §2-3), every frame.
+// The race's music cues (music §2-3), every frame.
 void RaceScreen::music_cues(App& app) {
     RaceMusic::Cues c;
-    c.music_on = replaying_ || demo_ || attract_ ? preset_.music && replay_settings_.bgm_on() : music_on_;
+    c.music_on = replaying_ || demo_ || attract_ ? preset_.music && view_settings().bgm_on() : music_on_;
+    c.menu_music_on = menu_music_on_;
+    c.replay = replaying_;
+    c.songs = music_.playlist().has_songs();
     bool lic_replay = !license_event_.empty() && !attract_ && (replaying_ || demo_);
     c.kind = lic_replay                       ? RaceMusic::Kind::LicenseReplay
              : demo_ || attract_              ? RaceMusic::Kind::Demo
@@ -18,8 +21,20 @@ void RaceScreen::music_cues(App& app) {
                                               : RaceMusic::Kind::Race;
     c.paused = paused_;
     c.start_type = field_ ? music_start_type_ : tt_start_.type;
-    c.holding = !replaying_ && (field_ ? field_->race_time() < 0 : tt_hold_ > 0);
+    // Held until the start signal, where the race music starts (music §2.2): a standing start's
+    // hold, the computer's 300 ticks of a rolling start, a flying start's run-up to the line.
+    // Replays re-run the start sequence (music §2.5): the start jingle over the hold, the race
+    // song from the signal.
+    c.holding = field_ ? field_->race_time() < 0 || rolling_runup()
+                       : tt_hold_ > 0 || (flying_runup() && !demo_ && !attract_);
     c.finished = finished_ || finished2_;
+    if (replaying_ && field_ && !two_player_) { // the car the cameras follow, at its finish
+        const int n = field_->opponents() + 1;
+        std::vector<bool> done(size_t(n), false);
+        for (const RaceField::Standing& s : field_->standings())
+            if (s.car >= -1 && s.car + 1 < n) done[size_t(s.car + 1)] = s.finished;
+        c.finished = replay_finish_.update(done, replay_focus_ + 1);
+    }
     c.position = 1; // every finish plays the jingle; in 2P the first one is the winner's
     // The fail jingle: a licence FAIL, a licence time slower than bronze (GT3 posts
     // ExamFail for both), a voided time trial.
@@ -33,11 +48,16 @@ void RaceScreen::music_cues(App& app) {
         c.failed = demo_end ? demo_judge_.state() == LicenseRun::State::Failed : music_license_failed_;
     }
     c.since_finish = finish_wait_;
-    bool results = (field_ || two_player_) && license_event_.empty() && machine_mark_m_ <= 0;
+    bool results = (field_ || two_player_) && license_event_.empty() && !machine_;
     c.menu = !quick_ ? RaceMusic::Menu::None
              : prerace_ || !results ? RaceMusic::Menu::Short
                                     : RaceMusic::Menu::Result;
     music_.cues(app.audio(), *app.vfs(), c);
+    // The playlist carries over to the next race: saved whenever a song was taken.
+    if (std::optional<std::string> pl = music_.take_playlist_change()) {
+        app.config().set("options", "music_playlist", *pl);
+        app.save_config();
+    }
 }
 
 // CRSS course ambience: one listener per screen, every car's track distance.
@@ -67,6 +87,61 @@ void RaceScreen::update_course_ambience(App& app) {
     crss_player_.update(app.audio().voices(), crss_);
 }
 
+// Every car runs the tyre routine (sound §7.6): its wheels' loops placed from the camera with the
+// view's gains (the followed car's, or the other cars'), and the followed cars' collision one-shots.
+void RaceScreen::update_tyre_sounds(App& app, const sim::VehicleState& s) {
+    VoiceMixer& mixer = app.audio().voices();
+    auto step = [](const CameraRig& cam, const sim::VehicleState& st, const sim::VehicleSetup& setup,
+                   const sim::Vehicle* v, SoundView view) {
+        CarSfx::Step p;
+        p.state = &st;
+        p.setup = &setup;
+        p.telemetry = v ? &v->telemetry() : nullptr;
+        p.view = view;
+        p.eye = to_sim(cam.eye());
+        p.right = cam_right(cam);
+        p.forward = cam_forward(cam);
+        return p;
+    };
+    const bool tv = camera_.mode() == CameraMode::Tv || replaying_;
+    CarSfx::Step p1 = step(camera_, s, vehicle_->setup(), vehicle_->sim_vehicle(),
+                           camera_.onboard() ? SoundView::InCarTarget : tv ? SoundView::Other : SoundView::ChaseTarget);
+    // The listener moves with the followed car (as for the other cars' engines, sound §8).
+    sim::Vec3 listener_v = s.velocity;
+    if ((replaying_ || attract_) && field_ && replay_focus_ >= 0 && replay_focus_ < field_->opponents())
+        listener_v = field_->opponent_state(replay_focus_).velocity;
+    auto doppler = [&](const sim::VehicleState& st, const sim::Vec3& eye) {
+        sim::Vec3 d = st.position - eye;
+        float n = d.length();
+        return OpponentEngines::doppler(n > 1e-3f ? d * (1.0f / n) : sim::Vec3{0, 0, 1}, st.velocity, listener_v);
+    };
+    p1.doppler = doppler(s, p1.eye);
+    p1.wall_impulse = replaying_ ? 0.0f : vehicle_->wall_impulse();
+    p1.car_impulse = replaying_ ? 0.0f : vehicle_->car_impulse();
+    car_sfx_.update(sfx_, mixer, p1);
+    if (field_ && field_->has_second()) {
+        CarSfx::Step p2 = step(camera2_, field_->second_state(), field_->second_setup(), field_->second_vehicle(),
+                               camera2_.onboard() ? SoundView::InCarTarget : SoundView::ChaseTarget);
+        p2.wall_impulse = field_->second_wall_impulse();
+        p2.car_impulse = field_->second_car_impulse();
+        car_sfx2_.update(sfx_, mixer, p2);
+    }
+    // The other cars: the "other car" gains, placed and attenuated (32/d) like the followed car's.
+    const int n = field_ ? field_->opponents() : 0;
+    if (int(opp_sfx_.size()) != n) {
+        for (CarSfx& c : opp_sfx_) c.stop(mixer);
+        opp_sfx_.clear();
+        opp_sfx_.resize(size_t(n));
+    }
+    const SoundView other = camera_.onboard() ? SoundView::InCarOther : tv ? SoundView::Other : SoundView::ChaseOther;
+    for (int i = 0; i < n; ++i) {
+        const sim::VehicleState& os = field_->opponent_state(i);
+        CarSfx::Step p = step(camera_, os, field_->opponent_setup(i), field_->opponent_vehicle(i), other);
+        p.doppler = doppler(os, p.eye);
+        opp_sfx_[size_t(i)].update(sfx_, mixer, p);
+    }
+}
+
 RaceScreen::SoundCar RaceScreen::car_sound_facts(const std::string& label) const {
     SoundCar c;
     std::string base = db_.car(label) ? label : "";
@@ -84,25 +159,6 @@ RaceScreen::SoundCar RaceScreen::car_sound_facts(const std::string& label) const
         if (t == int(data::TableId::Gear) && rec->size() > 0x10) c.whine = (*rec)[0x10] != 0;
     }
     return c;
-}
-
-// Turbo model inputs for one physics step. Physics does not expose the boost load and
-// the stage lag states yet: until VehicleTelemetry has `turbo_load` / `turbo_lag`, the
-// load is approximated from the boost (Bcap - 1) over the cap.
-CarExtraSounds::Step RaceScreen::extra_step(const sim::Vehicle& v, float throttle) {
-    CarExtraSounds::Step st;
-    const sim::VehicleTelemetry& t = v.telemetry();
-    const sim::TurboSpec& ts = v.spec().engine.turbo;
-    st.turbo = ts.on;
-    st.throttle = throttle;
-    st.torque = t.engine_torque;
-    st.load = ts.cap > 1.0f ? std::clamp(t.boost / (ts.cap - 1.0f), 0.0f, 1.0f) : 0.0f;
-    st.lag0 = st.lag1 = int(st.load * 6144.0f);
-    [&](const auto& tt) {
-        if constexpr (requires { tt.turbo_load; }) st.load = tt.turbo_load;
-        if constexpr (requires { tt.turbo_lag; }) st.lag0 = int(tt.turbo_lag[0]), st.lag1 = int(tt.turbo_lag[1]);
-    }(t);
-    return st;
 }
 
 CarExtraSounds::Frame RaceScreen::extra_frame(const sim::Vehicle& v, const sim::VehicleState& s, const SoundCar& car,
@@ -138,8 +194,9 @@ void RaceScreen::silence(App& app) {
     engine_.stop(app.audio().voices());
     engine2_.stop(app.audio().voices());
     opp_engines_.stop(app.audio().voices());
-    car_sfx_.stop(sfx_, app.audio().voices());
-    car_sfx2_.stop(sfx_, app.audio().voices());
+    car_sfx_.stop(app.audio().voices());
+    car_sfx2_.stop(app.audio().voices());
+    for (CarSfx& c : opp_sfx_) c.stop(app.audio().voices());
     extra_.stop(sfx_, app.audio().voices());
     extra2_.stop(sfx_, app.audio().voices());
     crss_player_.stop(app.audio().voices());

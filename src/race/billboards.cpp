@@ -1,6 +1,7 @@
 #include "race/billboards.h"
 
 #include "base/log.h"
+#include "formats/clut_animation.h"
 #include "formats/gs_memory.h"
 #include "formats/tex1.h"
 
@@ -24,6 +25,8 @@ bool Billboards::load(render::GpuContext& ctx, ByteSpan b, const std::string& na
     sprites_.clear();
     verts_.clear();
     gpu_.reset();
+    cluts_ = {};
+    ClutTextures clut;
     if (b.size() < 0x28 || std::memcmp(b.data(), "BLBd", 4) != 0) return false;
     u16 lists = rd16(b, 0x10), types = rd16(b, 0x14);
     u32 list_ptrs = rd32(b, 0x18), tex_off = rd32(b, 0x1C), type_off = rd32(b, 0x24);
@@ -36,8 +39,11 @@ bool Billboards::load(render::GpuContext& ctx, ByteSpan b, const std::string& na
             Tex1 tex = Tex1::parse(td);
             GsMemory gs;
             tex.upload(td, gs);
+            // (Textures fed by CLUT animations: in the animations' state.)
+            if (!tex.clut_animations.empty()) clut = ClutTextures(td, true);
             for (size_t i = 0; i < tex.textures.size(); ++i) {
                 Tex1::Image img = tex.decode(gs, i);
+                if (const std::vector<u32>* px = clut.rgba(u32(i)); px && px->size() == img.rgba.size()) img.rgba = *px;
                 scene::Texture t;
                 t.name = name + "/billboard" + std::to_string(i);
                 t.width = img.width, t.height = img.height;
@@ -112,6 +118,11 @@ bool Billboards::load(render::GpuContext& ctx, ByteSpan b, const std::string& na
             vi += 4;
         }
     gpu_ = std::make_unique<render::GpuModel>(ctx, model);
+    if (!clut.empty()) {
+        std::vector<gtm1::ClutSet> sets;
+        sets.push_back({0, std::move(clut)}); // the model's textures are the set's records in order
+        cluts_.add(gpu_.get(), std::move(sets));
+    }
     LOG_INFO("Billboards %s: %zu sprites, %zu textures", name.c_str(), sprites_.size(), model.textures.size());
     return true;
 }

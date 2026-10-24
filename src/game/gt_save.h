@@ -6,7 +6,9 @@
 // ("key value..." tokens separated by spaces; strings never contain
 // spaces). Written atomically (temporary file + rename); the saves live in
 // <user data dir>/saves/ (save_library.h). Unknown keys are ignored when
-// loading, so newer versions can add records.
+// loading, so newer versions can add records; a car's settings line may hold
+// fewer values (an older save: the rest keep their defaults) or more (ignored).
+// A save of a newer version is refused (FormatError).
 //
 // Import: the original PS2 memory-card file
 // BASCUS-97102GAMEDATA/BASCUS-97102GAMEDATA (save version 7.1: 0x40-byte
@@ -29,7 +31,14 @@ GameState load_from_text(const std::string& text);
 // folder in portable mode (portable.ini beside it); the app keeps mods and config there.
 std::string user_data_dir();
 bool write_save(const std::string& path, const GameState& s, std::string* error = nullptr);
+// nullopt when there is no save at `path` or it cannot be read (damaged, or from a newer
+// version); `error` says which, host_path_exists() tells them apart.
 std::optional<GameState> read_save(const std::string& path, std::string* error = nullptr);
+// Moves the file at `path` aside to "<path>.unreadable-<yyyymmdd>-<hhmmss>" ("-2", "-3"...
+// when taken; copied when it cannot be moved), keeping its bytes: a save that cannot be read
+// goes there before a new game is written to its path (GtModeSession::load). The save
+// library lists *.sav files only. Returns the new path, "" on failure (`error`).
+std::string set_aside_save(const std::string& path, std::string* error = nullptr);
 
 // Decodes an original GT3 (NTSC-U) GAMEDATA file. Needs the disc data for
 // the race-code / prize-key orders and the part tables. Throws FormatError.
@@ -39,7 +48,7 @@ GameState import_ps2_save(ByteSpan file, const GtData& data);
 // are written as a new game has them).
 Bytes export_ps2_save(const GameState& s, const GtData& data);
 
-// The original's memory-card save directory for the game file (spec §12):
+// The original's memory-card save directory for the game file (gt_mode §12.2):
 // BASCUS-97102GAMEDATA/ {BASCUS-97102GAMEDATA, icon.sys, icon0.ico, thumbnail}.
 constexpr const char* kPs2GameDir = "BASCUS-97102GAMEDATA";
 struct Ps2SaveFile {
@@ -68,6 +77,17 @@ void export_ps2_save_path(const GameState& s, std::shared_ptr<const GtData> data
 // e.g. for a path from a save dialog that has no extension. Throws FormatError.
 Bytes export_ps2_save_container(const GameState& s, std::shared_ptr<const GtData> data, const GtData::Reader& read,
                                 bool card);
+
+// The game save's options block (0x888 bytes, gt_mode §12.2) fields of view mode 1's replay pad
+// (presentation §G3): +0x114 the race-sound level of the music's marked sections (Up / Down,
+// a new game 0.1), +0x118 the music-timed cuts (Right / Left, 0 off, a new game). Ours keeps both
+// in its config (race::ReplaySettings::level / music_cuts), as the other option fields; the
+// block itself travels with an imported save (GameState::ps2_options) unchanged.
+struct Ps2ReplayPad {
+    float level = 0.1f, music_cuts = 0.0f;
+};
+Ps2ReplayPad ps2_replay_pad(ByteSpan options);              // (a short block: the new-game values)
+void set_ps2_replay_pad(Bytes& options, const Ps2ReplayPad& p); // (grown to 0x888 if short)
 
 // The 0x60-byte thumbnail the file list shows without loading the data file.
 Bytes ps2_thumbnail(const GameState& s, std::shared_ptr<const GtData> data);

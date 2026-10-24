@@ -47,7 +47,7 @@ struct DemoReplay {
 
     // nullopt (with *error) when the data is not a version-3 replay with an input stream.
     static std::optional<DemoReplay> parse(ByteSpan file, std::string* error = nullptr);
-    // The simulation's inputs for frame i; past the end an all-zero frame (spec §4.4).
+    // The simulation's inputs for frame i; past the end an all-zero frame (physics §4.4).
     sim::ControlInputs inputs(size_t i) const;
     // The pad record kind of frame i (2 analog, 3 digital steering; 3 past the end).
     int kind(size_t i) const { return i < frames.size() ? frames[i].kind : 3; }

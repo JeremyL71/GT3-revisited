@@ -52,11 +52,12 @@ void Turbo::step(bool turbo, float throttle, float prev_load, float load, float 
         return;
     }
     // Blow-off: fires once when the throttle drops under 75 %, with the boost
-    // load above 0.8 setting the strength; re-armed above 90 % throttle.
-    trigger_ = 0;
+    // load above 0.8 setting the strength; re-armed above 90 % throttle. The
+    // trigger waits for the next frame() (one sound per firing step, whatever
+    // the display rate).
     if (!fired_) {
         if (throttle < 0.75f) {
-            trigger_ = std::max(prev_load - 0.8f, 0.0f) / 256.0f;
+            trigger_ = std::max(trigger_, std::max(prev_load - 0.8f, 0.0f) / 256.0f);
             fired_ = true;
         }
     } else if (throttle > 0.9f) {
@@ -65,10 +66,9 @@ void Turbo::step(bool turbo, float throttle, float prev_load, float load, float 
     // Spool pitch follows the larger of the two stages' lag states.
     spool_ = u16(std::max(lag0 & 0xFFFF, lag1));
     // Spool level while the load is above 0.75: (load - 0.75), scaled down
-    // below 588 N m of torque, squared.
+    // below 588 N m of torque, squared; 1 otherwise (silent after the frame's scale).
     float over = prev_load - 0.75f;
-    if (over <= 0) return; // level left as it is (it decays in frame())
-    if (torque <= 0) {
+    if (over <= 0 || torque <= 0) {
         level_ = 1;
         return;
     }
@@ -79,6 +79,7 @@ void Turbo::step(bool turbo, float throttle, float prev_load, float load, float 
 void Turbo::frame() {
     level_ = u8(std::min(127, int(level_ * tuning::kTurboLevelScale)));
     blow_off_ = trigger_ * tuning::kBlowOffScale;
+    trigger_ = 0;
 }
 
 } // namespace gt3r::car_sound

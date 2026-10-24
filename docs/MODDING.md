@@ -16,6 +16,8 @@ mods/
     mod.ini
     cars/
       my_car.ini                   <- a new car (see "Adding cars")
+    makers/
+      my_maker.ini                 <- a new maker with a dealer (see "Dealers and makers")
     files/
       menu/license_bg.img          <- replaces this file from GT3.VOL
       bgm/race_a05.ads             <- replaces a music track
@@ -39,8 +41,8 @@ description = Replaces the license test background.
 priority = 10        ; higher wins when two mods provide the same file
 ```
 
-Enable or disable mods from the Mods screen; the choice is stored in
-`config.ini` under `[mods]`.
+A new mod is enabled. Enable or disable mods from the Mods screen; the choice is
+stored in `config.ini` under `[mods]`.
 
 ## Workflow
 
@@ -75,8 +77,8 @@ includes the upgrade parts the shops sell: tyres, suspension kits, weight
 reduction, brakes, LSD and, for engine cars, the engine parts. The clones get the
 new car's labels, and the values from the file are written over them. The new
 records go into the ordinary tables, so the car works wherever the engine
-looks up a car by label: the physics, the race and the database screen. The
-cloned upgrade parts will be ready once mod cars appear in the GT Mode shops.
+looks up a car by label: the physics, the race and the database screen. A mod
+car bought in GT Mode finds its cloned upgrade parts in the tune shop.
 
 ```ini
 [car]
@@ -154,7 +156,7 @@ level = 0                      ; arcade unlock level (0 = always open)
 zero_to_60_s = 3.3             ; magazine tests (1 ft rollout)
 quarter_mile_s = 11.5
 top_speed_kmh = 250
-skidpad_g = 0.88               ; 300 ft skidpad (also reported: 60-0 mph, lift-off decel)
+skidpad_g = 0.88               ; 300 ft skidpad (also: zero_to_100_s, brake_60_0_ft)
 
 [raw.chassis]                  ; advanced: bytes of the car's own record in any table
 0x1D = 120                     ; 0x30:u16 = 1000, 0x44:f32 = 2.1 (docs/formats/database.md)
@@ -162,8 +164,8 @@ skidpad_g = 0.88               ; 300 ft skidpad (also reported: 60-0 mph, lift-o
 
 In arcade mode, a mod car appears at the end of its class's car list. It is
 drawn in the turning showroom, with its own specs and its `[paints]` colours,
-and races against that class's opponents. The icon strip has no picture for it
-yet.
+and races against that class's opponents. The icon strip shows its
+`[dealer] thumb`.
 
 Mods load in priority order. A later mod's car replaces an earlier one with the
 same label, but a mod car can never replace a disc car. The Mods screen lists
@@ -234,10 +236,11 @@ gt3tool modcar game.iso mods/my_cars
 The command loads each file and reports errors and warnings. It then prints the
 resulting specs and drives the car on a flat plane. It reports 0-60 mph (standing
 start and with a 1 ft rollout, like US magazine tests), 0-100 km/h, the quarter
-mile, top speed and lift-off deceleration, each next to your `[reference]`
-figures. `disc:<label>` arguments run disc cars through the same test for
-comparison. Fit `power_kw` to the quarter-mile trap speed (top end) first, then
-`output_pct` to 0-60. GT3's physics loses a little at speed (the disc Viper
+mile, top speed, skidpad grip, 60-0 mph braking and lift-off deceleration, each
+next to your `[reference]` figures. `disc:<label>` arguments run disc cars
+through the same test for comparison. Fit `power_kw` to the quarter-mile trap
+speed (top end) first, then `output_pct` to 0-60. GT3's physics loses a little
+at speed (the disc Viper
 traps ~5 mph under its magazine tests), so the curve power often ends up
 10-15 % over the official rating. `rated_kw` keeps the rating on the specs
 screen. To hear the motor sound, run
@@ -287,9 +290,9 @@ come from the donor's car file; the shadow is stretched to the car's size.
 
 | Kind | Status |
 |---|---|
-| Music (`.ads`) | Works now: replace tracks; the jukebox and the game pick them up |
+| Music (`.ads`) | Works now: replace tracks; the jukebox and the game pick them up. Titles, artists and the song markers that time the replays' Video-mode cuts still come from `bgm/ads.inf` (music §8); the Options music list previews the intro file `bgm/i_<file>` |
 | Textures in `.img` files | Works now (needs a Tex1 encoder; a PNG import tool is planned) |
-| New cars (`cars/*.ini`) | Works now: data-only cars on a disc car's shell, including electric ones (see above) |
+| New cars (`cars/*.ini`) | Works now: data-only cars on a disc car's shell or their own glTF body, including electric ones, sold at GT Mode dealers, new makers included (see above) |
 | Any other file | Overrides are loaded wherever the game reads the file (menus, models, courses, sounds, databases, movies) |
 
 ## Planned

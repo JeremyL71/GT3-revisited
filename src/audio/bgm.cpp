@@ -4,6 +4,8 @@
 #include "base/log.h"
 #include "vfs/vfs.h"
 
+#include <algorithm>
+
 namespace gt3r::bgm {
 
 namespace {
@@ -18,6 +20,10 @@ constexpr const char* kSeqNames[0x12] = {"arcade01", "battle2p01", "dealer01", "
 const char* sequence_name(int id) { return is_sequence(id) ? kSeqNames[id] : nullptr; }
 bool is_sequence(int id) { return id >= 0 && id < 0x12; }
 bool is_stream(int id) { return id >= 0x12 && id <= 0x22; }
+
+int sequence_volume(float level) { return std::clamp(int(level * 16384.0f), 0, 0x3FFF); }
+
+float stream_gain(float level, float music_volume) { return std::max(level, 0.0f) * music_volume; }
 
 bool Player::load(Vfs& vfs) {
     if (loaded_) return !mads_.groups.empty();
@@ -43,9 +49,18 @@ std::string Player::identity(AudioEngine& audio, Vfs& vfs, int id, int index) {
     return std::string((index & kIntro) ? "bgm/i_" : "bgm/") + g[size_t(i)].file;
 }
 
-bool Player::play(AudioEngine& audio, Vfs& vfs, int id, int index, bool loop) {
+std::vector<std::string> Player::files(Vfs& vfs, int id) {
+    std::vector<std::string> out;
+    if (!is_stream(id) || !load(vfs)) return out;
+    for (const sound::MadsTrack& t : mads_.groups[size_t(id - 0x12)]) out.push_back(t.file);
+    return out;
+}
+
+bool Player::play(AudioEngine& audio, Vfs& vfs, int id, int index, bool loop, float volume) {
     if (is_sequence(id)) {
-        if (!audio.play_sequence(vfs, std::string(kSeqNames[id]))) return false;
+        if (!audio.play_sequence(vfs, std::string(kSeqNames[id]), volume)) return false;
+        ++generation_;
+        track_ = nullptr;
         id_ = id;
         index_ = index;
         what_ = identity(audio, vfs, id, index);
@@ -65,26 +80,32 @@ bool Player::play(AudioEngine& audio, Vfs& vfs, int id, int index, bool loop) {
         LOG_WARN("bgm: %s not found", path.c_str());
         audio.stop_music();
         id_ = -1;
+        track_ = nullptr;
+        ++generation_;
         return false;
     }
-    if (!audio.play_music(vfs, path, loop)) return false;
+    if (!audio.play_music(vfs, path, loop, volume)) return false;
+    ++generation_;
+    track_ = (index >= 0 && (index & kIntro)) ? nullptr : &g[size_t(i)];
     id_ = id;
     index_ = index;
     what_ = path;
     return true;
 }
 
-bool Player::play_if_different(AudioEngine& audio, Vfs& vfs, int id, int index, bool loop) {
+bool Player::play_if_different(AudioEngine& audio, Vfs& vfs, int id, int index, bool loop, float volume) {
     // The game restarts for a different index, a random or intro request,
     // or a different piece (sequence / stream file).
     bool same = id_ >= 0 && index == index_ && index >= 0 && !(index & kIntro) &&
                 is_sequence(id) == is_sequence(id_) && audio.music_playing() && identity(audio, vfs, id, index) == what_;
     if (same) return true;
-    return play(audio, vfs, id, index, loop);
+    return play(audio, vfs, id, index, loop, volume);
 }
 
 void Player::stop(AudioEngine& audio) {
     audio.stop_music();
+    ++generation_;
+    track_ = nullptr;
     id_ = index_ = -1;
     what_.clear();
 }

@@ -1,7 +1,8 @@
 #pragma once
 
 // A scene::Model uploaded to the GPU: one vertex and one index buffer for
-// all meshes, one texture per scene::Texture (with mipmaps), and a line
+// all meshes, one texture per scene::Texture (with mipmaps; identical texels
+// share one texture across models, GpuContext::acquire_texture), and a line
 // index list per mesh for wireframe display.
 
 #include "render/gpu_context.h"
@@ -22,6 +23,9 @@ ModelStats model_stats(const scene::Model& model, int lod = -1);
 class GpuModel {
 public:
     GpuModel(GpuContext& ctx, const scene::Model& model);
+    // A model whose geometry changes (update_geometry), drawn with `textures`' textures (shared:
+    // that model must outlive this one; texture indices are its). Empty until the first update.
+    GpuModel(GpuContext& ctx, const GpuModel& textures);
     ~GpuModel();
     GpuModel(const GpuModel&) = delete;
     GpuModel& operator=(const GpuModel&) = delete;
@@ -30,6 +34,18 @@ public:
     // Rewrites the vertex buffer (same layout and count as at construction, meshes in
     // order), e.g. camera-facing billboards. Returns false on a size mismatch.
     bool update_vertices(const std::vector<scene::Vertex>& all);
+    // Replaces textures' texels (RGBA8, the size they were uploaded with) and rebuilds their
+    // mipmaps, e.g. textures recoloured by CLUT animations; a texture other models share
+    // becomes this model's own first. Returns false when one is skipped (unknown index, size
+    // mismatch) or the upload fails.
+    struct TextureUpdate {
+        size_t index = 0;
+        const std::vector<u32>* rgba = nullptr;
+    };
+    bool update_textures(const std::vector<TextureUpdate>& updates);
+    // Replaces the geometry: the meshes and the vertex and index buffers (grown when needed);
+    // no wireframe lines. E.g. the course's animated nodes, every frame.
+    bool update_geometry(const std::vector<scene::Mesh>& meshes);
     size_t vertex_count() const { return vertex_count_; }
 
     struct MeshInfo {
@@ -47,20 +63,40 @@ public:
     struct TextureInfo {
         SDL_GPUTexture* texture = nullptr;
         bool clamp_u = false, clamp_v = false;
+        bool no_mips = false; // scene::Texture::no_mips
+        u32 width = 0, height = 0;
     };
 
     const std::vector<MeshInfo>& meshes() const { return meshes_; }
-    const std::vector<TextureInfo>& textures() const { return textures_; }
+    const std::vector<TextureInfo>& textures() const { return texture_source_ ? texture_source_->textures_ : textures_; }
     SDL_GPUBuffer* vertex_buffer() const { return vertices_; }
     SDL_GPUBuffer* index_buffer() const { return indices_; }
 
 private:
+    // One write into a GPU buffer for stage().
+    struct Upload {
+        SDL_GPUBuffer* buffer;
+        const void* data;
+        u32 size;
+    };
+    // Copies the uploads into their buffers through staging_ in one command buffer.
+    bool stage(const Upload* uploads, int count);
+
+    GpuContext* ctx_;
     SDL_GPUDevice* device_;
     SDL_GPUBuffer* vertices_ = nullptr;
     SDL_GPUBuffer* indices_ = nullptr;
     std::vector<MeshInfo> meshes_;
     std::vector<TextureInfo> textures_;
+    const GpuModel* texture_source_ = nullptr; // the model whose textures this one draws with
+    u32 vertex_capacity_ = 0, index_capacity_ = 0; // update_geometry's buffers (bytes)
     size_t vertex_count_ = 0;
+    // The updates' transfer buffer, kept between them (mapped with cycling: one an upload still
+    // reads is set aside, so after a few frames none is created). A new one per update allocated
+    // device memory every frame, ~7% of a Hiby R4's frame on Trial Mountain.
+    SDL_GPUTransferBuffer* staging_ = nullptr;
+    u32 staging_capacity_ = 0;
+    std::vector<u32> uploaded_indices_; // update_geometry: the index buffer's contents
 };
 
 } // namespace gt3r::render

@@ -7,6 +7,7 @@
 #include "disc/disc.h"
 #include "input/input_manager.h"
 #include "platform/display_insets.h"
+#include "render/dynamic_scale.h"
 #include "render/gpu_context.h"
 #include "vfs/vfs.h"
 #include "xr/xr_session.h"
@@ -67,6 +68,28 @@ public:
     bool fullscreen() const;
     void set_fullscreen(bool on);
 
+    // [video] limit_60fps = on: on high-refresh displays draw about 60 frames a second (the game
+    // runs at 60 Hz); steadier when the computer is busy. Off (default): every display refresh.
+    bool limit_60fps() const;
+    void set_limit_60fps(bool on);
+    // [video] dynamic_resolution = on | off (default on phones and tablets): the 3D resolution
+    // drops (to 50% at most) when the GPU cannot keep up and climbs while it does, up to [video]
+    // render_scale, or with auto the screen's full resolution (render::DynamicScale). Fixed for
+    // --shot and --render-scale runs.
+    bool dynamic_resolution() const;
+    void set_dynamic_resolution(bool on);
+    // The dynamic scale now in use, or null when off.
+    const render::DynamicScale* dynamic_scale() const { return dyn_on_ ? &dyn_ : nullptr; }
+    // Races: the dynamic scale a race reaches is where the next launch starts ([video]
+    // dynamic_start), so a phone that holds full resolution starts there and a slow one does
+    // not start too high. Only with 3D resolution on Auto (a manual setting starts at its own
+    // value); cleared when 3D resolution or dynamic resolution change. note_race_scale: every
+    // race frame; remember_race_scale: when a race ends and when the app goes to the background.
+    void note_race_scale();
+    void remember_race_scale();
+    // Applies [video] render_scale (after the setting changed).
+    void apply_render_scale();
+
     void push(std::unique_ptr<Screen> s) { pending_.push_back(std::move(s)); }
     void pop() { ++pops_; }
     void quit() { quit_ = true; }
@@ -82,6 +105,8 @@ public:
     MenuInput& menu() { return menu_; }
     SDL_Renderer* renderer() { return renderer_; }
     SDL_Window* window() { return window_; }
+    // Frames drawn so far (counted after each one).
+    int frame() const { return frame_; }
     // Shared SDL_GPU device for 3D views; nullptr when running 2D-only.
     render::GpuContext* gpu() { return gpu_.get(); }
 #if GT3R_XR
@@ -143,6 +168,18 @@ private:
     bool screenshot_requested_ = false;
     std::string auto_shot_path_; // --shot: capture after a few frames, then exit
     int frame_ = 0;
+    // 3D resolution: [video] render_scale (or --render-scale) and the dynamic scale under it.
+    float configured_scale_ = 1;
+    bool scale_auto_ = true; // [video] render_scale = auto (no --render-scale)
+    bool render_scale_arg_ = false;
+    render::DynamicScale dyn_;
+    bool dyn_on_ = false;
+    void reset_dynamic_scale();
+    float race_scale_ = 0; // note_race_scale: the dynamic scale in the last race frame (0: none)
+    static double dyn_cycle_s();
+    // The main loop rate set by App::apply_frame_limit (0: as fast as vsync allows).
+    double frame_limit_rate_ = 0;
+    void apply_frame_limit();
     bool touch_ui_ = false;  // phone/tablet sizing (mobile builds, or GT3R_PHONE)
     bool phone_sim_ = false; // GT3R_PHONE=1: desktop window shaped like a 20:9 phone
     std::optional<platform::DisplayInsets> display_insets_; // phones: cutout and corner radius (pixels)

@@ -51,11 +51,16 @@ DebugPreset read_preset() {
         else if (k == "p2") p.two_player = v != "0";
         else if (k == "quick") p.quick = v != "0";
         else if (k == "laps") p.laps = std::atoi(v.c_str());
+        else if (k == "exit_laps") p.exit_laps = std::atoi(v.c_str());
         else if (k == "split") p.split = v;
         else if (k == "car2") p.car2 = v;
         else if (k == "qm") p.qm = v;
         else if (k == "ropts") p.pause = true, p.ropts = std::atoi(v.c_str());
         else if (k == "rmode") p.rmode = std::atoi(v.c_str());
+        else if (k == "rtarget") p.rtarget = std::atoi(v.c_str());
+        else if (k == "hudmode") p.hud_mode = std::atoi(v.c_str());
+        else if (k == "ritems") p.ritems = std::atoi(v.c_str());
+        else if (k == "rcam") p.rcam = std::atoi(v.c_str());
         else if (k == "lcursor") p.lcursor = float(std::atof(v.c_str()));
         else if (k == "pit") p.pit = v != "0";
         else if (k == "demo") p.demo = v != "0";
@@ -133,10 +138,11 @@ void RaceScreen::resolve_launch() {
     if ((rq.mode == "single_race" || rq.mode == "go_race") && db_.event(code)) race_event_ = code;
     if (!rq.opponents.empty()) race_opponents_ = rq.opponents; // GT mode: the field drawn by the menus
     // Arcade Single Race: the field is drawn from the event's pool with the race module's
-    // generator (GT Mode spec §20.4), slots 1 .. cars-1.
+    // generator (gt_mode §20.4), slots 1 .. cars-1.
     else if (rq.mode == "single_race" && ev && !online_)
         race_opponents_ = race::draw_opponents(db_, *ev, std::max(int(ev->cars_in_race), 1) - 1, race_info_random());
-    if (rq.mode == "time_trial" && ev && ev->laps) race_laps_ = ev->laps;
+    // The arcade time trial: one timed lap, whatever the event's lap count (presentation §B7).
+    if (rq.mode == "time_trial" && ev) race_laps_ = race::kTimeTrialLaps;
     // Time attack / licence tests: a flying start when the event gives one.
     if (ev && (rq.mode == "time_trial" || rq.mode == "go_license" || rq.mode == "go_machine_test"))
         tt_start_ = event_start(*ev);
@@ -156,9 +162,9 @@ void RaceScreen::resolve_launch() {
         preset_.autodrive = true;
         preset_.hud = false;
         preset_.cam = int(CameraMode::Tv);
-        // The whole field from the event's pool (GT Mode spec §20.4): the demo's
+        // The whole field from the event's pool (gt_mode §20.4): the demo's
         // race information has no player car (gcf section 12 word +8 is "", whose label
-        // hash is 0), so every slot 0 .. cars-1 is drawn (spec gt_mode.md §15)
+        // hash is 0), so every slot 0 .. cars-1 is drawn (gt_mode §15)
         // on the race module's state; slot 0 is the car the demo follows.
         // (A demo with its own car keeps it in slot 0 and draws slots 1 .. cars-1.)
         const bool own = !rq.car.empty();
@@ -171,18 +177,21 @@ void RaceScreen::resolve_launch() {
             if (std::string c = base_car(field[0]); !c.empty()) preset_.car = car = c;
         }
     }
-    // Machine tests: 0-400 m / 0-1000 m (time to the mark) and the top-speed run (laps).
-    if (rq.mode == "go_machine_test") {
-        machine_mark_m_ = code == "M400" ? 400.0 : code == "M1000" ? 1000.0 : 0.0;
-        if (ev && ev->laps && machine_mark_m_ <= 0) race_laps_ = ev->laps;
-    }
-    // The garage car's odometer and oil counter (HUD odometer / oil lamp).
-    car_odometer_m_ = 0, car_oil_m_ = 0, car_dirt_ = 0;
+    // Machine tests (presentation §B7): the event's lap-count byte is the test (1 = 0-400 m,
+    // 2 = 0-1000 m, 3 = top speed); they run no laps.
+    if (rq.mode == "go_machine_test")
+        machine_.emplace(ev ? int(ev->laps) : code == "M1000" ? 2 : code == "MMAX" ? 3 : 1);
+    // The engine condition the runs start with and hand back (physics §10.3; GT mode fills it
+    // for the modes that carry it), and the garage car's dirt.
+    has_condition_ = rq.car_condition;
+    start_condition_ = run_condition_ = rq.car_condition ? sim::EngineCondition{rq.car_odometer, rq.car_wear_m, rq.car_oil_m}
+                                                         : sim::EngineCondition{};
+    live_condition_ = false;
+    car_dirt_ = 0;
     dirt_dims_ = true;
     if (rq.car_spec)
         if (game::GtModeSession* gs = game::gt_mode_session())
-            if (const game::GarageCar* gc = gs->gt().state().ride_car())
-                car_odometer_m_ = gc->cond.odometer_m, car_oil_m_ = gc->cond.oil_m, car_dirt_ = gc->cond.dirt;
+            if (const game::GarageCar* gc = gs->gt().state().ride_car()) car_dirt_ = gc->cond.dirt;
     if (rq.car_spec) launch_spec_ = rq.car_spec;
     // Licence / machine tests: the event's entry-0 car is a variant with its own parts
     // (Quick race practice: only when no other car was chosen).

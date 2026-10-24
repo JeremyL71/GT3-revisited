@@ -17,6 +17,7 @@
 //
 // Without a handler, the menu screen logs the request and shows it on screen.
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -68,6 +69,15 @@ struct GameRequest {
     std::shared_ptr<const sim::CarSpec> car2_spec;
     std::string car2_model, car2_wheel;
     bool racing_gearbox = false; // the garage car has a non-stock transmission (gear part +0x10 != 0): gear whine
+    // The engine condition player 1's car starts the run with (physics §10.3), for the modes
+    // that carry it and hand it back (GT race, machine test, free run, arcade race;
+    // game::GtMode::carries_engine_condition): the garage car's odometer (2 m units),
+    // running-in / wear and oil (metres); an arcade car's are zeros. garage_car: its index
+    // in the GT-mode garage (-1 = none). car_condition = false: a fresh engine, nothing back.
+    bool car_condition = false;
+    std::uint32_t car_odometer = 0;
+    float car_wear_m = 0, car_oil_m = 0;
+    int garage_car = -1;
     bool racing_gearbox2 = false; // the same for player 2's garage car (2 Player Battle)
     // Opponents (car variant labels) chosen by GT mode, e.g. a championship
     // field kept for every round; empty = draw them from the event's entries.
@@ -100,7 +110,13 @@ struct GameResult {
     double total_time = -1; // seconds, < 0 = none
     double best_lap = -1;   // seconds, < 0 = none
     std::vector<double> lap_times;
-    double distance_km = 0; // distance the player's car covered (odometer)
+    // The request carried an engine condition (GameRequest::car_condition): the player's car's
+    // words when the last live run ended, the odometer units (2 m each) the runs added, and
+    // the request's garage_car.
+    bool car_condition = false;
+    std::uint32_t car_odometer = 0, odometer_added = 0;
+    float car_wear_m = 0, car_oil_m = 0;
+    int garage_car = -1;
     // Every car in finishing order (finished cars by time, then by race
     // distance): an index into GameRequest::opponents, -1 = the player.
     std::vector<int> order;
@@ -112,10 +128,12 @@ struct GameResult {
     // finished + total_time), -1 = failed / no medal, 0 gold, 1 silver, 2 bronze.
     int license_medal = -2;
     std::string failure;    // why a test failed ("course_out", "time_over", ...), "" when OK
-    // The race already entered every run's record (licence tests: the original asks for the
-    // name right after each run that makes the ranking); the menus must not add it again.
+    // The race entered runs of this visit into their rankings (licence tests, machine tests,
+    // time trials, free runs: it records each run, with its name entry, when it ends, as the
+    // original does); the menus never record from a result, they only save it.
     bool records_done = false;
-    // The race already showed the race prize page (cup / consolation prize) itself.
+    // The race already showed the race prize page (cup / consolation prize, the arcade win
+    // trophy) itself, before its replay.
     bool prize_shown = false;
 };
 

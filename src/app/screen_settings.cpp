@@ -440,9 +440,14 @@ private:
             SDL_SetRenderVSync(a->renderer(), v ? 1 : 0);
             a->save_config();
         });
+        toggle("Limit to 60 fps",
+               "On 120 Hz and faster displays, draw about 60 frames a second (the game runs at 60 Hz). "
+               "Steadier when the computer is busy.",
+               app.limit_60fps(), [a](bool v) { a->set_limit_60fps(v); });
 
         static const int kMsaa[] = {1, 2, 4, 8};
-        int want = std::atoi(cfg.get("video", "msaa").value_or("4").c_str());
+        int want = cfg.get("video", "msaa") ? std::atoi(cfg.get("video", "msaa")->c_str())
+                                            : platform::default_msaa(platform::is_mobile());
         int idx = 0;
         for (int i = 0; i < 4; ++i)
             if (want >= kMsaa[i]) idx = i;
@@ -458,29 +463,49 @@ private:
         msaa.enabled = app.gpu() != nullptr;
         if (!msaa.enabled) msaa.desc = "Needs the 3D renderer (turn it on and restart).";
 
-        static const char* const kScales[] = {"auto", "0.5", "0.6", "0.7", "0.75", "0.8", "0.9", "1.0"};
+        // Auto sits among the fixed sizes at the scale it picks, so Left is always lower.
+        int win_w = 0, win_h = 0;
+        SDL_GetWindowSizeInPixels(app.window(), &win_w, &win_h);
+        const float auto_scale = platform::auto_render_scale(win_w, win_h, platform::is_mobile());
+        // With dynamic resolution, Auto climbs to the screen's full resolution when the GPU keeps up.
+        const float auto_top = app.dynamic_resolution() ? std::max(auto_scale, platform::dynamic_ceiling(win_w, win_h))
+                                                        : auto_scale;
+        static const char* const kScales[] = {"0.5", "0.6", "0.7", "0.75", "0.8", "0.9", "1.0"};
+        std::vector<std::string> svalues, snames;
+        for (const char* v : kScales) {
+            const float f = std::strtof(v, nullptr);
+            if (auto_scale <= f && std::find(svalues.begin(), svalues.end(), "auto") == svalues.end())
+                svalues.push_back("auto"), snames.push_back(auto_top > auto_scale + 0.001f
+                                                                ? "Auto (up to " + percent(auto_top) + ")"
+                                                                : "Auto (" + percent(auto_scale) + ")");
+            svalues.push_back(v), snames.push_back(percent(f));
+        }
         std::optional<float> rs = platform::parse_render_scale(cfg.get("video", "render_scale").value_or("auto"));
-        int sidx = 0;
+        int sidx = int(std::find(svalues.begin(), svalues.end(), "auto") - svalues.begin());
         if (rs) {
             float best = 9;
-            for (int i = 1; i < 8; ++i)
-                if (float d = std::fabs(std::strtof(kScales[i], nullptr) - *rs); d < best) best = d, sidx = i;
+            for (int i = 0; i < int(svalues.size()); ++i)
+                if (svalues[size_t(i)] != "auto")
+                    if (float d = std::fabs(std::strtof(svalues[size_t(i)].c_str(), nullptr) - *rs); d < best)
+                        best = d, sidx = i;
         }
-        std::vector<std::string> snames = {"Auto", "50%", "60%", "70%", "75%", "80%", "90%", "100%"};
-        if (app.gpu()) snames[0] = "Auto (" + percent(app.gpu()->render_scale()) + ")";
         Row& scale = choice("3D resolution", "Resolution of 3D views vs. the screen. Lower is faster on phones.", snames,
-                            sidx, [a](int i) {
-                                a->config().set("video", "render_scale", kScales[i]);
-                                if (render::GpuContext* g = a->gpu()) {
-                                    std::optional<float> v = platform::parse_render_scale(kScales[i]);
-                                    int pw = 0, ph = 0;
-                                    SDL_GetWindowSizeInPixels(a->window(), &pw, &ph);
-                                    g->set_render_scale(v ? *v : platform::auto_render_scale(pw, ph, platform::is_mobile()));
-                                }
+                            sidx, [a, svalues](int i) {
+                                a->config().set("video", "render_scale", svalues[size_t(i)]);
+                                a->apply_render_scale();
                                 a->save_config();
                             });
         scale.enabled = app.gpu() != nullptr;
         if (!scale.enabled) scale.desc = msaa.desc;
+
+        std::string dyn_desc = "Lowers the 3D resolution in heavy scenes (to 50% at most) to keep the frame rate and "
+                               "raises it while the GPU keeps up: to 3D resolution above, or with Auto the screen's "
+                               "full resolution.";
+        if (const render::DynamicScale* d = app.dynamic_scale()) dyn_desc += " Now " + percent(d->scale()) + ".";
+        Row& dyn = toggle("Dynamic resolution", dyn_desc, app.dynamic_resolution(),
+                          [a](bool v) { a->set_dynamic_resolution(v); });
+        dyn.enabled = scale.enabled;
+        if (!dyn.enabled) dyn.desc = msaa.desc;
 
         bool gpu_cfg = cfg.get("video", "gpu").value_or("1") != "0";
         Row& gpu = toggle("3D renderer (SDL_GPU)", "Off: 2D-only fallback for systems without a working GPU driver.",
@@ -684,18 +709,30 @@ private:
             }
             std::vector<std::string> shown = devs;
             shown[0] = "Auto: " + in.device_name(p);
-            if (filter != "auto" && in.device_name(p) == (in.keyboard_enabled(p) ? "Keyboard" : "No device"))
+            if (filter != "auto" && in.device_name(p) == (in.keyboard_active(p) ? "Keyboard" : "No device"))
                 shown[didx] += " (not connected)";
             choice("Device", "Controller for this player. Auto picks the first free pad (or wheel).", shown, didx,
                    [a, p, devs](int i) {
                        a->input().set_device_filter(p, devs[i]);
                        a->save_config();
                    });
-            toggle("Keyboard", "The keyboard also drives this player (alongside the device).", in.keyboard_enabled(p),
+            toggle("Keyboard",
+                   in.keyboard_fallback(p)
+                       ? "Off, but this preset has no controller buttons, so the keyboard still drives player 1."
+                       : "The keyboard also drives this player (alongside the device).",
+                   in.keyboard_enabled(p),
                    [a, p](bool v) {
                        a->input().set_keyboard(p, v);
                        a->save_config();
                    });
+            if (p == 0 && InputManager::phone_vibration_available())
+                toggle("Phone vibration",
+                       "Rumble on this device's own motor when the controls in use have none (built-in controls, "
+                       "touch). A controller with rumble always rumbles itself.",
+                       in.phone_vibration(), [a](bool v) {
+                           a->input().set_phone_vibration(v);
+                           a->save_config();
+                       });
         }
         heading("All players");
         {
@@ -964,7 +1001,10 @@ private:
     void start_preview(App& app) {
         if (!app.vfs() || app.audio().music_playing()) return;
         AudioEngine& au = app.audio();
-        if (au.play_sequence(*app.vfs(), std::string("gtmenu01")) || au.play_sequence(*app.vfs(), 0)) preview_ = true;
+        // The menu music at its own level, so the Music slider is heard as in the menus.
+        if (au.play_sequence(*app.vfs(), std::string("gtmenu01"), bgm::kMenuVolume) ||
+            au.play_sequence(*app.vfs(), 0, bgm::kMenuVolume))
+            preview_ = true;
     }
 
     void stop_preview(App& app) {

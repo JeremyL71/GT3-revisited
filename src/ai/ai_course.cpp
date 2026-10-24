@@ -2,7 +2,7 @@
 
 #include "ai/ai_driver.h"
 
-#include "sim/track_walls.h"
+#include "sim/models.h"
 #include "track/track.h"
 
 #include <algorithm>
@@ -51,7 +51,6 @@ bool fit_arc(const sim::Vec3& p, const sim::Vec3& q, float r, float dx, float dz
 } // namespace
 
 AiCourse::AiCourse(const track::Track& track) : track_(track), length_(track.length()) {
-    sim::TrackWorld world(track);
     const auto& file_lines = track.ai_lines().lines;
     lines_.resize(8);
     for (size_t fl = 0; fl < file_lines.size() && fl < 7; ++fl) {
@@ -81,7 +80,8 @@ AiCourse::AiCourse(const track::Track& track) : track_(track), length_(track.len
                 if (d < 0.5f * length_) covered += d;
             }
             prev = p.progress;
-            p.grip = top.hit ? world.surface_grip(top.surface).mu : 1.0f;
+            // The surface the tyre grip lookups use (ai §2.2 point byte +0x12): the road's at the point.
+            p.surface = top.hit ? sim::model::surface_index(top.surface) : 0;
             // [placeholder] slope and bank from the road normal (the game fills
             // point +0x1C/+0x20 at load; its derivation was not read).
             sim::Vec3 fwd = tp.direction, left{fwd.z, 0, -fwd.x};
@@ -106,7 +106,7 @@ AiCourse::AiCourse(const track::Track& track) : track_(track), length_(track.len
             const Point& q = line.points[(i + 1) % n];
             sim::Vec3 d = track.direction_at(p.progress);
             if (!fit_arc(p.pos, q.pos, p.radius, d.x, d.z, p)) p.arc = false;
-            // The game's own construction (spec §2.3): centre = P_i + r x the
+            // The game's own construction (ai §2.3): centre = P_i + r x the
             // left normal of the stored heading, angles from that centre to
             // P_i and P_j, interpolated, at distance |r|. Used when the
             // heading is consistent with the radius (the next point lies

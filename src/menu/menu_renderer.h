@@ -65,6 +65,10 @@ struct ElementDraw {
     // Per-corner alpha multipliers (top-left, top-right, bottom-right, bottom-left), e.g.
     // the arcade logos' diagonal cross-fade.
     float corner_alpha[4] = {1, 1, 1, 1};
+    // Replaces the element's corner colours (in the layout's order, from the bottom-left; then
+    // modulated as usual), e.g. the oil gauge's blend of two elements' colourings.
+    bool has_colors = false;
+    SDL_FColor colors[4]{};
     bool additive = false; // draw the parts additively (over-bright: a second pass of the same image)
     Kind kind = Kind::Element;
     float level = 0, level2 = 0;

@@ -204,11 +204,15 @@ void MenuRenderer::draw_element(const Element& e, const std::vector<SDL_Texture*
 
     SDL_Texture* tex = nullptr;
     if (e.image && ro.images && e.image->image < textures.size()) tex = textures[e.image->image];
-    if ((e.colors || tex) && !t.hide_parts) {
+    if ((e.colors || tex || t.has_colors) && !t.hide_parts) {
         SDL_Vertex v[4];
         for (int i = 0; i < 4; ++i) {
             v[i].position = corner[i];
-            v[i].color = modulate(e.colors ? fcolor((*e.colors)[i]) : SDL_FColor{1, 1, 1, 1});
+            // The layout lists colours from the bottom-left (y up): corner i takes colour 3 - i.
+            const int ci = 3 - i;
+            v[i].color = modulate(t.has_colors ? t.colors[ci]
+                                  : e.colors   ? fcolor((*e.colors)[size_t(ci)])
+                                               : SDL_FColor{1, 1, 1, 1});
             v[i].color.a *= t.corner_alpha[i];
             v[i].tex_coord = e.image ? SDL_FPoint{e.image->uv[i * 2], e.image->uv[i * 2 + 1]} : SDL_FPoint{0, 0};
         }

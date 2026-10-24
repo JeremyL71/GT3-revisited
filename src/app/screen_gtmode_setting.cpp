@@ -1,6 +1,6 @@
 // GT3's car settings menu (menu/setting.mbl) as a screen: the original pages
 // and layouts run by menu::flow::GameFlow (control "setting"), with the
-// GT-mode bindings of game/gt_mode_menu.cpp (sliders, value texts, locks,
+// GT-mode bindings of game/gt_mode_menu/ (sliders, value texts, locks,
 // part changes). Opened from a race's pre-race quick menu ("Setting") via
 // make_gt_setting_screen(), or `gt3r --screen gtsetting`.
 //
@@ -195,7 +195,7 @@ private:
         for (const std::string& s : flow_->take_sounds()) sounds_.play(app.audio().voices(), s);
         if (auto m = flow_->take_music()) { // presentation music (bgm cues); stopped when it closes
             if (m->empty()) app.audio().stop_music();
-            else app.audio().play_sequence(*app.vfs(), *m);
+            else app.audio().play_sequence(*app.vfs(), *m, bgm::kMenuVolume);
         }
         for (std::string& m : flow_->take_log()) LOG_INFO("gt setting: %s", m.c_str());
         ++pending_draws_;

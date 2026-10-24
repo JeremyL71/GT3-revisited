@@ -78,3 +78,28 @@ TEST(ffb_input_manager_without_devices) {
     input.update(0.5); // times out
     CHECK(input.ffb_config().enabled);
 }
+
+TEST(phone_vibration_only_without_controller_rumble) {
+    // Off by default; on, only player 1 and only when the device driving them has no rumble motor.
+    CHECK(!use_phone_vibrator(false, 0, false));
+    CHECK(use_phone_vibrator(true, 0, false));  // built-in controls / touch / a pad without motors
+    CHECK(!use_phone_vibrator(true, 0, true));  // a controller that rumbles itself
+    CHECK(!use_phone_vibrator(true, 1, false)); // player 2 never shakes the phone
+    CHECK(phone_vibration_strength(PadRumble{}) == 0);
+    CHECK(std::fabs(phone_vibration_strength(PadRumble{false, 255}) - 1.0f) < 1e-6f);
+    CHECK(std::fabs(phone_vibration_strength(PadRumble{true, 0}) - 0.6f) < 1e-6f);
+    CHECK(std::fabs(phone_vibration_strength(PadRumble{true, 200}) - 200 / 255.0f) < 1e-6f);
+    InputManager input;
+    CHECK(!input.phone_vibration());
+    input.load(IniDocument::parse("[player1]\nphone_vibration = on\n"));
+    CHECK(input.phone_vibration());
+    input.set_rumble(0, PadRumble{true, 200}); // no vibrator off Android: a harmless no-op
+    input.set_rumble(0, PadRumble{});
+    IniDocument out;
+    input.save(out);
+    CHECK(out.get("player1", "phone_vibration") == "on" && !out.get("player2", "phone_vibration"));
+    InputManager fresh;
+    IniDocument def;
+    fresh.save(def);
+    CHECK(def.get("player1", "phone_vibration") == "off");
+}

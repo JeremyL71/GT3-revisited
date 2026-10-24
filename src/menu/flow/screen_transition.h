@@ -30,6 +30,10 @@ public:
     int frames() const { return frame_; }
     // Frames after which the effect has (practically) covered the screen.
     static int settle_frames(TransitionType type);
+    // The DelayFadeout's wash (menus §6) after `frames` frames, as one fill over the
+    // picture it started on: grey 0.1 (12.8 / 255 drawn) at alpha 0 for the first 10
+    // frames, then 1 - 0.5^(frames - 10). The race exit draws it this way (presentation §C1).
+    static SDL_FColor delay_fadeout_cover(int frames);
 
     // Draws one frame of the effect into `dst` (the 640x448 menu frame, y down).
     void draw_frame(SDL_Renderer* r, const SDL_FRect& dst);
@@ -45,5 +49,21 @@ private:
     std::array<float, 256> rows_{}; // Combout: per row-pair sweep position
     u32 rng_ = 0;
 };
+
+// What stays on screen while a race loads (menus §6): the menu's last frame (a 640 x 448
+// render target owned by the menu screen, which stays under the race) with the transition
+// that was running on it when the menu was left. The game keeps drawing that transition
+// every frame for as long as the race takes to load (with the "still loading" square after
+// 3 s); the race then appears as a cut.
+struct LoadingPicture {
+    SDL_Texture* frame = nullptr;
+    ScreenTransition transition;
+    bool valid() const { return frame != nullptr && transition.active(); }
+    // Frames of the transition owed after `elapsed_ns` of wall time (60 Hz, at least one per
+    // drawn frame, at most 10 s worth at once).
+    static int frames_for(u64 elapsed_ns);
+};
+// The hand-over slot: the menu screen fills it as it starts a race, the race screen takes it.
+LoadingPicture& race_loading_picture();
 
 } // namespace gt3r::menu::flow

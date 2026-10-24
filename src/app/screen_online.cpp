@@ -38,6 +38,7 @@
 #include <set>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gt3r {
@@ -131,7 +132,7 @@ public:
                 } else {
                     status((e->kind == K::Rejected ? "The host refused: " : "Disconnected: ") + e->text, true);
                 }
-                page_ = Page::Start;
+                to_start();
                 break;
             case K::Retire:
                 if (const net::Player* p = ns.player(e->player)) status(p->name + " left", false);
@@ -170,7 +171,7 @@ public:
             ns.cancel_start();
             status("Start cancelled: not everyone is ready", true);
         }
-        if (page_ != Page::Start && !ns.active()) page_ = Page::Start;
+        if (page_ != Page::Start && !ns.active()) to_start();
         if (script_.have) run_script(app);
         if (editing_) return; // text entry has the keyboard (on_event)
         if (page_ == Page::Lobby && !prompts_.empty()) {
@@ -461,6 +462,11 @@ private:
     // --- start page ---
 
     enum StartRow { kCreate, kJoinCode, kHostIp, kJoinIp, kName, kServer, kBack, kStartRows };
+    int start_row_ = kCreate; // the row the session was started from
+
+    // Back to the start page (left, refused or disconnected) on the row the session came from,
+    // so a failed join is one Cross from editing its code.
+    void to_start() { page_ = Page::Start, sel_ = start_row_; }
 
     // "Update required to play online: version 0.2.0" (the update check, or a relay's refusal).
     static std::string update_text() {
@@ -479,7 +485,7 @@ private:
         if (!m.pressed(PadButton::Cross) && !circle) return;
         // Below the relay's min_online: no sessions through it; the update dialog again (direct-IP
         // and offline play stay open).
-        const bool blocked = updates().required() && (sel_ == kCreate || (sel_ == kJoinCode && !circle && !code_.empty()));
+        const bool blocked = updates().required() && (sel_ == kCreate || (sel_ == kJoinCode && !circle));
         if (blocked && !server_.empty()) {
             updates().open_dialog(net::UpdatePrompt::Required);
             return;
@@ -489,16 +495,10 @@ private:
             if (server_.empty()) begin_edit(Edit::Server);
             else create(app);
             break;
-        case kJoinCode:
-            if (code_.empty() || circle) begin_edit(Edit::Code);
-            else if (server_.empty()) begin_edit(Edit::Server);
-            else join_code(app);
-            break;
+        // Cross opens the last code / address for editing, Enter there joins; Circle only edits.
+        case kJoinCode: begin_edit(Edit::Code, circle ? After::Nothing : After::JoinCode); break;
         case kHostIp: host(app); break;
-        case kJoinIp:
-            if (address_.empty() || circle) begin_edit(Edit::Address);
-            else join(app);
-            break;
+        case kJoinIp: begin_edit(Edit::Address, circle ? After::Nothing : After::JoinAddress); break;
         case kName: begin_edit(Edit::Name); break;
         case kServer: begin_edit(Edit::Server); break;
         default: app.pop(); break;
@@ -515,7 +515,7 @@ private:
         }
         push_settings();
         announce_car();
-        page_ = Page::Lobby;
+        page_ = Page::Lobby, start_row_ = kCreate;
         sel_ = 0;
         status("Creating the session...", false);
         remember(app);
@@ -529,7 +529,7 @@ private:
             return;
         }
         announce_car();
-        page_ = Page::Lobby;
+        page_ = Page::Lobby, start_row_ = kJoinCode;
         sel_ = kCar;
         status("Looking for session " + net::format_code(net::normalize_code(code_)) + "...", false);
         remember(app);
@@ -544,7 +544,7 @@ private:
         }
         push_settings();
         announce_car();
-        page_ = Page::Lobby;
+        page_ = Page::Lobby, start_row_ = kHostIp;
         sel_ = 0;
         std::string where;
         for (const std::string& a : net::local_addresses()) where += (where.empty() ? "" : ", ") + a;
@@ -560,7 +560,7 @@ private:
             return;
         }
         announce_car();
-        page_ = Page::Lobby;
+        page_ = Page::Lobby, start_row_ = kJoinIp;
         sel_ = kCar;
         status("Connecting to " + address_ + "...", false);
         remember(app);
@@ -588,8 +588,10 @@ private:
             if (edit) v = edit_target() + "_";
             if (!v.empty()) ui.text(330, y, Ui::clip(v, 260), edit ? colors::kAccent : colors::kDim);
         }
-        std::string hint = editing_ ? "Type, Enter to finish (pad: up/down letter, right add, left delete, A done)"
-                                    : "Cross: choose   Circle: edit the code / address   Triangle: back";
+        const bool joins = after_edit_ != After::Nothing;
+        std::string hint = !editing_ ? "Cross: choose   Triangle: back"
+                           : joins   ? "Type, Enter to join, Esc to cancel (pad: up/down letter, right add, left delete, A join)"
+                                     : "Type, Enter to finish, Esc to cancel (pad: up/down letter, right add, left delete, A done)";
         ui.footer(hint);
         ui.text_center(Ui::kHeight - 62, "With a code nobody forwards ports: players connect directly when they can,",
                        colors::kDim);
@@ -599,6 +601,8 @@ private:
     // --- text entry ---
 
     enum class Edit { Address, Name, Code, Server } edit_ = Edit::Address;
+    // What confirming the text does next (a join row's Cross: edit, then join).
+    enum class After { Nothing, JoinCode, JoinAddress } after_edit_ = After::Nothing;
     bool editing_ = false;
     std::string edit_backup_;
     std::string& edit_target() {
@@ -610,8 +614,9 @@ private:
         }
     }
 
-    void begin_edit(Edit which) {
+    void begin_edit(Edit which, After then = After::Nothing) {
         edit_ = which;
+        after_edit_ = then;
         editing_ = true;
         edit_backup_ = edit_target();
         if (window_) SDL_StartTextInput(window_);
@@ -624,6 +629,14 @@ private:
         if (window_) SDL_StopTextInput(window_);
         app.menu().suppress(); // the keys typed are no menu input
         remember(app);
+        const After then = std::exchange(after_edit_, After::Nothing);
+        if (!keep) return;
+        if (then == After::JoinCode && !code_.empty()) {
+            if (!server_.empty()) join_code(app);
+            else if (edit_ != Edit::Server) begin_edit(Edit::Server, After::JoinCode); // then the relay server
+        } else if (then == After::JoinAddress && !address_.empty()) {
+            join(app);
+        }
     }
 
     // --- lobby page ---
@@ -690,7 +703,7 @@ private:
         if (sel_ != before) kick_armed_ = false;
         if (m.pressed(PadButton::Triangle)) {
             ns.close();
-            page_ = Page::Start;
+            to_start();
             status("Left the session", false);
             return;
         }
@@ -830,8 +843,7 @@ private:
             case kLeave:
                 if (!cross) break;
                 ns.close();
-                page_ = Page::Start;
-                sel_ = 0;
+                to_start();
                 break;
             default: break;
             }

@@ -78,12 +78,11 @@ upward unit normal, the raw surface value and the road segment.
 | 9 | Rough | road sections on Akasaka and Special Stage Route 5 (name is a guess) | 0 |
 
 The meanings come from top-down maps of the material per triangle (pictures in
-scratch `track/img/`) and from the game's behaviour (physics spec §3.6). The game's tyre model indexes its
+scratch `track/img/`) and from the game's behaviour (physics §3.6). The game's tyre model indexes its
 per-surface tables with the material, except on wet triangles (flag 0x02),
 where materials 0 and 7 become 12, 1 becomes 13 and 9 becomes 14
-(`surface_physics_index`). The physics-spec workstream found that each car
-maps these 15 indices to one of three tyre compound records (default map
-0,0,1,1,1,1,2,0,0,0,0,0,2,2,2). The other per-surface tables (bump amplitude
+(`surface_physics_index`). Each car maps these 15 indices to one of three
+tyre compound records (default map 0,0,1,1,1,1,2,0,0,0,0,0,2,2,2). The other per-surface tables (bump amplitude
 and frequency, rolling resistance, skid sound and smoke) are applied by the
 tyre and surface models in `src/sim/models.*`.
 
@@ -160,7 +159,7 @@ the edge of the road mesh: left edge, right edge, pit wall.
 - **Checked.** On trialmt, no point of the racing line comes within 1 m of a
   wall. Over all 80 courses, about 1.3% of racing-line samples do, mostly on
   the test-course oval, where the line hugs the outside wall.
-- **The game's own collision** is swept and polygon-based (physics spec §5.3; `src/sim/collision.*`).
+- **The game's own collision** is swept and polygon-based (physics §5.3; `src/sim/collision.*`).
   `wall_contact()` is a simpler, sphere-based stand-in.
 
 ## Lap geometry
@@ -208,8 +207,8 @@ direction of travel; this was checked on every course.
   reversing over the line, or crossing it backwards and forwards again, never
   counts a lap. Cutting the infield cannot skip progress either, because of
   the ±150 m search window.
-- **Clock.** Times follow the original's race clock (presentation spec "Race
-  order and finish"): `time` is the clock after the tick (0 = GO); a crossing is
+- **Clock.** Times follow the original's race clock (presentation §B9):
+  `time` is the clock after the tick (0 = GO); a crossing is
   timed at the clock before the tick plus trunc(f × the tick's 1/3000 s units),
   f the tick's fraction at the line on progress, ms = floor(units / 3), so every
   time is whole milliseconds (60 Hz: exactly the original's and
@@ -217,6 +216,12 @@ direction of travel; this was checked on every course.
   and standing licence tests time lap 1 from GO instead of the first crossing,
   and a race's current lap time runs from GO before the line.
   `freeze()` stops a finished car's laps (its lap time runs on).
+- **Split points.** `crossings()` lists the update's split-point and line crossings (the
+  point, the lap, the race clock and the time since the lap's start), timed like the line;
+  only the car's next point counts, once per timed lap. The points default to the course's
+  (`display_checkpoints`: the GTRW road markers of kind 2 with a second field of 0, at most
+  3; presentation §D6), `set_checkpoints()` replaces them. `crossing_ms()` times any mark
+  passed within a tick the same way (the machine tests' marks).
 - **Sectors.** By default the lap is split into 3 equal parts of track
   distance; `set_sector_distances()` changes the split. The timer records
   `sector_times()` for the current lap and `last_sector_times()`,

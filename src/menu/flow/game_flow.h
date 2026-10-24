@@ -12,18 +12,51 @@
 
 #include "menu/flow/game_hooks.h"
 #include "menu/flow/menu_controller.h"
+#include "menu/flow/music_list_page.h"
 #include "menu/flow/options.h"
 #include "menu/flow/save_page.h"
 #include "menu/flow/screen_transition.h"
+#include "menu/flow/text_box.h"
 #include "menu/flow/theater_page.h"
 
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace gt3r::menu::flow {
+
+// The title's focus (an item index of gt_mode.mbl page "root") when the title comes back
+// after the title command `command` ran (menus §7.1).
+// Arcade 0, Replay Theater 2, Load 3, Save 4, File operation 5, Options 6; anything else
+// (the theater's demonstrations and Analyzer, races, the attract demos, boot) 0.
+int title_focus_after(std::string_view command);
+
+// The music a top-level page asks for (music §4.1, §4.2): a music.inf name, "bgm:<id>"
+// (or "bgm:<id>:once") for streamed music, "" for silence, or "\x01" to keep the current
+// music. `set` is the menu set (control) the page belongs to.
+std::string page_music(const std::string& set, const std::string& page);
+
+// The GT-mode control's focus hooks of the race pages (menus §4.2). The stored race code is
+// the game's one "current race" string (set_race_code and its variants, go_license,
+// go_machine_test, go_free_run, arcade races); its type is 4 for set_race_code, 2 for
+// set_race_code_champ, 3 for set_race_code_spot.
+enum class RacePageHook : u8 {
+    None,
+    License,            // lc/lc_a, b, d, ia, ib, s: the code's last digit - 1
+    Series,             // a race series page: the code's last digit
+    ChampionshipSeries, // a series page with a championship item: the last two digits (+ 1)
+};
+// The hook of a page, from its name and items: a licence page (lc/lc_<x> with go_license
+// items) or a race series page (r/<class>/<series>, not an _entry page, with set_race_code
+// items). Hooked page names are lower case: the nine endurance series pages spelt with a
+// capital E (r/end/Eakasaka_n, ...) get no hook (menus §4.2).
+RacePageHook race_page_hook(std::string_view page, const std::vector<MblItem>& items);
+// The item index a hook gives for the stored race code (0 when the digits it reads are missing
+// or give a negative index; a licence index above 7 gives 0; the list clamps a large one).
+int race_page_focus(RacePageHook hook, std::string_view code, int race_type);
 
 class GameFlow {
 public:
@@ -59,6 +92,10 @@ public:
     std::optional<GameRequest> take_request();
     // Menu background music change: a music.inf sequence name, or "" to stop.
     std::optional<std::string> take_music();
+    // The Options music list's preview (menus §10.1, after take_music): a race song's track
+    // index in its group (bgm::kRace; its intro, looping, level 1.0, not gated by the Menu
+    // BGM option), or -1 to stop the music.
+    std::optional<int> take_preview() { return std::exchange(preview_request_, std::nullopt); }
     // Background movie for "mpeg" widgets: a VOL path, or "" to stop.
     std::optional<std::string> take_movie();
     // A full-screen transition the screen should start now over the last
@@ -131,6 +168,8 @@ public:
         std::vector<Old> old;
     };
     const Carousel* carousel() const { return carousel_.entries.empty() ? nullptr : &carousel_; }
+    // The Options music list page (option page "music/music"), while it is open.
+    const MusicListPage* music_list() const { return music_page_.is_open() ? &music_page_ : nullptr; }
     int car_paint() const { return car_paint_; }
     // Player 2's pad (2 Player Battle car page), set before tick().
     void set_player2_keys(MenuKeys held) { held2_ = held; }
@@ -156,10 +195,6 @@ public:
 
 private:
     std::vector<ElementDraw> draw_list_impl() const;
-    // Vertically flipped copies of elements (the name entry's TextBox draws its box and
-    // caret gradients upside down relative to the pmb corner order).
-    const Element* flipped(const Element* e) const;
-    mutable std::map<const Element*, std::unique_ptr<Element>> flipped_;
     MenuSet& load_set(const std::string& name);
     void switch_control(const std::string& set, const std::string& page, int focus);
     void open_control(const std::string& set, const std::string& page, int focus);
@@ -215,9 +250,13 @@ private:
     std::string resume_set_, resume_page_;
     int resume_focus_ = -1;
 
-    // Title / GT mode.
+    // Title / GT mode. The control's one title focus: page "root" always opens on it
+    // (title_focus_after on coming back from a title command, go_top, set_focus_replay_theater).
     int title_focus_ = 0;
+    // The stored race code and its type (race_page_hook); a race page's hook reads and clears it.
     std::string race_code_;
+    int race_type_ = 0;
+    int race_page_focus_now(const MenuSet& set, const std::string& page);
     // Arcade.
     int arcade_game_ = 0;           // index on ar/top
     std::string arcade_action_;     // its action
@@ -229,14 +268,22 @@ private:
     int transmission_ = 0, tire_mode_ = 0; // car page steps 2 / 3 (kept while the arcade runs)
     Carousel carousel_;
     IniDocument* options_ = nullptr;
-    mutable std::vector<std::pair<std::string, std::string>> songs_; // Options music list (title, artist)
-    mutable bool songs_loaded_ = false;
+    // Options music list (menus §10.1): the race songs on the disc, the page and the top page's view.
+    std::vector<MusicTrack> race_tracks_;
+    bool race_tracks_loaded_ = false;
+    MusicListPage music_page_, music_view_;
+    std::optional<int> preview_request_;
+    const std::vector<MusicTrack>& race_tracks();
+    race::RacePlaylist music_playlist(); // [options] music_playlist, or a new list (stored)
+    void open_music_list(bool editable);
+    bool music_list_active() const;      // the page is up and takes input
+    bool music_list_area(SDL_FRect& area) const;
     void option_draws(std::vector<ElementDraw>& out) const;
     std::function<void()> options_changed_;
     SavePage save_page_;
     bool save_mode_ = false; // the "memorycard" control shows the save page
     bool name_mode_ = false; // the save page's name entry (Edit file name, a new save)
-    std::string name_text_;
+    TextBox name_box_;       // its text and cursor
     MenuKeys held_name_ = 0;
     Target save_back_, save_ok_;
 public:

@@ -9,6 +9,7 @@
 // {u16 type, u16 texture + 1, f32 x, y, z} (bottom centre).
 
 #include "base/bytes.h"
+#include "race/clut_animations.h"
 #include "render/gpu_model.h"
 #include "render/view3d.h"
 #include "scene/model.h"
@@ -23,6 +24,8 @@ public:
     // False when the block is absent or empty.
     bool load(render::GpuContext& ctx, ByteSpan blbd, const std::string& name);
     size_t count() const { return sprites_.size(); }
+    // CLUT animations of the billboards' texture set.
+    ClutAnimations& clut_animations() { return cluts_; }
     // Turns every sprite to the camera (its right axis, flattened) and appends the item.
     void add_items(std::vector<render::DrawItem>& items, const render::Vec3& camera_right);
 
@@ -33,6 +36,7 @@ private:
     std::vector<Sprite> sprites_; // in vertex order (4 vertices each)
     std::vector<scene::Vertex> verts_;
     std::unique_ptr<render::GpuModel> gpu_;
+    ClutAnimations cluts_;
     render::Vec3 last_right_{0, 0, 0};
 };
 

@@ -62,7 +62,7 @@ SDL_FRect fit(const SDL_FRect& dst, float aspect) {
     return r;
 }
 
-// GT3's strip scroll (spec menus §9): centred and still when it fits in 600 units, else
+// GT3's strip scroll (menus §9.5): centred and still when it fits in 600 units, else
 // the focused icon centred within the strip's ends.
 float strip_target(int count, int focus, float step, float icon_w) {
     float total = float(count) * step - (step - icon_w);
@@ -416,7 +416,7 @@ struct CarTurntable::State {
     bool cam_tried = false;
     SDL_GPUTexture* env = nullptr;
     bool env_tried = false;
-    // The arcade showroom's motion (spec menus §9): yaw spinning up from its start, the
+    // The arcade showroom's motion (menus §9.5): yaw spinning up from its start, the
     // distance springing out; `frames` drives the fade-in.
     float yaw = 190, yaw_v = 0, dist = 0.4f, dist_v = 0;
     int frames = 0;
@@ -472,6 +472,7 @@ void CarTurntable::draw(App& app, const SDL_FRect& dst, const data::CarDatabase&
         if (file) try {
                 CarModelOptions opt;
                 opt.lod = 0;
+                opt.menu_tyres = true;
                 opt.paint = paint;
                 opt.wheel_spec = race::car_setup_from_database(db, car.label).wheels;
                 opt.body_mod = body_mod_for_car(db, car.label, paint);
@@ -567,7 +568,7 @@ std::vector<PaintInfo> CarPicker::paints(App& app, const PickerCar& c) const {
         PaintInfo p;
         p.rgb = gd ? gd->color_rgb(id) : 0x808080;
         std::string n = gd ? ascii(gd->color_name(id)) : "";
-        if (!n.empty() && n[0] != '-') p.name = n; // names starting with '-' show nothing (spec menus §9)
+        if (!n.empty() && n[0] != '-') p.name = n; // names starting with '-' show nothing (menus §9.5)
         return p;
     };
     if (gd) {
@@ -789,7 +790,7 @@ void CarPicker::render_cars(App& app, Ui& ui) {
         ui.text(16, 34, title_case(c.maker), colors::kDim);
     ui.text_big(118, 28, Ui::clip(name, 500), 2, colors::kText);
 
-    // Paint column (spec menus §9: the current paint, one slot above, five below), eased.
+    // Paint column (menus §9.5: the current paint, up to two slots above and four below), eased.
     paint_y_ += (float(c.garage >= 0 ? 0 : paint) - paint_y_) * 0.3f;
     {
         const float cx = 34, cy = 120, pitch = 20;

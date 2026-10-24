@@ -6,10 +6,6 @@
 
 namespace gt3r::sim::model {
 
-namespace {
-constexpr float kPi = 3.14159265f;
-}
-
 // --- generic -----------------------------------------------------------------
 
 float table_lookup(const float* x, const float* y, int n, float v) {
@@ -202,7 +198,7 @@ int shift_logic(const EngineSpec& e, const GearboxSpec& g, const ShiftIn& in) {
     if (in.gear >= 2) {
         int k = in.gear - 1; // down-shift k+1 -> k
         float per10 = rpm_at(in.gear, 10.0f / 3.6f);
-        float launch = std::max(e.launch_rpm, e.idle_rpm + 500); // [spec §2.4] launch rpm
+        float launch = std::max(e.launch_rpm, e.idle_rpm + 500); // [physics §2.4] launch rpm
         down = std::max(up * g.ratios[size_t(in.gear - 1)] / g.ratios[size_t(k - 1)] - per10, launch + 500);
         if (in.throttle > 0.25f) down -= 500; // B3 = 5
     }
@@ -213,7 +209,7 @@ int shift_logic(const EngineSpec& e, const GearboxSpec& g, const ShiftIn& in) {
 
 namespace {
 
-// PS2 EE FPU single precision [spec §6.7, draft 15b]: mul/add/sub round towards
+// PS2 EE FPU single precision [physics §6.7]: mul/add/sub round towards
 // zero, no denormals (flushed to zero), overflow saturates to the largest
 // magnitude, and add/sub first drop the smaller operand's mantissa bits beyond
 // one guard position; div.s rounds to nearest-even. Values are carried as
@@ -306,7 +302,7 @@ void generate_gear_ratios(int n, int rev_byte, int final_word, int rim, int wc, 
     float v = mul(float(10 * slider), k_kmh);
     float rpm = float(100 * rev_byte);
     float F = float(double(final_word) * 0.001); // double, then rounded to float
-    // Driven tyre [spec §6.7]: front for FF and for AWD system 0, rear otherwise. A
+    // Driven tyre [physics §6.7]: front for FF and for AWD system 0, rear otherwise. A
     // width code 0 gives no sidewall on the front path and 10 mm on the rear one.
     bool front = drive == 1 || (drive == 2 && awd_system == 0);
     const float c_mm = word_float(0x3A83126F), c_in = word_float(0x3CD013A9), c_sw = word_float(0x3D4CCCCD);
@@ -345,7 +341,7 @@ struct SurfaceRow {
     float amp, rr, wavelength;
     bool speed_scaled;
 };
-// [spec §3.6] static per-surface table.
+// [physics §3.6] static per-surface table.
 constexpr SurfaceRow kSurface[16] = {
     {0.000f, 0.10f, 0.5f, false}, {0.010f, 0.10f, 0.5f, false}, {0.010f, 0.20f, 2.5f, true},
     {0.024f, 25.5f, 5.0f, true},  {0.020f, 0.30f, 5.0f, true},  {0.010f, 0.20f, 0.5f, true},
@@ -367,8 +363,8 @@ float surface_mu(int s) { return kSurfaceMu[std::clamp(s, 0, 15)]; }
 float road_bump(int s, float x, float z, float hub_speed) {
     const SurfaceRow& r = kSurface[std::clamp(s, 0, 15)];
     if (r.amp == 0) return 0;
-    float f = 2 * kPi / r.wavelength;
-    float w = std::sin(f * x) + std::cos(f * z); // [spec §3.6, draft 12]
+    float f = 2 * kPiF / r.wavelength;
+    float w = std::sin(f * x) + std::cos(f * z); // [physics §3.6]
     w = w * std::fabs(w);                           // wave mode 1: signed square
     float scale = r.speed_scaled ? std::min(1.0f, 0.02f * std::fabs(hub_speed)) : 1.0f;
     return r.amp * w * scale;
@@ -421,7 +417,7 @@ float tire_peak_force(const TireSpec& t, float fz, int surface, float cam) {
 TireOut tire_force(const TireSpec& t, const TireIn& in) {
     TireOut out;
     if (in.peak <= 0) return out;
-    // Folded slip angle (spec §3.2): raw = atan2(-vy, vx); +pi when rolling backwards.
+    // Folded slip angle (physics §3.2): raw = atan2(-vy, vx); +pi when rolling backwards.
     float speed = std::sqrt(in.vx * in.vx + in.vy * in.vy);
     float u1 = 0, u2 = 0;
     if (speed > 1e-4f) {
@@ -449,7 +445,7 @@ TireOut tire_force(const TireSpec& t, const TireIn& in) {
         out.fx += px * f1 - dx * f2;
         out.fy += py * f1 - dy * f2;
     }
-    // Longitudinal (spec §3.3): Fx = -sign(s) C(|s|) F_peak along the heading.
+    // Longitudinal (physics §3.3): Fx = -sign(s) C(|s|) F_peak along the heading.
     float s = in.slip_ratio;
     if (s != 0) {
         float dir = in.rel != 0 ? (in.rel > 0 ? -1.0f : 1.0f) : (s > 0 ? -1.0f : 1.0f);
@@ -463,7 +459,7 @@ TireOut tire_force(const TireSpec& t, const TireIn& in) {
 
 float suspension_force(const AxleSpec& a, float x, float v) {
     if (x <= 0) return 0;
-    // Spec §4.2 structure: compression saturates at the bump-stop limit, a
+    // Spec physics §4.2 structure: compression saturates at the bump-stop limit, a
     // progressive term k2 (x - knee)^2 past the knee, damper velocity clamped to
     // +-1 m/s. Rates/curves are placeholders (linear damper).
     float limit = a.travel + 0.05f;
@@ -528,7 +524,7 @@ SuspensionOut suspension_wheel(const SuspensionSpec& s, float x, float v, float 
     float preload = s.unsprung * 9.8f;
     const SuspensionLimits lim = suspension_limits(s, xs);
     float droop = lim.droop;
-    if (x > droop) { // wheel in the air [spec §10.5]: x_prev := droop, spring force -preload (the body feels it)
+    if (x > droop) { // wheel in the air [physics §10.5]: x_prev := droop, spring force -preload (the body feels it)
         o.x = droop;
         o.spring = -preload;
         return o;
@@ -577,7 +573,7 @@ float oversteer_alt(float s, float r, float lat, float tyre_sum) {
 
 float oversteer_indicator(float v, float m) {
     if (v <= 0) return 0;
-    const float d2r = 3.14159265f / 180.0f;
+    const float d2r = kPiF / 180.0f;
     float q = std::min(1.0f, 0.018f * v);
     float th = (20.0f + (5.0f - 20.0f) * q) * d2r;
     float g = 3.0f + (14.0f - 3.0f) * q;
@@ -620,7 +616,7 @@ float rolling_curve(float speed) {
 }
 
 PitchTerms pitch_terms(const float cd[4], const float fx[4], const float width[2], float y, float m, float a, float b) {
-    const float tp = 6.2831853f;
+    const float tp = kTwoPiF;
     float kf = 0.5f * tp / (y + m * a * a), kr = 0.5f * tp / (y + m * b * b);
     float q[4];
     for (int i = 0; i < 4; ++i) q[i] = cd[i] * fx[i] * width[i / 2];
@@ -690,10 +686,10 @@ float toe_angle(int byte, float r) { return std::atan2((byte - 128) * 0.0005f, r
 
 float steer_target(const SteeringSpec& s, float input, float speed, float velocity_angle) {
     float v = std::max(speed, 0.0f);
-    // Pad curve clamped to the car's full lock [spec §4.4].
+    // Pad curve clamped to the car's full lock [physics §4.4].
     float lock = s.pad_curve.x.empty() ? s.max_angle / (1.0f + v / std::max(s.speed_reduction, 0.1f))
                                        : std::min(lookup(s.pad_curve, v), s.max_angle);
-    // [spec §4.4 steps 4-6] the bound on the side of the mean front velocity-direction angle is extended to
+    // [physics §4.4] the bound on the side of the mean front velocity-direction angle is extended to
     // it, then both are clamped to the full lock; the input scales the bound on its own side
     float pos = std::min(std::max(lock, velocity_angle), s.max_angle);
     float neg = std::min(std::max(lock, -velocity_angle), s.max_angle);
@@ -705,7 +701,7 @@ float pedal_shape(float x) { return x > 0 ? x + 0.1f * (1 - x) : x; }
 
 void steer_follow(const SteeringSpec& s, float target, float& angle, float& rate, float dt, bool digital) {
     // Moving back towards zero (including a target across zero): centring term
-    // and the separate return rate limit [spec §4.4].
+    // and the separate return rate limit [physics §4.4].
     bool back = (angle > 0 && target < angle) || (angle < 0 && target > angle);
     float acc = s.follow_k1 * (target - angle) - s.follow_k2 * rate;
     if (back) acc -= s.follow_k3 * angle;
@@ -770,13 +766,13 @@ void diff_step(int type, int initial, int accel, int decel, float t, float inert
 void diff_step_prev(int type, int initial, int accel, int decel, float t, float inertia, float dt, float acc_l,
                     float acc_r, float dw_prev, float& wl, float& wr, DiffState& st, float brake_l, float brake_r, float wl_prev,
                     float wr_prev) {
-    // Behaviour [spec §2.7], all quantities before the step:
+    // Behaviour [physics §2.7], all quantities before the step:
     // dw = previous wheel-speed difference; clutch packs stay locked while flagged
     // and |accL - accR| <= 2C, else transfer C (s = sign dw); viscous transfers
     // gain min(dw^2, cap); then d = dw/2 + (accL - accR) dt / (2 I); a sign change
     // against dw gives d = 0 (and sets the clutch-pack flag).
     if (type <= 0 || type > 7) { // f (and unknown): wheels integrate alone
-        // [draft 18] with brake torque on a wheel, a zero crossing (or an exact 0) clamps it to 0
+        // [physics §2.7] with brake torque on a wheel, a zero crossing (or an exact 0) clamps it to 0
         double Ii = std::max(double(inertia), 1e-3);
         auto clamp_wheel = [&](float& w, float acc, float brake, float given) {
             if (brake == 0) return;
@@ -836,7 +832,7 @@ float low_speed_hold(float peak, float w, float u_h, float v_h_body, float cos_d
     return peak * std::sin(2.82743f * v_h) * std::cos(1.13097f * w);
 }
 
-// ---- tyre wear [spec §8] ----
+// ---- tyre wear [physics §8] ----
 
 WearParams wear_params(const u8 e[7], bool enabled) {
     WearParams p;
@@ -936,7 +932,42 @@ float slip_intensity(int surface, float lat, float slip, float rim_speed, float 
 }
 
 namespace {
-// [spec §8.3b] Third curve set (smoke emission): lateral speed and signed slip speed (m/s).
+// [physics §8.3] Second curve set (the skid pitch): lateral speed and slip ratio, like the first.
+const SmokeClass kSkidPitch[3] = {
+    {{{0.444444478f, 0}, {3.33333349f, 0.109803922f}, {6.0f, 0.227450982f}, {9.22222233f, 0.350980401f}},
+     {{-1, 0.461176455f}, {-0.65882355f, 0.288627446f}, {-0.250980407f, 0.112941168f}, {-0.0156862754f, 0}, {0, 0},
+      {0.203921571f, 0.087843135f}, {0.721568644f, 0.326274484f}, {1, 0.461176455f}},
+     0.0166666657f, 0, 0.74999994f},
+    {{{1.11111116f, 0}, {6.88888931f, 0.470588237f}, {18.0f, 1.53725493f}, {28.333334f, 1.59215689f}},
+     {{-0.345098048f, 0.799999952f}, {-0.298039228f, 0.70274508f}, {-0.109803922f, 0.100392155f}, {-0.0470588244f, 0},
+      {0.0470588244f, 0}, {0.0784313753f, 0.163137242f}, {0.188235298f, 0.70274508f}, {0.282352954f, 0.799999952f}},
+     0.0555555522f, 0.200000003f, 0.49999997f},
+    {{{1.55555558f, 0}, {5.11111116f, 0.150588229f}, {11.7777786f, 0.301176459f}, {28.333334f, 0.293333322f}},
+     {{-0.501960814f, 0.299999982f}, {-0.43921569f, 0.26352939f}, {-0.125490203f, 0.0376470573f}, {-0.0470588244f, 0},
+      {0.0470588244f, 0}, {0.109803922f, 0.0611764677f}, {0.235294119f, 0.26352939f}, {0.266666681f, 0.299999982f}},
+     0.166666642f, 0.385714293f, 0.49999997f},
+};
+} // namespace
+
+float skid_pitch(int surface, float lat, float slip, float rim_speed, float ramp) {
+    if (surface == 1 || surface == 13) {
+        // Kerbs: a ramp on the rim speed (2.78 m/s -> 0.5, 55.6 m/s -> 4.3).
+        constexpr float x0 = 2.77777791f, y0 = 0.5f, x1 = 55.5555573f, y1 = 4.29999971f;
+        float v = std::fabs(rim_speed);
+        if (v <= x0) return y0;
+        if (x1 <= v) return y1;
+        return y0 + (v - x0) * (y1 - y0) / (x1 - x0);
+    }
+    int cls = (surface >= 2 && surface <= 5) ? 1 : (surface == 6 || (surface >= 12 && surface <= 14)) ? 2 : 0;
+    const SmokeClass& c = kSkidPitch[cls];
+    float a = pw_lookup(c.lat, 4, std::fabs(lat)), b = pw_lookup(c.slip, 8, slip);
+    float p = c.b + std::sqrt(a * a + b * b);
+    if (ramp > c.r0) p += (ramp - c.r0) * c.g;
+    return p;
+}
+
+namespace {
+// [physics §8.3b] Third curve set (smoke emission): lateral speed and signed slip speed (m/s).
 const SmokeClass kSmokeEmit[3] = {
     {{{11.555556f, 0}, {12.888889f, 0.04705882f}, {13.777778f, 0.1505882f}, {16.333333f, 0.177647f}},
      {{-10.0f, 0.1f}, {-8.888889f, 0.08784313f}, {-8.0f, 0.01254902f}, {-7.555556f, 0}, {8.0f, 0}, {8.444445f, 0.02039216f},
@@ -975,8 +1006,25 @@ float brake_heat_step(float y, float brake_torque, float radius, float pedal, fl
     return std::clamp(y, 0.0f, 1.0f);
 }
 
+void flap_step(float& x, float& v, float a_x, float u, float fz, float rim_speed, bool rough, float dt,
+               Vu0Random& rng) {
+    float a = a_x * 5.0f;
+    const float room = u >= 0 ? 1.0f - x : x + 1.0f;
+    if (rng.next() * room < 0.02f) a += (1.0f - x) * 5.0f * u;
+    if (rough && u > 0 && fz > 0) {
+        const float left = 1.0f - x;
+        if (rng.next() * left < 0.04f) a += left * 20.0f * rim_speed;
+    }
+    a -= x * 100.0f;
+    a -= v * 5.0f;
+    v += a * dt;
+    x += v * dt;
+    if (x > 1.0f) x = 1.0f, v = 0;
+    else if (x < -1.0f) x = -1.0f, v = 0;
+}
 
-// ---- axle driveline [spec §2.7, draft 18] ----
+
+// ---- axle driveline [physics §2.7] ----
 
 AwdLayout awd_layout(int drive, int sys, int b4, int b5) {
     AwdLayout l;
@@ -991,7 +1039,7 @@ AwdLayout awd_layout(int drive, int sys, int b4, int b5) {
     case 1: l = {3, 1, b4 * 0.01f, 0}; break;
     case 2: l = {4, 1, b4 >= 50 ? 1.0f : b4 * 0.01f, float(b5 ? b5 : 8) * 98}; break;
     case 3: l = {5, 1, b4 * 0.01f * 0.36f, float(b5 ? b5 : 15) * 98}; break;
-    case 4: l = {6, 1, b4 ? 1.0f / (b4 * 3.14159265f / 180) : 0.0f, float(b5 ? b5 : 15) * 98}; break;
+    case 4: l = {6, 1, b4 ? 1.0f / (b4 * kPiF / 180) : 0.0f, float(b5 ? b5 : 15) * 98}; break;
     case 7: l = {7, 1, b4 * 0.01f, 0}; break;
     default: l = {0, 1, 0, 0}; break; // 5, 6 (and unknown): plain rear drive
     }
@@ -1032,7 +1080,7 @@ AwdQ awd_front_torque(const AwdIn& in) {
 
 float awd_centre_clutch(const AwdIn& in, const AwdQ& q, float capacity, bool& engaged) {
     // Engaged: locked when Q is full, else while |(Ff - Fr) - T_g| <= capacity (else the flag
-    // clears) [spec §2.7].
+    // clears) [physics §2.7].
     if (engaged) {
         if (q.full || std::fabs((in.ff - in.fr) - in.tg) <= capacity) return 0; // locked: common speed
         engaged = false;
@@ -1043,7 +1091,7 @@ float awd_centre_clutch(const AwdIn& in, const AwdQ& q, float capacity, bool& en
 
 void torque_vectoring(int type, int initial, float steer_left, float speed, float wl, float wr, float& tl, float& tr) {
     if ((type != 6 && type != 7) || speed < 10 / 3.6f || speed > 180 / 3.6f) return; // 10..180 km/h
-    float t = std::min(std::fabs(steer_left) / (15 * 3.14159265f / 180), 1.0f) * initial * (type == 6 ? 9.8f : 0.01f);
+    float t = std::min(std::fabs(steer_left) / (15 * kPiF / 180), 1.0f) * initial * (type == 6 ? 9.8f : 0.01f);
     float mean = 0.5f * (wl + wr);
     float theta = steer_left > 0 ? 1.125f * mean : steer_left < 0 ? 0.875f * mean : mean;
     if (wr < theta) {
@@ -1169,10 +1217,24 @@ void engine_condition_step(float& E, float& O, float d) {
     }
 }
 
-float dirt_front_brake_scale(float steer) { return 1 - std::min(1.0f, std::fabs(steer) / (15 * 3.14159265f / 180)); }
+float odometer_step(u32& odometer, float x) {
+    if (x <= 0) return 0;
+    const s32 n = s32(x) / 2; // truncated metres, halved towards zero
+    const u32 w = odometer + u32(n);
+    if (w >= kOdometerMax) {
+        odometer = kOdometerMax;
+        return 0;
+    }
+    odometer = w;
+    return x - float(2 * n);
+}
+
+bool oil_worn(float O) { return O >= 300000.0f; }
+
+float dirt_front_brake_scale(float steer) { return 1 - std::min(1.0f, std::fabs(steer) / (15 * kPiF / 180)); }
 
 
-// ---- planar motion [spec §4.1] ----
+// ---- planar motion [physics §4.1] ----
 
 ForwardStep forward_step(const PlanarWheel w[4], float u, float mass, float rolling, float ext, float drag, float dt) {
     float fx = 0, meff = 0, ft = 0;
@@ -1224,7 +1286,7 @@ bool stop_hold(float u, const float fade[4], bool any_brake, bool frozen) {
 }
 
 
-// ---- per-wheel force outputs [spec §3.8] ----
+// ---- per-wheel force outputs [physics §3.8] ----
 
 TyreCurves tyre_curves(const TireSpec& t, float x) {
     TyreCurves o;
@@ -1245,7 +1307,7 @@ TyreLong tyre_long_force(float c, float fp, int st, int sg, float g) {
 
 namespace {
 float wrap_pi(float a) { // into [-pi, pi)
-    const float tp = 6.28318531f, p = 3.14159265f;
+    const float tp = kTwoPiF, p = kPiF;
     a = std::fmod(a + p, tp);
     if (a < 0) a += tp;
     return a - p;
@@ -1255,7 +1317,7 @@ float wrap_pi(float a) { // into [-pi, pi)
 TyreLat tyre_lateral(const TireSpec& t, float steer, bool hub_backwards, float phi, float k, float fp, float d) {
     TyreLat o;
     if (k == 0) return o;
-    const float p = 3.14159265f, hp = 1.57079633f;
+    const float p = kPiF, hp = kPiF / 2;
     float a = steer + (hub_backwards ? p : 0.0f);
     float beta = wrap_pi(wrap_pi(a) - wrap_pi(phi));
     o.beta = beta;
@@ -1300,7 +1362,7 @@ float ascc_pressure(const AidsSpec& a, int axle, bool outside, float pedal, floa
         if (outside && flag(0 + axle) && a.ascc_a_gain > 0 && o > a.ascc_a_thr) p += (o - a.ascc_a_thr) * a.ascc_a_gain;
         if (!outside && throttle == 0 && flag(4 + axle) && a.ascc_c_gain > 0 && u > a.ascc_c_thr) p += (u - a.ascc_c_thr) * a.ascc_c_gain;
     } else {
-        // [spec §4.6 step 5] D / E scale both the pressure and the wheel's ABS target slip cap
+        // [physics §4.6] D / E scale both the pressure and the wheel's ABS target slip cap
         if (!outside && flag(2 + axle) && a.ascc_d_gain > 0) {
             float f = std::clamp(1 - (o - 0.1f) * a.ascc_d_gain, 0.0f, 1.0f);
             p *= f, cap *= f;
@@ -1312,6 +1374,10 @@ float ascc_pressure(const AidsSpec& a, int axle, bool outside, float pedal, floa
     }
     if (cap_scale) *cap_scale = cap;
     return std::clamp(p, 0.0f, 1.0f);
+}
+
+bool asm_lamp_lit(const AidsSpec& a) {
+    return a.ascc_a_gain > 0 || a.ascc_c_gain > 0 || a.ascc_d_gain > 0 || a.ascc_e_gain > 0;
 }
 
 } // namespace gt3r::sim::model

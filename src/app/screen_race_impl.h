@@ -14,6 +14,7 @@
 #include "menu/flow/game_hooks.h"
 #include "menu/flow/options.h"
 #include "menu/flow/menu_sound.h"
+#include "menu/flow/screen_transition.h"
 #include "audio/engine_sound.h"
 #include "audio/motor_sound.h"
 #include "base/file.h"
@@ -21,6 +22,7 @@
 #include "base/hitch.h"
 #include "formats/model/wheel_spec.h"
 #include "ai/ai_driver.h"
+#include "ai/ai_rules.h"
 #include "game/gt_mode_menu.h"
 #include "game/gt_save.h"
 #include "sim/models.h"
@@ -36,8 +38,10 @@
 #include "race/demo_replay.h"
 #include "render/prize_view.h"
 #include "race/license.h"
+#include "race/machine_test.h"
 #include "track/track.h"
 #include "race/pit.h"
+#include "race/post_run.h"
 #include "race/billboards.h"
 #include "race/lamp_glows.h"
 #include "race/race_panels.h"
@@ -47,6 +51,7 @@
 #include "race/paint.h"
 #include "race/pool_draw.h"
 #include "race/hud.h"
+#include "race/hud_clocks.h"
 #include "race/interp.h"
 #include "race/race_audio.h"
 #include "race/race_scene.h"
@@ -59,6 +64,7 @@
 #include "race/road_shade.h"
 #include "race/replay.h"
 #include "race/replay_options.h"
+#include "race/replay_focus.h"
 #include "race/analyzer.h"
 #include "race/replay_library.h"
 #include "race/net_race.h"
@@ -91,7 +97,7 @@ struct LastView {
 };
 extern LastView g_last_view[2];
 
-// The menus' logical keys from a pad (menus spec §2): confirm = Circle or Cross,
+// The menus' logical keys from a pad (menus §2): confirm = Circle or Cross,
 // cancel = Triangle or Square, the left stick doubles the D-pad.
 u16 menu_keys(const PadState& pad);
 
@@ -114,6 +120,7 @@ struct DebugPreset {
     double lic_finish = 0;   // tests: a running licence test finishes at this elapsed time (forced result)
     bool demo_drive = false; // tests: the player's run driven by the disc's demo inputs (judged as a real run)
     double leave = 0; // tests: back to the menus this many seconds after the finish (posts the result)
+    int exit_laps = 0; // screenshots: a run ends as the pause menu's Exit once it has this many laps
     std::string replay; // file to watch ("last" = newest)
     std::string event;  // race against the event's opponents (e.g. AEAT0001)
     bool two_player = false; // 2P battle (split screen, pad 2)
@@ -130,7 +137,11 @@ struct DebugPreset {
     bool pit = false;        // auto-drive takes the pit lane (and stops) at the next entry marker
     std::string qm;          // quick menu: choose this item when it opens ("option", "record", "data_logger", ...)
     int ropts = -1;          // replays (screenshots): open REPLAY OPTIONS with the cursor on this row
-    int rmode = -1;          // replays: start in this view mode, mode indicator shown
+    int rmode = -1;          // replays (screenshots): this view mode (not stored)
+    int rtarget = -1;        // replays (screenshots): this TARGET for the view mode (not stored)
+    int hud_mode = -1;       // screenshots: draw the HUD in this layout (race::HudMode number)
+    int ritems = -1;         // replays (screenshots): these REPLAY OPTIONS ITEM bits (not stored)
+    int rcam = -1;           // replays (screenshots): this camera mode instead of the replay cameras (2: in-car)
     float lcursor = -1;      // the Analyzer (screenshots): its cursor at this distance (m); lpanel=1: EXPRESSION open
     float oyaw = 0.6f, opitch = 0.25f, odist = 7.0f;
     float at = -1, at_kmh = 150; // time trial: start moving at this distance past the line (debug shots)
@@ -207,14 +218,6 @@ private:
         float cd = 0.35f;   // body (racing modify, table 5) record +0x39 / 100
         bool whine = false; // gear part (table 17) +0x10 != 0: non-stock gearbox
     };
-    // GT3's replay director (view mode 1) rolls a colour filter at every cut (attract demo):
-    // on with p 0.1 (kept with p 0.8), preset curve from {red, blue, cyan, (0.3), (1)}, saturation
-    // 1 / random / 0 (0.7 / 0.15 / 0.15); separately (p 0.25) black / white levels, swapped
-    // (negative) in 1.25 % of shots. They replace the course grade for the shot.
-    struct ShotFilter {
-        bool on = false, levels = false;
-        float curve[3] = {0.5f, 0.5f, 0.5f}, saturation = 1, black = 0, white = 1;
-    };
     struct BestLicense {
         int medal = -1;   // 0 gold .. 2 bronze, -1 finished without a medal
         double time = -1; // judged time (s)
@@ -226,6 +229,12 @@ private:
 
     // Screen core (screen_race.cpp)
     void init(App& app);
+    // The run's start after init (launched from the menus: on the next frame, so the loading
+    // picture is on screen first).
+    void begin(App& app);
+    // The loading screen (menus §6): the menu's last frame with its transition running on,
+    // the "still loading" square after 3 s; black when no menu frame was handed over.
+    void render_loading(App& app, Ui& ui);
     void toast(std::string s);
     void log_perf(bool force);
 
@@ -243,12 +252,44 @@ private:
     void drop_vehicle();
     bool build_vehicle(App& app);
     bool build_vehicle_inner(App& app);
+    ReplayBattle live_battle(App& app, const std::string& car2, int course_category) const;
     void reset_run_state();
+    // Engine condition (physics §10.3): every live run starts with run_condition_ (the
+    // request's garage car words, then what the previous live run left) and hands its words
+    // back when it ends; replays run with the condition their run started with.
+    void take_live_condition();
+    void seed_vehicle_condition(const sim::EngineCondition& c, bool live);
+    sim::EngineCondition live_condition() const;
     static std::string respawn_mode(App& app);
     std::optional<Bytes> read_car(App& app, const std::string& model) const;
-    // Flying start (physics spec §9.1, 9.4: licence tests and time trials with the event's
+    // Flying start (physics §9.1, 9.4: licence tests and time trials with the event's
     // distance and speed): the computer drives the player's car until the first line crossing.
     bool flying_runup() const { return !race_mode_ && tt_start_.flying() && track_ && !track_->lap_started(); }
+    // The player's car's lap counter (race::lap_counter: 0 before the start line), as the
+    // replay cameras take it.
+    int lap_count() const { return race::lap_counter(track_->lap_started(), track_->laps_completed()); }
+    // Frames left to the start signal of a standing-start hold (0: none, or past it).
+    int frames_to_signal() const {
+        const double s = field_ ? -field_->race_time() : tt_hold_;
+        return s > 0 ? int(std::lround(s * 60.0)) : 0;
+    }
+    // A live view: not a replay, demonstration, attract demo or menu backdrop.
+    bool live_view() const { return !replaying_ && !demo_ && !attract_ && !backdrop_; }
+    // Rolling start: the computer drives the player's car for the first 300 ticks (counted in
+    // ticks, so the hand-over cannot drift by a frame).
+    bool rolling_runup() const { return rolling_ && field_ && std::llround(field_->race_time() * 60.0) < 300; }
+    // A flying start's start signal (presentation §B2): the line crossing that ends the
+    // computer's run-up starts the run as GO starts a standing one.
+    void flying_start_signal(App& app);
+    // Machine tests (presentation §B7): the time tests (0-400 m, 0-1000 m) rank the time to the
+    // goal, the top-speed test the top speed.
+    bool machine_time_test() const { return machine_ && machine_->timed(); }
+    bool machine_test_top_speed() const { return machine_ && !machine_->timed(); }
+    // An arcade or GT Mode free run (the course alone, no laps to run; not the free run before
+    // a GT race).
+    bool solo_free_run() const {
+        return from_menu_ && !field_ && (launch_.request.mode == "free_run" || launch_.request.mode == "go_free_run");
+    }
 
     // Drive loop (screen_race_drive.cpp)
     sim::ControlInputs scripted_inputs(double t) const;
@@ -256,6 +297,14 @@ private:
     void respawn();
     void apply_respawn(const TrackPose& p);
     sim::ControlInputs autodrive(const sim::VehicleState& s);
+    // The player's driver parameters (ai §9.1): the course's set for the car's driveline class
+    // (else the course category's built-in set); with `event`, the race / licence event's
+    // overrides on top (ai §1.1: re-applied at the end of a run).
+    ai::DriverParams player_params(bool event) const;
+    // The player's AI driver for the pit lane / the end of the run (created on first use).
+    ai::AiDriver& player_auto_driver();
+    // How the run ended, for the end-of-run driver (ai::end_of_run).
+    ai::EndOfRun player_end_of_run() const;
     void tick(App& app, const PadState& pad);
     void update_drive(App& app, double dt);
     static ForceFeedbackState feedback(const sim::Vehicle& v, const sim::ControlInputs& in, float wall, float car);
@@ -273,6 +322,17 @@ private:
     void render_vr_eyes(App& app, Ui& ui, const render::DrawOptions& o);
 #endif
 
+    // In-race pop-ups (screen_race_events.cpp): the event displays fed from the lap timers'
+    // split-point and line crossings, the race gaps and the time trials' best lap; in replays
+    // the re-run's, for the followed car.
+    void reset_lap_events();
+    void reset_session_best();
+    void lap_events(bool timer_updated);
+    HudRun hud_run() const; // the run's kind for the layout and the pop-ups (presentation §D4, §D6)
+    void post_info(std::string text) { pending_info_.push_back(std::move(text)); }
+    std::optional<int> car_at_position(int position) const; // Standing::car of race position 1..
+    void draw_event_icons(App& app, int half);
+
     // Drawing the race (screen_race_render.cpp)
     bool update_env_cube();
     void draw_mirror(App& app, Ui& ui, const SDL_FRect& frame, const render::DrawOptions& main, bool p2 = false,
@@ -281,9 +341,11 @@ private:
     void draw_car_icon(App& app, int car, const SDL_FRect& rc, size_t slot, bool on_bar = false);
     CarLook car_look(const sim::VehicleState& s, bool player) const;
     static TyreSmoke::View smoke_view(const CameraRig& c, float aspect, float fovy);
+    // `mirror`: the rear-view mirror's pass (its own sky; CourseScene::add_items).
     void collect_items(const render::Vec3& eye, const sim::Vec3& right = {1, 0, 0}, bool player = true,
-                       bool second = true, const TyreSmoke::View& smoke_v = {});
+                       bool second = true, const TyreSmoke::View& smoke_v = {}, bool mirror = false);
     size_t player_items_[2] = {0, 0}; // collect_items: the player's car is items_[first, end)
+    size_t scenery_items_ = 0;          // collect_items: the course's items are items_[0, end)
     HudData hud_data(int player);
     float sun_visibility(const render::Vec3& eye, float fovy, float rect_h);
     bool split_horizontal(App& app) const;
@@ -291,12 +353,17 @@ private:
     static sim::Vec3 cam_forward(const CameraRig& c);
     render::DrawOptions draw_options() const;
     void render_drive(App& app, Ui& ui);
-    void add_wet_road(const render::Vec3& eye, float aspect, const render::DrawOptions& o) {
-        add_wet_road(eye, camera_.view(), camera_.projection(aspect),
-                     render::Frustum::symmetric(camera_.fovy(), aspect), o);
+    size_t add_wet_road(const render::Vec3& eye, float aspect, const render::DrawOptions& o) {
+        return add_wet_road(eye, camera_.view(), camera_.projection(aspect),
+                            render::Frustum::symmetric(camera_.fovy(), aspect), o);
     }
-    void add_wet_road(const render::Vec3& eye, const render::Mat4& view, const render::Mat4& proj,
-                      const render::Frustum& fr, const render::DrawOptions& o);
+    void remove_wet_road(size_t n) {
+        auto first = items_.begin() + std::ptrdiff_t(scenery_items_);
+        items_.erase(first, first + std::ptrdiff_t(n));
+    }
+    // Returns the number of frame items inserted at items_[scenery_items_] (remove them after the draw).
+    size_t add_wet_road(const render::Vec3& eye, const render::Mat4& view, const render::Mat4& proj,
+                        const render::Frustum& fr, const render::DrawOptions& o);
     std::vector<CarLampGlows::Car> lamp_cars() const;
     static sim::Vec3 to_sim(const render::Vec3& v) { return {v.x, v.y, v.z}; }
     FieldLap field_lap2() const { return field_ && field_->has_second() ? field_->second_laps() : FieldLap{}; }
@@ -304,13 +371,15 @@ private:
     // Race audio (screen_race_audio.cpp)
     void music_cues(App& app);
     void update_course_ambience(App& app);
+    // Every car's tyre loops and the followed cars' collision one-shots, each physics step (sound §7.6).
+    void update_tyre_sounds(App& app, const sim::VehicleState& s);
     SoundCar car_sound_facts(const std::string& label) const;
-    static CarExtraSounds::Step extra_step(const sim::Vehicle& v, float throttle);
     static CarExtraSounds::Frame extra_frame(const sim::Vehicle& v, const sim::VehicleState& s, const SoundCar& car,
                                              bool onboard, float x, float z, SoundView view);
     void silence(App& app);
     // The original's global SE gain: race SE in live play, replay SE in replays and demos.
-    bool se_on() const { return replaying_ || demo_ || attract_ ? replay_se_ : race_se_; }
+    // (The race behind a quick menu is silent: ours, its sound behind the menu not traced.)
+    bool se_on() const { return backdrop_ ? false : replaying_ || demo_ || attract_ ? replay_se_ : race_se_; }
 
     // Selection (screen_race_select.cpp)
     void update_select(App& app);
@@ -325,7 +394,23 @@ private:
     bool menu_before_run() const;
     void fill_license_menu(App& app);
     std::string records_key() const;
+    bool course_time_trial() const;
+    // The run's stored records (presentation §B7): the values of its ranking, best first;
+    // empty when it has none (no GT-mode session, Quick race practice, debug runs).
+    std::vector<double> stored_records() const;
+    // A time trial, machine test or licence test finished with `value` (a time, or the
+    // top-speed test's km/h): its place in the stored records, and the session record check
+    // and RETRY lock (presentation §E3; `result`: licence 1..3 the medal, 0 none, else -2).
+    void rank_finish(double value, bool speed, int result = -2);
+    // The live run just over, into its ranking at once (licence with a medal, finished machine
+    // test or time-trial challenge; gt_mode §17); true when it ranked and its name entry was
+    // queued (make_presentation_screen) to run before the quick menu.
+    bool record_run();
     void fill_top3();
+    // The quick menu's item switches (menus §11): the visit's runs' and this run kind's, handed
+    // to the menu shown (again after they change while it is up).
+    void update_quick_menu_items();
+    bool dirt_course() const;
     void open_prerace_menu(App& app);
     void open_quick_menu(App& app);
     void update_quick_menu(App& app, double dt);
@@ -368,18 +453,71 @@ private:
     void start_playback(const Replay& r);
     void stop_playback();
     void save_current_replay();
-    void draw_replay_items(Ui& ui, const SDL_FRect& rect);
+    void draw_replay_items(App& app, Ui& ui, const SDL_FRect& rect);
+    // The title and replay-mark clocks from a run's or replay's start (presentation §B3):
+    // `replay` 0 a live run, 1 a replay, 2 the attract demo / menu backdrop (no title).
+    void start_hud_clocks(int replay, float start_speed);
+    bool long_title(float start_speed) const;
     void apply_replay_settings(App& app, const ReplaySettings& rs);
-    void update_replay_focus();
-    void draw_mode_display(Ui& ui);
+    // The view settings in force: the attract demo's and the menu backdrop's own pick (play
+    // mode 2), else REPLAY OPTIONS'.
+    const ReplaySettings& view_settings() const { return attract_ || backdrop_ ? attract_view_ : replay_settings_; }
+    // A new replay or demonstration: no shot, the director's generator seeded from the clock.
+    void restart_director();
+    void pick_attract_view();
+    void apply_replay_presets();
+    // The replay camera manager's 60 Hz frames (presentation §G14): the music's markers, the
+    // shot length, view mode 1's handler (avant_garde_frame), the next cut request.
+    void update_camera_manager(double dt);
+    void avant_garde_frame();
+    // The standing-start hold (the cars held on the grid before the signal).
+    bool start_hold() const;
+    // A dissolve from the last picture over `seconds` (presentation §G16), and its 60 Hz step.
+    void start_dissolve(float seconds);
+    void step_dissolve();
+    // The followed car and its battle partner (presentation §G3): the pad (Up / Down, Cross; view
+    // mode 1's cut buttons), TARGET, then the camera's aim (screen_race_replay.cpp).
+    void replay_pad(const MenuInput& m);
+    void begin_replay_focus();
+    void update_replay_focus(double dt);
+    void step_replay_focus();
+    void follow(int car, int partner, int frames);
+    std::vector<race::ReplayFocus::Car> focus_cars() const;
+    void aim_replay_camera();
     void update_shot_filter();
-    void apply_shot_filter(render::DrawOptions& o) const;
+    // The post-process pass (presentation §G6, §G16): the grade (the shot's levels / filter over
+    // the course's Env0 values), the dissolve and the trail.
+    void apply_post_pass(render::DrawOptions& o) const;
     std::string replay_dir(App& app) const { return app.data_dir() + "replays"; }
+
+    // After a run (screen_race_post_run.cpp; race/post_run.h): the race-exit transition, the
+    // prize / trophy and name-entry presentations, the automatic replay, the quick menu and
+    // what it shows behind it, the pause window's EXIT.
+    race::RunKind run_kind() const;
+    // The pause window's EXIT in a live run: the run ends (the exit transition), or, in a free
+    // run with a lap and the top-speed test once moving, it is the run's finish.
+    void pause_exit();
+    void exit_as_finish(double overlay_delay);
+    // The race-exit transition over the frame on screen; `then` runs at its end.
+    enum class ExitThen { RunEnd, Menu };
+    void begin_exit_transition(ExitThen then);
+    void after_run(App& app);        // the live run's transition is over
+    void start_auto_replay(App& app); // the run's replay, by itself
+    void return_to_menu(App& app);   // a replay's (or the licence demonstration's) transition is over
+    // The quick menu's backdrop (race::menu_backdrop): the race in play mode 2, the licence
+    // preview box, or nothing.
+    void start_menu_backdrop(bool before_run);
+    void stop_backdrop(App& app);
+    void update_backdrop(App& app, double dt);
+    // A live run is over and lost to the replays that re-run it: its laps for the saved replay.
+    void keep_run_laps() { run_laps_ = lap_times_; }
 
     // Analyzer (screen_race_analyzer.cpp)
     void load_analyzer(App& app);
     void open_session_analyzer(App& app);
     void setup_logger(App& app);
+    AnalyzerTrack sample_replay(App& app, const Replay& r);
+    AnalyzerTrack sample_other_replay(App& app, const Replay& r);
     void logger_seek(App& app, float d);
     bool update_logger(App& app, double dt);
 
@@ -418,7 +556,7 @@ private:
     bool finish_menu_shown_ = false;
     bool p1_won_ = false, p2_won_ = false; // 2P: who crossed first
     int finish_record_rank_ = -1;
-    double saved_best_ = -1; // best lap among saved replays (time trial records)
+    bool retry_locked_ = false; // the run set a record: RETRY greyed out until the next run (presentation §E3)
     bool quick_ = false;
     bool results_loaded_ = false;
     Panel panel_ = Panel::None;
@@ -429,9 +567,16 @@ private:
     std::unique_ptr<ai::AiDriver> hint_driver_;
     std::shared_ptr<ai::AiCourse> runup_course_;  // rolling / flying run-up: the CPU AI driver
     std::unique_ptr<ai::AiDriver> runup_driver_;
+    // The AI driving the player's car in the pit lane and after the run (ai §1.1, ai §13).
+    std::unique_ptr<ai::AiDriver> auto_driver_;
+    bool end_of_run_ = false; // the end-of-run driver has taken over
     int hint_gear_ = -1;
     bool hint_blink_ = false;
-    double car_odometer_m_ = 0, car_oil_m_ = 0; // garage car condition at the start
+    // The request's engine condition (has_condition_: the run hands it back to GT mode),
+    // the one the next live run starts with, and whether the vehicle holds a live run's words.
+    bool has_condition_ = false;
+    sim::EngineCondition start_condition_, run_condition_;
+    bool live_condition_ = false;
     double car_dirt_ = 0;
     int launch_tire_stage_ = -1;
     std::shared_ptr<const sim::CarSpec> launch_spec2_; // 2P: player 2's arcade car (own parts, tyres)
@@ -459,8 +604,19 @@ private:
     bool records_loaded_ = false;
     bool demo_ = false;                  // quick menu "demonstration": the computer drives
     std::optional<Replay> pre_demo_run_; // the player's run, kept for replay / save
-    bool replay_from_quick_ = false;
-    bool post_replay_ = false, post_replay_done_ = false; // 2P: the dimmed post-race replay     // replay started from the quick menu: back to it at the end
+    // After a run (screen_race_post_run.cpp): what the exit transition leads to, the replay
+    // whose end (or EXIT) goes back to the quick menu (the automatic one, the REPLAY item), the
+    // replay due once the run's presentations close, the menu's race in play mode 2.
+    ExitThen exit_then_ = ExitThen::RunEnd;
+    bool replay_to_menu_ = false, replay_pending_ = false, backdrop_ = false;
+    // The quick menus' item switches for this visit (race::QuickMenuItems), and whether the
+    // live run so far set a session record (SAVE GHOST, DATA LOGGER; reset at every run start).
+    race::QuickMenuItems qm_items_;
+    bool run_session_record_ = false;
+    bool last_run_ended_ = false; // the last live run ended (finished, failed, or EXIT as its finish)
+    bool exit_finished_ = false;  // pause EXIT was this run's finish
+    double overlay_delay_ = race::kRecordOverlayDelay; // finish -> record overlay (s)
+    std::vector<double> run_laps_; // the last live run's laps (the replays re-run lap_times_)
     bool abandoned_ = false;
     bool attract_ = false, attract_interrupted_ = false; // title-screen attract demo
     bool theater_ = false;     // started by the Replay Theater (theater_replay / theater_demo / logger)
@@ -469,15 +625,32 @@ private:
     bool analyzer_loaded_ = false, logger_mode_ = false;
     u32 logger_begin_ = 0, logger_end_ = 0; // track A's lap in its replay (ticks)
     double logger_acc_ = 0;
-    // REPLAY OPTIONS and the replay view mode (presentation.md §G).
+    // REPLAY OPTIONS and the replay view mode (presentation §G).
     ReplaySettings replay_settings_;
+    ReplaySettings attract_view_; // the attract demo: its picked view mode and target (not stored)
     ReplayOptions replay_opts_;
     bool replay_opts_open_ = false, replay_opts_loaded_ = false;
     double replay_opts_acc_ = 0;
-    static constexpr double kModeDisplaySeconds = 2.0; // mode indicator: alpha min(1, 4 t^2) (M: start)
-    double mode_display_t_ = 0;
     int replay_focus_ = -1;     // followed car in field replays: -1 the player, else an opponent
-    int replay_focus_shot_ = -2; // AUTO: the shot the focus was chosen for
+    // The followed car's battle partner in view modes 1 and 2 (0 the player's car, i the opponent
+    // i - 1; -1 none), the battles and interest scores, the camera's aim moving from the last
+    // car (pair, same numbering) over `aim_left_` of `aim_total_` frames, the pad's car step (Up
+    // 1 / Down -1) for the next focus frame, Cross's driver's view, the attract demo's car clock
+    // (modes 0 / 3).
+    int replay_partner_ = -1;
+    race::ReplayFocus focus_;
+    double focus_acc_ = 0;
+    int aim_from_ = -1, aim_from_partner_ = -1, aim_left_ = 0, aim_total_ = 0;
+    int focus_step_ = 0;
+    bool focus_cut_ = false; // a pad cut (view mode 1)
+    int level_step_ = 0, music_cut_step_ = 0; // view mode 1's Up / Down, Right / Left (+1 / -1)
+    race::CutClock cut_clock_;               // the camera manager's requests and shot length
+    double cut_acc_ = 0;
+    race::DissolveClock dissolve_; // the post pass's dissolve
+    race::FinishCue replay_finish_; // a field replay's finish jingle (the followed car's finish)
+    int hidden_opponent_ = -1;      // collect_items: an opponent not drawn (an on-board replay view)
+    bool driver_view_ = false;
+    int attract_car_frames_ = 0;
     std::string theater_demo_; // theater_demo: the demonstration's event code
     static constexpr double kAttractSeconds = 1800.0 / 60.0; // RaceArcadeDemo's 1800-step timer
     float demo_start_kmh_ = 0;    // demo events: every car starts at this speed
@@ -501,7 +674,7 @@ private:
     bool prerace_ = false;
     bool free_run_ = false;              // free run before a GT race (back to the pre-race menu)
     int free_run_laps_ = 0;               // the pre-race quick menu (before the race starts)
-    bool music_on_ = true, rumble_on_ = true, rumble2_on_ = true;
+    bool music_on_ = true, menu_music_on_ = true, rumble_on_ = true, rumble2_on_ = true;
     bool aids_options_apply_ = false, asm_on_ = true, tcs_on_ = true;
     bool race_se_ = true, replay_se_ = true, ghost_on_ = true, wide_mode_ = false;
     QuickMenu quick_menu_;
@@ -516,8 +689,9 @@ private:
     LicenseResultOverlay license_overlay_;
     std::unique_ptr<render::PrizeView> prize_; // licence medal model
     int shown_medal_ = -1;
-    bool run_recorded_ = false;     // this licence run went into the records (name entry)
-    bool gt_after_race_done_ = false, prize_shown_ = false, auto_replay_pending_ = false; // GT race: prize page, replay
+    bool run_recorded_ = false;     // this run went into the records (record_run)
+    bool top3_pending_ = false;     // its name entry is up: the Top 3 again once it closes
+    bool prize_shown_ = false;      // the race showed its prize page / arcade trophy (GameResult::prize_shown)
     bool any_run_recorded_ = false; // GameResult::records_done
     std::optional<text::StringTable> race_strings_;
     bool race_strings_tried_ = false;
@@ -530,17 +704,22 @@ private:
     bool show_perf_ = false;
     u16 race_prev_ = 0; // race pad buttons of the last frame (edges)
     bool init_ = false, db_ok_ = false, hud_loaded_ = false, paused_ = false;
+    menu::flow::LoadingPicture loading_; // the menu's frame and transition (or our own black one)
+    SDL_Texture* loading_own_ = nullptr;  // the black frame when no menu frame was handed over
+    u64 loading_ns_ = 0;                  // when the loading picture was last drawn
+    bool loading_drawn_ = false, begin_pending_ = false;
     Stage stage_ = Stage::Select;
     std::string error_, course_name_;
+    std::string title_name_; // the course table's name for the start title (presentation §B3; may be empty)
     data::CarDatabase db_;
     std::vector<CourseEntry> courses_;
     std::vector<CarEntry> cars_;
     int course_sel_ = 0, car_sel_ = 0, column_ = 0, pause_sel_ = 0;
     bool pause_more_ = false;
     int scripted_kind_ = 0;
-    ShotFilter shot_filter_;
-    int last_shot_ = -2;
-    PaintRng filter_rng_; // the replay director's per-shot rolls
+    race::TitleClock title_clock_;
+    race::ReplayMarkTimer mark_timer_;
+    int last_shot_ = -2; // the director's cut the shot filter was rolled for
     u32 paint_seed_ = GameRandom::kBootSeed;   // race_info_random() before this race's paint draw
     std::optional<u32> paint_seed_override_;     // the next build re-runs a replay's paint draw
     SDL_FRect frame_rect_{0, 0, 0, 0}; // the 3D frame's rectangle last drawn (UI units)
@@ -580,7 +759,8 @@ private:
     bool two_player_ = false;
     OpponentEngines opp_engines_;
     RaceSfx sfx_;
-    CarSfx car_sfx_{"p1_"}, car_sfx2_{"p2_"};
+    CarSfx car_sfx_, car_sfx2_;
+    std::vector<CarSfx> opp_sfx_; // every other car's tyre loops (sound §7.6)
     float ffb_wall_ = 0, ffb_car_ = 0, ffb_wall2_ = 0, ffb_car2_ = 0; // strongest hits since the last frame
     CarExtraSounds extra_{"p1_"}, extra2_{"p2_"};
     SoundCar sound_car_, sound_car2_;
@@ -588,6 +768,8 @@ private:
     CourseAmbiencePlayer crss_player_;
     bool crss_ok_ = false;
     int last_count_ = -1;
+    bool flying_runup_ = false; // last tick was in the flying run-up
+    double flying_go_t_ = -1;   // race_time_ of the flying start's signal (< 0: not yet)
     CarColors colors_;
     ControlMapper controls2_;
     CameraRig camera2_;
@@ -607,16 +789,42 @@ private:
     u16 pad2_prev_ = 0;
     std::string race_event_;
     std::vector<std::string> race_opponents_;
+    bool field_grid_by_power_ = false, field_cpu_respawn_ = true; // the field's rules (recorded in replays)
+    ReplayBattle battle_; // 2P battle: the field's set-up (recorded in replays)
     int race_laps_ = 0;
     bool rolling_ = false;   // rolling start (GT endurance)
     PitLane pit_;
-    double pit_msg_time_ = 0;     // "%s Pitting in..." shown for 3 s
-    std::string pit_msg_text_;
+    // The event displays (presentation §D6), one per player half: lap times, splits, gaps,
+    // "+N Laps" and "%s Pitting in..."; the race gaps' passing order; time trials' best lap
+    // of the visit (kept across retries).
+    std::array<EventDisplay, 2> event_display_{};
+    PassingOrder passing_;
+    BestLapSplits best_splits_;
+    std::vector<std::string> pending_info_; // this tick's "Pitting in..." messages
+    std::array<int, 2> event_icon_car_{-1, -1}; // the gap's car picture per half (set by hud_data)
+    // Replays of solo runs: the run has ended (its car's crossings post nothing more), and a
+    // licence test's time at its end has been posted.
+    bool replay_run_ended_ = false, replay_license_posted_ = false;
+    // The HUD's lap-time list and Total per player half (presentation §D4): the live run's
+    // laps (the last 8 kept), how many, their sum; and the visit's fastest lap of every car
+    // (races; kept across retries).
+    struct LapList {
+        std::vector<double> recent;
+        int count = 0;
+        double sum = 0;
+        void add(double t);
+    };
+    std::array<LapList, 2> lap_lists_{};
+    long long session_best_ms_ = -1;
     std::string license_event_;   // licence test event ("" = not a licence test)
     u32 event_paint_id_ = 0xFFFFFFFFu; // licence test: the event's slot-0 colour id (0xFFFFFFFF = none)
-    double machine_mark_m_ = 0;   // machine test distance (400 / 1000 m), 0 = none
-    double machine_dist_ = 0, machine_time_ = -1;
-    float top_speed_kmh_ = 0;     // best speed of the run (GameResult::top_speed_kmh)
+    // Machine tests (presentation §B7): the test (the event's test byte) and the run's timing
+    // points; machine_time_ is the time to the goal (s since GO), -1 before it.
+    std::optional<MachineTest> machine_;
+    std::vector<MachineTest::Crossing> machine_marks_; // this tick's timing points (lap_events)
+    double machine_time_ = -1;
+    float top_speed_kmh_ = 0;     // best speed of the run until its finish (GameResult::top_speed_kmh)
+    float hud_top_kmh_ = 0;       // the HUD's highest speed so far (the top-speed test's "Best" line)
     LicenseRun license_, demo_judge_;
     double license_dist_ = 0;          // the judge's previous unwrapped track distance
     bool license_dist_valid_ = false;
@@ -632,6 +840,24 @@ private:
     bool finished_ = false;
     int finish_position_ = 0;
     std::unique_ptr<CourseScene> course_scene_;
+    // The course's animations (CourseScene: CLUT animations and moving nodes; the wet road's and
+    // the billboards' CLUT animations): restarted with every run, advanced by the race steps,
+    // uploaded once per drawn frame.
+    void restart_course_animations(float countdown) {
+        if (course_scene_) course_scene_->restart_animations(countdown);
+        wet_.clut_animations().restart(countdown);
+        billboards_.clut_animations().restart(countdown);
+    }
+    void animate_course(float seconds) {
+        if (course_scene_) course_scene_->animate(seconds);
+        wet_.clut_animations().animate(seconds);
+        billboards_.clut_animations().animate(seconds);
+    }
+    void upload_course_animations() {
+        if (course_scene_) course_scene_->upload_animations();
+        wet_.clut_animations().upload();
+        billboards_.clut_animations().upload();
+    }
     std::unique_ptr<CarVisual> car_visual_;
     std::unique_ptr<render::View3D> view_;
     std::vector<render::DrawItem> items_;
@@ -659,9 +885,9 @@ private:
     ReplayDirector director_;
     ReverbAmbience ambience_;
     RaceMusic music_;
-    int music_start_type_ = 2;
+    int music_start_type_ = 2;          // the field event's start type (start jingle; music §2)
     double music_license_end_s_ = -1;   // the live licence run's end (race time), for its replay's finish cue
-    bool music_license_failed_ = false; // the field event's start type (start jingle; music spec §2)
+    bool music_license_failed_ = false; // the live licence run failed (its replay's fail jingle; music §3.1)
     std::string toast_;
     double toast_time_ = 0;
     bool show_replays_ = false;

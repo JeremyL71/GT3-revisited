@@ -41,8 +41,9 @@ folder (the Mods screen shows where it is; press Start there to open it):
 - macOS: `~/Library/Application Support/GT3Revisited/GT3Revisited/mods/`
 - Linux: `~/.local/share/GT3Revisited/GT3Revisited/mods/`
 
-Then enable **Example Coupe** on the Mods screen. The screen lists the car, or the
-reason it failed to load.
+A new mod is enabled (Square on the Mods screen rescans the folder while the game
+runs; Cross turns a mod off and on). Select **Example Coupe** there: the screen
+lists the car, or the reason it failed to load.
 
 ## Try it
 
@@ -132,7 +133,7 @@ target. Fit the trap speed and top speed with power and drag first, then 0-60 wi
 ## Pictures
 
 The dealer picture is a car viewer screenshot on the viewer's own dark backdrop,
-cropped and scaled by `source/pictures.py`:
+cropped and scaled by `source/pictures.py` (Python 3 with Pillow):
 
 ```bash
 GT3R_VIEWER="find=mod:gt3r_concept_coupe_24,clean=1,yaw=2.35,pitch=0.14,zoom=0.75" gt3r game.iso --screen cars --shot shot.png

@@ -4,6 +4,7 @@
 #include "base/log.h"
 #include "platform/device_tilt.h"
 
+#include <SDL3/SDL_init.h>
 #include <SDL3/SDL_joystick.h>
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
@@ -117,6 +118,10 @@ InputManager::~InputManager() {
         else if (d.joystick) SDL_CloseJoystick(d.joystick);
     }
     if (device_accel_) SDL_CloseSensor(device_accel_);
+    if (vibrator_) {
+        SDL_CloseHaptic(vibrator_);
+        SDL_QuitSubSystem(SDL_INIT_HAPTIC);
+    }
 }
 
 void InputManager::load(const IniDocument& cfg) {
@@ -127,6 +132,7 @@ void InputManager::load(const IniDocument& cfg) {
         p.preset = cfg.get(sec, "preset").value_or(std::string(default_preset()));
         p.device_filter = cfg.get(sec, "device").value_or("auto");
         if (auto kb = cfg.get(sec, "keyboard")) p.keyboard = to_lower(*kb) == "on" || *kb == "1";
+        if (i == 0) set_phone_vibration(to_lower(cfg.get(sec, "phone_vibration").value_or("off")) == "on");
         p.profile = make_preset(p.preset);
         p.custom_bindings = false;
         if (Profile custom = load_profile(cfg, section_name(i, ".bindings")); !custom.bindings.empty()) {
@@ -154,6 +160,7 @@ void InputManager::save(IniDocument& cfg) const {
         cfg.set(sec, "preset", p.preset);
         cfg.set(sec, "device", p.device_filter);
         cfg.set(sec, "keyboard", p.keyboard ? "on" : "off");
+        if (i == 0) cfg.set(sec, "phone_vibration", phone_vibration_ ? "on" : "off");
         cfg.set(sec, "race", p.race_layout);
         save_profile(cfg, section_name(i, ".bindings"), p.custom_bindings ? &p.profile : nullptr);
         save_profile(cfg, section_name(i, ".race"), p.race_custom ? &p.race_profile : nullptr);
@@ -291,6 +298,11 @@ void InputManager::assign_devices() {
     }
 }
 
+bool InputManager::keyboard_fallback(int player) const {
+    const Player& p = players_[player];
+    return player == 0 && !p.keyboard && p.profile.keyboard_only();
+}
+
 void InputManager::set_device_filter(int player, std::string filter) {
     players_[player].device_filter = filter.empty() ? "auto" : std::move(filter);
     assign_devices();
@@ -305,7 +317,7 @@ std::vector<std::string> InputManager::device_names() const {
 std::string InputManager::device_name(int player) const {
     const Device* d = find_device(players_[player].device);
     if (d) return d->name;
-    return players_[player].keyboard ? "Keyboard" : "No device";
+    return keyboard_active(player) ? "Keyboard" : "No device";
 }
 
 std::string InputManager::describe(int player, const InputSource& src) const {
@@ -419,14 +431,14 @@ float InputManager::read_source(const Player& p, const Device* dev, const InputS
     switch (src.kind) {
     case InputSource::Kind::None: return 0.0f;
     case InputSource::Kind::Key: {
-        if (!p.keyboard) return 0.0f;
+        if (!keyboard_active(int(&p - players_.data()))) return 0.0f;
         int n = 0;
         const bool* keys = SDL_GetKeyboardState(&n);
         bool latched = size_t(src.code) < key_latch_.size() && key_latch_[size_t(src.code)];
         return ((src.code < n && keys[src.code]) || latched) ? 1.0f : 0.0f;
     }
     case InputSource::Kind::Mouse:
-        if (!p.keyboard) return 0.0f;
+        if (!keyboard_active(int(&p - players_.data()))) return 0.0f;
         return (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_MASK(src.code)) ? 1.0f : 0.0f;
     case InputSource::Kind::PadButton:
         return dev && dev->gamepad && SDL_GetGamepadButton(dev->gamepad, SDL_GamepadButton(src.code)) ? 1.0f : 0.0f;
@@ -581,16 +593,75 @@ int InputManager::brake_trigger(const Player& p) const {
     return -1;
 }
 
+bool use_phone_vibrator(bool enabled, int player, bool device_rumbles) {
+    return enabled && player == 0 && !device_rumbles;
+}
+
+float phone_vibration_strength(const PadRumble& r) { return std::max(r.large / 255.0f, r.small ? 0.6f : 0.0f); }
+
 void InputManager::set_rumble(int player, const PadRumble& r) {
     Player& p = players_[player];
     p.rumble = r;
     const Device* d = find_device(p.device);
+    // Android reports a vibrator on the controller's input device as the rumble capability.
+    const bool rumbles = d && SDL_GetBooleanProperty(SDL_GetJoystickProperties(d->joystick),
+                                                     SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN, false);
+    if (player == 0)
+        vibrate_phone(use_phone_vibrator(phone_vibration_, player, rumbles) ? phone_vibration_strength(r) : 0.0f);
     if (!d) return;
     // DS2: large motor -> low-frequency rumble, small (on/off) -> high frequency.
     Uint16 low = Uint16(r.large * 257);
     Uint16 high = r.small ? 0xA000 : 0;
     if (d->gamepad) SDL_RumbleGamepad(d->gamepad, low, high, 250);
     else SDL_RumbleJoystick(d->joystick, low, high, 250);
+}
+
+bool InputManager::phone_vibration_available() {
+#if defined(SDL_PLATFORM_ANDROID)
+    return true;
+#else
+    return false;
+#endif
+}
+
+void InputManager::set_phone_vibration(bool on) {
+    if (!on) vibrate_phone(0);
+    phone_vibration_ = on;
+}
+
+void InputManager::vibrate_phone(float strength) {
+    if (strength <= 0) {
+        if (vibrator_ && vibrator_level_ > 0) SDL_StopHapticRumble(vibrator_);
+        vibrator_level_ = 0;
+        return;
+    }
+    if (!vibrator_ && !vibrator_tried_ && phone_vibration_available()) {
+        vibrator_tried_ = true;
+        // SDL's Android backend lists the system vibrator as a haptic device of this name.
+        if (SDL_InitSubSystem(SDL_INIT_HAPTIC)) {
+            int count = 0;
+            if (SDL_HapticID* ids = SDL_GetHaptics(&count)) {
+                for (int i = 0; i < count && !vibrator_; ++i) {
+                    const char* name = SDL_GetHapticNameForID(ids[i]);
+                    if (name && std::string_view(name) == "VIBRATOR_SERVICE") vibrator_ = SDL_OpenHaptic(ids[i]);
+                }
+                SDL_free(ids);
+            }
+            if (vibrator_ && !SDL_InitHapticRumble(vibrator_)) {
+                SDL_CloseHaptic(vibrator_);
+                vibrator_ = nullptr;
+            }
+            if (!vibrator_) SDL_QuitSubSystem(SDL_INIT_HAPTIC);
+        }
+        LOG_INFO("Phone vibration: %s", vibrator_ ? "device vibrator" : "no vibrator found");
+    }
+    if (!vibrator_) return;
+    // The race asks every frame: send on a change, and again before the last one runs out.
+    if (std::fabs(strength - vibrator_level_) > 0.1f || time_ - vibrator_sent_ > 0.2) {
+        SDL_PlayHapticRumble(vibrator_, strength, 300);
+        vibrator_level_ = strength;
+        vibrator_sent_ = time_;
+    }
 }
 
 void InputManager::set_trigger_rumble(int player, float left, float right) {

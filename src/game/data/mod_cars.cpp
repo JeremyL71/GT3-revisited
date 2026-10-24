@@ -720,7 +720,7 @@ bool add_mod_car(CarDatabase& db, const ModCarDef& def, std::string* error) {
     m.for_sale = def.for_sale;
     m.description = def.description;
     {
-        // Arcade class by weight / power, the game's garage-car table (gt_mode_menu.cpp
+        // Arcade class by weight / power, the game's garage-car table (gt_mode_menu/arcade.cpp
         // arcade_prepare): < 2.1 S, < 3.0 S+1, < 3.5 A, < 5.0 A+1, < 5.8 B, < 6.3 B+1, < 9.0 C,
         // else C+1. Power: the curve's peak with the hidden output factor.
         float ps = peak_kw * 1.35962f * (def.output_pct ? *def.output_pct : 100) / 100.0f;

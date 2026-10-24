@@ -215,7 +215,7 @@ struct Event {
     std::vector<std::string> entries; // opponent car variants (table 31)
     std::string regulation; // empty = none
     std::string race_mode;  // e.g. RACE_MODE_SINGLE (racemode.db labels)
-    u8 laps = 0;            // +0x199 (the race's lap count)
+    u8 laps = 0;            // +0x199 (the race's lap count; a machine test's type, race::MachineTest)
     u8 cars_in_race = 0;    // +0x1B5 (inferred)
     // +0x1D0..+0x1DB raw u16s. [0] is always 0 and [1] looks like flags
     // (0x500/0x600/0x700/0x809); [2..5] are the 1st..4th place prizes in

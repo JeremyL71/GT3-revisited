@@ -1,6 +1,7 @@
 #include "audio/voice_mixer.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace gt3r {
 
@@ -132,6 +133,7 @@ VoiceId VoiceMixer::key_on(const VoiceParams& p) {
     v.adsr2 = p.adsr2;
     v.reverb = p.reverb;
     v.priority = p.priority;
+    v.bus = u8(p.bus);
     v.age = ++clock_;
     return VoiceId{u32(pick) | (v.gen << 8)};
 }
@@ -175,6 +177,11 @@ void VoiceMixer::set_volume(VoiceId id, s16 l, s16 r) {
     }
 }
 
+void VoiceMixer::set_priority(VoiceId id, u8 priority) {
+    std::lock_guard lock(mutex_);
+    if (Voice* v = find(id)) v->priority = priority;
+}
+
 bool VoiceMixer::playing(VoiceId id) const {
     std::lock_guard lock(mutex_);
     return find(id) != nullptr;
@@ -200,6 +207,16 @@ float VoiceMixer::envelope(VoiceId id) const {
 void VoiceMixer::set_master_volume(float v) {
     std::lock_guard lock(mutex_);
     master_ = std::clamp(v, 0.0f, 2.0f);
+}
+
+void VoiceMixer::set_bus_gain(VoiceBus bus, float gain) {
+    std::lock_guard lock(mutex_);
+    bus_gain_[size_t(bus)] = s32(std::lround(std::clamp(gain, 0.0f, 1.0f) * 65536.0f));
+}
+
+float VoiceMixer::bus_gain(VoiceBus bus) const {
+    std::lock_guard lock(mutex_);
+    return float(bus_gain_[size_t(bus)]) / 65536.0f;
 }
 
 void VoiceMixer::set_interpolation(Interpolation i) {
@@ -354,8 +371,13 @@ void VoiceMixer::render(s16* out, size_t frames) {
     const s32 master = s32(master_ * 4096.0f);
     const bool gauss = interp_ == Interpolation::Gaussian;
     const bool rev = reverb_.mode() != SpuReverb::Off;
+    // Each bus sums its voices on its own and is scaled by its gain before the mix (a
+    // gain of 1 leaves the sum unchanged), so the reverb return follows the gains too.
+    auto scaled = [this](const s32 (&sum)[2]) {
+        return s32((s64(sum[0]) * bus_gain_[0] + s64(sum[1]) * bus_gain_[1]) >> 16);
+    };
     for (size_t n = 0; n < frames; ++n) {
-        s32 acc_l = 0, acc_r = 0, wet_l = 0, wet_r = 0;
+        s32 bus_l[2] = {}, bus_r[2] = {}, bus_wet_l[2] = {}, bus_wet_r[2] = {};
         for (Voice& v : voices_) {
             if (v.phase == Phase::Off) continue;
             // Advance the source position by pitch/0x1000 samples.
@@ -398,12 +420,14 @@ void VoiceMixer::render(s16* out, size_t frames) {
             v.vol_l += std::clamp(v.target_l - v.vol_l, -kVolSlew, kVolSlew);
             v.vol_r += std::clamp(v.target_r - v.vol_r, -kVolSlew, kVolSlew);
             s32 l = (e * v.vol_l) >> 14, r = (e * v.vol_r) >> 14;
-            acc_l += l;
-            acc_r += r;
-            if (v.reverb) wet_l += l, wet_r += r;
+            bus_l[v.bus] += l;
+            bus_r[v.bus] += r;
+            if (v.reverb) bus_wet_l[v.bus] += l, bus_wet_r[v.bus] += r;
             if (v.phase == Phase::Off) v.data.reset();
         }
+        s32 acc_l = scaled(bus_l), acc_r = scaled(bus_r);
         if (rev) {
+            const s32 wet_l = scaled(bus_wet_l), wet_r = scaled(bus_wet_r);
             s32 rl, rr;
             reverb_.process(wet_l, wet_r, rl, rr);
             acc_l += rl;

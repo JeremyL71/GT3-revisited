@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 
 namespace gt3r {
@@ -104,6 +106,7 @@ bool App::init(int argc, char** argv) {
     // backend) and no 3D. [video] gpu=0 or --no-gpu forces the fallback.
     render::GpuOptions gpu_opts;
     bool use_gpu = config_.get("video", "gpu").value_or("1") != "0";
+    gpu_opts.msaa = platform::default_msaa(platform::is_mobile());
     if (auto v = config_.get("video", "msaa")) gpu_opts.msaa = std::atoi(v->c_str());
     if (auto v = config_.get("video", "vsync")) gpu_opts.vsync = *v != "0";
     if (auto v = config_.get("video", "gpu_debug")) gpu_opts.debug = *v == "1";
@@ -113,12 +116,15 @@ bool App::init(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--no-gpu") use_gpu = false;
         else if (a == "--msaa" && i + 1 < argc) gpu_opts.msaa = std::atoi(argv[++i]);
-        else if (a == "--render-scale" && i + 1 < argc) render_scale = platform::parse_render_scale(argv[++i]);
+        else if (a == "--render-scale" && i + 1 < argc)
+            render_scale = platform::parse_render_scale(argv[++i]), render_scale_arg_ = true;
     }
     int win_pw = 0, win_ph = 0;
     SDL_GetWindowSizeInPixels(window_, &win_pw, &win_ph);
     gpu_opts.render_scale = render_scale ? *render_scale
                                          : platform::auto_render_scale(win_pw, win_ph, platform::is_mobile());
+    configured_scale_ = gpu_opts.render_scale;
+    scale_auto_ = !render_scale;
 #if GT3R_XR
     // A headset when there is one ([vr] enabled = off or --no-vr: the window, as on a phone).
     gpu_opts.xr = to_lower(config_.get("vr", "enabled").value_or("on")) != "off";
@@ -142,6 +148,7 @@ bool App::init(int argc, char** argv) {
 #endif
     if (gpu_) {
         renderer_ = gpu_->renderer2d();
+        if (platform::is_mobile()) gpu_->warm_pipelines(); // ~65 ms each on Mali: not mid-race
         // macOS switches a fullscreen window between direct-to-display and composited now and
         // then, and each switch stalls presentation for up to half a second (measured: 0 frames
         // over 40 ms per minute composited vs up to 13 direct). GT3R_DIRECT=1 for comparisons.
@@ -157,6 +164,7 @@ bool App::init(int argc, char** argv) {
     }
     layout_ui(false);
     LOG_INFO("Renderer: %s", SDL_GetRendererName(renderer_));
+    if (limit_60fps()) apply_frame_limit();
     ui_ = std::make_unique<Ui>(renderer_);
 
     input_ = std::make_unique<InputManager>();
@@ -211,6 +219,7 @@ bool App::init(int argc, char** argv) {
     // --shot runs use only the cached answer (no traffic to a live server) unless GT3R_UPDATE_CHECK=1.
     const char* uc = SDL_getenv("GT3R_UPDATE_CHECK");
     updates().startup(*this, auto_shot_path_.empty() || (uc && *uc == '1'));
+    reset_dynamic_scale();
     last_ticks_ = SDL_GetTicksNS();
     return true;
 }
@@ -280,6 +289,104 @@ void App::set_fullscreen(bool on) {
     SDL_SetWindowFullscreen(window_, on);
     config_.set("video", "fullscreen", on ? "on" : "off");
     save_config();
+}
+
+// [video] limit_60fps: on high-refresh displays, draw every Nth refresh (120 Hz -> 60 fps,
+// 144 -> 72, 240 -> 60; 60 and 90 Hz -> every refresh) as SDL's main loop rate (SDL's renderers
+// only offer vsync on or off), which with vsync still presents on a refresh.
+void App::apply_frame_limit() {
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window_));
+    const double hz = mode ? mode->refresh_rate : 0;
+    if (hz <= 0) return;
+    const int interval = limit_60fps() ? std::max(1, int(std::floor(hz / 60.0 + 0.25))) : 1;
+    const double rate = interval > 1 ? hz / interval : 0; // 0: as fast as vsync allows
+    if (rate == frame_limit_rate_) return;
+    frame_limit_rate_ = rate;
+    if (rate > 0) SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, std::to_string(rate).c_str());
+    else SDL_ResetHint(SDL_HINT_MAIN_CALLBACK_RATE);
+    LOG_INFO("Display %.0f Hz: drawing every %s", hz,
+             interval == 1 ? "refresh" : (std::to_string(interval) + " refreshes").c_str());
+}
+
+bool App::limit_60fps() const { return to_lower(config_.get("video", "limit_60fps").value_or("off")) == "on"; }
+
+void App::set_limit_60fps(bool on) {
+    config_.set("video", "limit_60fps", on ? "on" : "off");
+    save_config();
+    apply_frame_limit();
+}
+
+bool App::dynamic_resolution() const {
+    return to_lower(config_.get("video", "dynamic_resolution").value_or(platform::is_mobile() ? "on" : "off")) == "on";
+}
+
+void App::set_dynamic_resolution(bool on) {
+    config_.set("video", "dynamic_resolution", on ? "on" : "off");
+    config_.set("video", "dynamic_start", ""), race_scale_ = 0; // a fresh start
+    save_config();
+    reset_dynamic_scale();
+}
+
+void App::apply_render_scale() {
+    std::optional<float> v = platform::parse_render_scale(config_.get("video", "render_scale").value_or("auto"));
+    int pw = 0, ph = 0;
+    SDL_GetWindowSizeInPixels(window_, &pw, &ph);
+    configured_scale_ = v ? *v : platform::auto_render_scale(pw, ph, platform::is_mobile());
+    scale_auto_ = !v;
+    render_scale_arg_ = false; // the setting rules from now on
+    config_.set("video", "dynamic_start", ""), race_scale_ = 0; // a fresh start
+    save_config();
+    reset_dynamic_scale();
+}
+
+void App::note_race_scale() {
+    if (dyn_on_) race_scale_ = dyn_.scale();
+}
+
+void App::remember_race_scale() {
+    if (race_scale_ <= 0 || !dyn_on_ || !scale_auto_ || dyn_cycle_s() > 0) return;
+    char v[16];
+    std::snprintf(v, sizeof v, "%.2f", double(race_scale_));
+    if (config_.get("video", "dynamic_start").value_or("") == v) return;
+    config_.set("video", "dynamic_start", v);
+    save_config();
+}
+
+// GT3R_DYN_CYCLE=<seconds> (testing): the dynamic scale sweeps from its ceiling to 50% and back
+// every <seconds>, also in --shot runs, to check that resolution changes neither stall nor show.
+double App::dyn_cycle_s() {
+    static const double s = [] { const char* e = SDL_getenv("GT3R_DYN_CYCLE"); return e ? std::atof(e) : 0.0; }();
+    return s;
+}
+
+void App::reset_dynamic_scale() {
+    dyn_on_ = false;
+    if (!gpu_) return;
+#if GT3R_XR
+    if (xr_) return; // the eyes are sized by [vr] resolution
+#endif
+    gpu_->set_render_scale(configured_scale_);
+    gpu_->set_render_ceiling(0);
+    dyn_on_ = (dynamic_resolution() && auto_shot_path_.empty() && !render_scale_arg_) || dyn_cycle_s() > 0;
+    // The most the dynamic scale goes up to: the 3D resolution setting, or with Auto the screen's
+    // full resolution (platform::dynamic_ceiling); it starts at the setting's size either way.
+    float ceiling = configured_scale_;
+    if (dyn_on_ && scale_auto_) {
+        int pw = 0, ph = 0;
+        SDL_GetWindowSizeInPixels(window_, &pw, &ph);
+        ceiling = std::max(ceiling, platform::dynamic_ceiling(pw, ph));
+    }
+    // Where the last race's scale ended (Auto only: a manual setting starts at its own value).
+    float start = configured_scale_;
+    if (dyn_on_ && scale_auto_ && dyn_cycle_s() <= 0)
+        if (auto v = config_.get("video", "dynamic_start"); v && !v->empty())
+            if (float f = std::strtof(v->c_str(), nullptr); std::isfinite(f) && f > 0) {
+                start = std::clamp(f, render::DynamicScale::kMin, ceiling);
+                LOG_INFO("Dynamic resolution: starting at %d%% (the last race's)", int(std::lround(start * 100)));
+            }
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window_));
+    dyn_.reset(ceiling, mode ? mode->refresh_rate : 0, start);
+    if (dyn_on_) gpu_->set_render_scale(dyn_.scale()), gpu_->set_render_ceiling(ceiling); // targets sized once
 }
 
 void App::close_disc() {
@@ -452,7 +559,31 @@ SDL_AppResult App::iterate() {
         SDL_CreateDirectory(dir.c_str());
         save_screenshot(dir + "/gt3r-" + std::to_string(SDL_GetTicks()) + ".png");
     }
+    const Uint64 present_start = SDL_GetTicksNS();
     SDL_RenderPresent(renderer_);
+    const double present_ms = double(SDL_GetTicksNS() - present_start) / 1e6;
+    // A lost GPU (Vulkan's VK_ERROR_DEVICE_LOST, which SDL only reports in its error text) never
+    // comes back, and the frames that never finish grow the memory by hundreds of MB a second
+    // until the system kills us: close with a message instead.
+    if (gpu_ && std::strstr(SDL_GetError(), "DEVICE_LOST")) {
+        LOG_ERROR("GPU device lost: %s", SDL_GetError());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "GT3 Revisited",
+                                 "The graphics driver stopped responding (GPU device lost), so the game has to close.",
+                                 window_);
+        return SDL_APP_FAILURE;
+    }
+    if (dyn_on_) {
+        float s = dyn_.frame(frame_s * 1000.0, present_ms);
+        if (const double c = dyn_cycle_s(); c > 0) { // testing: down to 50% and back up every c seconds
+            const double t = std::fmod(double(SDL_GetTicksNS()) / 1e9 / c, 1.0);
+            const float top = dyn_.max_scale(), k = render::DynamicScale::kStep;
+            s = std::round((0.5f + (top - 0.5f) * float(std::fabs(2.0 * t - 1.0))) / k) * k;
+        }
+        if (s != gpu_->render_scale()) {
+            LOG_INFO("Dynamic resolution: %d%%", int(std::lround(s * 100)));
+            gpu_->set_render_scale(s);
+        }
+    }
 #if GT3R_XR
     if (xr_) xr_->end_frame();
 #endif
@@ -475,6 +606,8 @@ SDL_AppResult App::iterate() {
 
 SDL_AppResult App::event(const SDL_Event& e) {
     if (e.type == SDL_EVENT_QUIT) return SDL_APP_SUCCESS;
+    // Android may end a backgrounded app without a quit.
+    if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND || e.type == SDL_EVENT_TERMINATING) remember_race_scale();
     input_->handle_event(e);
     if (e.type == SDL_EVENT_DROP_FILE && e.drop.data) set_dialog_result(e.drop.data);
     if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat) screenshot_requested_ = true;
@@ -487,6 +620,7 @@ SDL_AppResult App::event(const SDL_Event& e) {
             save_config();
         }
     }
+    if (e.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED && limit_60fps()) apply_frame_limit(); // another refresh rate
     if (e.type == SDL_EVENT_WINDOW_SAFE_AREA_CHANGED || e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
         e.type == SDL_EVENT_DID_ENTER_FOREGROUND)
         display_insets_.reset(), insets_retry_ = 0; // re-query (rotation, foldables)
@@ -724,6 +858,7 @@ void App::xr_pointer() {
 #endif
 
 void App::shutdown() {
+    remember_race_scale();
     if (input_) save_config();
     screens_.clear();
     pending_.clear();

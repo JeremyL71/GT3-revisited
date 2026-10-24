@@ -27,9 +27,9 @@ struct ArcadeCar {
 std::optional<ArcadeCar> arcade_car(const data::CarDatabase& db, const std::string& id, int tire_mode,
                                     const std::string& course, std::string* error = nullptr);
 
-// The AI's built-in driver parameter set for a course (spec ai.md §9.1: the course category,
-// course table 34 byte +8: 1 -> set 1, 2 (dirt) -> set 2, else 0). Used as is (no event
-// overrides) for the player's rolling / flying run-up.
+// The AI's built-in driver parameter set for a course (ai §9.1: the course category,
+// course table 34 byte +8: 1 -> set 1, 2 (dirt) -> set 2, else 0), used where the course file
+// has no set for a car's driveline class (ai::course_params).
 int driver_param_set(const data::CarDatabase& db, const std::string& course);
 
 } // namespace gt3r::race

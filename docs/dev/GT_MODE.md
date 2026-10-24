@@ -4,9 +4,9 @@ The career mode: credits, garage, dealers, tune shop, wheels, car wash and
 oil, licenses, races and championships, prize money and prize cars, car
 settings, records, saves; plus the arcade-mode progression that the
 original keeps in the same game state.
-Behaviour follows a written description of the original's GT Mode rules
-and save data (the "spec"; "spec §n" below names its sections); this page
-describes the code.
+The rules and save data are described in
+[docs/behaviour/gt_mode.md](../behaviour/gt_mode.md) ("gt_mode §n" below names
+its sections); this page describes the code.
 
 ## Layout
 
@@ -21,11 +21,11 @@ describes the code.
 | `src/game/gt_save.*` | native save (text, versioned) and import/export of the original PS2 GAMEDATA file |
 | `src/game/save_library.*` | the save library: any number of native saves in `<user data>/saves/`, the current one, migration of older saves |
 | `src/menu/flow/save_page.*` | the save page (title Load / Save / File Operation, home Save, Trade, Load Garage, Load / Save Settings) on the original's file list art |
-| `src/game/gt_mode_menu.*` | binds GT mode to the interactive menus through `menu::flow::GtModeHooks` |
+| `src/game/gt_mode_menu.h`, `src/game/gt_mode_menu/` | binds GT mode to the interactive menus through `menu::flow::GtModeHooks` (files: "Menu integration" below) |
 | `src/menu/flow/gt_mode_hooks.*` | the hook interface (menu side; no dependency on `src/game`) |
 | `src/app/screen_gtmode.cpp` | installs the hooks; menu 3D renders of cars and wheels (`MenuModelRenderer`); `gt3r --screen gtmode` = save overview |
 | `src/app/screen_gtmode_setting.cpp` | the car settings menu and records screens (`make_gt_setting_screen`, `make_records_screen`) |
-| `tests/test_gtmode*.cpp` | logic tests (no disc) and disc tests |
+| `tests/test_gtmode*.cpp` | logic tests and the menus on a small invented world (`test_gtmode_menu_synth.cpp`, data in `tests/gtmode_synth.h`), both without the disc; disc tests |
 
 ## Rules (`GtMode`)
 
@@ -43,9 +43,18 @@ describes the code.
   the part's settings group is re-initialised), `buy_all_tires`,
   `power_with` (before/after PS).
 - **Wheels / wash / oil**: inventory of bought wheels (500 Cr each, never
-  used up), `fit_wheel`, `wash` (50), `change_oil` (250). `drive()` adds a
-  race's distance to the odometer, break-in/wear and oil; `engine_factor()`
-  is the power multiplier the bridge applies to the torque curve.
+  used up), `fit_wheel`, `wash` (50), `change_oil` (250). `engine_factor()`
+  is the condition's power multiplier (physics §10.3) the menus' power figures use.
+- **Engine condition through a run** (gt_mode §13): GT races and championships,
+  machine tests, free runs and arcade races carry the car's condition
+  (`carries_engine_condition`); the request gets `run_condition()` (odometer in 2 m
+  units, E, O; an arcade car: zeros), the race car advances the words tick by tick
+  with the factor applied live, and `end_run()` puts the result's words back
+  into the garage car and adds the odometer units to the total distance
+  (`gt_menu::fill_condition` / `apply_condition`; arcade results count their
+  distance too, finished or not). Licence tests, time trials and 2 Player
+  Battle run with a fresh engine and hand nothing back, also with a garage car.
+  `driven()` advances the words in one piece (tests, `GT3R_GTMODE_FAKE_RACE`).
 - **Licenses**: `judge` (time vs. the event's gold/silver/bronze),
   `record_license` (best medal kept; license held when 8 medals; all gold →
   the license prize car once), `can_open_license_page` (B → A → IB → IA → S;
@@ -59,28 +68,35 @@ describes the code.
   drawn once, points 10-6-4-3-2-1, champion only with strictly more points,
   bonus and prize car on every championship win. `enter()` = one day.
 - **Prize cars**: `award_prizes(code)` scans the gcf prize sets (series all
-  won, championship, endurance, license all gold, league/game complete,
+  won, championship, endurance, license all gold, league complete,
   completion %); single-car sets once, multi-car sets on every win, picked
-  by weight with the state's generator.
+  by weight with the state's generator. The whole game's set
+  (`gtmode_complete`, gt_mode §23) is eligible when the checked code is a
+  GT-mode one (`gt_mode_code`: series, championship, endurance, rally,
+  licence, machine test; not arcade) and every gcf section-4 result is won
+  (`all_races_won`: 364 on this disc); it is not the 100 % completion
+  rule (`achieve_complete`). Prize sets are checked after a race win, a
+  championship title and a licence turning all gold, as in the game.
 - **Bridge**: `car_spec(GarageCar)` = `sim::build_car_spec(db, car, parts,
-  settings)` with the torque curve × `engine_factor(condition)`.
-  `power_peak()` / `power_ps()` are the original's computed menu figure
-  (spec §5 "Power figures": `game::spec_power_peak`, the 100-rpm sweep of the
-  built curve with the condition factor); `power_text()` prints it the menus'
+  settings)`; the engine condition is not in the spec (the race car carries it,
+  above). `power_peak()` / `power_ps()` are the original's computed menu figure
+  (gt_mode §5 "Power figures": `game::spec_power_peak(spec, engine_factor)`, the
+  100-rpm sweep of the built curve, each looked-up torque × the condition
+  factor); `power_text()` prints it the menus'
   way (`display_power`: truncated, HP = PS × 0.98619 on NTSC-U data).
   `completion_text()` / `completion_percent()` / `completion_file_text()`
   are the status page's and the file lists' truncated texts. Settings screens that move the gear
   slider must call `sim::apply_gear_slider` (computed gearboxes); the
   drivetrain-split word is stored but ignored, as in the original.
 
-Randomness follows the original (spec §20; `base/game_random.h`): one
+Randomness follows the original (gt_mode §20; `base/game_random.h`): one
 generator (x = 17x + 17, output x ^ rotl16(x)) on several states. The
 trophy pick, prize-car pick and the paint of prize cars without a fixed
 colour use the GT-mode state `GameState::rng` (saved, kept by a new game;
 `pick_trophy_index`, `pick_weighted`, `prize_paint_index`); `record_round`
 picks the trophy before the prize cars (`Award::trophy`), as trophy_get
 comes before car_get. Each presentation opens with the original's "stir"
-(1..12 steps from a hardware random value + the shared state, spec §20.2; ours
+(1..12 steps from a hardware random value + the shared state, gt_mode §20.2; ours
 takes that value from the clock, `hardware_random()`), and `on_frame` steps the state once per
 menu frame like the original's menu loops, so the rolls are unpredictable
 the same way. Opponents are drawn by `race::draw_opponents` on the race
@@ -89,7 +105,31 @@ race; arcade Single Race draws its field the same way (`screen_race_launch.cpp`)
 Given the same states, every draw equals the original's (verified against
 the original's behaviour, 0 mismatches).
 
-## Menu integration (`gt_mode_menu.cpp`)
+## Menu integration (`src/game/gt_mode_menu/`)
+
+The bindings are the adapter between the generic menu runtime (`menu/flow/`, which
+does not depend on `src/game`) and the rules (`GtMode`). They stay on the game side:
+the public header `game/gt_mode_menu.h` is also the session's API (`GtModeSession`,
+the save library, the race screens' saves), used by `app/` and `game/` itself, and
+`game/` already builds on `menu/flow/`. One file per concern, sharing the private
+`internal.h`:
+
+| File | What lives there |
+|---|---|
+| `internal.h` | Private: `MenuState` (everything the module keeps between hook calls: disc data, session, queued presentations, sounds / popup / movie for the flow, map pointer, wheel-shop pin, save library, snapshot, attract cycle; `menu_state()`), `Show`, the presentation timeline constants, the list geometry; declarations grouped by file |
+| `install.cpp` | `install_gt_mode_menu()`: wires each hook to its file; `attach` |
+| `common.cpp` | `menu_state()`, `reset_gt_mode_menu_for_tests()` (a fresh `MenuState`), shared helpers (names, prices, settings working copy, autosave, layout lookups) |
+| `session.cpp` | `GtModeSession`, `start_session` (the one place a session is created: `attach`, `ensure_gt_mode_session`), save library, snapshot, the race screens' direct saves, `begin_setting` / `begin_records` |
+| `actions.cpp` | `on_event`: the GT-mode control's actions |
+| `prechecks.cpp` | `intercept` (pre-check popups), `enabled` |
+| `races.cpp` | `prepare_request`, `on_result`, `next_request`, `resume_request`, attract demos |
+| `presentations.cpp` | prize pages, license card, trophy, prize car, name entry: queueing, timelines, the prize counter's page state (its step: `game/prize_count_up.h`), `presentation_model` |
+| `widget_text.cpp` | `widget_text` |
+| `widget_art.cpp` | image widgets from hidden art (`widget_draws`), `hide_art`, `car_for_widget`, the oil change's and the car wash's timelines (`oil_cylinder_at`, `wash_spin_at`, `car_wash_spin`) |
+| `lists.cpp` | `on_tick` (every frame, busy or not: the car wash and the oil change), `on_frame` (per-frame input and timelines; a queued effect plays on a frame the page plays none and never holds the page's code), map pointer, garage / permitted-car / wheel-shop lists, tap and hover, `permitted_car_names` |
+| `extra_draws.cpp` | `extra_draws`, one helper per page element it adds |
+| `arcade.cpp` | the arcade hooks (pickers, refusals, entry art, garage-class races, arcade results) |
+| `save_backend.cpp` | the save page's files and operations (`save_list` / `save_run`) |
 
 `install_gt_mode_menu()` registers `GtModeHooks`; `GameFlow` calls them for
 the `gt_mode`, `setting` and `records` controls and the presentations
@@ -134,20 +174,38 @@ hooks, `intercept` / `enabled`, and the widget hooks on `ar/goodies`
   regulation as name + second name, a string once at its last place, rows of
   the `link_menu` template in `menu_regulated_car`, Up/Down; "No Limitations"
   without a list), the status bar day number (hidden-layer widget), and the wheel
-  inventory cursor. Dealer car lists use the controller's scrolling window
-  (`menu_car_goods` was added to its window widgets).
+  inventory cursor. Dealer pages (maker and car lists) are tile strips in the
+  controller's scrolling window (`menu_car_goods`, and `menu_dealer` on the England and
+  Germany pages, are among its window widgets; items parked off the screen vertically,
+  as on the Toyota list, count as parked).
+- **Car wash / oil change progress popups** (gt_mode §13): the shop buttons open
+  "Washing . . ." / "Changing oil . . ." popups whose `ignore_control` widget takes the
+  controls away when the page is built (`MenuController::ignoring_control`: no key or tap
+  does anything and the popup's "Complete" button is not drawn) until game code gives them
+  back (`give_control`). `GtModeHooks::on_tick` runs every frame, also during the confirm
+  feedback, and steps both: the oil gauge's drain and refill (~325 frames) and the car wash
+  (`wash_spin_at`: its effect after 31 frames, then 181 frames in which the car's turntable
+  gets an extra `kWashSpinPush` of yaw acceleration a frame, about 15 fast turns; the car
+  keeps its old dirt until the last push). The app's showroom applies each push once
+  (`car_wash_spin`: a serial per wash and the pushes so far), as its real-time steps allow.
+  Before this the "Complete" button could be chosen at once, and leaving the page ended the
+  oil change before its refill.
 - Popups: one level. A popup item confirmed inside a popup replaces it
   (`MenuController::build`), so the tune shop's Purchase? → Install parts
   now? → Installed (and the trade's Buy? → Bought) close back to the page
   they were opened from. A part is bought once per car (`can_buy_part`:
   `ts/already_you_have`); owned parts are swapped in the settings' Change
   Parts pages.
+- Focus (menus §4.2): the GT-mode control keeps the stored race code, so a race series
+  or licence page opens on the race entered or just driven (`race_page_focus`); other
+  pages open on the item leading back to where you came from, else the first (nothing
+  remembers the item confirmed last).
 - `prepare_request` → `GameRequest`: `event`, `race_code`, the garage car
   as `car_spec` (+ `car`, `car_model`, `car_color`) and `opponents`
   (championship field or a fresh draw). License tests drive the event's
   entry-0 car; free run sets `course`.
-- `on_result` ← `GameResult`: prize money / championship round / license
-  medal, odometer, prize cars, then an autosave. `next_request` chains the
+- `on_result` ← `GameResult`: the engine condition back into the garage car,
+  prize money / championship round / license medal, prize cars, then an autosave. `next_request` chains the
   next championship round without reopening the menu.
 
 Phase 2 additions:
@@ -194,7 +252,7 @@ Phase 2 additions:
   60 s time).
 
 Phase 4: **car settings menu** (`src/game/gt_setting.*`,
-`src/app/screen_gtmode_setting.cpp`, spec §14). GameFlow runs the original
+`src/app/screen_gtmode_setting.cpp`, gt_mode §14). GameFlow runs the original
 `setting.mbl` pages as control "setting" (`GameFlow::start("setting",
 "root")`, `exited()`); the screen `gtsetting` hosts it
 (`make_gt_setting_screen(event)` in `app/screen_gtmode.h`, for the race's
@@ -204,10 +262,10 @@ pre-race quick menu; `gt3r --screen gtsetting` with `GT3R_GTSETTING_EVENT`).
 (saved), Back discards it; the values feed `sim::CarSettings` and
 `build_car_spec` through `GtMode::car_spec` (`gt_ride_car_spec()` gives the
 rebuilt spec). `GarageCar::ref_final` holds the gear reference final
-(garage car settings word +0x1AC, spec §3.1; saved). Value texts, locks (`disable_*` overlays, status boxes),
+(garage car settings word +0x1AC, gt_mode §3.1; saved). Value texts, locks (`disable_*` overlays, status boxes),
 fitted-part marks (`attach_*`), slider markers and the part-change pages
 (`set_*`, with the `not_to_change` / `dirt_tire_only` guards) are bound in
-`gt_mode_menu.cpp`. (Setting files and the gear chart followed in Phase 5.)
+`src/game/gt_mode_menu/`. (Setting files and the gear chart followed in Phase 5.)
 
 Also: garage rows react to taps (`GtModeHooks::tap`); race pages show the
 course logo and result mark inside each race button and the course name in
@@ -221,16 +279,19 @@ Phase 5:
   native save); "Load Settings" applies the newest file of that car with the
   original's rule (a group is copied only if its part is still fitted;
   otherwise `load_warning`). The original's memory-card 'S' file
-  (one car's saved settings, spec §19) is read / written by
+  (one car's saved settings, gt_mode §19) is read / written by
   `import_ps2_setting` / `export_ps2_setting`. The files are picked on the
   save page (Load / Save Settings: the current game's files, no card slots).
 - **Gear chart** (`gear_chart`): rpm against road speed for every gear (the
   shift sawtooth up to the rev limit) from the working copy's car spec.
 - **Widgets**: status-page license marks, the license-violation popup's
-  license letter, the tune shop's maker logo, the oil-age gauge, torque
-  before/after, spec treads and torque/weight ratio.
+  license letter, the tune shop's maker logo, the oil gauge (a full
+  cylinder in the page's hidden `clean` colouring blended into its `dirty`
+  one by `GtMode::oil_age`; an oil change drains and refills it, also under
+  its progress popup, with its two `oil` effects), torque before/after, spec
+  treads and torque/weight ratio.
 - **Machine test records** (`GameState::machine`: best 0-400 m, 0-1000 m,
-  top speed, saved) from GameResult `total_time` / `top_speed_kmh`.
+  top speed, saved) with the rankings, run by run (`GtMode::record_machine_test`).
 - **Endings**: after a win that completes the Beginner league the short
   ending plays once, Amateur or Professional the long one
   (`GameRequest::Kind::PlayMovie`, played by the menu screen).
@@ -241,7 +302,8 @@ Phase 6:
 - **Wheel shop**: the brand pages' wheels as turning 3D models (wheel/<label>)
   in a row in the `menu_wheel_shop` window, the focused one larger; drawn by
   the app's model renderer (`ElementDraw::overlay`), which now caches cars
-  and wheels and composites any number per frame.
+  and wheels and composites any number per frame. (Replaced by the page's wheel
+  photographs in the presentation pass below.)
 - **Records** (`make_records_screen(key)`, `gt3r --screen gtrecords`):
   rankings in `GameState::rankings` (native save), filled from license,
   machine-test and arcade time-trial results.
@@ -251,7 +313,7 @@ Phase 6:
 
 Phase 7:
 
-- **Arcade progression** (spec §16): `GtData::arcade_courses` / `arcade_classes`
+- **Arcade progression** (gt_mode §16): `GtData::arcade_courses` / `arcade_classes`
   (gcf tags 8 / 14), `GameState::arcade` (`ArcadeProgress`: course level,
   12 car flags, award bits, best place per difficulty × course, time-trial
   best ranks) and the `GtMode::arcade_*` rules (unlock pass, Clear Status
@@ -271,20 +333,55 @@ Phase 7:
   shop the focused wheel, are drawn on the 3D car (`car_model.h`
   `CarModelOptions::wheel_override`), and races get it via
   `GameRequest::car_wheel`.
-- **Record name entry** (spec §17): a license / machine-test result that
-  makes a ranking opens `name_entry/name_entry` as a presentation; the grid
-  types characters (texts of `name_entry1.pmb`), Cancel deletes, OK stores
-  the name with the record (`RankEntry::name`, `GameState::player_name`).
+- **Record name entry** (gt_mode §17): a run that makes a ranking opens
+  `name_entry/name_entry` as a presentation. Licence runs with a medal,
+  finished machine tests and finished time-trial challenges are recorded by
+  the race screen right after each run (`RaceScreen::record_run` at the exit
+  transition: `game::add_license_record` / `add_machine_test_record` /
+  `add_time_trial_record`), which pushes `make_presentation_screen()` before
+  the run's automatic replay, or before the quick menu, whose Top 3 it then
+  refreshes when it closes (`top3_pending_`). `on_result` / `on_arcade_result`
+  never record from a result (the original records only in its drivers); the GameResult's
+  `records_done` (runs were recorded this visit) only makes the arcade
+  result save when the last run did not finish. The text box is a
+  `menu::flow::TextBox` (`GtModeSession::name_box`, the memory card's name
+  entry `GameFlow::name_box_`): starts with the stored name (the last name
+  entered), the grid's key goes in at the cursor (texts of
+  `name_entry1.pmb`, 15 characters at most), Cancel is Back Space
+  (`GtModeHooks::name_backspace`), L1 / R1 move the cursor (the bindings'
+  page frame), the caret is drawn at the cursor (`GtModeHooks::name_cursor`);
+  OK stores the name (`RankEntry::name`, `GameState::player_name`). Ranking
+  entries carry the GT day and a clock stamp (`RankEntry::stamp`, seconds
+  since 2000-01-01 local time; the records page's date, `record_date_text`).
+- **Course time trials** (gt_mode §17): `ct:<course>` rankings (12 places) for
+  the courses of the arcade TIME_ATTACK list (`GtMode::course_time_trial_index`,
+  the PS2 save's slot), entered with a free run's best lap in whole ms and the
+  run's car (`GtMode::record_course_time_trial`): the arcade time attack (mode
+  `free_run`) and GT Mode's free run (`go_free_run`), from the race screen
+  only (`add_course_time_trial_record`, the run's car). The free-run quick
+  menu's Top 3 and its Records page (with the car) read them.
+- **Rankings in the PS2 save**: the arcade time trials' records (their 32-byte
+  block at +0x120 kept in `RankEntry::code`, the car = the challenge's), the
+  44 course time-trial records (TIME_ATTACK order) and the three machine-test
+  ones (`read_ranking` / `write_ranking` in `gt_save.cpp`: ms, a top speed as
+  int(m/s x 1e5), names, car codes, stamps, blocks) are imported and exported;
+  the machine tests' bests (`GameState::machine`) follow their rankings on
+  import. Licence test records stay best-time only.
 
 Phase 8:
 
 - **Professional art**: on `ar/level`, while L1 and R1 are held the Hard
   button draws the hidden `pro` / `pro_a` art and the Professional text
   layer (`layer4`) replaces Hard's (GameFlow, `held_`).
-- **Time-trial name entry**: an arcade time trial that makes its ranking
-  queues the `name_entry` presentation (key `at:<code>`, car = the
-  challenge's base car); GameFlow shows arcade presentations through
-  `after_game()` and then reopens `ar/top`.
+- **Time-trial name entry**: an arcade time-trial challenge run that makes
+  its ranking (its best lap) queues the `name_entry` presentation (key
+  `at:<code>`, car = the challenge's base car), shown by the race screen
+  after the run (see "Record name entry"); the arcade result adds none.
+  GameFlow shows arcade presentations (the Single Race cup) through
+  `after_game()` and then reopens `ar/top`. The race screen shows a win's cup itself right
+  after the race, before its replay (`game::queue_arcade_trophy`, presentation §F), and posts
+  `GameResult::prize_shown` so `on_arcade_result` does not queue it again; GT races and
+  championship rounds likewise (`game::queue_race_prize`).
 - **Arcade class refusals** (`GtModeHooks::arcade_disabled`): on
   `ar/select_class` the road classes on a dirt course (database course
   surface 2) show `disable_road_doc`, the dirt class on a road course
@@ -295,7 +392,7 @@ Phase 8:
   Clear Status count + time trials cleared + license tests passed) /
   (364 + 102 + 10 + 48), which also drives the `achieve_*` prize cars.
 
-Phase 8 follow-up, prize models (spec §18):
+Phase 8 follow-up, prize models (gt_mode §18):
 
 - **License card** (`license_get`) and **championship trophy** (`trophy_get`,
   new: queued after every championship win, before the prize car; trophy =
@@ -316,7 +413,7 @@ Phase 8 follow-up, prize models (spec §18):
   `GT3R_GTMODE_FAKE_TROPHY=<NN>` shows trophy NN after any race win; with
   `GT3R_GTMODE_FAKE_RACE=1` license tests are won with gold.
 
-Menu fidelity pass (arcade pickers and code-drawn screens; menu spec §9):
+Menu fidelity pass (arcade pickers and code-drawn screens; menus §9):
 
 - `GameFlow` pickers (`Carousel`, `animate_carousel`, `draw_list`): the icon
   strip of every available entry (centred / scrolled, pulse), the sliding
@@ -371,8 +468,8 @@ the background movie, radius 0 -> 2); the step buttons over the car; the 2
 Player car page's player-1 half (gauges, colour column, badges, small 3D
 car); no AREA badge outside Single Race.
 
-Fourth round: the 2 Player car page as the original runs it (spec menus §9,
-notes "twoplayer"): no separate class page; on `ar/select_car_2p` each
+Fourth round: the 2 Player car page as the original runs it (menus §9.6):
+no separate class page; on `ar/select_car_2p` each
 player, on their own pad (`GameFlow::set_player2_keys`, fed from
 `InputManager::pad(1)`), goes class row (7 classes, wrapping) -> car and
 paint -> AUTOMATIC / MANUAL -> RACING / DRIFT -> ready, simultaneously; both
@@ -410,7 +507,7 @@ Completion push, batch 1 (systematic comparison with the reference captures):
 - flash_item: confirmed it draws as a plain image (the phase is never used).
 
 Completion push, batch 2:
-- Trade (spec §19): Home → Trade loads a guest garage (any save file, native or
+- Trade (gt_mode §19): Home → Trade loads a guest garage (any save file, native or
   PS2, on the save page; originally the `gameload_g` slot page), lists its cars
   on `hm/hm_gr_trade`, shows them on `hm/hm_car_trade` and buys copies
   (`GtMode::can_buy_guest_car` / `buy_guest_car`); the arcade "Load Garage"
@@ -420,20 +517,28 @@ Completion push, batch 2:
   were replaced by native save files): setting files keep their write time,
   power and name.
 Completion push, batch 3:
-- Options menu (menu spec §10): values in config.ini `[options]`, the
+- Options menu (menus §10): values in config.ini `[options]`, the
   option pages and the top page's previews show them (lit art of the current
   value, music list, key icons, 2P laps / handicap); Menu BGM / SE apply at once,
   Race BGM, 1P vibration and 2P laps at the next race, AT / MT for the arcade car
   pages.
+- Options music list (menus §10): the page `music/music` has no items, so its list is
+  code driven (`menu/flow/music_list_page.*`, `MusicListPage`, ticked by `GameFlow` on
+  that page with the controller's fired / pressed keys): Up / Down rows (the column
+  carried), Left / Right check mark / title or Order / Shuffle, Confirm toggles a song or
+  lifts it (Up / Down then carry it, Confirm puts it down), the focused listed song's intro
+  as a preview (`GameFlow::take_preview`, played by the menu screen). Cancel commits into
+  `[options] music_playlist` (`RacePlaylist::commit`: the race's next pass), not while a
+  song is lifted. Hover / tap work on the rows. The option pages play no BGM.
 - Arcade garage classes: the car pages list the home / guest garage's cars
   (`hg<i>` / `gg<i>` entries) with their own colour and wheel and the picture and
   strip icon of their car label (`GtModeHooks::arcade_image`; the original names a
-  car page entry's art by the car's label for every class, menu spec §9,
+  car page entry's art by the car's label for every class, menus §9,
   and the arcade layout holds art for every car); a garage car on a
   dirt course needs dirt tires; the race uses the car as tuned (both players in 2
   Player Battle: `GameRequest::car2_spec` / `car2_model` / `car2_wheel`) and Single
   Race picks the race code from its weight / power. 2 Player Battle keeps a class
-  row per player with the same rules for both (menu spec §9: road classes crossed out
+  row per player with the same rules for both (menus §9: road classes crossed out
   on dirt, Dirt on road, a garage class without cars), each player's car strip
   holding that class's cars.
 - File Operation (title): Copy and Edit file name (name entry page) in the file
@@ -448,14 +553,21 @@ Completion push, batch 3:
   floor mirror, and menu cars load `menu/cars/<model>` (e.g. the open Miata;
   `cars/day/` has the race hardtop).
 
-Presentation pass (compared with the reference captures; specs
-GT-mode spec §3 / §16 / §18, presentation spec §F, menu spec §9 "GT Mode screens"):
+Presentation pass (compared with the reference captures;
+gt_mode §3 / gt_mode §16 / gt_mode §18, presentation §F, menus §9.7 "GT Mode screens"):
 - Championship trophy: the credits and the bonus box are the race prize pages'
   prize counter (`run_counter`): "Cr. <balance>" counting up from 360 frames after the page
   opened, "Prize Cr. <left>" in the `get_mess` box (now drawn from the forced layer's own
   widgets, `MenuController` draws code-filled widgets of forced layers), mess1 and OK 15
   frames after the count. The prize line ("Prize Cr.") of the cups and the trophy fades in
   over 60 frames and out 61 frames after the count (`remain_alpha`).
+- Prize counter (`game/prize_count_up.h`, `step_prize_count_up`; presentation §F): the
+  original's step in single precision (the tripled step stored back as the velocity after the
+  first Confirm, the velocity cap dropping the acceleration to 0), stepped on every frame of the
+  page; its beep (SE "cursor") is played on the frame of its step, never on the finishing step.
+  500 Cr: done 220 frames after the page's first frame, 20 beeps. Approximate: our floats round
+  to nearest, the console's toward zero (the same frames up to at least 100,000 Cr; a 2,000,000
+  Cr count differs in a few middle digits on some frames).
 - Trophies and award bits: the trophy count rises for GT cups (places 1-3 with prize
   money), championship wins and arcade wins, not for prize cars (`note_race_prize`); the
   award bits (+0xC4) and prize-model bits (+0xC0, license cards) are kept and exported.
@@ -474,7 +586,12 @@ GT-mode spec §3 / §16 / §18, presentation spec §F, menu spec §9 "GT Mode sc
   the reference pixel rows.
 - Wheel shop: tiles are the page's wheel photographs (and "sold out"), no 3D wheels; the
   car's fitted wheel in menus is `menu/wheel/<code>`.
-- Showroom cars: accumulation anti-aliasing (4 / 2 jittered passes, mirror 2 / 1).
+- Showroom cars: accumulation anti-aliasing (4 / 2 jittered passes, mirror 2 / 1); one pass
+  on phones and tablets (`platform::is_mobile`), where each pass's render and composite cost
+  ~15 ms (5 fps → 75 fps on a Galaxy A15).
+- Menu 3D memory: `MenuModelRenderer` frees its cars, views, targets, reflection maps and prize
+  model when the menus start a race (`gt_mode_widget_release`); phones cache 3 menu cars (13 on
+  desktop); its size-keyed targets are freed 8 frames after their last use (the car zoom).
 - Arcade car filter: the base car's region byte (`GtMode::arcade_car_region_hidden`; no
   change on the NTSC-U lists); ending items confirmed.
 
@@ -490,13 +607,14 @@ GT mode, its menus and the arcade progression are complete except for:
   wheel tile spacing (56.5 units) and focus wash are measured on captures; a
   two-digit status-bar day was not captured (the 10-unit right inset is measured on
   "day 1"). The trophy page itself was not captured on the original (its timeline and
-  texts follow the spec, GT-mode spec §18 and presentation spec §F).
-- **Randomness** (spec §20): the GT-mode state is not stepped in the arcade
+  texts follow gt_mode §18 and presentation §F). The prize counter rounds its floats to
+  nearest, the console toward zero (multi-million counts show some digits on other frames).
+- **Randomness** (gt_mode §20): the GT-mode state is not stepped in the arcade
   menus (ours steps it on the GT-mode, setting and records controls only) and
   the frames spent on the presentation pages step it after our rolls (ours
   rolls when the result is recorded); both only add entropy. The attract
   demo draws its whole field from the pool (slot 0 included, the followed
-  car, spec §15) on the race state; its slot-0 car keeps the default paint
+  car, gt_mode §15) on the race state; its slot-0 car keeps the default paint
   (ours builds the followed car's visual before the paint draw).
 - **Unverified readings**: game state scalars +0x08 (an add-only counter), +0x38, the
   byte +0x70 and +0xD0.. (L); +0x2C's meaning (M).
@@ -521,6 +639,12 @@ files, any number of them (`game/save_library.*`):
 - `GT3R_GTMODE_SAVE=<path>` plays that file, its folder is the library and
   nothing is remembered (tests, screenshots); `GT3R_GTMODE_NOSAVE=1` writes
   nothing.
+- **Unreadable saves** (damaged, or from a newer version) are never written
+  over. The list shows them as Corrupt File (Delete is the only operation).
+  When the game to continue cannot be read, a new game starts in its place and
+  the file is first moved aside to `<file>.unreadable-<yyyymmdd>-<hhmmss>`
+  (`set_aside_save`, a warning in the log; not listed, its bytes unchanged:
+  rename it back to `.sav` in a build that reads it).
 
 The save page (`menu/flow/save_page.*`, `SavePage`) is drawn on the original's
 file list art (`memorycard.mbl` page `file_operation`): the left panel lists the
@@ -563,7 +687,8 @@ day 1 / races / wins / prize_money / distance (m) / next_serial / trophies / pri
 car <serial> <label> <colour> <wheel|-> <origin|->     one block per garage car, list order
  parts <27 hex u64>                 fitted part ids in data::Car::parts order (slot 26 = wheel slot, 0)
  owned <22 hex digits>              owned goods, 4 bits per digit, goods 0 first
- settings <54 ints>                 sim::CarSettings in declaration order
+ settings <52 ints>                 sim::CarSettings in declaration order (new fields appended)
+ ref_final <x1000>                  the gear reference final (GarageCar::ref_final)
  cond <odometer m> <wear m> <oil m> <dirt>
 wheel <label>                       wheel inventory
 license <lic 0-5> <test 0-7> <medal -1..2> <best seconds>
@@ -571,10 +696,12 @@ race <code> <best place 0-based>
 prize <prize key>                   prizes already given
 champ <series> <next> <n> <codes…> <m> <entrants…> <points (m+1)…>
 setfile <car> <day> <ref_final>     a setting file, followed by
- sparts <27 hex u64> / ssettings <54 ints>
+ sparts <27 hex u64> / ssettings <52 ints> / sinfo <write time> <power PS> <name>
 mtest 400|1000|max <value> <car>    best machine-test results
-rank <key> <value> <car> <day> <name>   records rankings (lic:, mt:, at:)
+rank <key> <value> <car> <day> <name> <stamp> <code>   records rankings (lic:, mt:, at:, ct:)
+trophyflags <bits>                  prize models received (GameState::trophy_flags)
 player <name>                       last name entered
+fcomment <name>                     the save's name (Edit file name)
 endings <short seen> <long seen>
 arcade <course level> <car flag bits> <award bits>
 abest <difficulty*34+course> <best place>    arcade Single Race results (non-default only)
@@ -586,25 +713,32 @@ end
 Strings escape space, `%`, control characters and bytes ≥ 0x80 as `%XX`; `-` = empty.
 A seeded time-trial record (`at:` ranking, no car) has as its name the original's
 one-byte mark 0xFF − 3 i − k (challenge i, record k), e.g. `rank at:AT020001 107.968 - 0
-%FC`; loading converts the names older saves gave them (`-`, empty, or 0xFF / 0xFE /
+%FC 0 -`; loading converts the names older saves gave them (`-`, empty, or 0xFF / 0xFE /
 0xFD in every challenge) to the challenge's marks by their order.
-Unknown keys are skipped, so later versions can add records.
+Unknown keys are skipped, so later versions can add records. A `settings` /
+`ssettings` line with fewer values (written before a field was appended) leaves the
+rest at their defaults; extra values (a newer build's) are ignored. Neither needs a
+version change; a newer version is refused rather than read as far as it goes.
 
 PS2 import/export (`import_ps2_save`, `export_ps2_save`): the original
-`BASCUS-97102GAMEDATA` data file (spec §12): header check (version 7),
+`BASCUS-97102GAMEDATA` data file (gt_mode §12): header check (version 7),
 CRC-32, byte inversion, then the scalar block, cars (part slots remapped to
 our order, settings, owned bits, condition), wheels, license medals and best
 times, race results (gcf tag-4 order), prize flags (tag-15 order), the
 arcade progression (scalar +0x3C / +0x40.. / +0xC4, the Single Race result
-block) and the arcade time-trial rankings (`at:` rankings, built-in records
+block), the arcade time-trial rankings (`at:` rankings, built-in records
 included: their one-byte name marks are kept as the names and written back unchanged
 with the new-game stamp; a challenge without a ranking is written with the new game's
-seeds, `GtMode::time_trial_seed_ranking`). Blocks GT mode does not track are written as a new game has them:
-the course / machine-test rankings, the idle championship and, unless the
-state came from a PS2 save, the options (`default_ps2_options`: all sound on,
-the race songs of `bgm/ads.inf` in the music list, the button tables). An
+seeds, `GtMode::time_trial_seed_ranking`) and the course time-trial and machine-test
+rankings (`ct:` / `mt:`, Phase 7 "Rankings in the PS2 save"). Blocks GT mode does not
+track are written as a new game has them: the licence rankings beyond the best time,
+the idle championship and, unless the state came from a PS2 save, the options
+(`default_ps2_options`: all sound on, the race songs of `bgm/ads.inf` in the music
+list, shuffled as a new game's race playlist, the button tables). An
 imported save keeps its 0x888-byte options block (`GameState::ps2_options`,
-native `ps2opt` line) so an export restores the player's options.
+native `ps2opt` line) so an export restores the player's options. Our own options,
+the race playlist (the block's music list, `race::RacePlaylist`) included, live in
+config.ini `[options]` and are not read from or written into that block.
 
 File level (`import_ps2_save_path`, `export_ps2_save_path`, `gt3tool
 save-import` / `save-export`, user steps in the README): the data file, its
@@ -636,9 +770,9 @@ Verified in PCSX2 (original game, folder and `.ps2` cards, October 2026):
   record blocks and the championship.
 
 Not carried: the memory card's setting files (`BASCUS-97102S…` folders; the
-'S' data file itself is `import_ps2_setting` / `export_ps2_setting`), the
-course and machine-test rankings, license rankings beyond the best time, a
-championship saved between rounds (restarts) and the prize-car origin. The
+'S' data file itself is `import_ps2_setting` / `export_ps2_setting`), license
+rankings beyond the best time, a championship saved between rounds (restarts)
+and the prize-car origin. The
 original's Game Status shows the total distance (scalar +0x20, 2 m units) as
 km labelled "miles" (169.0 for 169 km) while car mileage is converted; GT3
 Revisited converts both (M: an original display quirk).
@@ -646,7 +780,7 @@ Revisited converts both (M: an original display quirk).
 ## Tests and screenshots
 
 ```bash
-./build-gtmode/gt3r_tests gtmode                     # logic (no disc)
+./build-gtmode/gt3r_tests gtmode                     # logic and synthetic menus (no disc)
 GT3R_DISC="$PWD/PBPX-95503 (1.10).iso" ./build-gtmode/gt3r_tests gtmode
 GT3R_GTMODE_DEMO_SAVE=/tmp/x/demo.sav GT3R_DISC=… ./build-gtmode/gt3r_tests gtmode_disc_demo_save
 GT3R_GTMODE_SAVE=/tmp/x/demo.sav GT3R_GTMODE_NOSAVE=1 GT3R_GT3MENU_SCRIPT="down,cross,wait:90" \
@@ -664,13 +798,23 @@ rules (license, drivetrain, NA, regulation); license judging (B-1 35.100 /
 championship with bonus; the car-spec bridge (97 % new, final drive
 setting reaches the spec); PS2 export → import round trip and CRC; and the
 whole menu path title → map → dealer → buy → Sunday Cup → GameRequest →
-GameResult → prize money (`test_gtmode_menu.cpp`); the arcade data (34
+GameResult → prize money (`test_gtmode_menu.cpp`); the car wash and oil change
+popups holding the controls until the wash (212 frames) / the refill (325); the arcade data (34
 courses in six groups, class sizes, the NTSC-U open-car counts, the AT01
 defaults), the unlock pass (Easy opens groups, Normal / Hard car flags, the
 split-difficulty quirk, Pro not counting), time-trial ranks and the prize
 car, both save formats; and through the menus the filtered pickers, L1 + R1
 Professional and its art, Clear Status marks and the Goal refusal, the class
 refusals and the record name entry after machine tests and time trials.
+
+Without the disc, `gtmode_synth_*` drive the menus through `GameFlow` on the invented
+world of `tests/gtmode_synth.h` (made-up cars, races, licences, arcade courses and menu
+sets): title and map focus, dealer, garage, tune shop, races and prize pages, the
+whole-game prize, a championship, licences and name entry, the prize counter's steps,
+machine tests, course time trials and records, settings and setting files, the save
+page, arcade Single Race and 2 Player, options and the music list, attract mode, the car
+wash. They never write a save. `save_library_*` cover the save library (unreadable saves
+kept).
 
 - Showroom reflections: the image of the element a car is drawn on (the
   `car_render_*` widgets, the arcade pickers' `car` element) is the

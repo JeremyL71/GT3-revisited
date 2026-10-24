@@ -6,9 +6,11 @@ namespace gt3r {
 
 namespace {
 
+// int(gain x 16384) x region volume >> 14, then clamped: a gain above 1 is louder than the
+// region's own volume up to the 14-bit cap. The truncation saturates like the PS2's.
 s16 side_volume(float gain, const sound::InstRegion& r) {
-    s32 v = std::clamp(s32(gain * 16384.0f), -0x4000, 0x3FFF);
-    return s16(std::clamp((v * r.volume) >> 14, -0x4000, 0x3FFF));
+    s64 g = s64(std::clamp(gain * 16384.0f, -2147483648.0f, 2147483520.0f));
+    return s16(std::clamp<s64>((g * r.volume) >> 14, -0x4000, 0x3FFF));
 }
 
 u16 scaled_pitch(const sound::InstRegion& r, float pitch) {
@@ -31,8 +33,8 @@ VoiceParams LoopEffect::params(const sound::InstBank& b, int region, s16 l, s16 
     p.data = std::move(data);
     p.start = reg.address;
     p.pitch = scaled_pitch(reg, pitch);
-    p.vol_l = std::max<s16>(0, l);
-    p.vol_r = std::max<s16>(0, r);
+    p.vol_l = l; // negative inverts the phase (the surround cue)
+    p.vol_r = r;
     p.adsr1 = reg.adsr1;
     p.adsr2 = reg.adsr2;
     p.reverb = reg.reverb();
@@ -49,8 +51,9 @@ void LoopEffect::update(VoiceMixer& mixer, float l, float r, float pitch, int pr
         return;
     }
     if (mixer.playing(voice_) && !mixer.releasing(voice_)) {
+        if (priority >= 0) mixer.set_priority(voice_, u8(std::min(priority, 255)));
         mixer.set_pitch(voice_, scaled_pitch(reg, pitch));
-        mixer.set_volume(voice_, std::max<s16>(0, vl), std::max<s16>(0, vr));
+        mixer.set_volume(voice_, vl, vr);
         return;
     }
     voice_ = mixer.key_on(params(*bank_, region_, vl, vr, pitch, priority, bank_->adpcm));

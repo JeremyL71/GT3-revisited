@@ -15,7 +15,7 @@ std::vector<std::string> RaceScreen::pause_items() const {
     return {"Resume", "Restart", "Watch replay", "Save replay", "Camera", "Gearbox", exit};
 }
 
-// GT3's pause window for this run (presentation spec §E): time trials,
+// GT3's pause window for this run (presentation §E): time trials,
 // licence tests and machine tests have RETRY (RacePauseWithRetry), races / free runs /
 // 2P do not (RacePause), replays have REPLAY OPTIONS (ReplayPause).
 PauseMenu::Kind RaceScreen::pause_kind() const {
@@ -30,6 +30,8 @@ void RaceScreen::open_pause(App& app) {
     pause_sel_ = 0;
     pause_more_ = false;
     if (!pause_loaded_) pause_loaded_ = true, pause_menu_.load(*app.vfs(), app.renderer(), hud_.fonts());
+    // A run that set a record keeps RETRY greyed out until the next run (presentation §E3).
+    pause_menu_.set_retry_enabled(!retry_locked_);
     pause_menu_.open(pause_kind());
     silence(app);
 }
@@ -70,7 +72,7 @@ void RaceScreen::update_pause(App& app, double dt) {
         case PauseMenu::Result::Continue:
             if (!(replaying_ && player_.done())) paused_ = false;
             break;
-        case PauseMenu::Result::Retry: // the run again from its start (presentation.md §E retry)
+        case PauseMenu::Result::Retry: // the run again from its start (presentation §E retry)
             paused_ = false;
             if (online_) toast("Online races cannot be restarted");
             else restart();
@@ -85,9 +87,9 @@ void RaceScreen::update_pause(App& app, double dt) {
         case PauseMenu::Result::Exit:
             paused_ = false;
             if (theater_) leave(app);
-            else if (replaying_) end_replay(app);
-            else if (free_run_ || attract_ || online_) leave(app);
-            else exit_transition_ = 0; // the race ends: GT3's loader transition, then the quick menu
+            else if (replaying_) end_replay(app); // at once: the transition, then the menu
+            else if (attract_ || online_) leave(app);
+            else pause_exit(); // the run ends (GT3's loader transition), or it is its finish
             break;
         }
         return;

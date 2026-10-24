@@ -84,7 +84,7 @@ public:
     std::function<int(const std::string& page)> initial_focus;
     // Enable predicate; disabled items stay focusable but refuse confirm.
     std::function<bool(const std::string& page, const MblItem& item)> enabled;
-    // Confirm intercept (the original's per-page popup hook, spec §3 step 1):
+    // Confirm intercept (a per-page popup hook, menus §3 step 1):
     // return a page name to open it as a popup instead of running the item
     // (e.g. "00cmn/no_money"); "" = run the item normally.
     std::function<std::string(const std::string& page, const MblItem& item)> intercept;
@@ -105,6 +105,11 @@ public:
     const ItemState* focused() const;
     int depth() const { return int(levels_.size()) - 1; } // 0 = base page, >0 popups
     bool busy() const { return phase_ != Phase::Idle; }    // input is ignored
+    // A page with an "ignore_control" widget takes the controls away when it is built (the
+    // car wash's and the oil change's progress popups): no input at all, and the top page's
+    // buttons are not drawn, until control code gives control back.
+    bool ignoring_control() const { return ignore_control_; }
+    void give_control() { ignore_control_ = false; }
     bool finished() const { return finished_; }
     int result() const { return result_; }
     u32 frame() const { return frame_; }
@@ -198,7 +203,6 @@ private:
     std::vector<Level> levels_;
     std::string return_page_;                 // the original's "return" target
     std::map<std::string, int> choices_;      // page\x1fitem -> child (kept across visits)
-    std::map<std::string, int> focus_memory_; // pages with duplicate link targets
     std::vector<MenuEvent> events_;
     std::vector<std::string> sounds_;
     bool finished_ = false;
@@ -222,6 +226,7 @@ private:
     int black_out_ = -1; // fade to black progress in frames (page flag 8), -1 = off
     u32 frame_ = 0;
     bool free_moved_ = false; // Left / Right on a free (name-entry) row since the last row change
+    bool ignore_control_ = false; // ignoring_control()
 };
 
 } // namespace gt3r::menu::flow

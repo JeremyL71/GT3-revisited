@@ -1,7 +1,7 @@
 #pragma once
 
 // Adapter: track::Track walls as a sim::WorldQuery (surfaces use the sim's
-// own spec §3.6 tables via the raw SurfaceHit::surface value), so physics
+// own physics §3.6 tables via the raw SurfaceHit::surface value), so physics
 // stays independent of the track runtime.
 //
 //   sim::TrackWorld world(*track);
@@ -30,7 +30,7 @@ public:
     // Edges of each wall line (track::Track::wall_lines: per-point flags and
     // closure), within `radius` in x/z and in the height band [-5 m, +8 m]
     // around the centre (bridges). Edges starting at a kWallSensor point are
-    // marked sensor: crossings are reported but get no response [spec §5.3].
+    // marked sensor: crossings are reported but get no response [physics §5.3].
     bool wall_segments(const Vec3& c, float radius, std::vector<collide::Segment>& out) const override {
         for (const auto& line : track_.wall_lines()) {
             size_t n = line.points.size();

@@ -5,6 +5,7 @@
 // car for debugging (right stick / mouse orbit, L2/R2 zoom).
 
 #include "input/virtual_pad.h"
+#include "race/procedural_cameras.h"
 #include "race/replay_cameras.h"
 #include "render/math3d.h"
 #include "sim/sim_types.h"
@@ -27,6 +28,16 @@ struct TvCamera {
     float zoom = 1; // > 1 narrows the field of view
 };
 const char* camera_mode_name(CameraMode m);
+
+// GT3's pre-race shot (presentation §B3), by C = frames left to the start signal of a
+// standing-start hold: shown in every live view while C is 60 or more, at
+// t = 1 - (C - 60) / 600, with a 1 s dissolve from the last picture when C - 60 is 120 or 60
+// (the shot's own cuts, t 0.8 and 0.9) and 0 (the cut to the player's view).
+constexpr bool start_shot_on(int frames_to_signal) { return frames_to_signal >= 60; }
+constexpr float start_shot_t(int frames_to_signal) { return 1.0f - float(frames_to_signal - 60) / 600.0f; }
+constexpr bool start_shot_dissolve(int frames_to_signal) {
+    return frames_to_signal == 180 || frames_to_signal == 120 || frames_to_signal == 60;
+}
 
 class CameraRig {
 public:
@@ -74,12 +85,27 @@ public:
     void set_track_distance(float s) { track_s_ = s; }
     // The course's own replay camera script (GTRC); used by the TV mode when set.
     void set_replay_director(ReplayDirector* d) { director_ = d; }
-    void set_lap(int lap) { lap_ = lap; }
+    // Replays, for the next update() only: the point the TV camera aims at (the followed car, or
+    // between it and its battle partner, moving from the last target), the pair, and the
+    // partner's car (mode 2's on-board cut is mounted on it).
+    void set_replay_aim(const render::Vec3& aim, const ReplayDirector::Pair* pair, const sim::VehicleState* partner,
+                        float partner_length);
+    void set_lap(int lap) { lap_ = lap; } // the followed car's lap counter (race::lap_counter)
+    // View mode 1's procedural cameras: the road height (Roadside's placement, the orbit's and
+    // the telephoto's ground clearance) and, for the next update() only, the followed car's
+    // camera mounts.
+    void set_ground(GroundHeight g) { ground_ = std::move(g); }
+    void set_replay_mounts(const std::vector<CarMount>* m) { replay_mounts_ = m; }
+    // The followed car as the procedural cameras see it (its body origin, extents, attitude).
+    static CameraCar camera_car(const sim::VehicleState& s, const sim::VehicleSetup& setup);
     int replay_record() const { return director_record_; }
     int tv_index() const { return tv_active_; }
     // The eye is in the car: own car hidden, mirror, in-car HUD and sounds. Not during the
     // pre-race shot, which looks at the car from outside (GT3 draws it with the chase HUD).
     bool onboard() const { return (mode_ == CameraMode::Bumper || mode_ == CameraMode::Roof) && !intro_; }
+    // The replay camera is one of view mode 1's on-board car mounts (in-car, a bumper, the
+    // driver's head): the followed car is not drawn.
+    bool replay_on_board() const { return mode_ == CameraMode::Tv && replay_on_board_; }
 
     float near_plane = 0.1f, far_plane = 6000.0f;
 
@@ -121,6 +147,17 @@ private:
     int tv_active_ = -1;
     ReplayDirector* director_ = nullptr;
     int lap_ = 0, director_record_ = -1;
+    std::optional<render::Vec3> replay_aim_;
+    std::optional<ReplayDirector::Pair> replay_pair_;
+    std::optional<sim::VehicleState> replay_partner_;
+    float replay_partner_length_ = 4.5f;
+    // Mode 1's procedural camera of the current cut (the director's cut serial), stepped at 60 Hz.
+    ProceduralCamera proc_;
+    bool replay_on_board_ = false;
+    int proc_serial_ = -1;
+    double proc_acc_ = 0;
+    GroundHeight ground_;
+    const std::vector<CarMount>* replay_mounts_ = nullptr;
 };
 
 } // namespace gt3r::race

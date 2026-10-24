@@ -105,17 +105,18 @@ bool GpuContext::init(SDL_Window* window, const GpuOptions& options) {
     set_msaa(options.msaa);
     set_render_scale(options.render_scale);
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
+        const bool no_mips = (i & 4) != 0; // the base level only (GS MXL 0)
         SDL_GPUSamplerCreateInfo si{};
         si.min_filter = SDL_GPU_FILTER_LINEAR;
         si.mag_filter = SDL_GPU_FILTER_LINEAR;
-        si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+        si.mipmap_mode = no_mips ? SDL_GPU_SAMPLERMIPMAPMODE_NEAREST : SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
         si.address_mode_u = (i & 1) ? SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE : SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
         si.address_mode_v = (i & 2) ? SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE : SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
         si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
-        si.max_lod = 1000.0f;
-        si.enable_anisotropy = anisotropy_;
-        si.max_anisotropy = anisotropy_ ? 4.0f : 1.0f;
+        si.max_lod = no_mips ? 0.0f : 1000.0f;
+        si.enable_anisotropy = anisotropy_ && !no_mips;
+        si.max_anisotropy = anisotropy_ && !no_mips ? 4.0f : 1.0f;
         samplers_[i] = SDL_CreateGPUSampler(device_, &si);
         if (!samplers_[i]) {
             LOG_WARN("Sampler creation failed: %s", SDL_GetError());
@@ -145,6 +146,7 @@ GpuContext::~GpuContext() {
         for (SDL_GPUSampler* s : samplers_)
             if (s) SDL_ReleaseGPUSampler(device_, s);
         if (white_) SDL_ReleaseGPUTexture(device_, white_);
+        for (auto& [t, shared] : shared_textures_) SDL_ReleaseGPUTexture(device_, t);
         if (vs_) SDL_ReleaseGPUShader(device_, vs_);
         if (fs_) SDL_ReleaseGPUShader(device_, fs_);
     }
@@ -182,6 +184,10 @@ void GpuContext::set_render_scale(float s) {
     render_scale_ = std::isfinite(s) ? std::clamp(s, 0.5f, 1.0f) : 1.0f;
 }
 
+void GpuContext::set_render_ceiling(float s) {
+    render_ceiling_ = std::isfinite(s) ? std::clamp(s, 0.0f, 1.0f) : 0.0f;
+}
+
 void GpuContext::set_msaa(int samples) {
     SDL_GPUSampleCount want = samples >= 8   ? SDL_GPU_SAMPLECOUNT_8
                               : samples >= 4 ? SDL_GPU_SAMPLECOUNT_4
@@ -194,18 +200,92 @@ void GpuContext::set_msaa(int samples) {
         SDL_WaitForGPUIdle(device_);
         release_pipelines();
         samples_ = want;
+        if (warm_) warm_pipelines(); // the sample count is part of every pipeline
     }
 }
 
+void GpuContext::stop_warming() {
+    warm_stop_ = true;
+    if (warm_thread_.joinable()) warm_thread_.join();
+}
+
 void GpuContext::release_pipelines() {
+    stop_warming();
+    std::lock_guard lock(pipelines_mutex_);
     for (auto& [key, p] : pipelines_) SDL_ReleaseGPUGraphicsPipeline(device_, p);
     pipelines_.clear();
 }
 
-SDL_GPUGraphicsPipeline* GpuContext::pipeline(const PipelineKey& key) {
-    auto it = pipelines_.find(key);
-    if (it != pipelines_.end()) return it->second;
+void GpuContext::warm_pipelines() {
+    stop_warming();
+    warm_ = true;
+    // The combinations five courses and the menus drew with: opaque and alpha blending with
+    // every cull, depth write and frame-alpha mode; the other blends without depth or alpha
+    // writes. Then the same for transparent pictures (coverage, no frame alpha): car models on
+    // the race's gap pop-ups and results bar, the online pickers' cars. A pop-up's first car
+    // built three of these mid-race, a 0.5 s stall on a Moto G Power 2024. Others are still
+    // created on first use.
+    std::vector<PipelineKey> keys;
+    for (bool coverage : {false, true}) {
+        const std::vector<AlphaWrite> alphas = coverage ? std::vector<AlphaWrite>{AlphaWrite::Keep}
+                                                        : std::vector<AlphaWrite>{AlphaWrite::Keep, AlphaWrite::Write,
+                                                                                  AlphaWrite::Only};
+        for (BlendMode b : {BlendMode::Opaque, BlendMode::Alpha})
+            for (bool depth_write : {true, false})
+                for (CullMode c : {CullMode::Back, CullMode::None, CullMode::Front})
+                    for (AlphaWrite a : alphas) {
+                        PipelineKey k;
+                        k.blend = b, k.depth_write = depth_write, k.cull = c, k.alpha = a, k.coverage = coverage;
+                        keys.push_back(k);
+                    }
+        for (BlendMode b :
+             {BlendMode::Additive, BlendMode::DestAlphaAdd, BlendMode::MultiplyDest, BlendMode::DestAlphaLerp})
+            for (CullMode c : {CullMode::Back, CullMode::None, CullMode::Front}) {
+                PipelineKey k;
+                k.blend = b, k.depth_write = false, k.cull = c, k.coverage = coverage;
+                keys.push_back(k);
+            }
+    }
+    warm_stop_ = false;
+    warm_thread_ = std::thread([this, keys] {
+        const u64 t0 = SDL_GetTicksNS();
+        int made = 0;
+        for (const PipelineKey& k : keys) {
+            if (warm_stop_) return;
+            {
+                std::lock_guard lock(pipelines_mutex_);
+                if (pipelines_.count(k)) continue;
+            }
+            SDL_GPUGraphicsPipeline* p = create_pipeline(k);
+            ++made;
+            std::lock_guard lock(pipelines_mutex_);
+            if (!pipelines_.emplace(k, p).second && p) SDL_ReleaseGPUGraphicsPipeline(device_, p);
+        }
+        LOG_INFO("3D pipelines warmed: %d in %.0f ms", made, double(SDL_GetTicksNS() - t0) / 1e6);
+    });
+}
 
+SDL_GPUGraphicsPipeline* GpuContext::pipeline(const PipelineKey& key) {
+    {
+        std::lock_guard lock(pipelines_mutex_);
+        auto it = pipelines_.find(key);
+        if (it != pipelines_.end()) return it->second;
+    }
+    // Not warmed: built here, on the render thread, which stalls the frame (~200 ms per
+    // pipeline on some phone GPUs).
+    const u64 t0 = SDL_GetTicksNS();
+    SDL_GPUGraphicsPipeline* p = create_pipeline(key);
+    LOG_INFO("3D pipeline built on first use in %.0f ms: blend %d, cull %d, depth write %d, lines %d, coverage %d, "
+             "alpha %d",
+             double(SDL_GetTicksNS() - t0) / 1e6, int(key.blend), int(key.cull), int(key.depth_write), int(key.lines),
+             int(key.coverage), int(key.alpha));
+    std::lock_guard lock(pipelines_mutex_);
+    auto [it, added] = pipelines_.emplace(key, p); // failures too, so we don't retry every frame
+    if (!added && p) SDL_ReleaseGPUGraphicsPipeline(device_, p); // the warm-up made it meanwhile
+    return it->second;
+}
+
+SDL_GPUGraphicsPipeline* GpuContext::create_pipeline(const PipelineKey& key) {
     SDL_GPUVertexBufferDescription vb{};
     vb.slot = 0;
     vb.pitch = sizeof(scene::Vertex);
@@ -310,10 +390,10 @@ SDL_GPUGraphicsPipeline* GpuContext::pipeline(const PipelineKey& key) {
     info.multisample_state.sample_count = samples_;
     info.depth_stencil_state.enable_depth_test = true;
     info.depth_stencil_state.enable_depth_write = key.depth_write;
-    // Passes without depth writes (second passes over the same vertices, decals, sky) must
-    // pass on equal depth too.
-    info.depth_stencil_state.compare_op =
-        key.lines || !key.depth_write ? SDL_GPU_COMPAREOP_LESS_OR_EQUAL : SDL_GPU_COMPAREOP_LESS;
+    // GT3's depth test, for every pass with or without depth writes: GEQUAL on a reversed depth
+    // (render::perspective: 1 near, 0 far), so second passes over the same vertices (decals,
+    // reflections) pass on equal depth.
+    info.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_GREATER_OR_EQUAL;
     info.target_info.color_target_descriptions = &color;
     info.target_info.num_color_targets = 1;
     info.target_info.depth_stencil_format = depth_format_;
@@ -321,32 +401,61 @@ SDL_GPUGraphicsPipeline* GpuContext::pipeline(const PipelineKey& key) {
 
     SDL_GPUGraphicsPipeline* p = SDL_CreateGPUGraphicsPipeline(device_, &info);
     if (!p) LOG_WARN("Pipeline creation failed: %s", SDL_GetError());
-    pipelines_[key] = p; // cache failures too, so we don't retry every frame
     return p;
+}
+
+SDL_GPUTexture* GpuContext::acquire_texture(Uploader& up, u32 w, u32 h, const u32* rgba) {
+    if (w == 0 || h == 0) return nullptr;
+    // FNV-1a and a multiply-rotate mix over the texels: a 128-bit content key.
+    TextureKey key{w, h, {14695981039346656037ull, 0x9E3779B97F4A7C15ull}};
+    for (size_t i = 0, n = size_t(w) * h; i < n; ++i) {
+        key.hash[0] = (key.hash[0] ^ rgba[i]) * 1099511628211ull;
+        u64 x = key.hash[1] + rgba[i] * 0xBF58476D1CE4E5B9ull;
+        key.hash[1] = ((x << 31) | (x >> 33)) * 0x94D049BB133111EBull;
+    }
+    if (auto it = textures_by_key_.find(key); it != textures_by_key_.end()) {
+        ++shared_textures_[it->second].holders;
+        return it->second;
+    }
+    SDL_GPUTexture* t = up.texture_rgba(w, h, rgba, true);
+    if (t) {
+        textures_by_key_[key] = t;
+        shared_textures_[t] = {key, 1};
+    }
+    return t;
+}
+
+void GpuContext::release_texture(SDL_GPUTexture* t) {
+    if (!t) return;
+    auto it = shared_textures_.find(t);
+    if (it != shared_textures_.end()) {
+        if (--it->second.holders > 0) return;
+        textures_by_key_.erase(it->second.key);
+        shared_textures_.erase(it);
+    }
+    SDL_ReleaseGPUTexture(device_, t);
+}
+
+bool GpuContext::take_texture(SDL_GPUTexture* t) {
+    auto it = shared_textures_.find(t);
+    if (it == shared_textures_.end()) return true;
+    if (it->second.holders > 1) return false;
+    textures_by_key_.erase(it->second.key);
+    shared_textures_.erase(it);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 
 Uploader::Uploader(SDL_GPUDevice* device) : device_(device) {}
 
-Uploader::~Uploader() {
-    for (Pending& p : pending_) SDL_ReleaseGPUTransferBuffer(device_, p.transfer);
-}
-
-static SDL_GPUTransferBuffer* make_transfer(SDL_GPUDevice* device, const void* data, u32 size) {
-    SDL_GPUTransferBufferCreateInfo ti{};
-    ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    ti.size = size;
-    SDL_GPUTransferBuffer* t = SDL_CreateGPUTransferBuffer(device, &ti);
-    if (!t) return nullptr;
-    void* dst = SDL_MapGPUTransferBuffer(device, t, false);
-    if (!dst) {
-        SDL_ReleaseGPUTransferBuffer(device, t);
-        return nullptr;
-    }
-    std::memcpy(dst, data, size);
-    SDL_UnmapGPUTransferBuffer(device, t);
-    return t;
+u32 Uploader::stage(const void* data, u32 size) {
+    // Each upload at a 512-byte boundary: D3D12 places texture data that way (SDL copies
+    // anything else through a temporary buffer).
+    size_t at = (staging_.size() + 511) & ~size_t(511);
+    staging_.resize(at + size);
+    std::memcpy(staging_.data() + at, data, size);
+    return u32(at);
 }
 
 SDL_GPUBuffer* Uploader::buffer(SDL_GPUBufferUsageFlags usage, const void* data, u32 size) {
@@ -356,68 +465,104 @@ SDL_GPUBuffer* Uploader::buffer(SDL_GPUBufferUsageFlags usage, const void* data,
     bi.size = size;
     SDL_GPUBuffer* b = SDL_CreateGPUBuffer(device_, &bi);
     if (!b) return nullptr;
-    SDL_GPUTransferBuffer* t = make_transfer(device_, data, size);
-    if (!t) {
-        SDL_ReleaseGPUBuffer(device_, b);
-        return nullptr;
-    }
-    pending_.push_back({t, b, nullptr, size, 0, 0, false});
+    pending_.push_back({b, nullptr, stage(data, size), size, 0, 0, 0, false});
     return b;
+}
+
+u32 mip_levels(u32 w, u32 h) {
+    u32 levels = 1;
+    while ((std::max(w, h) >> levels) > 0) ++levels;
+    return levels;
+}
+
+std::vector<u32> half_size(const u32* rgba, u32 w, u32 h) {
+    const u32 hw = std::max(1u, w / 2), hh = std::max(1u, h / 2);
+    std::vector<u32> out(size_t(hw) * hh);
+    for (u32 y = 0; y < hh; ++y)
+        for (u32 x = 0; x < hw; ++x) {
+            const u32 x0 = std::min(2 * x, w - 1), x1 = std::min(2 * x + 1, w - 1);
+            const u32 y0 = std::min(2 * y, h - 1), y1 = std::min(2 * y + 1, h - 1);
+            const u32 p[4] = {rgba[size_t(y0) * w + x0], rgba[size_t(y0) * w + x1], rgba[size_t(y1) * w + x0],
+                              rgba[size_t(y1) * w + x1]};
+            u32 c = 0;
+            for (int shift = 0; shift < 32; shift += 8) {
+                u32 sum = 2;
+                for (u32 q : p) sum += (q >> shift) & 0xFF;
+                c |= (sum / 4) << shift;
+            }
+            out[size_t(y) * hw + x] = c;
+        }
+    return out;
 }
 
 SDL_GPUTexture* Uploader::texture_rgba(u32 w, u32 h, const u32* rgba, bool mipmaps) {
     if (w == 0 || h == 0) return nullptr;
-    u32 levels = 1;
-    if (mipmaps)
-        while ((std::max(w, h) >> levels) > 0) ++levels;
     SDL_GPUTextureCreateInfo ti{};
     ti.type = SDL_GPU_TEXTURETYPE_2D;
     ti.format = GpuContext::kColorFormat;
-    ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | (levels > 1 ? SDL_GPU_TEXTUREUSAGE_COLOR_TARGET : 0);
+    ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
     ti.width = w;
     ti.height = h;
     ti.layer_count_or_depth = 1;
-    ti.num_levels = levels;
+    ti.num_levels = mipmaps ? mip_levels(w, h) : 1;
     SDL_GPUTexture* tex = SDL_CreateGPUTexture(device_, &ti);
-    if (!tex) return nullptr;
-    SDL_GPUTransferBuffer* t = make_transfer(device_, rgba, w * h * 4);
-    if (!t) {
-        SDL_ReleaseGPUTexture(device_, tex);
-        return nullptr;
-    }
-    pending_.push_back({t, nullptr, tex, w * h * 4, w, h, levels > 1});
+    if (tex) update_rgba(tex, w, h, rgba, mipmaps, false);
     return tex;
+}
+
+void Uploader::update_rgba(SDL_GPUTexture* tex, u32 w, u32 h, const u32* rgba, bool mipmaps, bool cycle) {
+    pending_.push_back({nullptr, tex, stage(rgba, w * h * 4), w * h * 4, w, h, 0, cycle});
+    if (!mipmaps) return;
+    std::vector<u32> level;
+    const u32* above = rgba;
+    for (u32 i = 1, n = mip_levels(w, h); i < n; ++i) {
+        level = half_size(above, w, h);
+        w = std::max(1u, w / 2), h = std::max(1u, h / 2);
+        pending_.push_back({nullptr, tex, stage(level.data(), w * h * 4), w * h * 4, w, h, i, false});
+        above = level.data();
+    }
 }
 
 bool Uploader::submit() {
     if (pending_.empty()) return true;
-    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device_);
-    if (!cmd) return false;
-    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
-    for (const Pending& p : pending_) {
-        if (p.buffer) {
-            SDL_GPUTransferBufferLocation src{p.transfer, 0};
-            SDL_GPUBufferRegion dst{p.buffer, 0, p.size};
-            SDL_UploadToGPUBuffer(copy, &src, &dst, false);
-        } else {
-            SDL_GPUTextureTransferInfo src{};
-            src.transfer_buffer = p.transfer;
-            src.pixels_per_row = p.width;
-            src.rows_per_layer = p.height;
-            SDL_GPUTextureRegion dst{};
-            dst.texture = p.texture;
-            dst.w = p.width;
-            dst.h = p.height;
-            dst.d = 1;
-            SDL_UploadToGPUTexture(copy, &src, &dst, false);
+    SDL_GPUTransferBufferCreateInfo ti{};
+    ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    ti.size = u32(staging_.size());
+    SDL_GPUTransferBuffer* t = SDL_CreateGPUTransferBuffer(device_, &ti);
+    void* mapped = t ? SDL_MapGPUTransferBuffer(device_, t, false) : nullptr;
+    bool ok = false;
+    if (mapped) {
+        std::memcpy(mapped, staging_.data(), staging_.size());
+        SDL_UnmapGPUTransferBuffer(device_, t);
+        if (SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device_)) {
+            SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
+            for (const Pending& p : pending_) {
+                if (p.buffer) {
+                    SDL_GPUTransferBufferLocation src{t, p.offset};
+                    SDL_GPUBufferRegion dst{p.buffer, 0, p.size};
+                    SDL_UploadToGPUBuffer(copy, &src, &dst, false);
+                } else {
+                    SDL_GPUTextureTransferInfo src{};
+                    src.transfer_buffer = t;
+                    src.offset = p.offset;
+                    src.pixels_per_row = p.width;
+                    src.rows_per_layer = p.height;
+                    SDL_GPUTextureRegion dst{};
+                    dst.texture = p.texture;
+                    dst.mip_level = p.level;
+                    dst.w = p.width;
+                    dst.h = p.height;
+                    dst.d = 1;
+                    SDL_UploadToGPUTexture(copy, &src, &dst, p.cycle);
+                }
+            }
+            SDL_EndGPUCopyPass(copy);
+            ok = SDL_SubmitGPUCommandBuffer(cmd);
         }
     }
-    SDL_EndGPUCopyPass(copy);
-    for (const Pending& p : pending_)
-        if (p.texture && p.mipmaps) SDL_GenerateMipmapsForGPUTexture(cmd, p.texture);
-    bool ok = SDL_SubmitGPUCommandBuffer(cmd);
-    for (Pending& p : pending_) SDL_ReleaseGPUTransferBuffer(device_, p.transfer); // deferred until the GPU is done
+    if (t) SDL_ReleaseGPUTransferBuffer(device_, t); // deferred until the GPU is done
     pending_.clear();
+    staging_ = {};
     return ok;
 }
 

@@ -82,6 +82,40 @@ size_t AnalyzerTrack::index_at_distance(float d) const {
     return std::min(size_t(it - trace.dist.begin()), trace.size() ? trace.size() - 1 : 0);
 }
 
+AnalyzerLap analyzer_lap(const Replay& r) {
+    if (r.best_lap < 0 || r.best_lap_end <= r.best_lap_begin) return {0, r.ticks(), true};
+    return {r.best_lap_begin, std::min(r.best_lap_end, r.ticks()), false};
+}
+
+LapSampler::LapSampler(double hz, float lap_length, bool whole) : lap_length_(lap_length), whole_(whole) { t_.hz = hz; }
+
+void LapSampler::add(const sim::VehicleState& s, const sim::ControlInputs& in, float d) {
+    const float L = lap_length_;
+    // A lap starts on the line: a first sample just short of it counts from -0.
+    if (prev_ < 0 && !whole_ && L > 0 && d > L * 0.5f) base_ = -L;
+    // Unwrapped distance from the lap's first sample (the line for a lap).
+    if (prev_ >= 0 && L > 0) {
+        if (d < prev_ - L * 0.5f) base_ += L;
+        else if (d > prev_ + L * 0.5f) base_ -= L;
+    }
+    prev_ = d;
+    float u = d + base_;
+    if (t_.trace.dist.empty() && whole_) base_ -= u, u = 0;
+    LapTrace& tr = t_.trace;
+    tr.dist.push_back(std::max(0.0f, u));
+    tr.speed_kmh.push_back(s.speed_kmh);
+    tr.throttle.push_back(in.throttle);
+    tr.brake.push_back(in.brake);
+    tr.x.push_back(s.position.x);
+    tr.z.push_back(s.position.z);
+    t_.ghost.add(s);
+}
+
+AnalyzerTrack LapSampler::take(double lap_time) {
+    t_.trace.time = lap_time >= 0 ? lap_time : double(t_.trace.size()) / t_.hz;
+    return std::exchange(t_, {});
+}
+
 std::optional<LoggerMap> LoggerMap::parse(ByteSpan d) {
     if (d.size() < 0x38 || std::memcmp(d.data(), "LGM0", 4) != 0) return std::nullopt;
     auto u32at = [&](size_t o) { u32 v; std::memcpy(&v, d.data() + o, 4); return v; };
@@ -109,9 +143,10 @@ std::optional<LoggerMap> LoggerMap::parse(ByteSpan d) {
 }
 
 std::pair<float, float> LoggerMap::project(float x, float z) const {
-    float dx = x - ox, dz = z - oz;
-    float px = scale * (std::cos(rot) * dx - std::sin(rot) * dz);
-    float pz = scale * (std::sin(rot) * dx + std::cos(rot) * dz);
+    // The origin is taken off after the rotation (unlike the HUD map's GTCM, which rotates
+    // the offset from it): every map's sector points land on its outline this way.
+    float px = scale * (std::cos(rot) * x - std::sin(rot) * z - ox);
+    float pz = scale * (std::sin(rot) * x + std::cos(rot) * z - oz);
     return {float(width) / 2 + px, float(height) / 2 + pz};
 }
 

@@ -13,46 +13,71 @@ namespace {
 
 constexpr float kKmh = 1.0f / 3.6f;
 
-// The three built-in parameter sets (spec §9.1), as the raw bytes the game
-// converts. Only the bytes the driver uses are listed; the aid bytes (9..13,
-// 19..24) feed the AI's own stability-control block, which our physics does
-// not model separately.
-struct RawSet {
-    u8 brake_pct, speed_pct, speed_offset, yaw_gain, sat_throttle, sat_brake, look_speed, look_min, look_max,
-        grip_weight, bonus_kmh, steer_rate, bonus_ticks, pit_kmh;
-};
-constexpr RawSet kSets[3] = {
-    {100, 100, 100, 24, 100, 0, 90, 15, 40, 100, 20, 9, 0, 80},
-    {100, 100, 100, 24, 100, 0, 90, 15, 40, 100, 20, 9, 0, 80},
-    {100, 100, 100, 24, 100, 0, 90, 30, 60, 100, 20, 9, 0, 80},
+// The three built-in parameter sets (ai §9.1), as stored (bytes 25-31 unused).
+constexpr ParamBytes kSets[3] = {
+    {100, 100, 100, 24, 100, 0, 90, 15, 40, 15, 5, 10, 0, 60, 100, 20, 9, 0, 80},
+    {100, 100, 100, 24, 100, 0, 90, 15, 40, 15, 5, 10, 0, 60, 100, 20, 9, 0, 80},
+    {100, 100, 100, 24, 100, 0, 90, 30, 60, 0, 0, 10, 0, 60, 100, 20, 9, 0, 80},
 };
 
 u8 byte_at(const data::Event& ev, size_t off) { return off < ev.bytes.size() ? ev.bytes[off] : 0; }
 
 } // namespace
 
-DriverParams DriverParams::builtin(int set) {
-    const RawSet& r = kSets[set == 1 ? 1 : set == 2 ? 2 : 0];
+DriverParams DriverParams::from_bytes(const ParamBytes& b) {
     DriverParams p;
-    p.brake_factor = 100.0f / float(std::max<u8>(r.brake_pct, 1));
-    p.speed_scale = r.speed_pct * 0.01f;
-    p.speed_offset = (float(r.speed_offset) - 100.0f) * kKmh;
-    p.yaw_gain = float(r.yaw_gain) * 5.0f * 0.01f;
-    p.sat_throttle_cut = r.sat_throttle * 0.01f;
-    p.sat_brake = r.sat_brake * 0.01f;
-    p.lookahead_full_speed = float(r.look_speed) * 2.0f * kKmh;
-    p.lookahead_min = r.look_min;
-    p.lookahead_max = r.look_max;
-    p.grip_front_weight = r.grip_weight * 0.01f;
-    p.corner_bonus = float(r.bonus_kmh) * kKmh;
-    p.steer_rate = float(r.steer_rate) * 10.0f * 0.0174533f;
-    p.corner_bonus_ticks = r.bonus_ticks * 10;
-    p.pit_speed = float(r.pit_kmh ? r.pit_kmh : 80) * kKmh;
+    p.brake_factor = 100.0f / float(std::max<u8>(b[0], 1));
+    p.speed_scale = b[1] * 0.01f;
+    p.speed_offset = (float(b[2]) - 100.0f) * kKmh;
+    p.yaw_gain = float(b[3]) * 5.0f * 0.01f;
+    p.sat_throttle_cut = b[4] * 0.01f;
+    p.sat_brake = b[5] * 0.01f;
+    p.lookahead_full_speed = float(b[6]) * 2.0f * kKmh;
+    p.lookahead_min = b[7];
+    p.lookahead_max = b[8];
+    p.grip_front_weight = b[14] * 0.01f;
+    p.corner_bonus = float(b[15]) * kKmh;
+    p.steer_rate = float(b[16]) * 10.0f * 0.0174533f;
+    p.corner_bonus_ticks = b[17] * 10;
+    p.pit_speed = float(b[18] ? b[18] : 80) * kKmh;
+    // The AI aid block (ai §9.1): ASCC A gain / threshold, D, C gain / threshold, E (x 0.01) with
+    // the channel flags; TCS lateral a (x 0.1), b (x 0.01), gain (x 0.1), slip scale (x 0.01; 0
+    // and 100 give 1).
+    sim::ScriptedAids& a = p.aids;
+    a.ascc_a_gain = b[9] * 0.01f;
+    a.ascc_a_thr = b[10] * 0.01f;
+    a.tcs_lat_a = b[11] * 0.1f;
+    a.tcs_lat_b = b[12] * 0.01f;
+    a.tcs_gain = b[13] * 0.1f;
+    a.ascc_flags = b[19];
+    a.ascc_d_gain = b[20] * 0.01f;
+    a.ascc_c_gain = b[21] * 0.01f;
+    a.ascc_c_thr = b[22] * 0.01f;
+    a.ascc_e_gain = b[23] * 0.01f;
+    a.tcs_scale = b[24] == 0 || b[24] == 100 ? 1.0f : b[24] * 0.01f;
     return p;
 }
 
-void apply_event(DriverParams& p, const data::Event& ev, int chassis_class) {
-    size_t c = size_t(std::clamp(chassis_class, 0, 3));
+const ParamBytes& DriverParams::builtin_bytes(int set) { return kSets[set == 1 ? 1 : set == 2 ? 2 : 0]; }
+
+DriverParams DriverParams::builtin(int set) { return from_bytes(builtin_bytes(set)); }
+
+int driveline_class(const sim::CarSpec& spec) {
+    const sim::DrivetrainSpec& d = spec.drivetrain;
+    if (d.drive == sim::Drive::FF) return 1;
+    if (d.drive == sim::Drive::AWD) return d.awd_system == 0 ? 1 : d.awd_system == 3 ? 3 : 2;
+    return 0;
+}
+
+int builtin_set(int course_category) { return course_category == 1 || course_category == 2 ? course_category : 0; }
+
+DriverParams course_params(const course::DriverSets& sets, int course_category, int driveline_class) {
+    if (const course::DriverSets::Set* s = sets.for_class(driveline_class)) return DriverParams::from_bytes(*s);
+    return DriverParams::builtin(builtin_set(course_category));
+}
+
+void apply_event(DriverParams& p, const data::Event& ev, int driveline_class) {
+    size_t c = size_t(std::clamp(driveline_class, 0, 3));
     int throttle = byte_at(ev, 0x1A4 + c), brake = byte_at(ev, 0x1A8 + c), speed = byte_at(ev, 0x1AC + c);
     int offset = s8(byte_at(ev, 0x1B0 + c));
     if (throttle == 0 || throttle > 100) throttle = 100;
@@ -62,6 +87,12 @@ void apply_event(DriverParams& p, const data::Event& ev, int chassis_class) {
     if (brake != 100) p.brake_factor *= 100.0f / float(brake);
     if (speed != 100) p.speed_scale *= speed * 0.01f;
     if (offset) p.speed_offset += float(offset) * kKmh;
+}
+
+DriverParams after_finish(DriverParams p) {
+    p.speed_scale *= 0.8f;
+    p.throttle_scale = 0.5f;
+    return p;
 }
 
 RubberBand RubberBand::from_event(const data::Event& ev) {
@@ -78,8 +109,9 @@ RubberBand RubberBand::from_event(const data::Event& ev) {
 }
 
 void adapt_spec_for_ai(sim::CarSpec& spec) {
-    // spec §6: the AI clamps its angle at 45 degrees; physics clamps
-    // steer_angle to the car's full lock, so AI cars get at least that much.
+    // ai §6: the AI clamps its angle at 45 degrees. The physics clamps a CPU car's
+    // steer_angle to +-1 rad, not to the lock; the raised lock only changes steer_angle / lock,
+    // the steering fraction of the car-to-car stuck-steer nudge (sim::World, physics §5.3).
     spec.steering.max_angle = std::max(spec.steering.max_angle, 0.7854f);
 }
 

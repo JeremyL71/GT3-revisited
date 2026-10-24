@@ -16,10 +16,33 @@ namespace gt3r {
 //          +0x00 TEX0, +0x08 TEX1, +0x10/+0x18 (mip registers?), +0x20 CLAMP
 //   0x1C u32 buffer table offset   -> 12-byte upload records:
 //          u32 data offset, u16 dbp, u8 dbw, u8 dpsm, u16 width, u16 height
+//   0x20 u32 paint table offset (cars; 0 = none, see gtm1::paint_variants)
+//   0x24 u32 CLUT animation offset (0 = none, see ClutAnimation)
 //
 // Buffers are uploaded into GS memory in their own format; textures are then
 // sampled through TEX0, often in a different format (see GsMemory).
 struct Tex1 {
+    // CLUT animation (header +0x24 -> u32 count (low 16 bits), u32 entry table offset; offsets
+    // from the Tex1 start). An entry (0x20 bytes) rewrites `words` CT32 colours of the set's
+    // upload data at `target` (inside a CLUT buffer) from a list of timed palettes, cross-fading
+    // from each frame to the next over the frame's time (clut_animation.h plays them):
+    //   +0x00 u16 group, +0x02 u16 mode, +0x04 u16 words, +0x06 u16 frame count,
+    //   +0x08 u32 target, +0x0C u32 frame table, +0x10..+0x1F run-time state (0 on disc).
+    // Frame (8 bytes): f32 seconds (negative: the animation holds there until released),
+    // u32 offset of its `words` colours.
+    struct ClutAnimation {
+        struct Frame {
+            float seconds = 0;
+            u32 source = 0;
+        };
+        u16 group = 0;          // 0: runs from the set's load; 1: the course start signal
+        u16 mode = 0;           // 0 loop, 1 ping-pong, 2 once (stays on the last frame)
+        u32 words = 0;          // colours per frame
+        u32 target = 0;         // offset of the colours it rewrites
+        std::vector<Frame> frames;
+        std::vector<u32> colours; // frames x words, the frames' colours as stored
+    };
+
     struct Texture {
         Tex0 tex0;
         Clamp clamp;
@@ -36,6 +59,7 @@ struct Tex1 {
 
     std::vector<Texture> textures;
     std::vector<Buffer> buffers;
+    std::vector<ClutAnimation> clut_animations;
 
     static bool is_tex1(ByteSpan data);
     // `data` must begin with the "Tex1" header.
@@ -51,5 +75,14 @@ struct Tex1 {
 // Finds every embedded Tex1 set inside an arbitrary container (car models,
 // course files and menus embed texture sets). Returns byte offsets.
 std::vector<size_t> find_tex1_sets(ByteSpan data);
+
+// True for an indexed texture (T4 / T8 and their H variants) with a 32-bit (CT32 / CT24) CSM1
+// CLUT: the textures whose palette TEX0.CSA selects and CLUT animations recolour.
+bool indexed_ct32(const Tex0& t);
+// Position of CLUT entry `e` (0..255) in the 16 x 16 CT32 rectangle of a CSM1 CLUT (a T4
+// texture's entry i is e = CSA x 16 + i).
+void csm1_position(u32 e, u32& x, u32& y);
+// A CT32 CLUT colour as RGBA8 (GS alpha 0..0x80 expanded to 0..255; CT24: opaque).
+u32 clut_rgba(u32 c, u32 cpsm);
 
 } // namespace gt3r

@@ -63,6 +63,7 @@ sim::VehicleState interpolate(const sim::VehicleState& a, const sim::VehicleStat
     r.engine_rpm = lerp(a.engine_rpm, b.engine_rpm, t);
     r.throttle = lerp(a.throttle, b.throttle, t);
     r.speed_kmh = lerp(a.speed_kmh, b.speed_kmh, t);
+    r.steer = lerp(a.steer, b.steer, t);
     for (size_t i = 0; i < r.wheels.size(); ++i) {
         const sim::WheelState &wa = a.wheels[i], &wb = b.wheels[i];
         sim::WheelState& w = r.wheels[i];
@@ -71,6 +72,7 @@ sim::VehicleState interpolate(const sim::VehicleState& a, const sim::VehicleStat
         w.spin_angle = lerp(wa.spin_angle, wb.spin_angle, t);
         w.angular_velocity = lerp(wa.angular_velocity, wb.angular_velocity, t);
         w.suspension = lerp(wa.suspension, wb.suspension, t);
+        w.flap = lerp(wa.flap, wb.flap, t);
     }
     return r;
 }

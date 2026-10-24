@@ -91,6 +91,12 @@ public:
     bool wrong_way() const override { return lap_.wrong_way(); }
     void lap_set_lap1_from_go(bool from_go, bool before_line) override { lap_.set_lap1_from_go(from_go, before_line); }
     void lap_freeze() override { lap_.freeze(); }
+    std::vector<LapCrossing> lap_crossings() const override {
+        std::vector<LapCrossing> out;
+        for (const track::LapTimer::Crossing& c : lap_.crossings()) out.push_back({c.point, c.line, c.lap, c.ms, c.split_ms});
+        return out;
+    }
+    std::vector<float> split_points() const override { return lap_.checkpoints(); }
     const track::Track& track() const { return *t_; }
     const track::Track* runtime() const override { return t_.get(); }
     double race_distance() const override { return lap_.race_distance(); }
@@ -108,7 +114,8 @@ class VehicleAdapter : public RaceVehicle {
 public:
     VehicleAdapter(std::unique_ptr<sim::Vehicle> v, const RaceTrack& t) : v_(std::move(v)), t_(t) {}
     const char* backend_name() const override { return "sim::Vehicle"; }
-    // Grid starts and respawns use the spawn hold (spec §4.3): 2 s held above the ground.
+    // Respawns use the spawn hold (physics §4.3): 2 s held above the ground; a standing grid
+    // start (place) does not.
     void reset(const TrackPose& p) override { v_->spawn(p.position, p.orientation); }
     void place(const TrackPose& p) override { v_->reset(p.position, p.orientation); }
     void set_dirt_course(bool dirt) override { v_->set_dirt_course(dirt); }
@@ -128,8 +135,11 @@ public:
     float boost() const override { return v_->telemetry().boost; }
     const sim::Vehicle* sim_vehicle() const override { return v_.get(); }
     void begin_pit_stop(const sim::Quat& box) override { v_->begin_pit_stop(box); }
+    void set_engine_condition(const sim::EngineCondition& c) override { v_->set_engine_condition(c); }
+    sim::EngineCondition engine_condition() const override { return v_->engine_condition(); }
     void set_reverse_request(bool on) override { v_->set_reverse_request(on); }
     void set_driver_kind(int kind) override { v_->set_driver_kind(kind); }
+    void set_scripted_aids(const sim::ScriptedAids& a) override { v_->set_scripted_aids(a); }
     bool set_race_hold(bool on) override {
         v_->set_race_hold(on);
         return true;

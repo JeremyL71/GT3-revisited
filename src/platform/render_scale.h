@@ -16,6 +16,17 @@ std::optional<float> parse_render_scale(std::string_view value);
 // Scale for "auto" given the window size in physical pixels.
 float auto_render_scale(int pixel_w, int pixel_h, bool mobile);
 
+// With dynamic resolution and "auto", the most the 3D resolution goes up to: the screen's full
+// resolution, up to kDynamicMaxLines lines of the 16:9 game area. It starts at auto_render_scale
+// and climbs while the GPU keeps up, so a phone that can draw its full resolution does.
+constexpr int kDynamicMaxLines = 1440;
+float dynamic_ceiling(int pixel_w, int pixel_h);
+
+// [video] msaa when the config has none: 4 on desktop, 2 on phones and tablets. On a phone
+// GPU 4x costs about 19% of the frame and 2x about 3% (Moto G Power 2024, Trial Mountain), so
+// dynamic resolution keeps a sharper picture at 2x while the edges stay nearly as smooth.
+int default_msaa(bool mobile);
+
 // True on Android and iOS builds.
 bool is_mobile();
 

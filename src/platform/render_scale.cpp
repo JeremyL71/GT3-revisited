@@ -27,6 +27,14 @@ float auto_render_scale(int pixel_w, int pixel_h, bool mobile) {
     return std::clamp(float(kAutoTargetLines) / lines, 0.5f, 1.0f);
 }
 
+float dynamic_ceiling(int pixel_w, int pixel_h) {
+    if (pixel_w <= 0 || pixel_h <= 0) return 1.0f;
+    float lines = std::min(float(pixel_h), float(pixel_w) * 9.0f / 16.0f);
+    return std::clamp(float(kDynamicMaxLines) / lines, 0.5f, 1.0f);
+}
+
+int default_msaa(bool mobile) { return mobile ? 2 : 4; }
+
 bool is_mobile() {
 #if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)
     return true;

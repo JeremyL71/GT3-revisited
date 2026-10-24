@@ -59,16 +59,16 @@ OnlineCar online_car_from_garage(const data::CarDatabase& db, const GarageCar& g
 std::optional<sim::CarSpec> online_car_spec(const data::CarDatabase& db, const OnlineCar& c, std::string* error = nullptr);
 
 // Max power (PS) and its rpm the way the original computes the figure its menus show for a
-// built car: the full-throttle torque curve (with
-// the engine condition already applied by the caller's spec) sampled every 100 rpm from the
-// first curve point (rounded to 100 rpm) up to the rev limit; power = (N*m / 9.8) * rpm / 716.2.
+// built car: the full-throttle torque curve times the engine condition factor `condition`
+// (physics §10.3; 1 = a fresh engine) sampled every 100 rpm from the first curve point
+// (rounded to 100 rpm) up to the rev limit; power = (N*m / 9.8) * rpm / 716.2.
 struct PowerPeak {
     float ps = 0;
     int rpm = 0;
 };
-PowerPeak spec_power_peak(const sim::CarSpec& spec);
+PowerPeak spec_power_peak(const sim::CarSpec& spec, float condition = 1);
 // Peak power at the crank (PS) of a spec (spec_power_peak().ps).
-float spec_power_ps(const sim::CarSpec& spec);
+float spec_power_ps(const sim::CarSpec& spec, float condition = 1);
 // The integer a menu shows for a power in PS: NTSC-U menus convert to HP (x 0.98619), and the
 // value is truncated, not rounded. power_unit() is the label printed after it ("HP" / "PS").
 int display_power(float ps, bool imperial);

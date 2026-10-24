@@ -236,7 +236,7 @@ TEST(track_synthetic_laps) {
     CHECK(near(float(w.race_distance() - before), 3, 0.6f)); // last update was at s = 29
 }
 
-// The original's lap clock (presentation spec "Race order and finish"): a crossing at
+// The original's lap clock (presentation §B9): a crossing at
 // clock-before-the-tick + trunc(50 f) units of 1/3000 s, ms = floor(units / 3); a race times
 // lap 1 from GO, a time trial from the first crossing; a frozen (finished) timer counts no
 // more laps.

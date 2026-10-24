@@ -76,6 +76,32 @@ TEST(random_algorithm) {
     }
 }
 
+TEST(random_vu0_register) {
+    // Seed 0.1: R = 1.m with 0.1's mantissa (0x4CCCCD); each draw shifts m left with bit 4 ^ bit 22
+    // (0 ^ 1) fed in at the bottom: 0x19999B, i.e. 1.2000000477 - 1.
+    Vu0Random r;
+    r.init(Vu0Random::kRunSeed);
+    CHECK(r.r == 0x3FCCCCCDu);
+    float f = r.next();
+    CHECK(r.r == 0x3F99999Bu);
+    u32 bits = 0x3F99999Bu;
+    float expect;
+    std::memcpy(&expect, &bits, 4);
+    CHECK(f == expect - 1.0f);
+    // Always [0, 1); a zero mantissa stays zero (as the hardware's feedback register).
+    bool in_range = true;
+    std::set<u32> seen;
+    for (int i = 0; i < 10000; ++i) {
+        float v = r.next();
+        in_range = in_range && v >= 0 && v < 1;
+        seen.insert(r.r);
+    }
+    CHECK(in_range && seen.size() == 10000);
+    Vu0Random z;
+    z.r = 0x3F800000u;
+    CHECK(z.next() == 0 && z.next() == 0);
+}
+
 TEST(random_stir_range) {
     // (hardware random value + shared int) mod 13, 0 -> 1: always 1..12 steps.
     GameRandom shared{0x2468ACE0};

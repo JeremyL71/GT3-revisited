@@ -3,9 +3,10 @@
 // A looping sound-effect voice driven every game frame, like the game's SE
 // handles (sound/se.inf regions): keyed on at the region's sample with its
 // ADSR when it becomes audible, its volume and pitch updated while it plays,
-// keyed off when both sides reach 0. Volume per side = gain * 0x4000 *
-// region volume >> 14 (clamped); pitch = the region pitch at key_lo times
-// `pitch`. Also hosts the matching one-shot player.
+// keyed off when both sides reach 0. Volume per side = int(gain * 0x4000) *
+// region volume >> 14, clamped to 14 bits (negative = phase inverted); pitch =
+// the region pitch at key_lo times `pitch`; a stealing priority given with an
+// update is re-sent while the voice plays. Also hosts the matching one-shot player.
 
 #include "audio/voice_mixer.h"
 #include "formats/sound/inst.h"
@@ -21,8 +22,8 @@ public:
     void set(std::shared_ptr<const sound::InstBank> bank, int region);
     bool valid() const { return bank_ && region_ >= 0; }
 
-    // l, r: side gains (1 = the region's full volume); pitch: multiplier;
-    // priority: stealing priority 0..255 (-1 = the region's own).
+    // l, r: side gains (1 = the region's full volume, negative inverts); pitch: multiplier;
+    // priority: stealing priority 0..255 (-1 = the region's own, kept while playing).
     void update(VoiceMixer& mixer, float l, float r, float pitch = 1.0f, int priority = -1);
     void stop(VoiceMixer& mixer);
     bool playing(const VoiceMixer& mixer) const { return mixer.playing(voice_); }

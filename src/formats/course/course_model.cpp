@@ -31,19 +31,25 @@ void append_model(scene::Model& dst, scene::Model&& src) {
 
 namespace {
 
-scene::Model gtm1_model(ByteSpan block, const CourseModelOptions& opt, const std::string& name) {
+scene::Model gtm1_model(ByteSpan block, const CourseModelOptions& opt, const std::string& name,
+                        std::vector<gtm1::ClutSet>* clut_sets, gtm1::AnimatedNodes* animated,
+                        bool carry_state = false) {
     gtm1::Gtm1 g = gtm1::Gtm1::parse(block);
     if (!opt.reflections)
         for (gtm1::Chunk& c : g.chunks)
-            if (c.flags & 4) c.packets.clear(); // env-mapped second pass over the same vertices
+            if ((c.flags & 0x1F) == 4) c.packets.clear(); // the road sheen pass over the same vertices
     gtm1::Options o;
     o.run.lod = opt.lod;
     o.textures = opt.textures;
     o.reflection = opt.reflections;
     o.road_sheen = opt.reflections;
+    o.course_env_maps = true;
     o.frame_alpha = opt.frame_alpha;
     o.alpha_test = true;
     o.gs_state = true;
+    o.carry_state = carry_state;
+    o.clut_sets = clut_sets;
+    o.animated = animated;
     scene::Model m = gtm1::build_model(g, o, name);
     for (scene::Mesh& mesh : m.meshes) mesh.name = name + "/" + mesh.name;
     return m;
@@ -113,18 +119,28 @@ scene::Mesh make_ribbon(const std::vector<Vec3>& pts, float width, u32 color, fl
     return mesh;
 }
 
-scene::Model build_course_model(ByteSpan data, const CourseModelOptions& opt, const std::string& name) {
+scene::Model build_course_model(ByteSpan data, const CourseModelOptions& opt, const std::string& name,
+                                std::vector<gtm1::ClutSet>* clut_sets, std::vector<gtm1::AnimatedNodes>* animated) {
     CourseFile file = CourseFile::parse(data);
     scene::Model model;
     model.name = name;
     auto add = [&](int slot, const char* label) {
         ByteSpan s = file.section(data, slot);
         if (s.empty() || !gtm1::Gtm1::is_gtm1(s)) return;
-        append_model(model, gtm1_model(s, opt, label));
+        size_t sets = clut_sets ? clut_sets->size() : 0;
+        int base = int(model.textures.size());
+        gtm1::AnimatedNodes nodes;
+        append_model(model, gtm1_model(s, opt, label, clut_sets, animated ? &nodes : nullptr, slot == kSlotCourseLine));
+        if (clut_sets)
+            for (size_t i = sets; i < clut_sets->size(); ++i) (*clut_sets)[i].first += base;
+        if (animated && !nodes.empty()) {
+            nodes.rebase_textures(base);
+            animated->push_back(std::move(nodes));
+        }
     };
     if (opt.scenery) add(kSlotScenery, "scenery");
     if (opt.scenery2) add(kSlotScenery2, "scenery2");
-    if (opt.extras) add(27, "extra27");
+    if (opt.course_line) add(kSlotCourseLine, "course_line");
     if (opt.road_reflection) add(9, "reflection");
     if (opt.road_reflection_mask) add(13, "reflection_mask");
     if (opt.backdrop) add(kSlotBackdrop, "backdrop");
@@ -140,6 +156,18 @@ scene::Model build_course_model(ByteSpan data, const CourseModelOptions& opt, co
                 model.meshes.push_back(make_ribbon(c.ai.lines[0].sample(c.road, 2.0f), 1.2f, 0xFF0000FFu, 0.3f, "ai_line0"));
         }
     }
+    model.compute_bounds();
+    return model;
+}
+
+scene::Model course_line_model(ByteSpan data, const std::string& name) {
+    scene::Model model;
+    model.name = name;
+    ByteSpan s = CourseFile::parse(data).section(data, kSlotCourseLine);
+    if (s.empty() || !gtm1::Gtm1::is_gtm1(s)) return model;
+    CourseModelOptions o;
+    o.frame_alpha = true; // its FBMSK (colour only) as scene::kKeepAlpha
+    append_model(model, gtm1_model(s, o, name.empty() ? "course_line" : name, nullptr, nullptr, true));
     model.compute_bounds();
     return model;
 }

@@ -12,6 +12,7 @@
 #include "formats/model/car_model.h"
 #include "menu/flow/gt_mode_hooks.h"
 #include "menu/flow/menu_set.h"
+#include "platform/render_scale.h"
 #include "race/backend.h"
 #include "render/prize_view.h"
 #include "render/showroom.h"
@@ -41,6 +42,7 @@ public:
               const std::string& page, const menu::MenuImage* image) {
         (void)alpha;
         if (!app.gpu() || !app.vfs()) return;
+        frame_ = app.frame();
         // The car renders' own image (car_render_* widgets, the arcade pickers' "car" element) is
         // the showroom's reflection map.
         SDL_GPUTexture* env = env_map(app, image);
@@ -125,8 +127,10 @@ public:
             const ShowroomCamera& cam = showroom_camera(app, kind);
             if (cam.valid) {
                 // GT-mode kinds: the fast (k = 8) intro fade; a dirty car reflects less (1 - dirt).
+                // A wheel change keeps the camera. The car wash spins its car (game::car_wash_spin).
+                const game::CarWashSpin spin = game::car_wash_spin();
                 showroom(app, r, menu_rect(0, 0, 640, 448), *m, kind + ":" + car + "#" + std::to_string(paint), cam,
-                         -1, 0, true, 1.0f - dirt, env); // a wheel change keeps the camera
+                         -1, 0, true, 1.0f - dirt, env, 4, kind == "carwash" ? &spin : nullptr);
                 return;
             }
         }
@@ -150,7 +154,25 @@ private:
     struct Targets {
         SDL_Texture* black = nullptr;
         SDL_Texture* white = nullptr;
+        int used = 0; // App::frame of the last use
     };
+    // Offscreen 2D targets by size. The car's box changes size every frame while it zooms to
+    // the next car, so a size unused for 8 frames is freed (otherwise every size of every zoom
+    // stayed allocated).
+    Targets& targets_for(std::map<std::pair<int, int>, Targets>& m, int w, int h) {
+        for (auto it = m.begin(); it != m.end();) {
+            if (it->second.used < frame_ - 8) {
+                if (it->second.black) SDL_DestroyTexture(it->second.black);
+                if (it->second.white) SDL_DestroyTexture(it->second.white);
+                it = m.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        Targets& t = m[{w, h}];
+        t.used = frame_;
+        return t;
+    }
 
     using ShowroomCamera = render::ShowroomCamera;
     const ShowroomCamera& showroom_camera(App& app, const std::string& kind) {
@@ -171,11 +193,17 @@ private:
     // frames); else real time.
     // `passes`: the car's accumulation passes (4; 2 for the
     // split and compulsory showrooms).
+    // `spin`: the car wash's pushes of the turntable (one kWashSpinPush of yaw acceleration per
+    // step until all the pushes so far are applied).
     void showroom(App& app, SDL_Renderer* r, const SDL_FRect& page, const Loaded& m, const std::string& entry,
                   const ShowroomCamera& cam, int frame = -1, int slot = 0, bool fast_fade = false, float reflect = 1,
-                  SDL_GPUTexture* env = nullptr, int passes = 4) {
+                  SDL_GPUTexture* env = nullptr, int passes = 4, const game::CarWashSpin* spin = nullptr) {
         Showroom& show_ = shows_[slot];
         if (!cam.valid) return;
+        // Phones and tablets: one pass (MSAA still smooths the edges) and so one mirror pass,
+        // 3 renders a frame instead of 10. Each pass is its own small 3D render, submit and
+        // composite, which a tile-based mobile GPU pays for in full (5 fps on a Galaxy A15).
+        if (platform::is_mobile()) passes = 1;
         if (show_.key != entry) {
             show_ = Showroom{};
             show_.key = entry;
@@ -184,7 +212,9 @@ private:
             show_.yaw = cam.key(0x3E);
             show_.elev = cam.key(0x3D);
             show_.dist = cam.key(0x3F);
+            if (spin) show_.spin_serial = spin->serial, show_.spin_pushes = spin->pushes; // (pushes before it: gone)
         }
+        if (spin && spin->serial != show_.spin_serial) show_.spin_serial = spin->serial, show_.spin_pushes = 0;
         u64 now = SDL_GetTicksNS();
         double dt = double(now - show_.ticks) / 1e9;
         show_.ticks = now;
@@ -206,7 +236,9 @@ private:
             };
             spring(show_.dist, show_.dist_v, cam.key(0x44), cam.key(0x45), cam.key(0x46));
             for (int a = 0; a < 3; ++a) spring(show_.look[a], show_.look_v[a], cam.key(0x38 + a), cam.key(0x3B), cam.key(0x3C));
-            show_.yaw_v += cam.key(0x42) / 60.0f;
+            float push = 0;
+            if (spin && show_.spin_pushes < spin->pushes) push = game::kWashSpinPush, ++show_.spin_pushes;
+            show_.yaw_v += (cam.key(0x42) + push) / 60.0f;
             show_.yaw_v -= show_.yaw_v * cam.key(0x43) / 60.0f;
             show_.yaw += show_.yaw_v / 60.0f;
             show_.elev_v += cam.key(0x41) / 60.0f;
@@ -248,7 +280,7 @@ private:
         auto jittered = [&](SDL_Renderer* rr, SDL_Texture* target, int w, int h, int n, auto&& draw_pass) {
             static const float kJ2[2][2] = {{0.25f, 0.75f}, {0.75f, 0.25f}};
             static const float kJ4[4][2] = {{0.375f, 0.25f}, {0.125f, 0.75f}, {0.875f, 0.25f}, {0.625f, 0.75f}};
-            SDL_Texture*& tmp = pass_tex_[{w, h}];
+            SDL_Texture*& tmp = targets_for(pass_tex_, w, h).black;
             if (n > 1 && !tmp) tmp = SDL_CreateTexture(rr, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, w, h);
             if (!tmp) n = 1;
             const float px = 0.6f * float(w) / 640.0f, py = 0.6f * float(h) / 448.0f;
@@ -332,7 +364,7 @@ private:
         if (e.w > 0 && e.h > 0) {
             float sx = box.w / e.w, sy = box.h / e.h;
             area = SDL_FRect{box.x - e.x * sx, box.y - (448 - e.y - e.h) * sy, 640 * sx, 448 * sy};
-            // The championship trophy item draws 160 pixels left of centre (spec §18, M).
+            // The championship trophy item draws 160 pixels left of centre (gt_mode §18, M).
             if (trophy) area.x -= 160 * sx;
             // Race prizes (MiniPrize): the cup appears smaller and higher than the .prm camera
             // over the full frame gives (M: fitted to the reference capture of the Sunday Cup
@@ -342,7 +374,7 @@ private:
                 area = SDL_FRect{cx - area.w * k * 0.5f, cy - area.h * k * 0.5f, area.w * k, area.h * k};
             }
         }
-        // The game's multi-pass draw (spec §18): license 6 passes, trophy 4, each with an
+        // The game's multi-pass draw (gt_mode §18): license 6 passes, trophy 4, each with an
         // accumulation-AA sub-pixel offset and, when the file's focus distance A > 1, the eye
         // on a circle of the aperture radius around the axis (depth of field); the passes are
         // averaged (pass i weighted 1 / (i + 1)).
@@ -354,7 +386,7 @@ private:
             r, area,
             [&](SDL_Texture* tex, int w, int h, float bg) {
                 const float clear[4] = {bg, bg, bg, 1};
-                SDL_Texture*& tmp = pass_tex_[{w, h}];
+                SDL_Texture*& tmp = targets_for(pass_tex_, w, h).black;
                 if (!tmp) tmp = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, w, h);
                 const float A = prize_->focus(), B = prize_->aperture();
                 const float px_scale = float(w) / 640.0f;
@@ -412,7 +444,7 @@ private:
     void add_mirror(SDL_Renderer* r, const SDL_FRect& dst, float factor, Paint&& paint) {
         int w = int(dst.w + 0.5f), h = int(dst.h + 0.5f);
         if (w < 8 || h < 8 || factor <= 0) return;
-        Targets& t = targets_[{w, h}];
+        Targets& t = targets_for(targets_, w, h);
         if (!t.black) t.black = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, w, h);
         if (!t.black) return;
         SDL_Texture* prev = SDL_GetRenderTarget(r);
@@ -437,7 +469,7 @@ private:
     void composite(SDL_Renderer* r, const SDL_FRect& dst, Paint&& paint, float opacity = 1.0f) {
         int w = int(dst.w + 0.5f), h = int(dst.h + 0.5f);
         if (w < 8 || h < 8) return;
-        Targets& t = targets_[{w, h}];
+        Targets& t = targets_for(targets_, w, h);
         if (!t.black) t.black = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, w, h);
         if (!t.white) t.white = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, w, h);
         if (!t.black || !t.white) return;
@@ -492,7 +524,8 @@ private:
     const Loaded* car(App& app, const std::string& car, int paint, const std::string& wheel) {
         std::string key = car + "#" + std::to_string(paint) + "#" + wheel;
         if (auto it = cars_.find(key); it != cars_.end()) return it->second.model ? &it->second : nullptr;
-        if (cars_.size() > 12) cars_.clear();
+        // Phones keep fewer of the detailed menu cars (Mali drivers spend ~185 KB per texture).
+        if (cars_.size() >= (platform::is_mobile() ? 3u : 13u)) cars_.clear();
         Loaded& l = cars_[key];
         const game::GtModeSession* s = game::gt_mode_session();
         if (!s) return nullptr;
@@ -505,6 +538,7 @@ private:
         try {
             CarModelOptions opt;
             opt.lod = 0;
+            opt.menu_tyres = true;
             opt.paint = paint;
             race::CarSetup setup = race::car_setup_from_database(s->gt().db(), car);
             opt.wheel_spec = setup.wheels;
@@ -535,6 +569,29 @@ private:
         return l.model ? &l : nullptr;
     }
 
+public:
+    // Before a race: the models, views and targets kept between frames (the pages load them
+    // again when drawn).
+    void release(App& app) {
+        cars_.clear();
+        prize_.reset();
+        prize_path_.clear();
+        view_black_.reset();
+        view_white_.reset();
+        for (auto* m : {&targets_, &pass_tex_}) {
+            for (auto& [size, t] : *m) {
+                if (t.black) SDL_DestroyTexture(t.black);
+                if (t.white) SDL_DestroyTexture(t.white);
+            }
+            m->clear();
+        }
+        if (app.gpu())
+            for (auto& [key, t] : env_maps_)
+                if (t) SDL_ReleaseGPUTexture(app.gpu()->device(), t);
+        env_maps_.clear();
+    }
+
+private:
     std::map<std::string, Loaded> cars_;
     struct Showroom {
         std::string key;
@@ -543,11 +600,13 @@ private:
         int frames = 0;
         int load_wait = 0; // frames spent "loading" (the original's async car load)
         u64 ticks = 0;
+        int spin_serial = 0, spin_pushes = 0; // the car wash whose pushes are applied, and how many
     };
     std::map<int, Showroom> shows_; // 0 single / dealer, 1 / 2 the 2 Player cars
     std::map<std::string, ShowroomCamera> cameras_;
     std::unique_ptr<render::PrizeView> prize_;
-    std::map<std::pair<int, int>, SDL_Texture*> pass_tex_; // prize multi-pass scratch targets
+    std::map<std::pair<int, int>, Targets> pass_tex_; // multi-pass scratch targets (in .black)
+    int frame_ = 0; // App::frame of this draw
     std::string prize_path_;
     int prize_serial_ = -1, prize_skip_ = -1;
     u64 prize_ticks_ = 0;
@@ -556,14 +615,19 @@ private:
     std::map<u64, SDL_GPUTexture*> env_maps_; // showroom reflection maps (env_map)
 };
 
+MenuModelRenderer& menu_models() {
+    // Never destroyed: GPU objects must not outlive the app's GPU context at exit.
+    static MenuModelRenderer* renderer = new MenuModelRenderer;
+    return *renderer;
+}
+
 const bool gt_mode_hooks_installed = [] {
     game::install_gt_mode_menu();
     menu::flow::set_gt_mode_widget_drawer([](App& app, SDL_Renderer* r, const menu::Element& e, const SDL_FRect& box,
                                              float alpha, const std::string& page, const menu::MenuImage* image) {
-        // Never destroyed: GPU objects must not outlive the app's GPU context at exit.
-        static MenuModelRenderer* renderer = new MenuModelRenderer;
-        renderer->draw(app, r, e, box, alpha, page, image);
+        menu_models().draw(app, r, e, box, alpha, page, image);
     });
+    menu::flow::set_gt_mode_widget_release([](App& app) { menu_models().release(app); });
     return true;
 }();
 

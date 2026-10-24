@@ -1,8 +1,11 @@
 // Vehicle simulation tests on a flat infinite plane (no game data needed),
 // plus sanity checks against real cars from the decoded database (need
-// GT3R_DISC).
+// GT3R_DISC). The disc-free vehicle tests here use CarSpec::test_car, which has no
+// suspension block and so runs the placeholder rigid body; the spec path every disc
+// car takes is tested without the disc in test_sim_spec_path.cpp.
 
 #include "test_framework.h"
+#include "sim_fixtures.h"
 
 #include "game/data/car_database.h"
 #include "sim/models.h"
@@ -26,18 +29,11 @@
 
 using namespace gt3r;
 using namespace gt3r::sim;
+using test::EdgeGround;
+using test::FlatGround;
+using test::Slope;
 
 namespace {
-
-struct FlatGround : TrackQuery {
-    float height = 0;
-    SurfaceHit probe(float, float, float y_max) const override {
-        SurfaceHit h;
-        h.hit = y_max >= height;
-        h.height = height;
-        return h;
-    }
-};
 
 constexpr double kDt = 1.0 / kDefaultTickHz;
 
@@ -115,7 +111,7 @@ TEST(sim_curve_torque_interpolates) {
     CHECK(std::fabs(model::curve_torque(e, 1500) - 150) < 1e-3f);
     CHECK(std::fabs(model::curve_torque(e, 3000) - 150) < 1e-3f);
     CHECK(std::fabs(model::curve_torque(e, 9000) - 100) < 1e-3f); // clamped
-    CHECK(std::fabs(model::curve_torque(e, 500) - 100) < 1e-3f);  // clamped below the axis (spec 2.1)
+    CHECK(std::fabs(model::curve_torque(e, 500) - 100) < 1e-3f);  // clamped below the axis (physics §2.1)
 }
 
 TEST(sim_engine_limiter_hysteresis) {
@@ -127,7 +123,7 @@ TEST(sim_engine_limiter_hysteresis) {
     CHECK(a.limiter && a.torque < 0);
     auto b = model::engine_torque(e, 6950, 1, true); // within hysteresis
     CHECK(b.limiter);
-    auto c = model::engine_torque(e, 6400, 1, true); // clears 500 rpm below the limit (spec 2.2)
+    auto c = model::engine_torque(e, 6400, 1, true); // clears 500 rpm below the limit (physics §2.2)
     CHECK(!c.limiter && c.torque > 150);
     auto idle = model::engine_torque(e, 600, 0, false); // closed throttle: -k_f * omega
     CHECK(idle.throttle == 0 && idle.torque < 0);
@@ -169,11 +165,11 @@ TEST(sim_tire_force_shape) {
 }
 
 TEST(sim_spec_helpers) {
-    // table lookup clamps [spec §2.1]
+    // table lookup clamps [physics §2.1]
     const float x[] = {1, 2, 4}, y[] = {10, 20, 0};
     CHECK(model::table_lookup(x, y, 3, 0) == 10 && model::table_lookup(x, y, 3, 9) == 0);
     CHECK(std::fabs(model::table_lookup(x, y, 3, 3) - 10) < 1e-5f);
-    // Euler axes at zero and a pure heading [spec §1.3]
+    // Euler axes at zero and a pure heading [physics §1.3]
     float f[3], l[3], u[3];
     model::euler_axes(0, 0, 0, f, l, u);
     CHECK(f[1] == 1 && l[0] == 1 && u[2] == 1);
@@ -181,21 +177,21 @@ TEST(sim_spec_helpers) {
     CHECK(std::fabs(f[0] + 1) < 1e-5f); // heading +90 deg turns the nose to phys -x (left)
     Vec3 fw = model::phys_to_world(f);
     CHECK(std::fabs(fw.x + 1) < 1e-5f);
-    // slip angle fade [spec §3.2]: 1..10 km/h
+    // slip angle fade [physics §3.2]: 1..10 km/h
     float fade;
     CHECK(model::patch_slip_angle(0.2f, 0.1f, fade) == 0 && fade == 0);
     model::patch_slip_angle(10, -1, fade);
     CHECK(fade == 1);
     CHECK(std::fabs(model::patch_slip_angle(10, -10, fade) - 0.7853982f) < 1e-5f);
-    // slip ratio (spec 3.4): locked wheel at speed = +1 x gain, dead band, spin at standstill
+    // slip ratio (physics §3.4): locked wheel at speed = +1 x gain, dead band, spin at standstill
     CHECK(std::fabs(model::slip_ratio(30, 0, 30) - (0.5f + 0.5f * 30 / 27.78f > 1 ? 1.0f : 0.5f + 0.5f * 30 / 27.78f)) < 1e-4f);
     CHECK(model::slip_ratio(0.001f, 0.001f, 0.001f) == 0);
     CHECK(std::fabs(model::slip_ratio(0, 5, 0) + 0.5f * 5 / (20 * 0.27778f)) < 1e-5f); // low-speed fade
-    // surface index (spec 3.6)
+    // surface index (physics §3.6)
     CHECK(model::surface_index(0) == 0 && model::surface_index(0x200) == 12 && model::surface_index(0x201) == 13);
     CHECK(model::surface_index(0x209) == 14 && model::surface_index(0x205) == 5 && model::surface_index(3) == 3);
     CHECK(model::surface_rolling(3) == 25.5f);
-    // slipstream and filter/drag [spec §5.2]
+    // slipstream and filter/drag [physics §5.2]
     CHECK(model::slipstream_factor(-10, 0, 40, 0.9f) == 0.75f);
     CHECK(model::slipstream_factor(-10, 0, 20, 0.9f) == 0);
     CHECK(model::slipstream_factor(-10, 1.0f, 40, 0.9f) == 0);
@@ -208,7 +204,7 @@ TEST(sim_spec_helpers) {
     CHECK(slip == 1.0f);
     o = model::aero_step(a, 50, 1, slip, 1 / 60.0f);
     CHECK(std::fabs(o.drag + 0.5f * 0.4f * 2500) < 1e-2f); // full slipstream halves drag
-    // torque curve build [spec §2.1]: factor 1180 -> x1.18; tilt between lo% and hi per mille
+    // torque curve build [physics §2.1]: factor 1180 -> x1.18; tilt between lo% and hi per mille
     const u16 tq[] = {2000, 4000};
     const u8 ax[] = {10, 70};
     float rpm[2], nm[2];
@@ -219,7 +215,7 @@ TEST(sim_spec_helpers) {
 }
 
 TEST(sim_turbo_and_suspension_models) {
-    // Turbo (spec 2.3, R34 stock bytes: cap 1+0.1*c, stages 0.2/3500/12.5, 0.6/5500/10.5).
+    // Turbo (physics §2.3, R34 stock bytes: cap 1+0.1*c, stages 0.2/3500/12.5, 0.6/5500/10.5).
     TurboSpec t;
     t.on = true;
     t.cap = 1.6f;
@@ -236,7 +232,7 @@ TEST(sim_turbo_and_suspension_models) {
     CHECK(x > 0.99f && st.lag[0] > 5000);  // spools up to the engine rpm
     TurboSpec na;
     CHECK(model::turbo_step(na, st, 0.4f, 6000, 1 / 60.0f) == 0.4f);
-    // Damper fit through two points (spec 4.2): F(v) = g (sqrt(v - t) - sqrt(-t)).
+    // Damper fit through two points (physics §4.2): F(v) = g (sqrt(v - t) - sqrt(-t)).
     auto d = model::fit_damper(0.1f, 500, 0.5f, 1500);
     CHECK(d.t < 0 && d.g > 0);
     CHECK(std::fabs(d.o + d.g * std::sqrt(-d.t)) < 1e-2f);
@@ -318,7 +314,7 @@ TEST(sim_test_car_acceleration) {
     std::printf("  test car (AWD): 0-100 %.2f s, 400 m %.2f s, top %.0f km/h\n", r.t100, r.t400, r.top_kmh);
     CHECK(r.finite);
     // Upshifts go through the spec's state-3 shift clutch (no torque until the engine
-    // falls to the new ratio), so each shift costs drive time (spec 2.4, draft 18).
+    // falls to the new ratio), so each shift costs drive time (physics §2.4).
     CHECK(r.t100 > 3.8 && r.t100 < 8.5);
     CHECK(r.top_kmh > 230 && r.top_kmh < 330);
 }
@@ -341,7 +337,7 @@ TEST(sim_braking_and_abs) {
     }
     float dist = (car->state().position - p0).length();
     std::printf("  100-0 km/h: %.1f m in %.2f s\n", dist, ticks * kDt);
-    CHECK(dist > 28 && dist < 55); // the clutch stays locked under braking (spec 2.4, draft 18)
+    CHECK(dist > 28 && dist < 55); // the clutch stays locked under braking (physics §2.4)
 }
 
 TEST(sim_steady_cornering) {
@@ -476,12 +472,12 @@ TEST(sim_manual_reverse) {
     car->reset({}, {});
     ControlInputs in;
     in.automatic = false;
-    for (int i = 0; i < 12; ++i) car->step(in, g, kDt); // standing start: shift lockout 12 (spec 9.3)
+    for (int i = 0; i < 12; ++i) car->step(in, g, kDt); // standing start: shift lockout 12 (physics §9.3)
     in.shift_down = true; // 1 -> N
     car->step(in, g, kDt);
     CHECK(car->state().gear == 0);
     in.shift_down = false;
-    car->step(in, g, kDt); // 1-step shift lockout (spec 2.6)
+    car->step(in, g, kDt); // 1-step shift lockout (physics §2.6)
     in.shift_down = true;
     car->step(in, g, kDt); // N -> R
     CHECK(car->state().gear == -1);
@@ -508,17 +504,6 @@ struct WallWorld : WorldQuery {
     Grip surface_grip(u32) const override { return {mu, 0}; }
 };
 
-struct Slope : TrackQuery {
-    float grade = 0.15f; // rise per metre along -Z
-    SurfaceHit probe(float, float z, float y_max) const override {
-        SurfaceHit h;
-        h.height = -z * grade;
-        h.hit = y_max >= h.height;
-        h.normal = Vec3{0, 1, grade} * (1.0f / std::sqrt(1 + grade * grade));
-        return h;
-    }
-};
-
 } // namespace
 
 TEST(sim_wall_stops_car) {
@@ -541,7 +526,7 @@ TEST(sim_wall_stops_car) {
 }
 
 TEST(sim_wall_swept_octagon) {
-    // Same wall as segments (spec 5.3 swept octagon): the car must stop at it
+    // Same wall as segments (physics §5.3 swept octagon): the car must stop at it
     // even at speed (no tunnelling), at an angle it glances off.
     struct SegWorld : WorldQuery {
         bool wall_contact(const Vec3&, float, Vec3&, float&) const override { return false; }
@@ -595,7 +580,8 @@ TEST(sim_direct_steer_angle) {
 }
 
 TEST(sim_spawn_hold) {
-    // spec 4.3: 120 ticks held 0.3 m up (last 30 at ground), flat, gear 1, clutch open.
+    // physics §4.3: 120 ticks held 0.3 m up (last 30 at ground), flat, gear 1, clutch open.
+    // Disc-free twin: sim_spec_spawn_hold_and_pit_stop.
     data::CarDatabase* db = database();
     if (!db) SKIP("needs GT3R_DISC (spec suspension block)");
     auto car = Vehicle::create(*db, "r34_gtr_v_99");
@@ -635,7 +621,7 @@ TEST(sim_spawn_moving) {
 
 TEST(sim_swept_car_contact_no_tunnelling) {
     // A body crossing 3 m in one tick through a 1.8 m wide one: the end poses do
-    // not overlap, the swept test (spec 5.3) still finds the hit.
+    // not overlap, the swept test (physics §5.3) still finds the hit.
     collide::Body a, b;
     a.local = b.local = collide::octagon(2.3, 2.3, 1.8);
     a.radius = b.radius = collide::bounding_radius(a.local);
@@ -659,7 +645,7 @@ TEST(sim_swept_car_contact_no_tunnelling) {
 }
 
 TEST(sim_wear_models) {
-    // spec 8.1/8.4: the one shipped curve and its grip factor.
+    // physics §8.1/8.4: the one shipped curve and its grip factor.
     model::WearParams p = model::shipped_wear_params();
     CHECK(p.on() && p.fresh == -20000 && p.knee1 == 40000 && p.knee2 == 150000 && p.max == 210000);
     CHECK(std::fabs(p.loss_fresh - 0.06f) < 1e-6f && std::fabs(p.loss_max - 0.30f) < 1e-6f && std::fabs(p.worn - 0.91f) < 1e-6f);
@@ -673,23 +659,66 @@ TEST(sim_wear_models) {
     int lv = 0;
     CHECK(std::fabs(model::wear_grip(p, w, 0.5f, &lv) - 0.70f) < 1e-6f && w == 210000 && lv == 127);
     CHECK(grip(210000, 1.0f) == 1.0f); // control compound floor
-    // spec 8.3: tarmac smoke ~1 at 8.2 m/s lateral or slip +0.385 / -0.272; none when gripping.
+    // physics §8.3: tarmac smoke ~1 at 8.2 m/s lateral or slip +0.385 / -0.272; none when gripping.
     CHECK(std::fabs(model::slip_intensity(0, 8.2f, 0, 20, 4000) - 1) < 0.02f);
     CHECK(std::fabs(model::slip_intensity(0, 0, 0.385f, 20, 4000) - 1) < 0.02f);
     CHECK(std::fabs(model::slip_intensity(0, 0, -0.272f, 20, 4000) - 1) < 0.02f);
     CHECK(model::slip_intensity(0, 0.5f, 0.02f, 20, 4000) == 0 && model::slip_intensity(3, 0.5f, 0.02f, 20, 4000) == 0);
     CHECK(model::slip_intensity(1, 0, 0, 20, 4000) > 0.4f); // kerb: rim speed and load
-    // spec 8.2 example: R34 normal tyres, 6000 N in a full slide ~3100 units/s.
+    // physics §8.2 example: R34 normal tyres, 6000 N in a full slide ~3100 units/s.
     float rate = model::wear_increment(1.5f, p.slip_cap, 0.40f, 6000, 0.245f, 1.0f);
     std::printf("  wear: 6000 N full slide %.0f units/s\n", rate);
     CHECK(rate > 3000 && rate < 3200);
     CHECK(model::wear_increment(1, 1, 0.4f, 1000, 0.245f, 1) == 0); // light load: below the 1960 offset
-    // spec 8.5: brake heat stays in [0, 1].
+    // physics §8.5: brake heat stays in [0, 1].
     float y = 0;
     for (int i = 0; i < 600; ++i) y = model::brake_heat_step(y, 3000, 0.32f, 1, 40, float(kDt));
     CHECK(y > 0.5f && y <= 1);
     for (int i = 0; i < 3000; ++i) y = model::brake_heat_step(y, 3000, 0.32f, 0, 20, float(kDt));
     CHECK(y < 0.01f);
+}
+
+TEST(sim_mud_flap_step) {
+    // physics §8.8. Standing (u = 0) on a smooth surface the kicks add nothing: the spring alone.
+    Vu0Random high;
+    high.r = 0x3FFFFFFFu;
+    float x = 0.5f, v = 0;
+    model::flap_step(x, v, 0, 0, 1000, 0, false, 1.0f / 60, high);
+    CHECK(v == -50.0f * (1.0f / 60) && x == 0.5f + v * (1.0f / 60));
+    // Settles back to the middle with no acceleration.
+    for (int i = 0; i < 600; ++i) model::flap_step(x, v, 0, 0, 1000, 0, false, 1.0f / 60, high);
+    CHECK(std::fabs(x) < 1e-3f);
+    // Braking (a_x < 0) holds it off centre: x -> 5 a_x / 100.
+    for (int i = 0; i < 600; ++i) model::flap_step(x, v, -8, 0, 1000, 0, false, 1.0f / 60, high);
+    CHECK(std::fabs(x + 0.4f) < 1e-3f);
+    // Stops at +-1.
+    x = 0.99f, v = 10;
+    model::flap_step(x, v, 0, 0, 1000, 0, false, 1.0f / 60, high);
+    CHECK(x == 1 && v == 0);
+
+    // Draws of 0 (a zero register) always kick: a = 5 a_x + (1 - x) 5 u + (1 - x) 20 w (rough,
+    // loaded, rolling forward) - 100 x - 5 v.
+    Vu0Random zero;
+    zero.r = 0x3F800000u;
+    x = 0, v = 0;
+    model::flap_step(x, v, 2, 10, 1000, 10, true, 0.01f, zero);
+    CHECK(std::fabs(v - 2.6f) < 1e-5f && std::fabs(x - 0.026f) < 1e-6f);
+    x = 0, v = 0;
+    model::flap_step(x, v, 2, 10, 0, 10, true, 0.01f, zero); // airborne: no surface kick
+    CHECK(std::fabs(v - 0.6f) < 1e-6f);
+    // One draw, or two on a rough surface with the wheel loaded and rolling forward.
+    Vu0Random a, b;
+    a.init(Vu0Random::kRunSeed), b.init(Vu0Random::kRunSeed);
+    x = 0, v = 0;
+    model::flap_step(x, v, 0, 5, 1000, 5, false, 0.01f, a);
+    b.next();
+    CHECK(a.r == b.r);
+    model::flap_step(x, v, 0, 5, 1000, 5, true, 0.01f, a);
+    b.next(), b.next();
+    CHECK(a.r == b.r);
+    model::flap_step(x, v, 0, -5, 1000, 5, true, 0.01f, a); // reversing
+    b.next();
+    CHECK(a.r == b.r);
 }
 
 namespace {
@@ -703,8 +732,8 @@ struct PitGround : FlatGround {
 } // namespace
 
 TEST(sim_tire_wear_and_pit_stop) {
-    // Wheelspin launches wear the driven tyres (spec 8.2); the pit surface freezes
-    // wear; a pit stop holds the car 300 steps and fits fresh tyres (spec 8.6).
+    // Wheelspin launches wear the driven tyres (physics §8.2); the pit surface freezes
+    // wear; a pit stop holds the car 300 steps and fits fresh tyres (physics §8.6).
     CarSpec spec = CarSpec::test_car(Drive::FR);
     auto car = Vehicle::create(spec);
     FlatGround g;
@@ -738,7 +767,7 @@ TEST(sim_tire_wear_and_pit_stop) {
 }
 
 TEST(sim_stuck_steer_nudge) {
-    // [spec §5.3] a nearly stopped body (|vx|, |vy| < 1 m/s) whose last
+    // [physics §5.3] a nearly stopped body (|vx|, |vy| < 1 m/s) whose last
     // hit was early in the step (t < 0.1) gets yaw rate += -steer x 20 x dt.
     auto run = [](float steer_a) {
         collide::Body a, b;
@@ -825,7 +854,7 @@ TEST(sim_world_kinematic_remote_car) {
 }
 
 TEST(sim_surface_grip_scales_braking) {
-    // Surface index from the raw material byte (spec 3.6): 0 tarmac, 2 grass.
+    // Surface index from the raw material byte (physics §3.6): 0 tarmac, 2 grass.
     struct Surface : TrackQuery {
         u32 raw = 0;
         SurfaceHit probe(float, float, float y_max) const override {
@@ -902,8 +931,8 @@ TEST(sim_database_r34_gtr) {
                     "L(4 kN) %.2f\n",
                     t.compound.c_str(), t.mu, t.surface_mu[2], amax, aat * 57.2958f, t.opt_drive, t.opt_brake,
                     t.long_c.x.size(), model::lookup(t.load, 4000 / t.width));
-        CHECK(std::fabs(t.mu - 1.45f) < 1e-4f); // spec 6.5: "normal" compound
-        CHECK(std::fabs(t.wear_rate - 0.40f) < 1e-6f); // spec 8.2: normal compound wear rate
+        CHECK(std::fabs(t.mu - 1.45f) < 1e-4f); // physics §6.5: "normal" compound
+        CHECK(std::fabs(t.wear_rate - 0.40f) < 1e-6f); // physics §8.2: normal compound wear rate
         std::printf("  R34 driveline inertia words: spin %.2f / %.2f, shaft %.2f / %.2f, engine %.3f, final %.3f\n",
                     spec->axle[0].spin_inertia, spec->axle[1].spin_inertia, spec->axle[0].shaft_inertia, spec->axle[1].shaft_inertia,
                     spec->engine.inertia, spec->gearbox.final_drive);
@@ -912,10 +941,10 @@ TEST(sim_database_r34_gtr) {
     CHECK(spec->drivetrain.drive == Drive::AWD);
     CHECK(std::fabs(spec->axle[0].max_brake_torque - 3332) < 1 && std::fabs(spec->axle[1].max_brake_torque - 2254) < 1);
     CHECK(std::fabs(spec->yaw_inertia - 9500) < 1);
-    // spec 4.7 R34: drag 0.511, downforce 0.348 / 0.564
+    // physics §4.7 R34: drag 0.511, downforce 0.348 / 0.564
     CHECK(std::fabs(spec->aero.c_drag - 0.511f) < 0.002f);
     CHECK(std::fabs(spec->aero.c_front - 0.348f) < 0.002f && std::fabs(spec->aero.c_rear - 0.564f) < 0.002f);
-    // spec 4.2 R34 suspension blocks
+    // physics §4.2 R34 suspension blocks
     const SuspensionSpec &sf = spec->axle[0].susp, &sr = spec->axle[1].susp;
     std::printf("  susp k %.0f/%.0f, arb %.0f/%.0f, k2 %.3g, unsprung %.1f kg, ride %.3f m, bump damper g %.0f t %.4f\n",
                 sf.k, sr.k, sf.arb_gain, sr.arb_gain, sf.k2, sf.unsprung, sf.ride_height, sf.bump.g, sf.bump.t);
@@ -923,10 +952,10 @@ TEST(sim_database_r34_gtr) {
     CHECK(std::fabs(sf.k - 37240) < 1 && std::fabs(sr.k - 46550) < 1);
     CHECK(std::fabs(sf.arb_gain - 4900) < 1 && std::fabs(sr.arb_gain - 3430) < 1);
     CHECK(std::fabs(sf.k2 - 1.568e6f) < 10 && std::fabs(sf.unsprung - 10) < 1e-3f);
-    CHECK(spec->mass > 1570 && spec->mass < 1770); // 1560 kg + 120 kg [spec 6.4]
+    CHECK(spec->mass > 1570 && spec->mass < 1770); // 1560 kg + 120 kg [physics §6.4]
     CHECK(spec->gearbox.ratios.size() == 6);
     {
-        // Explicit load transfer (spec 4.2): steady right-hand corner loads the left wheels.
+        // Explicit load transfer (physics §4.2): steady right-hand corner loads the left wheels.
         auto car = Vehicle::create(*spec);
         FlatGround g;
         car->reset({}, {});
@@ -955,6 +984,28 @@ TEST(sim_database_r34_gtr) {
         std::printf("  R34 boost: max %.2f (cap %.2f)\n", max_boost, car->setup().max_boost);
         CHECK(car->setup().has_turbo && max_boost > 0.1f && max_boost <= car->setup().max_boost + 1e-5f);
     }
+    {
+        // physics §8.8: the mud flaps lean back under full throttle (x = 5 a_x / 100 when settled) and
+        // swing with the random kicks as the speed grows, within +-1; published with the steering
+        // command.
+        auto car = Vehicle::create(*spec);
+        FlatGround g;
+        car->reset({}, {});
+        vu0_random().init(Vu0Random::kRunSeed);
+        ControlInputs in;
+        in.throttle = 1;
+        in.steer = 0.3f;
+        float most = 0;
+        for (int i = 0; i < 120; ++i) {
+            car->step(in, g, kDt);
+            for (const auto& w : car->state().wheels) most = std::max(most, w.flap);
+        }
+        std::printf("  R34 flaps: up to %.3f under full throttle; steer %.3f rad\n", most, car->state().steer);
+        CHECK(most > 0.1f && most <= 1.0f);
+        CHECK(car->state().steer == car->telemetry().steer_angle && car->state().steer != 0);
+        car->reset({}, {});
+        CHECK(car->state().wheels[0].flap == 0 && car->state().steer == 0);
+    }
     AccelResult r = accelerate(*spec, 70);
     std::printf("  R34: 0-100 %.2f s, 400 m %.2f s, top %.0f km/h\n", r.t100, r.t400, r.top_kmh);
     CHECK(r.finite);
@@ -963,7 +1014,7 @@ TEST(sim_database_r34_gtr) {
 }
 
 TEST(sim_car_settings) {
-    // User settings (spec 6.6) feed the spec with the spec's conversions; the
+    // User settings (physics §6.6) feed the spec with the spec's conversions; the
     // stock settings reproduce the default build exactly.
     data::CarDatabase* db = database();
     if (!db) SKIP("needs GT3R_DISC");
@@ -971,7 +1022,7 @@ TEST(sim_car_settings) {
     CHECK(car != nullptr);
     if (!car) return;
     CarSettings st = stock_settings(*db, car->label, car->parts);
-    CHECK(st.spring[0] == 40 && st.spring[1] == 50 && st.motion_ratio[0] == 95); // spec 6.6 R34 values
+    CHECK(st.spring[0] == 40 && st.spring[1] == 50 && st.motion_ratio[0] == 95); // physics §6.6 R34 values
     CHECK(st.ride_height[0] == 130 && st.downforce_front == 29 && st.downforce_rear == 47 && st.final_drive == 3545);
     auto a = build_car_spec(*db, car->label, car->parts);
     auto b = build_car_spec(*db, car->label, car->parts, st);
@@ -995,7 +1046,7 @@ TEST(sim_car_settings) {
     CHECK(c.has_value());
     if (!c) return;
     CHECK(std::fabs(c->axle[0].susp.k - 60 * 980.0f) < 1 && std::fabs(c->axle[1].susp.k - 70 * 980 * 0.9f) < 1);
-    // [spec §4.2] both suspension blocks read the front ride height (the rear ride-height byte is ignored)
+    // [physics §4.2] both suspension blocks read the front ride height (the rear ride-height byte is ignored)
     CHECK(std::fabs(c->axle[0].susp.ride_height - 0.110f) < 1e-6f && std::fabs(c->axle[1].susp.ride_height - 0.110f) < 1e-6f);
     float af = 0.5f * 1.2f * 2.0f; // R34 frontal area 2.0 m^2
     CHECK(std::fabs(c->aero.c_front - af * 0.5f) < 1e-4f && c->aero.c_rear == 0);
@@ -1025,7 +1076,7 @@ TEST(sim_car_settings) {
 }
 
 TEST(sim_computed_gearbox_slider) {
-    // Computed gearboxes regenerate from the slider (spec 6.7): a higher design
+    // Computed gearboxes regenerate from the slider (physics §6.7): a higher design
     // speed gives a taller (smaller) top gear.
     data::CarDatabase* db = database();
     if (!db) SKIP("needs GT3R_DISC");
@@ -1040,12 +1091,12 @@ TEST(sim_computed_gearbox_slider) {
     if (!a || !b) return;
     std::printf("  zz2 slider: top gear %.3f -> %.3f, first %.3f -> %.3f\n", a->gearbox.ratios.back(), b->gearbox.ratios.back(),
                 a->gearbox.ratios[0], b->gearbox.ratios[0]);
-    CHECK(std::fabs(a->gearbox.ratios[0] - 3.194f) < 1e-4f); // spec 6.7 check value
+    CHECK(std::fabs(a->gearbox.ratios[0] - 3.194f) < 1e-4f); // physics §6.7 check value
     CHECK(b->gearbox.ratios.back() < a->gearbox.ratios.back());
 }
 
 TEST(sim_showroom_top_speed) {
-    // The arcade car pages' speed gauge (menus spec §9): km/h as read off the
+    // The arcade car pages' speed gauge (menus §9.3): km/h as read off the
     // original's gauges (reference captures, about +-2 km/h).
     data::CarDatabase* db = database();
     if (!db) SKIP("needs GT3R_DISC");
@@ -1147,11 +1198,11 @@ TEST(sim_drives_trial_mountain) {
 
 namespace {
 
-// Flying-start pose (spec §9.2): on AI line 6 at race progress -metres_before,
+// Flying-start pose (physics §9.2): on AI line 6 at race progress -metres_before,
 // heading along the line over the next 10 m (the grid slot without line 6).
 track::Pose demo_flying_pose(const track::Track& t, float metres_before) {
     track::Pose g = t.grid_pose(0);
-    static const int kLine = std::getenv("SIM_DEMO_LINE") ? std::atoi(std::getenv("SIM_DEMO_LINE")) : 6; // [spec §9.2] line 6
+    static const int kLine = std::getenv("SIM_DEMO_LINE") ? std::atoi(std::getenv("SIM_DEMO_LINE")) : 6; // [physics §9.2] line 6
     std::vector<Vec3> line = t.racing_line(kLine, 1.0f);
     if (line.size() < 20) return g;
     float len = t.length(), target = std::fmod(len - std::max(0.0f, metres_before) + len, len);
@@ -1216,14 +1267,17 @@ DemoResult run_license_demo(const std::string& code) {
     if (std::getenv("SIM_DEMO_TRACE") && code == std::getenv("SIM_DEMO_TRACE"))
         std::printf("   start type %d speed %.0f flying %.0f m, length %.1f, start_distance %.1f, grid0 s=%.1f\n", es.type, es.initial_kmh,
                     es.flying_m, t->length(), t->road().start_distance, t->locate(t->grid_pose(0).position).distance);
-    // [spec draft 23b, §9.4] the flying-start run-up is the CPU AI driver on line 6 (kind 1)
+    // [physics §9.4] the flying-start run-up is the CPU AI driver on line 6 (kind 1)
     auto ai_course = std::make_shared<ai::AiCourse>(*t);
-    // [ai.md §9.1] the player's run-up uses the built-in set by course category (1 -> 1, dirt 2 -> 2,
-    // else 0), without the CPU event overrides
+    // [ai §9.1] the player's run-up uses the course's set for the car's driveline class (the built-in
+    // set of the course category where there is none), without the CPU event overrides; its aid block
+    // is what the physics reads while the AI drives
     int course_category = 0;
     for (const data::Course& c : db->courses())
         if (c.label == ev->course) course_category = c.surface;
-    ai::AiDriver run_up(ai_course, ai::DriverParams::builtin(course_category == 1 || course_category == 2 ? course_category : 0));
+    const ai::DriverParams run_up_params = ai::course_params(t->driver_sets(), course_category, ai::driveline_class(*spec));
+    car->set_scripted_aids(run_up_params.aids);
+    ai::AiDriver run_up(ai_course, run_up_params);
     if (es.flying()) {
         track::Pose p = demo_flying_pose(*t, es.flying_m);
         car->spawn_moving(p.position, p.orientation, es.initial_kmh / 3.6f);
@@ -1250,13 +1304,13 @@ DemoResult run_license_demo(const std::string& code) {
     float hint = t->locate(car->state().position).distance, prev = hint;
     size_t n = demo->size() + 600; // the recording, then zero frames (10 s) to let the run end
     for (size_t i = 0; i < n; ++i) {
-        // After the last frame the original feeds an all-zero frame (digital, steer 0) [spec §4.4].
+        // After the last frame the original feeds an all-zero frame (digital, steer 0) [physics §4.4].
         ControlInputs in = i < demo->size() ? demo->inputs(i) : ControlInputs{};
         in.automatic = demo->automatic;
         in.steer = -in.steer; // the disc's steering is positive to the left
         in.controller_kind = i < demo->size() ? demo->frames[i].kind : 3;
         if (es.flying() && !started) {
-            // Flying start (spec §9.4, draft 23b): the AI drives until the first start-line crossing;
+            // Flying start (physics §9.4): the AI drives until the first start-line crossing;
             // the recorded pad input is ignored until then. Steering is the road-wheel angle.
             const VehicleState& s0 = car->state();
             ai::CarSnapshot snap;
@@ -1274,8 +1328,8 @@ DemoResult run_license_demo(const std::string& code) {
         if (const char* pk = std::getenv("SIM_DEMO_INPUTS"); pk && code == pk && demo->frames[std::min(i, demo->size() - 1)].steer != 0)
             std::printf("   in t=%6.3f steer=%6d kind=%d\n", (int(i) - hold) * kDt, demo->frames[std::min(i, demo->size() - 1)].steer,
                         demo->frames[std::min(i, demo->size() - 1)].kind);
-        car->set_race_hold(int(i) < hold); // standing start: the race hold (as the race scene, spec §9.3)
-        // [spec draft 23a] the flying-start run-up is driver kind 1 until the first line crossing
+        car->set_race_hold(int(i) < hold); // standing start: the race hold (as the race scene, physics §9.3)
+        // [physics §9.4] the flying-start run-up is driver kind 1 until the first line crossing
         car->set_driver_kind(es.flying() && !started ? 1 : 0);
         car->step(in, *t, kDt, &world);
         const VehicleState& st = car->state();
@@ -1443,21 +1497,10 @@ TEST(sim_r34_skidpad_brake) {
     CHECK(best_g > 0.3f);
 }
 
-namespace {
-// Road only for z > -20; beyond it the ground query misses (off the road mesh).
-struct EdgeGround : TrackQuery {
-    SurfaceHit probe(float, float z, float y_max) const override {
-        SurfaceHit h;
-        h.hit = z > -20 && y_max >= 0;
-        return h;
-    }
-};
-} // namespace
-
 TEST(sim_ground_miss_keeps_previous_height) {
-    // spec §1.3/§5.3: a ground-query miss keeps the previous ground height; the car is not
+    // physics §1.3/physics §10.5: a ground-query miss keeps the previous ground height; the car is not
     // stopped (it keeps driving on that height, the wheels stay grounded and the body is not
-    // held up above airborne wheels).
+    // held up above airborne wheels). Disc-free twin: sim_spec_ground_miss_keeps_previous_height.
     data::CarDatabase* db = database();
     if (!db) SKIP("needs GT3R_DISC (spec suspension block)");
     auto car = Vehicle::create(*db, "r34_gtr_v_99");
@@ -1475,7 +1518,7 @@ TEST(sim_ground_miss_keeps_previous_height) {
 
 
 TEST(sim_wall_contact_held) {
-    // [spec §5.3] a point flagged on a wall (by an impulse or a push-out of at most
+    // [physics §5.3] a point flagged on a wall (by an impulse or a push-out of at most
     // 0.5 m) is held on the wall line while the car keeps pressing in: the body moves so the
     // point is on the line and the velocity into the wall is removed, with no impulse. The flag
     // drops once the car moves away.

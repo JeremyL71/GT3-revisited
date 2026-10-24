@@ -72,21 +72,31 @@ const Element* find_widget(const Page& p, std::string_view name) {
     return nullptr;
 }
 
+bool has_widget_class(const Page& p, std::string_view cls) {
+    for (const Layer& l : p.layers)
+        if (l.name == "defaultLayer")
+            for (const Element& e : l.widgets)
+                if (e.widget_class && *e.widget_class == cls) return true;
+    return false;
+}
+
 // Pages whose items are parked off-screen (x >= 640) and that have a window
 // widget ("menu_top"/"menu") are scrolling selectors: the list places the
-// focused item in the window (e.g. the title menu "root").
+// focused item in the window (e.g. the title menu "root"). A parked item may also
+// sit below the screen (the Toyota dealer list keeps four of its cars there).
 // The race quick menus (qm_*.pmb "root") park their icons above the screen instead
 // (y >= 448) and place them as a horizontal row in their "menu" window.
 const Element* scroller_window(const Page& p) {
     if (p.items.empty()) return nullptr;
     bool right = true, above = true;
     for (const Element& e : p.items) {
-        right = right && e.x >= 640;
+        right = right && (e.x >= 640 || e.y + e.h <= 0);
         above = above && (e.x >= 640 || e.y >= kMenuHeight);
     }
     if (!right) return above ? find_widget(p, "menu") : nullptr;
     if (const Element* w = find_widget(p, "menu_top")) return w;
     if (const Element* w = find_widget(p, "menu_car_goods")) return w; // GT mode dealer car lists
+    if (const Element* w = find_widget(p, "menu_dealer")) return w;    // the England and Germany dealers
     return find_widget(p, "menu");
 }
 
@@ -205,8 +215,6 @@ void MenuController::build(const std::string& name, const std::string& from, boo
                 if (e.name == n) return &e;
             return nullptr;
         };
-        bool duplicate = false;
-        std::vector<std::string> links;
         for (const MblItem& it : lv.page.flow->items) {
             ItemState s;
             s.flow = &it;
@@ -220,14 +228,11 @@ void MenuController::build(const std::string& name, const std::string& from, boo
             for (const MblItem& c : it.children) s.children.push_back(find(c.name));
             // The button list only builds buttons for page items it finds.
             if (!s.element) continue;
-            if (!it.link.empty()) {
-                if (std::find(links.begin(), links.end(), it.link) != links.end()) duplicate = true;
-                links.push_back(it.link);
-            }
             lv.items.push_back(s);
         }
-        // Initial focus: control hook, the item leading to the page we came
-        // from, the focus memory (pages with duplicate targets), else 0.
+        // Initial focus (menus §4.2): the control's hook, else the first item leading to the
+        // page we came from, else 0. There is no remembered focus: a page opened again starts
+        // by the same rule.
         int f = initial_focus ? initial_focus(name) : -1;
         if (f < 0 && !from.empty())
             for (int i = 0; i < int(lv.items.size()); ++i)
@@ -235,10 +240,6 @@ void MenuController::build(const std::string& name, const std::string& from, boo
                     f = i;
                     break;
                 }
-        if (f < 0 && duplicate) {
-            auto m = focus_memory_.find(name);
-            if (m != focus_memory_.end()) f = m->second;
-        }
         lv.focus = std::clamp(f, 0, std::max(0, int(lv.items.size()) - 1));
         lv.scroll = float(lv.focus);
     }
@@ -248,6 +249,9 @@ void MenuController::build(const std::string& name, const std::string& from, boo
     else if (levels_.size() > 1) levels_.pop_back();
     levels_.push_back(std::move(lv));
     Level& t = top();
+    // An "ignore_control" widget takes the controls away until control code gives them back
+    // (give_control); building another page does not.
+    if (t.page && has_widget_class(t.page.layout(), "ignore_control")) ignore_control_ = true;
     if (t.flags & page_flag::kFadeIn) {
         black_in_ = true;
         black_in_since_ = frame_;
@@ -369,8 +373,9 @@ void MenuController::tick(MenuKeys held) {
         }
     }
 
-    fired_ = phase_ == Phase::Idle && !finished_ ? fired : 0;
-    pressed_ = phase_ == Phase::Idle && !finished_ ? pressed : 0;
+    const bool input = phase_ == Phase::Idle && !finished_ && !ignore_control_;
+    fired_ = input ? fired : 0;
+    pressed_ = input ? pressed : 0;
     switch (phase_) {
     case Phase::Idle: break;
     case Phase::Feedback:
@@ -403,7 +408,7 @@ void MenuController::tick(MenuKeys held) {
         if (--phase_frames_ <= 0) phase_ = Phase::Idle;
         return;
     }
-    if (finished_ || levels_.empty()) return;
+    if (finished_ || levels_.empty() || ignore_control_) return;
     handle_input(pressed, fired);
 }
 
@@ -519,9 +524,6 @@ void MenuController::confirm() {
 }
 
 void MenuController::run_item(const MblItem& it, int index) {
-    Level& lv = top();
-    // Focus memory, only where two items lead to the same page.
-    focus_memory_[lv.name] = index;
     if (!it.action.empty()) emit(MenuEvent::Kind::Action, it.action, it.name, index);
     feedback_item_ = index;
     switch (item_kind(it)) {
@@ -663,7 +665,7 @@ int MenuController::hit_test(float x, float y) const {
 }
 
 bool MenuController::tap(float x, float y) {
-    if (busy() || levels_.empty()) return false;
+    if (busy() || ignore_control_ || levels_.empty()) return false;
     int i = hit_test(x, y);
     if (i < 0) return false;
     if (i == top().focus) {
@@ -676,7 +678,7 @@ bool MenuController::tap(float x, float y) {
 }
 
 bool MenuController::hover(float x, float y) {
-    if (busy() || levels_.empty() || !top().page) return false;
+    if (busy() || ignore_control_ || levels_.empty() || !top().page) return false;
     Level& lv = top();
     const bool scrolls = scroller_window(lv.page.layout()) != nullptr;
     if (scrolls && !(lv.flags & page_flag::kHorizontal)) return false;
@@ -844,7 +846,9 @@ void MenuController::add_level_draws(std::vector<ElementDraw>& out, const Level&
     if (window && lv.items.size() >= 2)
         spacing = std::fabs(lv.items[0].element->y - lv.items[1].element->y);
     const int fb_frame = phase_ == Phase::Feedback && is_top ? feedback_frames(feedback_) - phase_frames_ + 1 : 0;
-    for (int i = 0; i < int(lv.items.size()); ++i) {
+    // While the controls are taken away the top page's buttons are not drawn.
+    const size_t buttons = is_top && ignore_control_ ? 0 : lv.items.size();
+    for (int i = 0; i < int(buttons); ++i) {
         const ItemState& s = lv.items[size_t(i)];
         const Element& e = *s.element;
         const bool is_focus = i == lv.focus;
@@ -885,6 +889,19 @@ void MenuController::add_level_draws(std::vector<ElementDraw>& out, const Level&
             if (!en && !disable_overlay) d.brightness = 0.5f;
             d.alpha *= distance_alpha;
         };
+        // A button's highlight (its alt look) is drawn where the button is (in a scrolling list,
+        // where the list puts it), in the button's place in the draw order: the alt's own x, y
+        // and z in the layout are not used (menus §5.3). (The GT Auto page's Wheel Shop
+        // highlight sits 10 units right of its button in the layout, the dealer car pages' Spec
+        // highlight off-screen.)
+        auto highlight = [&](const Element& button, const Element& alt, float alpha) -> ElementDraw& {
+            ElementDraw& d = push(scene, &alt, alpha);
+            d.z = zbase + button.z;
+            d.has_box = true;
+            d.box = {button.x, button.y, alt.w, alt.h};
+            place(d);
+            return d;
+        };
         bool fb = fb_frame > 0 && i == feedback_item_;
         if (is_focus && !e.alt.empty()) {
             const Element& alt = e.alt[0];
@@ -900,10 +917,13 @@ void MenuController::add_level_draws(std::vector<ElementDraw>& out, const Level&
             } else if (fb) {
                 over = 0;
             }
-            place(push(scene, &alt, alt_a));
+            // A disabled item's highlight is drawn at half brightness, under the page's
+            // `disable` widget too (menus §5.3).
+            ElementDraw& hd = highlight(e, alt, alt_a);
+            if (!en) hd.brightness = 0.5f;
             if (over > 0) {
                 ElementDraw& d = push(scene, &e, base_alpha * over);
-                d.z = zbase + alt.z + 0.0001f;
+                d.z = zbase + e.z + 0.0001f;
                 place(d);
             }
         } else {
@@ -954,10 +974,10 @@ void MenuController::add_level_draws(std::vector<ElementDraw>& out, const Level&
             if (!ce) continue;
             if (c == ch && !ce->alt.empty()) {
                 const Element& alt = ce->alt[0];
-                place(push(scene, &alt, fade_alpha(alt, lv.built)));
+                highlight(*ce, alt, fade_alpha(alt, lv.built));
                 if (free_row && focus_mode(*ce) == 2) { // the normal look over it: the pulse
                     ElementDraw& d = push(scene, ce, fade_alpha(*ce, lv.built) * 2.0f * (0.5f - pulse));
-                    d.z = zbase + alt.z + 0.0001f;
+                    d.z = zbase + ce->z + 0.0001f;
                     place(d);
                 }
                 continue;

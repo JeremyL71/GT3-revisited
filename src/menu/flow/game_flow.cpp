@@ -1,8 +1,9 @@
 #include "menu/flow/game_flow.h"
 
 #include "base/log.h"
+#include "formats/db/gt_db.h"
+#include "formats/sound/mads.h"
 #include "menu/flow/gt_mode_hooks.h"
-#include "formats/bgm_index.h"
 
 #include <algorithm>
 #include <cctype>
@@ -14,7 +15,15 @@ namespace {
 
 // Items of the title page "root" in .mbl order; the original focuses the
 // item of the mode it comes back from.
-enum TitleItem { kTitleArcade = 0, kTitleGtMode = 1, kTitleReplay = 2, kTitleOption = 6 };
+enum TitleItem {
+    kTitleArcade = 0,
+    kTitleGtMode = 1,
+    kTitleReplay = 2,
+    kTitleLoad = 3,
+    kTitleSave = 4,
+    kTitleFile = 5,
+    kTitleOption = 6
+};
 
 constexpr int kSwitchFrames = 40; // Fadeout has darkened the screen to ~2 % by then; the next control loads
 
@@ -33,18 +42,29 @@ const Element* find_element(const Layer* l, const std::string& name) {
 
 bool starts(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
 
+bool is_code_page(const std::string& p) {
+    return p == "ar/select_course" || p == "ar/select_class" || p == "ar/select_car" || p == "ar/select_car_2p" ||
+           p == "ar/select_compulsory";
+}
+
+bool is_car_page(const std::string& p) { return p == "ar/select_car" || p == "ar/select_car_2p"; }
+
+} // namespace
+
 // Menu BGM by page, as the page build picks it (prefix tests in this
 // order; a later match wins). The game passes an index into its music
 // table; the music.inf names here are matched by meaning.
 std::string page_music(const std::string& set, const std::string& p) {
-    if (set == "option") return "option01";
+    // The option pages match none of the prefixes: no BGM (menus §10; the music list's
+    // previews are the only music there).
+    if (set == "option") return "";
     std::string m = "\x01"; // keep current
     if (starts(p, "cd/") || p == "00cmn/cd_ride_sure") m = "dealer01";
     else if (starts(p, "at/") || p == "00cmn/ws_fit_sure") m = "wash01";
     if (starts(p, "hm/")) m = "home01";
     if (starts(p, "lc/")) m = "license01";
     else if (starts(p, "r/") || p == "00cmn/race_info") m = "gorace01";
-    else if (p == "replay_theater") m = "theater01";
+    else if (p == "replay_theater") m = "bgm:26"; // 0x1A, the "Are You Gonna Go My Way" remix, looping
     else if (starts(p, "ts/")) m = "tune01";
     else if (p == "map") m = "gtmenu01";
     else if (starts(p, "mt/")) m = "machtest01";
@@ -58,14 +78,53 @@ std::string page_music(const std::string& set, const std::string& p) {
     return m;
 }
 
-bool is_code_page(const std::string& p) {
-    return p == "ar/select_course" || p == "ar/select_class" || p == "ar/select_car" || p == "ar/select_car_2p" ||
-           p == "ar/select_compulsory";
+int title_focus_after(std::string_view command) {
+    if (command == "go_arcade_menu") return kTitleArcade;
+    if (command == "go_replay_theater") return kTitleReplay;
+    if (command == "go_load_game_menu") return kTitleLoad;
+    if (command == "go_save_game_menu") return kTitleSave;
+    if (command == "go_file_operation") return kTitleFile;
+    if (command == "go_option") return kTitleOption;
+    return kTitleArcade;
 }
 
-bool is_car_page(const std::string& p) { return p == "ar/select_car" || p == "ar/select_car_2p"; }
+RacePageHook race_page_hook(std::string_view page, const std::vector<MblItem>& items) {
+    auto has = [&](const char* action) {
+        return std::any_of(items.begin(), items.end(), [&](const MblItem& it) { return it.action == action; });
+    };
+    if (page.substr(0, 6) == "lc/lc_" && page.find('/', 6) == std::string_view::npos)
+        return has("go_license") ? RacePageHook::License : RacePageHook::None;
+    // r/<class>/<series>
+    const size_t a = page.find('/'), b = a == std::string_view::npos ? a : page.find('/', a + 1);
+    if (page.substr(0, 2) != "r/" || b == std::string_view::npos || page.find('/', b + 1) != std::string_view::npos)
+        return RacePageHook::None;
+    if (page.size() >= 6 && page.substr(page.size() - 6) == "_entry") return RacePageHook::None;
+    if (std::any_of(page.begin(), page.end(), [](char c) { return c >= 'A' && c <= 'Z'; })) return RacePageHook::None;
+    if (has("set_race_code_champ")) return RacePageHook::ChampionshipSeries;
+    return has("set_race_code") ? RacePageHook::Series : RacePageHook::None;
+}
 
-} // namespace
+int race_page_focus(RacePageHook hook, std::string_view code, int race_type) {
+    // The code's last characters as digits; a character the code is too short for counts as
+    // a negative digit, so the index is then 0.
+    auto digit = [&](size_t from_end) -> int {
+        if (code.size() < from_end) return -1000;
+        return int(static_cast<signed char>(code[code.size() - from_end])) - '0';
+    };
+    switch (hook) {
+    case RacePageHook::License: {
+        const int i = digit(1) - 1;
+        return i >= 0 && i <= 7 ? i : 0;
+    }
+    case RacePageHook::Series: return std::max(0, digit(1));
+    case RacePageHook::ChampionshipSeries: {
+        int i = digit(2) * 10 + digit(1);
+        if (race_type != 2) ++i; // a single race: after the championship item
+        return std::max(0, i);
+    }
+    default: return -1;
+    }
+}
 
 GameFlow::GameFlow(FileReader reader, std::string lang) : reader_(std::move(reader)), lang_(std::move(lang)) {}
 
@@ -81,8 +140,8 @@ void GameFlow::log(std::string msg) {
 }
 
 void GameFlow::start() {
-    title_focus_ = 0;
-    open_control("gt_mode", "root", 0);
+    title_focus_ = title_focus_after({}); // boot: Arcade
+    open_control("gt_mode", "root", title_focus_);
 }
 
 bool GameFlow::start_presentations() {
@@ -111,11 +170,17 @@ void GameFlow::open_control(const std::string& set, const std::string& page, int
         set_ = &s;
         control_ = set;
     }
-    // Initial focus hook (the original's per-page table).
+    // The control's initial focus hooks (menus §7.1, menus §4.2). The title always opens on the
+    // control's current title focus, however it is reached.
+    // The race series and licence pages open on the item of the stored race code (menus §4.2).
     std::string fpage = page;
-    ctl_->initial_focus = [this, fpage, focus](const std::string& p) -> int {
+    const MenuSet* gt = set == "gt_mode" ? &s : nullptr;
+    ctl_->initial_focus = [this, gt, fpage, focus](const std::string& p) -> int {
         if (p == "ar/top") return arcade_game_;
         if (p == "ar/level") return std::min(difficulty_, 2);
+        if (gt && p == "root") return title_focus_;
+        if (gt)
+            if (int f = race_page_focus_now(*gt, p); f >= 0) return f;
         return p == fpage ? focus : -1;
     };
     if (set == "gt_mode" || set == "setting" || set == "records" || presenting_) {
@@ -144,9 +209,19 @@ void GameFlow::open_control(const std::string& set, const std::string& page, int
     if (two_page_) two_player_open();
 }
 
+int GameFlow::race_page_focus_now(const MenuSet& set, const std::string& page) {
+    const MenuSet::PageRef ref = set.page(page);
+    if (!ref.flow) return -1;
+    const RacePageHook hook = race_page_hook(page, ref.flow->items);
+    if (hook == RacePageHook::None) return -1;
+    const int f = race_page_focus(hook, race_code_, race_type_);
+    race_code_.clear(); // every call of a race page's hook clears the stored code
+    return f;
+}
+
 void GameFlow::switch_control(const std::string& set, const std::string& page, int focus) {
     // Leaving a menu control: the menu's transition type (default 0 = Fadeout) over the last
-    // frame while the next one loads; the next control appears as a cut (menus.md §6).
+    // frame while the next one loads; the next control appears as a cut (menus §6).
     transition_ = TransitionType::Fadeout;
     switch_frames_ = kSwitchFrames;
     next_set_ = set;
@@ -194,6 +269,7 @@ void GameFlow::start_attract_demo() {
         in_attract_ = false;
         return;
     }
+    title_focus_ = title_focus_after({}); // the title idled without a command: back on Arcade
     resume_set_ = "gt_mode";
     resume_page_ = "root";
     resume_focus_ = title_focus_;
@@ -238,7 +314,7 @@ void GameFlow::game_finished() {
             GameResult r = *result;
             if (r.course.empty()) r.course = course_;
             h.on_arcade_result(r);
-            // Presentations it queued (time-trial name entry), then the arcade menu.
+            // Presentations it queued (the Single Race cup), then the arcade menu.
             after_game();
             return;
         }
@@ -312,7 +388,12 @@ std::optional<TransitionType> GameFlow::take_transition() { return std::exchange
 std::vector<std::string> GameFlow::take_log() { return std::exchange(log_, {}); }
 
 bool GameFlow::tap(float x, float y) {
-    if (!ctl_ || switching() || waiting_game_ || ctl_->busy()) return false;
+    if (!ctl_ || switching() || waiting_game_ || ctl_->busy() || ctl_->ignoring_control()) return false;
+    if (SDL_FRect area; music_list_active() && music_list_area(area)) {
+        const bool used = music_page_.tap(area, x, y, sounds_);
+        if (std::optional<int> p = music_page_.take_preview()) preview_request_ = p;
+        return used;
+    }
     if (gt_active())
         if (const GtModeHooks& h = gt_mode_hooks(); h.tap)
             if (int r = h.tap(*ctl_, x, y)) {
@@ -333,7 +414,12 @@ bool GameFlow::tap(float x, float y) {
 }
 
 bool GameFlow::hover(float x, float y) {
-    if (!ctl_ || switching() || waiting_game_ || ctl_->busy()) return false;
+    if (!ctl_ || switching() || waiting_game_ || ctl_->busy() || ctl_->ignoring_control()) return false;
+    if (SDL_FRect area; music_list_active() && music_list_area(area)) {
+        const bool used = music_page_.hover(area, x, y, sounds_);
+        if (std::optional<int> p = music_page_.take_preview()) preview_request_ = p;
+        return used;
+    }
     if (gt_active())
         if (const GtModeHooks& h = gt_mode_hooks(); h.hover)
             if (int r = h.hover(*ctl_, x, y)) {
@@ -379,32 +465,33 @@ void GameFlow::tick(MenuKeys held) {
     if (control_ == "memorycard") {
         // The slot page is code driven: the controller only animates the page's layers.
         if (name_mode_) {
-            // Edit file name: the name entry page (characters append, Cancel deletes the
-            // last one or leaves when empty, OK confirms).
-            // Triangle / Square: Back Space (never leaves the page); Start: to the OK row.
+            // Edit file name: the name entry page's text box (TextBox: a key's character goes
+            // in at the cursor, OK confirms). Triangle / Square: Back Space (never leaves the
+            // page); Start: to the OK row; L1 / R1: the cursor.
             const MenuKeys pressed = held & MenuKeys(~held_name_);
             held_name_ = held;
-            if ((pressed & key_bit(MenuKey::Cancel)) && !ctl_->busy() && !name_text_.empty()) {
-                name_text_.pop_back();
+            if ((pressed & key_bit(MenuKey::Cancel)) && !ctl_->busy() && name_box_.back_space())
                 sounds_.push_back("cursor");
-            }
             if ((pressed & key_bit(MenuKey::Start)) && !ctl_->busy()) ctl_->set_focus("free_command");
             held &= MenuKeys(~(key_bit(MenuKey::Cancel) | key_bit(MenuKey::Start)));
             const bool cancel = false;
             ctl_->tick(held);
+            if (const MenuKeys f = ctl_->fired(); f & (key_bit(MenuKey::L1) | key_bit(MenuKey::R1)))
+                if (name_box_.move((f & key_bit(MenuKey::L1)) ? -1 : 1)) sounds_.push_back("cursor");
             for (const MenuEvent& e : ctl_->take_events()) {
                 if (e.kind == MenuEvent::Kind::Action && e.action == "input_text") {
-                    // The key's character: its layout element's text ("A", "chr1" = "[", ...).
+                    // The key's character: its layout element's text ("A", "chr1" = "[", ...;
+                    // the space key has none).
                     if (ctl_->page())
                         for (const Element& it : ctl_->page().layout().items)
-                            if (it.name == e.item && it.text && !it.text->text.empty()) {
-                                if (int(name_text_.size()) < SavePage::kNameMax) name_text_ += it.text->text;
+                            if (it.name == e.item) {
+                                if (name_box_.insert(it.text ? it.text->text : std::string())) sounds_.push_back("cursor");
                                 break;
                             }
                 } else if (e.kind == MenuEvent::Kind::Exit || e.kind == MenuEvent::Kind::Finish) {
                     name_mode_ = false;
                     open_control("memorycard", "file_operation", -1);
-                    save_page_.name_done(!cancel, name_text_);
+                    save_page_.name_done(!cancel, name_box_.text);
                     return;
                 }
             }
@@ -416,7 +503,7 @@ void GameFlow::tick(MenuKeys held) {
         int r = save_page_.tick(held, sounds_);
         if (save_page_.wants_name()) {
             name_mode_ = true;
-            name_text_ = save_page_.name_start();
+            name_box_.reset(save_page_.name_start(), size_t(SavePage::kNameMax));
             held_name_ = held;
             open_control("memorycard", "name_entry", -1);
             return;
@@ -446,7 +533,8 @@ void GameFlow::tick(MenuKeys held) {
             held &= MenuKeys(~dirs);
         }
     // Record name entry (presentation page): Triangle / Square = Back Space only, Start
-    // jumps to the OK row (the original's controls; only OK ends the page).
+    // jumps to the OK row (the original's controls; only OK ends the page). L1 / R1 move the
+    // text box's cursor (the GT-mode bindings' page frame).
     if (ctl_->has_page() && ctl_->page_name() == "name_entry") {
         const MenuKeys pressed = held & MenuKeys(~held_name_);
         held_name_ = held;
@@ -458,6 +546,12 @@ void GameFlow::tick(MenuKeys held) {
         held &= MenuKeys(~(key_bit(MenuKey::Cancel) | key_bit(MenuKey::Start)));
     }
     ctl_->tick(held);
+    // Options, the music list (the page has no items: its list takes the keys; Cancel is the
+    // page's, handled with its back action below).
+    if (music_list_active()) {
+        music_page_.tick(ctl_->fired(), ctl_->pressed(), sounds_);
+        if (std::optional<int> p = music_page_.take_preview()) preview_request_ = p;
+    }
     // Options, 2P battle page: Left / Right on the laps slider change the laps (1..99).
     if (control_ == "option" && options_ && ctl_->has_page() && ctl_->page_name() == "split/split" && !ctl_->busy()) {
         int f = ctl_->focus();
@@ -495,6 +589,9 @@ void GameFlow::tick(MenuKeys held) {
     } else {
         idle_frames_ = 0;
     }
+    if (gt_active())
+        if (const GtModeHooks& h = gt_mode_hooks(); h.on_tick)
+            if (std::string se = h.on_tick(*ctl_); !se.empty()) sounds_.push_back(std::move(se));
     if (gt_active())
         if (const GtModeHooks& h = gt_mode_hooks(); h.on_frame && !ctl_->busy())
             if (std::string se = h.on_frame(*ctl_); !se.empty()) sounds_.push_back(std::move(se));
@@ -633,13 +730,20 @@ void GameFlow::handle_gt(const MenuEvent& e) {
     using K = MenuEvent::Kind;
     switch (e.kind) {
     case K::Action:
-        if (e.action == "set_race_code" || e.action == "set_race_code_spot" || e.action == "set_race_code_info" ||
-            e.action == "go_license") {
+        // The stored race code (and its type: 4 race, 2 championship, 3 spot race).
+        if (e.action == "set_race_code" || e.action == "set_race_code_spot") {
+            race_code_ = e.item;
+            race_type_ = e.action == "set_race_code" ? 4 : 3;
+        } else if (e.action == "set_race_code_info") {
+            // The race information: the item name without its last "_..." part.
+            race_code_ = e.item.substr(0, std::min(e.item.size(), e.item.rfind('_')));
+        } else if (e.action == "go_license" || e.action == "go_machine_test") {
             race_code_ = e.item;
         } else if (e.action == "set_race_code_champ") {
             // Championship: the item name with its last character advanced by one.
             race_code_ = e.item;
             if (!race_code_.empty()) ++race_code_.back();
+            race_type_ = 2;
         } else if (e.action == "clear_race_code") {
             race_code_.clear();
         } else if (e.action == "go_free_run") {
@@ -649,7 +753,7 @@ void GameFlow::handle_gt(const MenuEvent& e) {
     case K::Finish: {
         const std::string& a = e.action;
         if (a == "go_arcade_menu") {
-            title_focus_ = kTitleArcade;
+            title_focus_ = title_focus_after(a);
             arcade_game_ = 0;
             // The car pages start on the Options menu's transmission (Race: AT / MT).
             transmission_ = option_value(options_, "gear_auto") == "off" ? 1 : 0;
@@ -668,12 +772,12 @@ void GameFlow::handle_gt(const MenuEvent& e) {
                 }
         } else if (a == "go_save_game_menu" || a == "go_load_game_menu") {
             // Title Save / Load: the save page, then back to the title.
-            title_focus_ = e.child >= 0 ? e.child : title_focus_;
+            title_focus_ = title_focus_after(a);
             Target t{"gt_mode", "root", title_focus_};
             open_save_page(a == "go_save_game_menu" ? SavePage::Mode::SaveGame : SavePage::Mode::LoadGame, t, t, true);
         } else if (a == "go_file_operation") {
             // Title File Operation: the save list (rename, copy, delete, export, import).
-            title_focus_ = e.child >= 0 ? e.child : title_focus_;
+            title_focus_ = title_focus_after(a);
             Target t{"gt_mode", "root", title_focus_};
             open_save_page(SavePage::Mode::Files, t, t, true);
         } else if (a == "go_save_in_home") {
@@ -685,7 +789,7 @@ void GameFlow::handle_gt(const MenuEvent& e) {
             open_save_page(SavePage::Mode::LoadGuest, Target{"gt_mode", e.page, e.child},
                            Target{"gt_mode", "hm/hm_gr_trade", -1}, true, "Trade");
         } else if (a == "go_option") {
-            title_focus_ = kTitleOption;
+            title_focus_ = title_focus_after(a);
             switch_control("option", "option", 0);
         } else if (a == "go_race" || a == "go_license" || a == "go_machine_test" || a == "go_free_run" ||
                    a == "go_preview") {
@@ -705,11 +809,14 @@ void GameFlow::handle_gt(const MenuEvent& e) {
             if (const GtModeHooks& h = gt_mode_hooks(); h.prepare_request) h.prepare_request(r);
             request_race(std::move(r));
         } else if (a == "go_replay_theater") {
+            title_focus_ = title_focus_after(a);
             open_theater(TheaterPage::Mode::LoadReplay, TheaterFrom::Theater);
         } else if (a == "go_demonstration") {
+            title_focus_ = title_focus_after(a);
             open_theater(TheaterPage::Mode::Demonstration, TheaterFrom::Theater);
         } else if (a == "go_logger") {
             // The Analyzer (menu/logger.mbl): its own control, page "top".
+            title_focus_ = title_focus_after(a);
             logger_focus_ = 0; // REPLAY (the original's first focus)
             switch_control("logger", "top", -1);
         } else {
@@ -724,13 +831,19 @@ void GameFlow::handle_gt(const MenuEvent& e) {
         }
         break;
     }
+    case K::BackAction:
+        // Cancel on the Replay Theater page: the title focus goes to Replay Theater before
+        // the title is built (back "root").
+        if (e.action == "set_focus_replay_theater") title_focus_ = kTitleReplay;
+        break;
     case K::Exit:
         if (e.page == "hm/hm_gr_trade") {
             // The trade session ends (its list page has no back page): the home page.
             open_control("gt_mode", "hm/hm", -1);
         } else if (e.action == "go_top" || e.page == "map") {
-            // Back from GT mode to the title, focus on "Gran Turismo mode".
-            open_control("gt_mode", "root", kTitleGtMode);
+            // go_top: back from GT mode to the title, focus on "Gran Turismo mode".
+            title_focus_ = kTitleGtMode;
+            open_control("gt_mode", "root", title_focus_);
         } else {
             open_control("gt_mode", "root", title_focus_);
         }
@@ -806,28 +919,10 @@ void GameFlow::option_draws(std::vector<ElementDraw>& out) const {
                 if (!s || !ic) continue;
                 put(w, ic, {s->x + (s->w - ic->w) * 0.5f, s->y + (s->h - ic->h) * 0.5f, ic->w, ic->h});
             }
-        } else if (cls == "song_list" || cls == "song_edit") {
-            if (!songs_loaded_) {
-                songs_loaded_ = true;
-                if (std::optional<Bytes> inf = reader_("bgm/ads.inf")) try {
-                        for (const BgmTrack& t : parse_bgm_index(*inf))
-                            if (!t.title.empty() && t.name.rfind("race", 0) == 0) // the race songs
-                                songs_.push_back({t.title, t.artist});
-                    } catch (const std::exception&) {
-                    }
-            }
-            // One row per race song, every one in the favourites (check mark on), 24 px apart
-            // from the top of the list.
-            const Element* check = find_element(hidden, "check_on");
-            const Element* label = find_element(hidden, "label_box");
-            float top = e.y + e.h;
-            for (size_t i = 0; i < songs_.size(); ++i) {
-                float y = top - 24 * float(i + 1);
-                if (y < e.y - 8) break;
-                put(w, check, {e.x, y, 24, 24});
-                std::string t = songs_[i].first + " / " + songs_[i].second;
-                if (label) put(w, label, {e.x + 38, y, e.w - 38, 24}, &t); // text start from the capture (M)
-            }
+        } else if (cls == "song_edit" || cls == "song_list") {
+            // The music list (menus §10.1): the page's own list, or the top page's view of it.
+            const MusicListPage& list = cls == "song_edit" && music_page_.is_open() ? music_page_ : music_view_;
+            list.draw(hidden, w, add);
         } else if (cls == "slider_split_race_laps") {
             marker(w, e.x + float(option_laps(options_) - 1) / 98.0f * e.w);
         } else if (cls == "slider_split_handicap") {
@@ -853,10 +948,90 @@ void GameFlow::option_draws(std::vector<ElementDraw>& out) const {
     for (ElementDraw& d : add) out.push_back(std::move(d));
 }
 
+const std::vector<MusicTrack>& GameFlow::race_tracks() {
+    if (!race_tracks_loaded_) {
+        race_tracks_loaded_ = true;
+        if (std::optional<Bytes> inf = reader_("bgm/ads.inf")) try {
+                const sound::MadsIndex m = sound::MadsIndex::parse(*inf);
+                const size_t g = size_t(0x14 - 0x12); // the race songs' group (bgm id 0x14)
+                if (g < m.groups.size())
+                    for (const sound::MadsTrack& t : m.groups[g])
+                        race_tracks_.push_back({db::id_hash(t.file), t.title, t.artist});
+            } catch (const std::exception& ex) {
+                LOG_WARN("menu flow: bgm/ads.inf: %s", ex.what());
+            }
+    }
+    return race_tracks_;
+}
+
+race::RacePlaylist GameFlow::music_playlist() {
+    std::vector<u64> ids;
+    for (const MusicTrack& t : race_tracks()) ids.push_back(t.id);
+    std::optional<std::string> stored = options_ ? options_->get("options", "music_playlist") : std::nullopt;
+    const bool valid = stored && race::RacePlaylist::from_text(*stored);
+    race::RacePlaylist p = race::RacePlaylist::stored_or_new(valid ? stored : std::nullopt, ids);
+    // The options always hold a list (the original makes it with a new game): a new one is
+    // kept, so the race and the next visit see the same one.
+    if (!valid && options_) options_->set("options", "music_playlist", p.to_text());
+    return p;
+}
+
+void GameFlow::open_music_list(bool editable) {
+    MusicListPage& page = editable ? music_page_ : music_view_;
+    if (!ctl_ || !ctl_->page()) return;
+    const MenuSet::PageRef ref = ctl_->page();
+    const Layer* hidden = find_layer(ref.layout(), "hidden");
+    const char* cls = editable ? "song_edit" : "song_list";
+    float view_h = MusicListPage::Layout{}.view_h;
+    for (const Layer& l : ref.layout().layers)
+        for (const Element& w : l.widgets)
+            if (w.widget_class && *w.widget_class == cls) view_h = w.h;
+    page.open(music_playlist(), race_tracks(), editable, MusicListPage::Layout::from(hidden, view_h));
+    if (editable)
+        if (std::optional<int> p = page.take_preview()) preview_request_ = p;
+}
+
+bool GameFlow::music_list_active() const {
+    return control_ == "option" && music_page_.is_open() && ctl_ && ctl_->has_page() && ctl_->depth() == 0 &&
+           ctl_->page_name() == "music/music" && !ctl_->busy();
+}
+
+bool GameFlow::music_list_area(SDL_FRect& area) const {
+    if (!ctl_ || !ctl_->page()) return false;
+    for (const Layer& l : ctl_->page().layout().layers)
+        for (const Element& w : l.widgets)
+            if (w.widget_class && *w.widget_class == "song_edit") {
+                area = {w.x, w.y, w.w, w.h};
+                return true;
+            }
+    return false;
+}
+
 void GameFlow::handle_option(const MenuEvent& e) {
     using K = MenuEvent::Kind;
-    if (e.kind == K::Exit) switch_control("gt_mode", "root", kTitleOption);
-    else if (e.kind == K::Choice) {
+    // The music list (menus §10.1): built with its page; its edit is kept by the page's Cancel
+    // (back action stop_music, which also stops the music) unless a song is lifted.
+    if (e.kind == K::PageChanged) {
+        music_page_.close();
+        if (e.page == "music/music") open_music_list(true);
+        else if (e.page == "option") open_music_list(false);
+        return;
+    }
+    if (e.kind == K::BackAction && e.action == "stop_music") {
+        if (music_page_.is_open() && !music_page_.lifted() && options_) {
+            race::RacePlaylist p = music_playlist();
+            music_page_.commit(p);
+            options_->set("options", "music_playlist", p.to_text());
+            if (options_changed_) options_changed_();
+        }
+        music_page_.close();
+        preview_request_ = -1;
+        return;
+    }
+    if (e.kind == K::Exit) {
+        title_focus_ = title_focus_after("go_option");
+        switch_control("gt_mode", "root", title_focus_);
+    } else if (e.kind == K::Choice) {
         const GameOption* o = find_game_option_by_item(e.page, e.item);
         if (o && options_) {
             set_option(*options_, *o, e.child);
@@ -889,7 +1064,8 @@ void GameFlow::handle_arcade(const MenuEvent& e) {
     if (page == "ar/top") {
         if (e.kind == K::Exit) {
             // cancel_select_game: back to the title.
-            switch_control("gt_mode", "root", kTitleArcade);
+            title_focus_ = title_focus_after("go_arcade_menu");
+            switch_control("gt_mode", "root", title_focus_);
         } else if (e.kind == K::Finish) {
             arcade_game_ = std::max(0, e.child);
             arcade_action_ = e.action;
@@ -1083,6 +1259,10 @@ void GameFlow::arcade_start_race() {
         r.mode = arcade_action_;
     }
     if (const GtModeHooks& h = gt_mode_hooks(); h.arcade_prepare) h.arcade_prepare(r);
+    // Single Race, Time Trial and Free Run store their race code as the game's race code
+    // (the GT-mode race pages' focus reads it; menus §4.2).
+    if (arcade_action_ == "single_race" || arcade_action_ == "compulsory" || arcade_action_ == "time_attack")
+        race_code_ = r.race_code;
     // After the race the arcade menu reopens on ar/top with the same game focused.
     resume_set_ = "arcade";
     resume_page_ = "ar/top";
@@ -1276,25 +1456,15 @@ void GameFlow::animate_carousel(int move, int prev_index) {
     }
 }
 
-const Element* GameFlow::flipped(const Element* e) const {
-    if (!e) return e;
-    std::unique_ptr<Element>& f = flipped_[e];
-    if (!f) {
-        f = std::make_unique<Element>(*e);
-        if (f->colors) {
-            auto& c = *f->colors; // top-left, top-right, bottom-right, bottom-left
-            std::swap(c[0], c[3]);
-            std::swap(c[1], c[2]);
-        }
-    }
-    return f.get();
-}
-
 std::vector<ElementDraw> GameFlow::draw_list() const {
     std::vector<ElementDraw> out = draw_list_impl();
-    // Name entry: the text box's caret is the hidden red bar "cursor" (3 x 16, fading
-    // downwards), drawn after the text (TextBox, name_entry_controls.md; the reference).
+    // Name entry: the text box's caret is the hidden red bar "cursor" (3 x 16, brightest
+    // at its bottom), drawn at the text box's cursor: after the text before it (TextBox, menus §12.3;
+    // the reference).
     if (ctl_ && ctl_->has_page() && ctl_->page_name() == "name_entry" && ctl_->page()) {
+        int cursor = -1; // characters before the cursor (-1: the whole text)
+        if (control_ == "memorycard" && name_mode_) cursor = int(name_box_.cursor);
+        else if (const GtModeHooks& h = gt_mode_hooks(); h.name_cursor) cursor = h.name_cursor();
         // Left / right aligned text sits 12 units in from its box (the reference: help
         // labels, text box).
         apply_text_inset(out);
@@ -1307,19 +1477,18 @@ std::vector<ElementDraw> GameFlow::draw_list() const {
                     if (e.name == "cursor") caret = &e;
         for (ElementDraw& d : out) {
             if (!caret || !d.element || !d.element->widget_class || *d.element->widget_class != "text_box") continue;
-            // The caret right after the text, which starts 12 units in (kTextInset); the box
-            // and the caret are drawn with their gradients flipped (lighter at the top).
-            d.element = flipped(d.element);
+            // The caret right after the text before the cursor; the text starts 12 units in
+            // (kTextInset).
             const Element& box = *d.element;
             std::string txt = d.text ? *d.text : box.text ? box.text->text : std::string();
-            if (!txt.empty() && txt.back() == '_') txt.pop_back(); // older text hooks append a caret
+            if (cursor >= 0 && size_t(cursor) < txt.size()) txt.resize(size_t(cursor));
             std::string font = box.text ? box.text->font : std::string("sw_20");
             float w = 0;
             if (measure_text) w = measure_text(font, txt);
             else w = float(txt.size()) * FontSpec::parse(font).size * 0.5f;
             ElementDraw c;
             c.scene = d.scene;
-            c.element = flipped(caret);
+            c.element = caret;
             c.has_box = true;
             c.box = {box.x + 12.0f + w + 1.0f, box.y, caret->w, caret->h};
             c.z = d.z + 0.01f;
@@ -1401,7 +1570,7 @@ std::vector<ElementDraw> GameFlow::draw_list_impl() const {
             // The name being entered in the text box, with the cursor.
             for (ElementDraw& d : out)
                 if (d.element && d.element->widget_class && *d.element->widget_class == "text_box")
-                    d.text = std::make_shared<const std::string>(name_text_);
+                    d.text = std::make_shared<const std::string>(name_box_.text);
             return out;
         }
         if (save_mode_) save_page_.draw(ctl_->page(), out);
@@ -1593,8 +1762,8 @@ std::vector<ElementDraw> GameFlow::draw_list_impl() const {
                 }
             }
         }
-        // Car pages: the 3D car (slot element "car") above the strip, drawn by the app's
-        // model renderer (overlay); recreated on each move, without a slide.
+        // Car pages: the 3D car (slot element "car"), drawn by the app's model renderer
+        // (overlay); recreated on each move, without a slide.
         if (is_car_page(c.page) || c.page == "ar/select_compulsory")
             if (const Element* slot = find_element(hidden, "car")) {
                 ElementDraw d;
@@ -1605,9 +1774,10 @@ std::vector<ElementDraw> GameFlow::draw_list_impl() const {
                 d.box = c.page == "ar/select_car_2p" ? SDL_FRect{-45, 72, 440, 308} : SDL_FRect{0, 0, 640, 448};
                 d.overlay = true;
                 d.hide_parts = true;
-                // The 3D car and its floor reflection appear over the cross band and the icon
-                // strip (as in the original's screens).
-                d.z = 75.0f;
+                // The 3D car and its floor reflection at the slot's depth (5): over the
+                // background and the spec ticker, under the paint name, the cross band, the icon
+                // strip and the rest of the page.
+                d.z = slot->z;
                 out.push_back(d);
             }
         // Car page: the three CircleGauges (riding on the cross with the car's art): a ring

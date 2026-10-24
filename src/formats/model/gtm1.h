@@ -18,10 +18,13 @@
 // packets that feed the VU1 renderer: float positions, strip lengths,
 // normals or colours, float ST coordinates, plus a GIF tag.
 
+#include "formats/clut_animation.h"
 #include "formats/ps2/vif.h"
 #include "scene/model.h"
 
 #include <array>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -64,6 +67,15 @@ struct Draw {
     u32 texset = 0;      // index into Gtm1::texsets
     Matrix matrix{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     bool has_matrix = false;
+    u32 op = 0;          // offset of the draw op (0x04 / 0x05 / 0x35) in the block
+    // Op 0x35 u16 base, u16 count: an animated chunk range. The phase op 0x34 set (f32, clamped
+    // to 0..1) picks chunk base + min(phase x count, count - 1) (truncated) and the weight of its
+    // second key frame, phase x count - that index (morph chunks: (1 - w) key 0 + w key 1).
+    u32 range_base = 0, range_count = 0;
+    float morph = 0;
+    // Car models: the op 0x06 callback id (1-5, RunParams::callback) that set that phase; 0 = op 0x34
+    // (or nothing).
+    u8 phase_id = 0;
     // Render state at the time of the draw (node program ops):
     //   op 0x20 u8 mode, u8 fix: GS ALPHA register (A|B<<2|C<<4|D<<6, FIX).
     //     0x44 = (Cs-Cd)*As+Cd (normal), 0x58 = Cs*Ad+Cd (additive, weighted by
@@ -77,6 +89,10 @@ struct Draw {
     //   row C1 (f -> (f, f, f, 0)). Reflection (env-normal) packets are weighted per vertex
     //   by C0 + C1 min(V.N, 0) (V the unit view vector). C0 = 1, C1 = 0 on node entry here.
     std::array<float, 4> env_c0{1, 1, 1, 1}, env_c1{0, 0, 0, 0};
+    //   op 0x31 vec3: the point chunk kind 3 (the panoramic environment lookup) is yawed towards
+    //   (from the camera); it stays set for the rest of the run.
+    bool pano_set = false;
+    std::array<float, 3> pano{0, 0, 0};
     //   ops 0x1A / 0x1B: alpha test on / off (GS TEST.ATE; render flag 4).
     //   op 0x1C u8 method, u8 ref: TEST.ATST / AREF (ref in GS units, 0x80 = 1.0).
     //   ops 0x1D / 0x1E: destination alpha test on / off (TEST.DATE; render flag 3).
@@ -108,7 +124,18 @@ struct RunParams {
     // "brake pressed now" state instead: branch 1 = brake lamps lit (GT3's lens swap).
     bool brake = false;
     int texture_lod = 0;  // per-texture-LOD set table (0x34), clamped
+    // Operand values written by the +0x3C animators (AnimatedNodes), by operand offset in the
+    // block, as raw bits: f32 for ops 0x14 / 0x15 / 0x16 / 0x34, u16 for op 0x05.
+    const std::map<u32, u32>* operands = nullptr;
+    // Car models: the car's callback values for op 0x06 ids 1-5, which set the phase of the next
+    // op 0x35 (clamped to 0..1) and take branch 0: ids 1-4 the wheels' flap pendulums (FL, FR, RL,
+    // RR: rally cars' mud flaps, race cars' aerials), id 5 the steering (formula cars' driver's arms
+    // and wheel). nullptr: ids 1-5 are plain switches (selector).
+    const float* callback = nullptr;
 };
+
+// The car callback's values before the race sets any (the menus): flaps 0, steering 0.5.
+inline constexpr std::array<float, 5> kCarCallbackDefaults{0, 0, 0, 0, 0.5f};
 
 // A decoded VIF packet, vertices in strip order.
 struct DecodedPacket {
@@ -116,11 +143,14 @@ struct DecodedPacket {
     std::vector<u32> strips;       // vertex count per triangle strip
     ps2::GifTag tag;
     ps2::Prim prim;
+    // Morph packets: key frame 1 (positions V3-32 @0x20, S,T @0x60, normals V3-32 or colours
+    // V4-8 @0xA0; other attributes as key 0); empty otherwise.
+    std::vector<scene::Vertex> key1;
     bool has_normals = false;      // V3-32 at 0x80 (lit)
     bool has_colors = false;       // V4-8 at 0x80 (pre-lit)
     bool has_uv = false;           // V2-32 at 0x40
     bool env_normals = false;      // V3-32 at 0x40 (reflection pass: normal used for the env map)
-    bool morph = false;            // a second key frame is present (ignored; key 0 decoded)
+    bool morph = false;            // a second key frame is present (key1)
     u32 raw_rgb_max = 0;           // largest raw vertex colour channel (0x80 = 1.0; up to 0xFF = 2.0)
 };
 
@@ -143,15 +173,44 @@ public:
     std::vector<u32> texsets;               // Tex1 offsets (distinct, in table order); 0xFFFFFFFF in tables = empty slot
     std::vector<std::vector<u32>> texset_tables; // [texture LOD][set index] -> index into texsets
 
-    // Executes node `node`'s program and returns its draws (calls 0x02/0x03
-    // are followed recursively).
-    std::vector<Draw> run(u32 node, const RunParams& params = {}) const;
+    // The +0x3C animation list (docs/formats/course.md): values the game advances every frame
+    // and writes into node program operands (`targets`, offsets in the block).
+    struct Animator {
+        u16 type = 0;     // 1..4 an angle (degrees; 2 / 3 / 4: ops 0x14 / 0x15 / 0x16), 5 a chunk
+                          // number (op 0x05), 7 a phase (op 0x34)
+        float speed = 0;  // per second
+        float start = 0;  // the value at reset (type 5: its initial phase)
+        u16 first = 0, end = 0; // type 5: chunk numbers first..end-1
+        std::vector<u32> targets;
+    };
+    std::vector<Animator> animators;
+    // Nodes whose programs hold animator targets, ascending.
+    std::vector<u32> animated_nodes() const;
 
-    DecodedPacket decode_packet(const Packet& p) const;
+    // Executes node `node`'s program and returns its draws (calls 0x02/0x03
+    // are followed recursively, each called node starting from the default state).
+    // With `state` (only its render-state fields are used) the program starts from
+    // that state instead of the default and leaves its own final state there.
+    std::vector<Draw> run(u32 node, const RunParams& params = {}, Draw* state = nullptr) const;
+
+    // `prelit`: the packet's chunk is kind 0 (the VU passes the vertex colour through), so an
+    // untextured packet's RGB is kept as the GS shows it (gtm1.cpp expand_color).
+    DecodedPacket decode_packet(const Packet& p, bool prelit = false) const;
 
 private:
-    void run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std::vector<Draw>& out, int depth) const;
+    void run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std::vector<Draw>& out, int depth,
+                Draw* state) const;
 };
+
+// A texture set with CLUT animations that a built model uses: its textures start in the
+// animations' reset state; the caller plays them (race: per frame, and the start signal).
+struct ClutSet {
+    int first = 0;          // Model::textures index of the set's texture record 0
+    ClutTextures textures;  // the animations and the records they recolour
+};
+
+class AnimatedNodes;
+class MorphDraws;
 
 struct Options {
     RunParams run;
@@ -160,14 +219,14 @@ struct Options {
     bool textures = true;     // decode texture sets into Model::textures
     int paint = 0;            // car colour index (Tex1 paint variant), 0 = default
     std::optional<std::array<float, 3>> tint; // multiply vertex colours of tintable packets (RGB 0..1)
-    // Course road "sheen": chunks with flag 4 are a second, lit pass over the
-    // same vertices as the node's base pass. The game masks it with the base
-    // pass's vertex alpha (written to the frame buffer's alpha; the second pass
-    // blends with destination alpha). With this set, such packets get the base
-    // vertex's alpha copied in (matched by position) and are flagged
-    // kAdditive | kEnvironmentMap, which the renderer draws as an additive,
-    // view-dependent specular layer (see docs/dev/RENDERING.md). Without it,
-    // they are drawn like any other packet (an opaque-looking noisy layer).
+    // Course road "sheen": chunks of kind 4 (flag bits 0-4) are a second, lit pass
+    // over the same vertices as the node's base pass, drawn with ALPHA 0x58
+    // (Cs*Ad + Cd): masked by the base pass's alpha in the frame buffer. With this
+    // set, they and other blended ALPHA 0x58 packets get the base vertex's alpha
+    // copied in (matched by position) and are flagged kAdditive | kDestAlphaAdd |
+    // kNoDepthWrite; the sheen keeps its material with
+    // scene::Material::specular_local (see docs/formats/course.md "Lighting").
+    // Without it, they are drawn like any other packet (an opaque-looking noisy layer).
     bool road_sheen = false;
     // Flag kAlphaTest on textured packets whose texture has transparent texels
     // (alpha < 0x40 in PS2 units). Courses: tree/fence cut-outs. Not for cars,
@@ -199,17 +258,118 @@ struct Options {
     // (name suffix "_mask", UVs from the mask quad's plane), coloured with the
     // mean colour of its own env map (see docs/formats/prm.md).
     bool static_env_maps = false;
+    // Course environment passes of chunk kind 2: the VU sphere-maps the packet's own texture (not
+    // a runtime slot) with the reflected view vector; with this set they keep that texture
+    // (kEnvironmentMap with a texture: the renderer's DrawItem::sphere_map kernel).
+    bool course_env_maps = false;
     // Courses: map the node program's GS state per packet instead of the generic
     // `alpha_test` guess. Culling off (op 0x2E) -> kDoubleSided; ZMSK (ops 0x25/0x26) -> kNoDepthWrite; an enabled alpha test
     // (TEST.ATE, ATST GREATER/GEQUAL, AREF) on a textured packet -> kAlphaTest with
     // Primitive::alpha_ref = the GS reference; on blended packets with AFAIL RGB_ONLY
     // also kAlphaFailBlend (the failing fragments still blend, without depth write).
-    // Packets with the test off keep `alpha_test`'s behaviour.
+    // Opaque packets with the test off are drawn whole (the GS writes every texel; their texel
+    // alpha only reaches the frame alpha); blended ones keep `alpha_test`'s behaviour.
     bool gs_state = false;
+    // Receives the model's texture sets that have CLUT animations (when set).
+    std::vector<ClutSet>* clut_sets = nullptr;
+    // When set, the nodes the +0x3C animators move are left out of the model and built into
+    // this instead (texture indices: the model's).
+    AnimatedNodes* animated = nullptr;
+    // When set, the draws whose phase a car callback id sets (Draw::phase_id, op 0x35 after op
+    // 0x06 ids 1-5) are left out of the model and built into this instead (texture indices: the
+    // model's). Needs run.callback.
+    MorphDraws* morphs = nullptr;
     // Courses drawn with the PS2's frame-buffer alpha (render::DrawItem::frame_alpha): alpha-only
     // passes (FBMSK 0x00FFFFFF, the shadow masks that switch the road sheen off) are kept as
     // scene::kAlphaOnly primitives, colour-only ones (FBMSK 0xFF000000) get scene::kKeepAlpha.
     bool frame_alpha = false;
+    // Every node continues from the render state the node before it left, as the game's
+    // whole-model draw runs them (the default state is set once, before node 0). Without
+    // it each node starts from the default state. A node may only set state for the ones
+    // after it: the licence course line (course slot 27) turns culling and depth writes
+    // off and masks the frame alpha in node 0, then draws in node 1.
+    bool carry_state = false;
+};
+
+// The nodes the +0x3C animators move (flags, spinning parts, flip-book crowds and screens;
+// docs/formats/course.md) drawn as the game draws them: every frame it advances the animators,
+// writes their values into the node programs' operands and runs the programs again. Built by
+// build_model (Options::animated) into parts, one per chunk and draw state the nodes can draw, in
+// the chunk's own space with its key frames 0 and 1; meshes() places the parts the programs draw
+// now (their matrices, the morph weights of op 0x35).
+class AnimatedNodes {
+public:
+    bool empty() const { return nodes_.empty(); }
+    const std::vector<u32>& nodes() const { return nodes_; }
+    size_t part_count() const { return parts_.size(); }
+
+    // The animators' start values (the game: at load and with every run).
+    void reset();
+    // Advances the animators by `seconds` (the game: 1/60 s per frame).
+    void update(float seconds);
+    // The operand values the animators write now, by operand offset in the block.
+    const std::map<u32, u32>& operands() const { return operands_; }
+
+    // The nodes as drawn now: one mesh per node ("node<N>"), in model space.
+    std::vector<scene::Mesh> meshes() const;
+    // Adds `base` to the parts' texture indices (their model's textures appended to others).
+    void rebase_textures(int base);
+
+private:
+    friend scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& name);
+    struct Part {
+        std::vector<scene::Vertex> key0, key1;
+        std::vector<u32> indices;                // into key0 / key1
+        std::vector<scene::Primitive> primitives; // first_index into indices
+    };
+    using Key = std::vector<u32>; // the chunk and the draw state its primitives depend on
+    static Key key(const Draw& d);
+
+    std::shared_ptr<const Bytes> programs_; // the block up to the end of the animated nodes' programs
+    Gtm1 g_;                                // over programs_
+    RunParams run_;
+    std::vector<u32> nodes_;
+    std::vector<Gtm1::Animator> animators_;
+    std::vector<float> values_; // per animator: the angle or phase
+    std::map<u32, u32> operands_;
+    std::map<Key, Part> parts_;
+};
+
+// A car model's morph draws (Options::morphs): the op 0x35 draws whose phase comes from the car's
+// callback (mud flaps, aerials, formula cars' steering). Car programs take the same branches
+// whatever those values are, so each draw keeps its matrix and every chunk of its range, in the
+// chunk's own space with key frames 0 and 1; meshes() draws the chunk the values pick, morphed.
+class MorphDraws {
+public:
+    bool empty() const { return draws_.empty(); }
+    size_t size() const { return draws_.size(); }
+    // The callback ids (1-5) the draws read, ascending.
+    std::vector<int> ids() const;
+
+    // The draws for the callback values `values` (ids 1-5): one mesh ("morph", Mesh::lod = the
+    // LOD built), in model space.
+    std::vector<scene::Mesh> meshes(const std::array<float, 5>& values) const;
+    // Adds `base` to the parts' texture indices (their model's textures appended to others).
+    void rebase_textures(int base);
+    // The texture indices the parts use, ascending; and renumbering them (t -> map[t]).
+    std::vector<int> textures() const;
+    void map_textures(const std::vector<int>& map);
+
+private:
+    friend scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& name);
+    struct Part {
+        std::vector<scene::Vertex> key0, key1;
+        std::vector<u32> indices;                 // into key0 / key1
+        std::vector<scene::Primitive> primitives; // first_index into indices
+    };
+    struct Entry {
+        u8 id = 0;
+        Matrix matrix{};
+        bool has_matrix = false;
+        std::vector<Part> chunks; // range_base + k
+    };
+    std::vector<Entry> draws_;
+    int lod_ = 0;
 };
 
 // Turns a parsed GTM1 block into a scene::Model: one Mesh per node that draws
@@ -239,7 +399,10 @@ std::vector<PaintVariant> paint_variants(ByteSpan tex1);
 
 // Appends the textures of one Tex1 set (all of them) to `out`; returns the
 // index of the first one. `paint` > 0 selects a colour variant (when the set
-// has one). Indexed textures honour TEX0.CSA. Shared by the car/wheel/course loaders.
-int decode_texture_set(ByteSpan tex1, std::vector<scene::Texture>& out, const std::string& prefix, int paint = 0);
+// has one). Indexed textures honour TEX0.CSA. Textures fed by the set's CLUT
+// animations show the animations' reset state; `clut` (when given) receives them
+// (empty without animations). Shared by the car/wheel/course loaders.
+int decode_texture_set(ByteSpan tex1, std::vector<scene::Texture>& out, const std::string& prefix, int paint = 0,
+                       ClutTextures* clut = nullptr);
 
 } // namespace gt3r::gtm1

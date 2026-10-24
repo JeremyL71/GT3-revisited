@@ -3,6 +3,7 @@
 
 #include "test_framework.h"
 
+#include "audio/bgm.h"
 #include "audio/sequencer.h"
 #include "audio/spu_reverb.h"
 #include "audio/voice_mixer.h"
@@ -197,6 +198,39 @@ TEST(sound_seq_timing) {
     int peak = 0;
     for (int i = on; i < off; ++i) peak = std::max(peak, int(left[size_t(i)]));
     CHECK(std::abs(peak - int(4076 * 11519 / 16384.0)) < 8);
+}
+
+TEST(sound_seq_music_bus_and_level) {
+    // The sequencer's voices are on the mixer's music bus: the effects volume leaves them
+    // alone, the music volume scales them. A request's level is the sequencer's music
+    // volume and acts squared: the menu level 0.8 gives 0.64 (music §6).
+    Bytes t;
+    put_number(t, 0);
+    t.push_back(0x05), t.push_back(0x40), put_number(t, 0);
+    t.push_back(0x80 | 60), t.push_back(127), put_number(t, 64), put_number(t, 100);
+    t.push_back(0x00);
+    auto seqs = std::make_shared<const SeqBank>(SeqBank::parse(make_seqg(t, 1000000)));
+    auto bank = make_bank();
+    auto peak = [&](float effects, float music, float level) {
+        Sequencer seq;
+        seq.set_instruments(bank);
+        seq.set_sequences(seqs);
+        seq.set_master_volume(bgm::sequence_volume(level));
+        VoiceMixer mixer;
+        mixer.set_master_volume(1.0f);
+        mixer.set_bus_gain(VoiceBus::Effects, effects);
+        mixer.set_bus_gain(VoiceBus::Music, music);
+        CHECK(seq.play(mixer, 0));
+        int p = 0;
+        for (s16 v : run(seq, mixer, 6)) p = std::max(p, int(v));
+        return p;
+    };
+    const int full = peak(1, 1, 1);
+    CHECK(std::abs(full - int(4076 * 11519 / 16384.0)) < 8); // as in sound_seq_timing
+    CHECK(peak(0, 1, 1) == full);
+    CHECK(std::abs(peak(1, 0.5f, 1) - full / 2) <= 2);
+    CHECK(peak(1, 0, 1) == 0);
+    CHECK(std::abs(peak(1, 1, bgm::kMenuVolume) - int(full * 0.64)) <= 0.01 * full);
 }
 
 TEST(sound_seq_loops_and_bend) {

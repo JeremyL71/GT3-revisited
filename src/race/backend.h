@@ -38,6 +38,16 @@ struct TrackPose {
     sim::Quat orientation;
 };
 
+// A split-point or line crossing of a car's lap timer (track::LapTimer::Crossing;
+// presentation §D6).
+struct LapCrossing {
+    int point = 0;          // split point index; at the line, the points passed this lap
+    bool line = false;      // a completed lap
+    int lap = 0;            // laps completed before it
+    long long ms = 0;       // race clock (ms)
+    long long split_ms = 0; // since the lap's start (at the line: the lap time)
+};
+
 // Track runtime as seen by the race scene.
 class RaceTrack {
 public:
@@ -82,6 +92,10 @@ public:
     // track::LapTimer::set_lap1_from_go (races: lap 1 from GO) and freeze (after the finish).
     virtual void lap_set_lap1_from_go(bool from_go, bool before_line) { (void)from_go, (void)before_line; }
     virtual void lap_freeze() {}
+    // The player's split-point / line crossings of the last lap_update().
+    virtual std::vector<LapCrossing> lap_crossings() const { return {}; }
+    // The course's split points (track distances), as the lap timer uses them.
+    virtual std::vector<float> split_points() const { return {}; }
 };
 
 // What the race scene knows about the chosen car; filled from the database.
@@ -111,12 +125,12 @@ class RaceVehicle {
 public:
     virtual ~RaceVehicle() = default;
     virtual const char* backend_name() const = 0;
-    // Places the car (grid start, respawn). Real vehicles use the spawn hold:
-    // held 0.3 m up for 2 s, then dropped (sim::Vehicle::spawn).
-    virtual void reset(const TrackPose& pose) = 0; // respawn: with the spawn hold
-    // Grid start (physics spec §9): placed at rest without the spawn hold.
+    // Respawns (the player's car, replayed respawn events). Real vehicles use
+    // the spawn hold: held 0.3 m up for 2 s, then dropped (sim::Vehicle::spawn).
+    virtual void reset(const TrackPose& pose) = 0;
+    // Grid start (physics §9): placed at rest without the spawn hold.
     virtual void place(const TrackPose& pose) { reset(pose); }
-    // Dirt course (course table 34 +0x08 = 2): the §10.4 front-brake cut with steering.
+    // Dirt course (course table 34 +0x08 = 2): the physics §10.4 front-brake cut with steering.
     // In a field this applies to every car.
     virtual void set_dirt_course(bool dirt) { (void)dirt; }
     // Rolling / flying starts: placed moving straight ahead at speed (m/s), no spawn hold.
@@ -136,12 +150,19 @@ public:
     // Scripted driving (sim::Vehicle::set_driver_kind; 0 = the driver): the pit lane's
     // auto drive sets its state (2 lane, 3 box line, 4 leaving): aids off like a CPU car.
     virtual void set_driver_kind(int kind) { (void)kind; }
-    // The start-countdown hold (sim::Vehicle::set_race_hold, spec physics.md §9.3): the car is held in place, the
+    // The AI aid block the physics reads while the computer drives this car (sim::Vehicle::
+    // set_scripted_aids; the player's AI parameter set, ai §9.1).
+    virtual void set_scripted_aids(const sim::ScriptedAids& a) { (void)a; }
+    // The start-countdown hold (sim::Vehicle::set_race_hold, physics §9.3): the car is held in place, the
     // brakes stay off and the engine can rev. Returns false when the backend has no such hold (the
     // caller then holds the car with the brakes).
     virtual bool set_race_hold(bool on) { (void)on; return false; }
     // The pit-box stop (sim::Vehicle::begin_pit_stop): 5 s, tyres changed at 1 s.
     virtual void begin_pit_stop(const sim::Quat& box) { (void)box; }
+    // Engine condition (sim::Vehicle::set_engine_condition, physics §10.3): what the run starts
+    // with and, read back, what it hands on. The stand-in has none (a fresh engine).
+    virtual void set_engine_condition(const sim::EngineCondition& c) { (void)c; }
+    virtual sim::EngineCondition engine_condition() const { return {}; }
     // Wall impulse of the last step (N*s; sim::VehicleTelemetry::wall_impulse), for sounds.
     virtual float wall_impulse() const { return 0; }
     // Strongest car-to-car contact impulse of the last step involving this car (N*s).

@@ -1,5 +1,6 @@
 #include "formats/model/gtm1.h"
 
+#include "formats/clut_animation.h"
 #include "formats/gs_memory.h"
 #include "formats/tex1.h"
 
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <set>
 
 namespace gt3r::gtm1 {
 
@@ -73,9 +75,14 @@ int fixed_operand_bytes(u8 op) {
     }
 }
 
-u32 expand_color(const std::array<u32, 4>& c) {
+// A GS vertex colour in our 0..255 terms, 0x80 = 1.0: alpha is a blend weight, RGB a factor (a
+// texture's MODULATE, or the VU's lighting / reflection maths). `rgb_as_is`: a pre-lit packet's
+// colour that the VU passes straight to an untextured primitive, which the GS shows as it is
+// (0x80 = mid grey: the licence course line's coasting dashes).
+u32 expand_color(const std::array<u32, 4>& c, bool rgb_as_is) {
     auto ch = [](u32 v) { return std::min<u32>(255, (v * 255 + 64) / 128); };
-    return ch(c[0]) | ch(c[1]) << 8 | ch(c[2]) << 16 | ch(c[3]) << 24;
+    auto rgb = [&](u32 v) { return rgb_as_is ? std::min<u32>(255, v) : ch(v); };
+    return rgb(c[0]) | rgb(c[1]) << 8 | rgb(c[2]) << 16 | ch(c[3]) << 24;
 }
 
 } // namespace
@@ -138,6 +145,34 @@ Gtm1 Gtm1::parse(ByteSpan data) {
         g.chunks.push_back(std::move(c));
     }
 
+    // +0x3C animation list: u32 count, u32 entry offsets[count].
+    if (u32 list = rd32(data, 0x3C); list && list <= data.size() - 4) {
+        u32 n = rd32(data, list);
+        for (u32 k = 0; k < n && list + 8 + 4ull * k <= data.size(); ++k) {
+            u32 e = rd32(data, list + 4 + 4 * k);
+            if (e > data.size() - 0x10) throw FormatError("GTM1 animator out of range");
+            Animator a;
+            a.type = rd16(data, e);
+            u32 count = rd16(data, e + 2);
+            a.speed = rdf(data, e + 4);
+            u32 targets = e + 0x10;
+            if (a.type == 5) {
+                a.first = rd16(data, e + 8), a.end = rd16(data, e + 10);
+                a.start = rdf(data, e + 12);
+                targets = e + 0x14;
+            } else {
+                a.start = rdf(data, e + 8);
+            }
+            if (targets + 4ull * count > data.size()) throw FormatError("GTM1 animator out of range");
+            for (u32 j = 0; j < count; ++j) {
+                u32 t = rd32(data, targets + 4 * j);
+                if (t > data.size() - 4) throw FormatError("GTM1 animator target out of range");
+                a.targets.push_back(t);
+            }
+            g.animators.push_back(std::move(a));
+        }
+    }
+
     auto set_index = [&](u32 off) -> u32 {
         if (off == 0) return kNoTexset; // unused slot (e.g. wheel/pd0004)
         auto it = std::find(g.texsets.begin(), g.texsets.end(), off);
@@ -160,14 +195,15 @@ Gtm1 Gtm1::parse(ByteSpan data) {
     return g;
 }
 
-std::vector<Draw> Gtm1::run(u32 node, const RunParams& params) const {
+std::vector<Draw> Gtm1::run(u32 node, const RunParams& params, Draw* state) const {
     std::vector<Matrix> stack{kIdentity};
     std::vector<Draw> out;
-    run_at(node, params, stack, out, 0);
+    run_at(node, params, stack, out, 0, state);
     return out;
 }
 
-void Gtm1::run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std::vector<Draw>& out, int depth) const {
+void Gtm1::run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std::vector<Draw>& out, int depth,
+                  Draw* state) const {
     if (node >= nodes.size()) throw FormatError("GTM1 node index out of range");
     if (depth > 16) throw FormatError("GTM1 node call depth exceeded");
     const std::vector<u32>& sets = texset_tables[std::clamp<size_t>(size_t(std::max(p.texture_lod, 0)), 0,
@@ -182,10 +218,40 @@ void Gtm1::run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std:
     bool ate = true, date = false, zwrite = true, ztest = true, cull = true;
     u8 atst = 6, aref = 0x20, afail = 0;
     std::array<float, 4> env_c0{1, 1, 1, 1}, env_c1{0, 0, 0, 0}; // reflection weight rows; see Draw
-    auto draw = [&](u32 chunk) {
+    if (state) { // continue from the caller's state (Options::carry_state)
+        alpha_mode = state->alpha_mode, fb_mask = state->fb_mask;
+        ate = state->alpha_test, date = state->dest_alpha_test, zwrite = state->depth_write;
+        ztest = state->depth_test, cull = state->cull;
+        atst = state->alpha_test_method, aref = state->alpha_test_ref, afail = state->alpha_fail;
+        env_c0 = state->env_c0, env_c1 = state->env_c1;
+    }
+
+    bool pano_set = false;
+    std::array<float, 3> pano{0, 0, 0}; // op 0x31; see Draw
+    float phase = 0;                                              // op 0x34 (or a car callback id)
+    u8 phase_id = 0;                                              // the callback id that set it
+    // Operands the +0x3C animators rewrite: their current value when given.
+    auto operand32 = [&](size_t o) {
+        if (p.operands)
+            if (auto it = p.operands->find(u32(o)); it != p.operands->end()) return it->second;
+        return rd32(data, o);
+    };
+    auto operand16 = [&](size_t o) -> u32 {
+        if (p.operands)
+            if (auto it = p.operands->find(u32(o)); it != p.operands->end()) return it->second & 0xFFFF;
+        return rd16(data, o);
+    };
+    auto operand_f = [&](size_t o) {
+        u32 v = operand32(o);
+        float f;
+        std::memcpy(&f, &v, 4);
+        return f;
+    };
+    auto draw = [&](u32 chunk, size_t op) -> Draw& {
         if (chunk >= chunks.size()) throw FormatError("GTM1 draw of unknown chunk");
         Draw d;
         d.chunk = chunk;
+        d.op = u32(op);
         d.texset = texset;
         d.matrix = stack.back();
         d.has_matrix = matrix_used;
@@ -201,7 +267,10 @@ void Gtm1::run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std:
         d.cull = cull;
         d.env_c0 = env_c0;
         d.env_c1 = env_c1;
+        d.pano_set = pano_set;
+        d.pano = pano;
         out.push_back(d);
+        return out.back();
     };
     auto s16_at = [&](size_t o) { return s32(s16(rd16(data, o))); };
     for (int steps = 0; steps < 100000; ++steps) {
@@ -209,15 +278,29 @@ void Gtm1::run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std:
         u8 op = data[pc];
         size_t a = pc + 1; // operand address
         switch (op) {
-        case 0x00: return;
-        case 0x02: run_at(data[a], p, stack, out, depth + 1); pc = a + 1; continue;
-        case 0x03: run_at(rd16(data, a), p, stack, out, depth + 1); pc = a + 2; continue;
-        case 0x04: draw(data[a]); pc = a + 1; continue;
-        case 0x05: draw(rd16(data, a)); pc = a + 2; continue;
-        case 0x06: { // s16 ?, u8 n, s16 rel[n]; rel relative to its own field
+        case 0x00:
+            if (state) {
+                state->alpha_mode = alpha_mode, state->fb_mask = fb_mask;
+                state->alpha_test = ate, state->dest_alpha_test = date, state->depth_write = zwrite;
+                state->depth_test = ztest, state->cull = cull;
+                state->alpha_test_method = atst, state->alpha_test_ref = aref, state->alpha_fail = afail;
+                state->env_c0 = env_c0, state->env_c1 = env_c1;
+            }
+            return;
+        case 0x02: run_at(data[a], p, stack, out, depth + 1, nullptr); pc = a + 1; continue;
+        case 0x03: run_at(rd16(data, a), p, stack, out, depth + 1, nullptr); pc = a + 2; continue;
+        case 0x04: draw(data[a], pc); pc = a + 1; continue;
+        case 0x05: draw(operand16(a), pc); pc = a + 2; continue;
+        case 0x06: { // u16 callback id, u8 n, s16 rel[n]; rel relative to its own field
             u32 n = data[a + 2];
             size_t tab = a + 3;
-            int sel = rd16(data, a) == 0 ? (p.brake ? 1 : 0) : p.selector; // id 0: brake now
+            const u32 id = rd16(data, a);
+            int sel = id == 0 ? (p.brake ? 1 : 0) : p.selector; // id 0: brake now
+            if (p.callback && id >= 1 && id <= 5) { // a car's morph phase; the callback returns 0
+                phase = std::clamp(p.callback[id - 1], 0.0f, 1.0f);
+                phase_id = u8(id);
+                sel = 0;
+            }
             if (sel >= 0 && u32(sel) < n) pc = tab + 2 * sel + s16_at(tab + 2 * sel);
             else pc = tab + 2 * n;
             continue;
@@ -267,7 +350,7 @@ void Gtm1::run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std:
             Matrix r;
             if (op == 0x13) r = rotation(rdf(data, a), rdf(data, a + 4), rdf(data, a + 8), rdf(data, a + 12));
             else {
-                float rad = rdf(data, a) * 3.14159265f / 180.0f;
+                float rad = operand_f(a) * 3.14159265f / 180.0f;
                 r = rotation(op == 0x14, op == 0x15, op == 0x16, rad);
             }
             stack.back() = mul(r, stack.back());
@@ -291,11 +374,26 @@ void Gtm1::run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std:
         case 0x2E: cull = false; pc = a; continue;
         case 0x2B: texset = data[a] < sets.size() ? sets[data[a]] : texset; pc = a + 1; continue;
         case 0x2C: texset = rd16(data, a) < sets.size() ? sets[rd16(data, a)] : texset; pc = a + 2; continue;
-        case 0x35: draw(rd16(data, a)); pc = a + 4; continue; // animated chunk range: first frame
+        case 0x34: phase = std::clamp(operand_f(a), 0.0f, 1.0f), phase_id = 0; pc = a + 4; continue;
+        case 0x35: { // animated chunk range: the frame and morph weight of the phase
+            u32 base = rd16(data, a), count = rd16(data, a + 2);
+            if (count) {
+                float f = phase * float(count);
+                s32 k = s32(f); // truncated
+                if (!(k < s32(count))) k = s32(count) - 1;
+                Draw& d = draw(base + u32(k), pc);
+                d.range_base = base, d.range_count = count;
+                d.morph = f - float(k);
+                d.phase_id = phase_id;
+            }
+            pc = a + 4;
+            continue;
+        }
         case 0x32: { float f = rdf(data, a); env_c1 = {f, f, f, 0}; pc = a + 4; continue; }
         case 0x33: env_c1 = {rdf(data, a), rdf(data, a + 4), rdf(data, a + 8), rdf(data, a + 12)}; pc = a + 16; continue;
         case 0x36: { float f = rdf(data, a); env_c0 = {f, f, f, 1}; pc = a + 4; continue; }
         case 0x37: env_c0 = {rdf(data, a), rdf(data, a + 4), rdf(data, a + 8), rdf(data, a + 12)}; pc = a + 16; continue;
+        case 0x31: pano_set = true, pano = {rdf(data, a), rdf(data, a + 4), rdf(data, a + 8)}; pc = a + 12; continue;
         default: {
             int n = fixed_operand_bytes(op);
             if (n < 0) throw FormatError("GTM1 program: unknown opcode " + std::to_string(op));
@@ -307,11 +405,27 @@ void Gtm1::run_at(u32 node, const RunParams& p, std::vector<Matrix>& stack, std:
     throw FormatError("GTM1 program does not terminate");
 }
 
-DecodedPacket Gtm1::decode_packet(const Packet& pk) const {
+std::vector<u32> Gtm1::animated_nodes() const {
+    std::vector<std::pair<u32, u32>> starts; // program offset, node
+    for (u32 i = 0; i < nodes.size(); ++i)
+        if (nodes[i]) starts.push_back({nodes[i], i});
+    std::sort(starts.begin(), starts.end());
+    std::vector<u32> out;
+    for (const Animator& a : animators)
+        for (u32 t : a.targets) {
+            auto it = std::upper_bound(starts.begin(), starts.end(), std::make_pair(t, ~0u));
+            if (it != starts.begin()) out.push_back(std::prev(it)->second);
+        }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+DecodedPacket Gtm1::decode_packet(const Packet& pk, bool prelit) const {
     DecodedPacket out;
     std::vector<ps2::VifCommand> cmds = ps2::parse_vif(data.subspan(pk.offset, size_t(pk.qwc) * 16));
-    std::vector<std::array<float, 4>> pos, nrm, uv, envn;
-    std::vector<std::array<u32, 4>> col;
+    std::vector<std::array<float, 4>> pos, nrm, uv, envn, pos1, nrm1, uv1;
+    std::vector<std::array<u32, 4>> col, col1;
     for (const ps2::VifCommand& c : cmds) {
         if (!c.is_unpack()) continue;
         ps2::VifUnpack u = c.unpack();
@@ -332,8 +446,16 @@ DecodedPacket Gtm1::decode_packet(const Packet& pk) const {
             uv = ps2::unpack_floats(u);
         } else if (u.addr == 0x40 && u.vn == 2 && u.vl == 0) {
             envn = ps2::unpack_floats(u);
+        } else if (u.addr == 0x20 && u.vn == 2 && u.vl == 0) { // second key frame
+            pos1 = ps2::unpack_floats(u), out.morph = true;
+        } else if (u.addr == 0x60 && u.vn == 1 && u.vl == 0) {
+            uv1 = ps2::unpack_floats(u), out.morph = true;
+        } else if (u.addr == 0xA0 && u.vn == 2 && u.vl == 0) {
+            nrm1 = ps2::unpack_floats(u), out.morph = true;
+        } else if (u.addr == 0xA0 && u.vn == 3 && u.vl == 2) {
+            col1 = ps2::unpack_words(u), out.morph = true;
         } else if (u.addr == 0x20 || u.addr == 0x60 || u.addr == 0xA0) {
-            out.morph = true; // second key frame
+            out.morph = true;
         }
     }
     size_t n = pos.size();
@@ -342,6 +464,7 @@ DecodedPacket Gtm1::decode_packet(const Packet& pk) const {
     if (total != n) throw FormatError("GTM1 packet strip lengths do not match vertex count");
     auto check = [&](size_t sz) { if (sz && sz != n) throw FormatError("GTM1 packet attribute count mismatch"); };
     check(nrm.size()), check(col.size()), check(uv.size()), check(envn.size());
+    check(pos1.size()), check(nrm1.size()), check(uv1.size()), check(col1.size());
     out.has_normals = !nrm.empty();
     out.has_colors = !col.empty();
     out.has_uv = !uv.empty();
@@ -354,8 +477,18 @@ DecodedPacket Gtm1::decode_packet(const Packet& pk) const {
         else if (!envn.empty()) for (int k = 0; k < 3; ++k) v.normal[k] = envn[i][k];
         if (!uv.empty()) v.uv[0] = uv[i][0], v.uv[1] = uv[i][1];
         if (!col.empty()) {
-            v.color = expand_color(col[i]);
+            v.color = expand_color(col[i], prelit && !out.prim.tme);
             out.raw_rgb_max = std::max({out.raw_rgb_max, col[i][0] & 0xFF, col[i][1] & 0xFF, col[i][2] & 0xFF});
+        }
+    }
+    if (!pos1.empty()) {
+        out.key1 = out.vertices;
+        for (size_t i = 0; i < n; ++i) {
+            scene::Vertex& v = out.key1[i];
+            for (int k = 0; k < 3; ++k) v.pos[k] = pos1[i][k];
+            if (!nrm1.empty()) for (int k = 0; k < 3; ++k) v.normal[k] = nrm1[i][k];
+            if (!uv1.empty()) v.uv[0] = uv1[i][0], v.uv[1] = uv1[i][1];
+            if (!col1.empty()) v.color = expand_color(col1[i], prelit && !out.prim.tme);
         }
     }
     return out;
@@ -371,12 +504,9 @@ std::vector<u32> decode_indexed_csa(const GsMemory& gs, const Tex0& t, u32 width
     u32 n = is4 ? 16 : 256;
     u32 palette[256];
     for (u32 i = 0; i < n; ++i) {
-        u32 e = (is4 ? t.csa * 16 : 0) + i; // position in the 256-entry CSM1 arrangement
-        u32 x = (e & 7) | ((e & 0x10) >> 1);
-        u32 y = ((e >> 5) << 1) | ((e >> 3) & 1);
-        u32 c = gs.read_texel(t.cbp, 1, u32(Psm::CT32), x, y);
-        u32 a = std::min<u32>(255, ((c >> 24) * 255 + 64) / 128);
-        palette[i] = (c & 0x00FFFFFFu) | (t.cpsm == u32(Psm::CT24) ? 0xFF000000u : a << 24);
+        u32 x, y;
+        csm1_position((is4 ? t.csa * 16 : 0) + i, x, y);
+        palette[i] = clut_rgba(gs.read_texel(t.cbp, 1, u32(Psm::CT32), x, y), t.cpsm);
     }
     std::vector<u32> out(size_t(width) * height);
     for (u32 y = 0; y < height; ++y)
@@ -385,12 +515,6 @@ std::vector<u32> decode_indexed_csa(const GsMemory& gs, const Tex0& t, u32 width
             out[size_t(y) * width + x] = t.tcc ? c : (c | 0xFF000000u);
         }
     return out;
-}
-
-bool indexed_ct32(const Tex0& t) {
-    bool idx = t.psm == u32(Psm::T4) || t.psm == u32(Psm::T4HL) || t.psm == u32(Psm::T4HH) ||
-               t.psm == u32(Psm::T8) || t.psm == u32(Psm::T8H);
-    return idx && (t.cpsm == u32(Psm::CT32) || t.cpsm == u32(Psm::CT24)) && t.csm == 0;
 }
 
 } // namespace
@@ -414,7 +538,8 @@ std::vector<PaintVariant> paint_variants(ByteSpan tex1) {
     return out;
 }
 
-int decode_texture_set(ByteSpan tex1, std::vector<scene::Texture>& out, const std::string& prefix, int paint) {
+int decode_texture_set(ByteSpan tex1, std::vector<scene::Texture>& out, const std::string& prefix, int paint,
+                       ClutTextures* clut) {
     Tex1 t = Tex1::parse(tex1);
     GsMemory gs;
     t.upload(tex1, gs);
@@ -439,12 +564,19 @@ int decode_texture_set(ByteSpan tex1, std::vector<scene::Texture>& out, const st
         st.clamp_v = tx.clamp.wmt == 1 || tx.clamp.wmt == 2;
         out.push_back(std::move(st));
     }
+    // CLUT animations: the textures they feed show the animations' state (at their reset here).
+    if (!t.clut_animations.empty() && !pv) {
+        ClutTextures c(tex1);
+        for (u32 r : c.records())
+            if (const std::vector<u32>* px = c.rgba(r); px && px->size() == out[size_t(first) + r].rgba.size())
+                out[size_t(first) + r].rgba = *px;
+        if (clut) *clut = std::move(c);
+    }
     return first;
 }
 
 namespace {
 
-// True when some texel is less than half opaque (PS2 alpha < 0x40).
 // GS alpha test of one texel (alpha expanded to 0..255; GS units are 0x80 = 1.0).
 bool gs_alpha_pass(u32 a255, u8 method, u8 ref) {
     u32 a = (a255 * 128 + 127) / 255;
@@ -477,10 +609,15 @@ struct Written {
     u32 vertex_alpha = 255;
 };
 
-bool texture_has_holes(const scene::Texture& t) {
-    for (u32 c : t.rgba)
-        if ((c >> 24) < 128) return true;
-    return false;
+// v' = v M (row vectors) for the position, M's rotation part for the (renormalised) normal.
+void place_vertex(const Matrix& m, scene::Vertex& v) {
+    float p[3], n[3];
+    for (int j = 0; j < 3; ++j) {
+        p[j] = v.pos[0] * m[j] + v.pos[1] * m[4 + j] + v.pos[2] * m[8 + j] + m[12 + j];
+        n[j] = v.normal[0] * m[j] + v.normal[1] * m[4 + j] + v.normal[2] * m[8 + j];
+    }
+    float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    for (int j = 0; j < 3; ++j) v.pos[j] = p[j], v.normal[j] = len > 0 ? n[j] / len : 0;
 }
 
 } // namespace
@@ -490,20 +627,34 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
     model.name = name;
     std::map<u32, int> set_first; // texset -> first model texture index (-1 = failed)
     std::map<u32, u32> set_size;
+    // Texture -> smallest texel alpha (alpha tests): over every frame of a CLUT animation.
+    std::map<int, u32> min_alpha;
     auto texture_for = [&](u32 texset, u32 index) -> int {
         if (!opt.textures || texset >= g.texsets.size()) return -1;
         auto it = set_first.find(texset);
         if (it == set_first.end()) {
             ByteSpan sub = g.data.subspan(g.texsets[texset]);
             size_t before = model.textures.size();
-            int first = decode_texture_set(sub, model.textures, "set" + std::to_string(texset) + "_", opt.paint);
+            ClutTextures clut;
+            int first = decode_texture_set(sub, model.textures, "set" + std::to_string(texset) + "_", opt.paint, &clut);
             it = set_first.emplace(texset, first).first;
             set_size[texset] = u32(model.textures.size() - before);
+            if (!clut.empty()) {
+                for (u32 r : clut.records()) min_alpha[first + int(r)] = clut.min_alpha(r);
+                if (opt.clut_sets) opt.clut_sets->push_back({first, std::move(clut)});
+            }
         }
         return index < set_size[texset] ? it->second + int(index) : -1;
     };
-
-    std::map<int, u32> min_alpha; // texture -> smallest texel alpha (gs_state alpha test)
+    auto lowest_alpha = [&](int tex) {
+        auto mt = min_alpha.find(tex);
+        if (mt == min_alpha.end()) {
+            u32 lo = 255;
+            for (u32 c : model.textures[size_t(tex)].rgba) lo = std::min(lo, c >> 24);
+            mt = min_alpha.emplace(tex, lo).first;
+        }
+        return mt->second;
+    };
     // Alpha-tested copies of textures: (texture, method, ref) -> texture with binary alpha.
     std::map<std::array<int, 3>, int> cutouts;
     auto cutout_for = [&](int tex, u8 method, u8 ref) -> int {
@@ -578,21 +729,23 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
         }
     };
 
-    for (u32 node = 0; node < g.nodes.size(); ++node) {
-        if (opt.node >= 0 && u32(opt.node) != node) continue;
-        std::vector<Draw> draws = g.run(node, opt.run);
+    int gs_texture = -1; // the texture the GS holds (TEX0 stays set from packet to packet)
+    // Emits one node's draws into `mesh`, vertices placed by the draws' matrices. `ranges` (when
+    // given) receives where each draw's vertices, indices and primitives start, `key1` every
+    // vertex's key frame 1 (its key frame 0 where the packet has no second key).
+    struct Range {
+        size_t vertex = 0, index = 0, primitive = 0;
+    };
+    auto emit = [&](const std::vector<Draw>& draws, scene::Mesh& mesh, std::vector<Range>* ranges,
+                    std::vector<scene::Vertex>* key1) {
         // What earlier passes left in the frame buffer's alpha, by vertex position: the
         // reflectivity that later Cs*Ad+Cd reflection passes are weighted with.
         std::map<std::array<float, 3>, Written> written_alpha;
-        if (draws.empty()) continue;
-        scene::Mesh mesh;
-        mesh.name = "node" + std::to_string(node);
-        mesh.lod = opt.run.lod;
         // Base-pass vertex alpha by position, for the road sheen mask.
         std::map<std::array<float, 3>, u32> base_alpha;
         if (opt.road_sheen)
             for (const Draw& d : draws) {
-                if ((g.chunks[d.chunk].flags & 4) || d.fb_mask) continue;
+                if ((g.chunks[d.chunk].flags & 0x1F) == 4 || d.fb_mask) continue; // not the sheen itself
                 for (const Packet& pk : g.chunks[d.chunk].packets) {
                     DecodedPacket bp = g.decode_packet(pk);
                     // ALPHA 0x58 only matters with blending on (PRIM.ABE): an opaque packet drawn
@@ -628,6 +781,7 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
             for (int j = 0; j < 3; ++j) p[j] = q[j];
         };
         for (const Draw& d : draws) {
+            if (ranges) ranges->push_back({mesh.vertices.size(), mesh.indices.size(), mesh.primitives.size()});
             // Alpha-only frame buffer passes (shadow masks) produce no colour.
             const bool alpha_only = (d.fb_mask & 0x00FFFFFFu) == 0x00FFFFFFu;
             if (alpha_only && !opt.static_env_maps && !opt.frame_alpha) continue;
@@ -655,32 +809,41 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
             for (const Packet& pk : g.chunks[d.chunk].packets) {
                 u32 tex = pk.mat & 0x1FF;       // texture index + 1, 0x1FF = runtime slot
                 u32 mat = pk.mat >> 9;          // material index + 1, 0x7F = runtime slot
-                DecodedPacket dp = g.decode_packet(pk);
-                // Road sheen: the chunk-flag-4 pass, or a blended packet drawn with ALPHA 0x58
-                // (Cs*Ad + Cd). Opaque packets drawn while ALPHA still holds 0x58 (e.g. the
+                // The chunk kind (flag bits 0-4) picks the VU program: 0 = pre-lit (the vertex colour
+                // passed through), 4 = the road sheen's specular-only lighting
+                // (scene::Material::specular_local).
+                const u32 kind = g.chunks[d.chunk].flags & 0x1F;
+                DecodedPacket dp = g.decode_packet(pk, kind == 0);
+                // Course passes blended with ALPHA 0x58 (Cs*Ad + Cd): the road sheen (kind 4) and
+                // other blended packets drawn with it, added weighted by the frame-buffer alpha the
+                // base pass left. Opaque packets drawn while ALPHA still holds 0x58 (e.g. the
                 // Laguna / Rome road base passes) are ordinary opaque geometry.
-                bool sheen = opt.road_sheen && ((g.chunks[d.chunk].flags & 4) || (d.alpha_mode == 0x58 && dp.prim.abe));
+                const bool sheen = opt.road_sheen && kind == 4;
+                const bool dest_add = opt.road_sheen && (sheen || (d.alpha_mode == 0x58 && dp.prim.abe));
+                // Cars: kind-4 specular passes drawn with ALPHA 0x58 add over the body weighted by
+                // the alpha its pass wrote (the per-vertex Written weight).
+                const bool car_glint = opt.weighted_reflection && kind == 4 && d.alpha_mode == 0x58 && dp.prim.abe;
                 // Reflection passes carry a normal in the UV slot; the VU derives the env-map coordinates.
                 bool env = dp.env_normals;
                 if (env && !opt.reflection) continue;
                 bool weighted = opt.weighted_reflection && env && d.alpha_mode == 0x58;
                 u32 base = u32(mesh.vertices.size());
-                for (scene::Vertex v : dp.vertices) {
-                    if (sheen) {
-                        auto it = base_alpha.find({v.pos[0], v.pos[1], v.pos[2]});
+                auto prepare = [&](scene::Vertex v, const scene::Vertex& k0) {
+                    if (car_glint) {
+                        auto it = written_alpha.find({k0.pos[0], k0.pos[1], k0.pos[2]});
+                        u32 a = it != written_alpha.end() ? std::min<u32>(255, it->second.weight) : 0u;
+                        v.color = (v.color & 0x00FFFFFFu) | (a << 24);
+                    }
+                    if (dest_add) {
+                        auto it = base_alpha.find({k0.pos[0], k0.pos[1], k0.pos[2]});
                         v.color = (v.color & 0x00FFFFFFu) | ((it != base_alpha.end() ? it->second : 0u) << 24);
                     }
-                    if (d.has_matrix) {
-                        const Matrix& m = d.matrix;
-                        float p[3], n[3];
-                        for (int j = 0; j < 3; ++j) {
-                            p[j] = v.pos[0] * m[j] + v.pos[1] * m[4 + j] + v.pos[2] * m[8 + j] + m[12 + j];
-                            n[j] = v.normal[0] * m[j] + v.normal[1] * m[4 + j] + v.normal[2] * m[8 + j];
-                        }
-                        float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-                        for (int j = 0; j < 3; ++j) v.pos[j] = p[j], v.normal[j] = len > 0 ? n[j] / len : 0;
-                    }
-                    mesh.vertices.push_back(v);
+                    if (d.has_matrix) place_vertex(d.matrix, v);
+                    return v;
+                };
+                for (size_t i = 0; i < dp.vertices.size(); ++i) {
+                    mesh.vertices.push_back(prepare(dp.vertices[i], dp.vertices[i]));
+                    if (key1) key1->push_back(dp.key1.empty() ? mesh.vertices.back() : prepare(dp.key1[i], dp.vertices[i]));
                 }
                 scene::Primitive prim;
                 prim.first_index = u32(mesh.indices.size());
@@ -689,11 +852,15 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
                     for (u32 i = 0; i + 2 < len; ++i) {
                         u32 a = strip_start + i, b = strip_start + i + 1, c = strip_start + i + 2;
                         if (i & 1) std::swap(a, b);
-                        const float* pa = mesh.vertices[a].pos;
-                        const float* pb = mesh.vertices[b].pos;
-                        const float* pc = mesh.vertices[c].pos;
-                        if (std::memcmp(pa, pb, 12) == 0 || std::memcmp(pb, pc, 12) == 0 || std::memcmp(pa, pc, 12) == 0)
-                            continue; // degenerate stitching triangle
+                        auto degenerate = [&](const std::vector<scene::Vertex>& vs) {
+                            const float* pa = vs[a].pos;
+                            const float* pb = vs[b].pos;
+                            const float* pc = vs[c].pos;
+                            return std::memcmp(pa, pb, 12) == 0 || std::memcmp(pb, pc, 12) == 0 ||
+                                   std::memcmp(pa, pc, 12) == 0;
+                        };
+                        if (degenerate(mesh.vertices) && (!key1 || dp.key1.empty() || degenerate(*key1)))
+                            continue; // degenerate stitching triangle (in both key frames)
                         mesh.indices.insert(mesh.indices.end(), {a, b, c});
                     }
                     strip_start += len;
@@ -726,11 +893,22 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
                         sm.shininess = m.shininess;
                     }
                     if ((g.chunks[d.chunk].flags >> 8) & 1) sm.scale = 255.0f / 128.0f;
+                    sm.specular_local = kind == 4;
                 }
                 // 0x1FF is a runtime texture slot (op 0x29; the game fills it, e.g. the wheel rim image);
                 // the set's first texture is the closest static stand-in.
                 if (dp.prim.tme && dp.has_uv && tex != 0 && !env)
                     prim.texture = texture_for(d.texset, tex == 0x1FF ? 0 : tex - 1);
+                if (opt.course_env_maps && env && (kind == 2 || kind == 3) && dp.prim.tme && tex != 0) {
+                    // The packet's own texture; the runtime slot 0x1FF is empty while the course is
+                    // drawn, so the GS keeps the texture the packet before bound.
+                    prim.texture = tex != 0x1FF ? texture_for(d.texset, tex - 1) : gs_texture;
+                    prim.env_kind = u8(kind);
+                    prim.env_alpha[0] = d.env_c0[3], prim.env_alpha[1] = d.env_c1[3];
+                    prim.env_point = d.pano_set;
+                    for (int k = 0; k < 3; ++k) prim.env_point_pos[k] = d.pano[size_t(k)];
+                }
+                if (dp.prim.tme && tex != 0 && tex != 0x1FF && prim.texture >= 0) gs_texture = prim.texture;
                 if (opt.static_env_maps) {
                     // Env-map pass whose sphere map is in the file (prize scenes): bind it; the
                     // renderer derives the UVs from the view-space normal.
@@ -806,13 +984,7 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
                         } else if (d.alpha_fail == 0) {
                             // Only where something can fail (keeps early depth for solid packets).
                             u32 cut = u32(ref * 255.0f);
-                            auto mt = min_alpha.find(prim.texture);
-                            if (mt == min_alpha.end()) {
-                                u32 lo = 255;
-                                for (u32 c : model.textures[size_t(prim.texture)].rgba) lo = std::min(lo, c >> 24);
-                                mt = min_alpha.emplace(prim.texture, lo).first;
-                            }
-                            bool fails = mt->second <= cut;
+                            bool fails = lowest_alpha(prim.texture) <= cut;
                             for (u32 vi = base; vi < mesh.vertices.size() && !fails; ++vi)
                                 fails = (mesh.vertices[vi].color >> 24) <= cut;
                             if (fails) prim.flags |= scene::kAlphaTest, prim.alpha_ref = ref;
@@ -821,9 +993,12 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
                     }
                 }
                 // Textures with transparent texels: the GS alpha test keeps those pixels out of the
-                // colour and depth buffers (foliage cut-outs, fences, decal edges).
-                if (!gs_tested && opt.alpha_test && prim.texture >= 0 &&
-                    texture_has_holes(model.textures[size_t(prim.texture)]))
+                // colour and depth buffers (foliage cut-outs, fences, decal edges). With the GS state,
+                // an opaque packet whose program turned the test off draws every texel: its low texel
+                // alpha only reaches the frame alpha (Route 11's perforated panels: the reflectivity
+                // of their kind-2 pass; Laguna's wall banners).
+                const bool gs_whole = opt.gs_state && !d.alpha_test && !dp.prim.abe;
+                if (!gs_tested && !gs_whole && opt.alpha_test && prim.texture >= 0 && lowest_alpha(prim.texture) < 128)
                     prim.flags |= scene::kAlphaTest;
                 if (mat != 0 && mat != 0x7F && mat - 1 < g.materials.size() && (g.materials[mat - 1].flags & 1)) {
                     prim.flags |= kTintable;
@@ -838,8 +1013,10 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
                             c = out;
                         }
                 }
-                if (sheen) prim.flags = (prim.flags & ~u32(scene::kAlphaBlend | scene::kUnlit)) | scene::kAdditive |
-                                        scene::kEnvironmentMap | scene::kNoDepthWrite;
+                if (dest_add) prim.flags = (prim.flags & ~u32(scene::kAlphaBlend)) | scene::kAdditive | scene::kDestAlphaAdd |
+                                           scene::kNoDepthWrite;
+                if (sheen) prim.flags &= ~u32(scene::kUnlit);
+                if (car_glint) prim.flags = (prim.flags & ~u32(scene::kAlphaBlend)) | scene::kAdditive | scene::kNoDepthWrite;
                 if (opt.frame_alpha) {
                     if (alpha_only) { // writes only the frame alpha (texel x vertex alpha)
                         // (an alpha test only when the node program enables one: not the generic
@@ -857,10 +1034,312 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
                 if (prim.index_count) mesh.primitives.push_back(prim);
             }
         }
+    };
+
+    // A part: one draw's vertices, indices and primitives of an emit() into `mesh` / `key1`,
+    // between two of its ranges, in their own numbering.
+    auto split = [](auto& part, const scene::Mesh& mesh, const std::vector<scene::Vertex>& key1, const Range& r0,
+                    const Range& r1) {
+        part.key0.assign(mesh.vertices.begin() + std::ptrdiff_t(r0.vertex), mesh.vertices.begin() + std::ptrdiff_t(r1.vertex));
+        part.key1.assign(key1.begin() + std::ptrdiff_t(r0.vertex), key1.begin() + std::ptrdiff_t(r1.vertex));
+        for (size_t k = r0.index; k < r1.index; ++k) part.indices.push_back(u32(mesh.indices[k] - r0.vertex));
+        for (size_t k = r0.primitive; k < r1.primitive; ++k) {
+            scene::Primitive q = mesh.primitives[k];
+            q.first_index -= u32(r0.index);
+            part.primitives.push_back(q);
+        }
+    };
+
+    // Nodes the +0x3C animators move: drawn by `opt.animated`, from parts. Car morph draws: by
+    // `opt.morphs`.
+    const std::vector<u32> animated = opt.animated ? g.animated_nodes() : std::vector<u32>{};
+    std::vector<Draw> morph_draws;
+    auto moving = [&](const Draw& d) {
+        return opt.morphs && d.phase_id != 0 && d.range_count != 0 && d.range_base + d.range_count <= g.chunks.size();
+    };
+    Draw carried; // Options::carry_state: the render state the previous node left
+    for (u32 node = 0; node < g.nodes.size(); ++node) {
+        // With carry_state, nodes left out here (another opt.node, the animated ones) still run for
+        // the state they leave. (The animated nodes' own parts start from the default state: the
+        // course line, the one carry_state model, has no animators.)
+        const bool skip = (opt.node >= 0 && u32(opt.node) != node) ||
+                          std::binary_search(animated.begin(), animated.end(), node);
+        if (skip && !opt.carry_state) continue;
+        std::vector<Draw> draws = g.run(node, opt.run, opt.carry_state ? &carried : nullptr);
+        if (skip) continue;
+        if (opt.morphs) {
+            for (const Draw& d : draws)
+                if (moving(d)) morph_draws.push_back(d);
+            draws.erase(std::remove_if(draws.begin(), draws.end(), moving), draws.end());
+        }
+        if (draws.empty()) continue;
+        scene::Mesh mesh;
+        mesh.name = "node" + std::to_string(node);
+        mesh.lod = opt.run.lod;
+        emit(draws, mesh, nullptr, nullptr);
         if (!mesh.primitives.empty()) model.meshes.push_back(std::move(mesh));
+    }
+
+    if (opt.animated) {
+        AnimatedNodes& an = *opt.animated;
+        an = AnimatedNodes{};
+        // The programs run again every frame: a copy of the block up to their end.
+        std::vector<u32> starts;
+        for (u32 off : g.nodes) starts.push_back(off);
+        std::sort(starts.begin(), starts.end());
+        size_t end = 0;
+        for (u32 n : animated) {
+            auto next = std::upper_bound(starts.begin(), starts.end(), g.nodes[n]);
+            end = std::max<size_t>(end, next == starts.end() ? g.data.size() : *next);
+        }
+        an.programs_ = std::make_shared<const Bytes>(g.data.begin(), g.data.begin() + std::ptrdiff_t(end));
+        an.g_ = g;
+        an.g_.data = *an.programs_;
+        an.run_ = opt.run;
+        an.run_.operands = nullptr;
+        an.animators_ = g.animators;
+        an.reset();
+        // Chunk numbers the type 5 animators write (op 0x05 operands): every one they can draw.
+        std::map<u32, std::pair<u32, u32>> flip;
+        for (const Gtm1::Animator& a : g.animators)
+            if (a.type == 5)
+                for (u32 t : a.targets) flip[t] = {a.first, a.end};
+        RunParams run = an.run_;
+        run.operands = &an.operands_;
+        for (u32 node : animated) {
+            // Every chunk each draw can draw (the animated chunk range, the flip-book's frames),
+            // in its own space with the draw's state: the parts.
+            std::vector<Draw> parts;
+            std::set<AnimatedNodes::Key> seen;
+            for (const Draw& d : g.run(node, run)) {
+                std::vector<u32> chunks{d.chunk};
+                if (d.range_count) {
+                    chunks.clear();
+                    for (u32 k = 0; k < d.range_count; ++k) chunks.push_back(d.range_base + k);
+                } else if (auto f = flip.find(d.op + 1); f != flip.end()) {
+                    chunks.clear();
+                    for (u32 c = f->second.first; c < f->second.second && c < g.chunks.size(); ++c) chunks.push_back(c);
+                }
+                for (u32 c : chunks) {
+                    Draw p = d;
+                    p.chunk = c;
+                    p.matrix = kIdentity, p.has_matrix = false, p.morph = 0;
+                    AnimatedNodes::Key k = AnimatedNodes::key(p);
+                    if (!an.parts_.count(k) && seen.insert(k).second) parts.push_back(p);
+                }
+            }
+            if (parts.empty()) {
+                an.nodes_.push_back(node);
+                continue;
+            }
+            scene::Mesh mesh;
+            std::vector<Range> ranges;
+            std::vector<scene::Vertex> key1;
+            emit(parts, mesh, &ranges, &key1);
+            ranges.push_back({mesh.vertices.size(), mesh.indices.size(), mesh.primitives.size()});
+            for (size_t i = 0; i + 1 < ranges.size(); ++i) {
+                AnimatedNodes::Part part;
+                split(part, mesh, key1, ranges[i], ranges[i + 1]);
+                an.parts_[AnimatedNodes::key(parts[i])] = std::move(part);
+            }
+            an.nodes_.push_back(node);
+        }
+    }
+
+    if (opt.morphs) {
+        MorphDraws& md = *opt.morphs;
+        md = MorphDraws{};
+        md.lod_ = opt.run.lod;
+        // Every chunk of each draw's range, in its own space with the draw's state.
+        std::vector<Draw> parts;
+        for (const Draw& d : morph_draws)
+            for (u32 k = 0; k < d.range_count; ++k) {
+                Draw p = d;
+                p.chunk = d.range_base + k;
+                p.matrix = kIdentity, p.has_matrix = false, p.morph = 0;
+                parts.push_back(p);
+            }
+        scene::Mesh mesh;
+        std::vector<Range> ranges;
+        std::vector<scene::Vertex> key1;
+        emit(parts, mesh, &ranges, &key1);
+        ranges.push_back({mesh.vertices.size(), mesh.indices.size(), mesh.primitives.size()});
+        size_t r = 0;
+        for (const Draw& d : morph_draws) {
+            MorphDraws::Entry e;
+            e.id = d.phase_id;
+            e.matrix = d.matrix, e.has_matrix = d.has_matrix;
+            e.chunks.resize(d.range_count);
+            for (MorphDraws::Part& part : e.chunks) split(part, mesh, key1, ranges[r], ranges[r + 1]), ++r;
+            md.draws_.push_back(std::move(e));
+        }
     }
     model.compute_bounds();
     return model;
+}
+
+namespace {
+
+// Appends a part to `mesh`, its key frames blended by `w` ((1 - w) key 0 + w key 1) and placed by
+// the draw's matrix.
+template <class P>
+void append_part(scene::Mesh& mesh, const P& p, float w, const Matrix& m, bool has_matrix) {
+    const u32 base = u32(mesh.vertices.size()), first = u32(mesh.indices.size());
+    for (size_t k = 0; k < p.key0.size(); ++k) {
+        scene::Vertex v = p.key0[k];
+        if (w != 0) {
+            const scene::Vertex& b = p.key1[k];
+            for (int j = 0; j < 3; ++j)
+                v.pos[j] += (b.pos[j] - v.pos[j]) * w, v.normal[j] += (b.normal[j] - v.normal[j]) * w;
+            for (int j = 0; j < 2; ++j) v.uv[j] += (b.uv[j] - v.uv[j]) * w;
+            u32 c = 0;
+            for (int s = 0; s < 32; s += 8) {
+                float c0 = float((v.color >> s) & 0xFF), c1 = float((b.color >> s) & 0xFF);
+                c |= u32(c0 + (c1 - c0) * w) << s;
+            }
+            v.color = c;
+        }
+        if (has_matrix) place_vertex(m, v);
+        mesh.vertices.push_back(v);
+    }
+    for (u32 i : p.indices) mesh.indices.push_back(base + i);
+    for (scene::Primitive q : p.primitives) {
+        q.first_index += first;
+        mesh.primitives.push_back(q);
+    }
+}
+
+} // namespace
+
+AnimatedNodes::Key AnimatedNodes::key(const Draw& d) {
+    auto bits = [](float f) {
+        u32 v;
+        std::memcpy(&v, &f, 4);
+        return v;
+    };
+    Key k{d.chunk, d.texset, d.alpha_mode, d.fb_mask, d.alpha_test, d.alpha_test_method, d.alpha_test_ref,
+          d.dest_alpha_test, d.alpha_fail, d.depth_write, d.depth_test, d.cull};
+    for (int i = 0; i < 4; ++i) k.push_back(bits(d.env_c0[size_t(i)])), k.push_back(bits(d.env_c1[size_t(i)]));
+    k.push_back(d.pano_set);
+    for (float f : d.pano) k.push_back(bits(f));
+    return k;
+}
+
+void AnimatedNodes::reset() {
+    values_.assign(animators_.size(), 0.0f);
+    for (size_t i = 0; i < animators_.size(); ++i) values_[i] = animators_[i].start;
+    update(0.0f);
+}
+
+void AnimatedNodes::update(float seconds) {
+    for (size_t i = 0; i < animators_.size(); ++i) {
+        const Gtm1::Animator& a = animators_[i];
+        float& v = values_[i];
+        u32 out = 0;
+        if (a.type >= 1 && a.type <= 4) { // an angle, wrapped once into 0..360
+            v += a.speed * seconds;
+            if (v > 360.0f) v -= 360.0f;
+            else if (v < 0.0f) v += 360.0f;
+            std::memcpy(&out, &v, 4);
+        } else if (a.type == 5) { // a chunk number: the phase rounded, first..end-1
+            v += a.speed * seconds;
+            s32 frame = s32(double(v) + 0.5);
+            if (frame >= s32(a.end)) {
+                v -= float(s32(a.end) - s32(a.first));
+                frame -= s32(a.end) - s32(a.first);
+            }
+            out = u32(frame) & 0xFFFF;
+        } else if (a.type == 7) { // a phase, wrapped into 0..1
+            v += a.speed * seconds;
+            if (v < 0.0f) {
+                do v += 1.0f;
+                while (v < 0.0f);
+            } else {
+                while (v >= 1.0f) v -= 1.0f;
+            }
+            std::memcpy(&out, &v, 4);
+        } else {
+            continue; // (type 6: none on the disc)
+        }
+        for (u32 t : a.targets) operands_[t] = out;
+    }
+}
+
+std::vector<scene::Mesh> AnimatedNodes::meshes() const {
+    RunParams r = run_;
+    r.operands = &operands_;
+    std::vector<scene::Mesh> out;
+    for (u32 n : nodes_) {
+        scene::Mesh mesh;
+        mesh.name = "node" + std::to_string(n);
+        mesh.lod = run_.lod;
+        std::vector<Draw> draws;
+        try {
+            draws = g_.run(n, r);
+        } catch (const FormatError&) {
+            continue; // (a value its data does not cover, e.g. a chunk number past the table)
+        }
+        for (const Draw& d : draws)
+            if (auto it = parts_.find(key(d)); it != parts_.end()) append_part(mesh, it->second, d.morph, d.matrix, d.has_matrix);
+        if (!mesh.primitives.empty()) out.push_back(std::move(mesh));
+    }
+    return out;
+}
+
+void AnimatedNodes::rebase_textures(int base) {
+    for (auto& [k, p] : parts_)
+        for (scene::Primitive& q : p.primitives)
+            if (q.texture >= 0) q.texture += base;
+}
+
+std::vector<int> MorphDraws::ids() const {
+    std::vector<int> out;
+    for (const Entry& e : draws_) out.push_back(e.id);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+std::vector<scene::Mesh> MorphDraws::meshes(const std::array<float, 5>& values) const {
+    scene::Mesh mesh;
+    mesh.name = "morph";
+    mesh.lod = lod_;
+    for (const Entry& e : draws_) {
+        // As op 0x35: chunk min(phase x count, count - 1) (truncated), morphed by the rest.
+        const float phase = std::clamp(values[size_t(e.id - 1)], 0.0f, 1.0f);
+        const s32 count = s32(e.chunks.size());
+        const float f = phase * float(count);
+        s32 k = s32(f);
+        if (!(k < count)) k = count - 1;
+        append_part(mesh, e.chunks[size_t(k)], f - float(k), e.matrix, e.has_matrix);
+    }
+    if (mesh.primitives.empty()) return {};
+    return {std::move(mesh)};
+}
+
+void MorphDraws::rebase_textures(int base) {
+    for (Entry& e : draws_)
+        for (Part& p : e.chunks)
+            for (scene::Primitive& q : p.primitives)
+                if (q.texture >= 0) q.texture += base;
+}
+
+std::vector<int> MorphDraws::textures() const {
+    std::vector<int> out;
+    for (const Entry& e : draws_)
+        for (const Part& p : e.chunks)
+            for (const scene::Primitive& q : p.primitives)
+                if (q.texture >= 0) out.push_back(q.texture);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+void MorphDraws::map_textures(const std::vector<int>& map) {
+    for (Entry& e : draws_)
+        for (Part& p : e.chunks)
+            for (scene::Primitive& q : p.primitives)
+                if (q.texture >= 0 && size_t(q.texture) < map.size()) q.texture = map[size_t(q.texture)];
 }
 
 scene::Model decode_gtm1(ByteSpan gtm1, const Options& opt, const std::string& name) {

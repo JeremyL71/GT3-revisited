@@ -1,6 +1,8 @@
 #include "race/field.h"
 
 #include "ai/ai_driver.h"
+#include "ai/ai_rules.h"
+#include "ai/safety_respawn.h"
 #include "base/bytes.h"
 #include "base/log.h"
 #include "game/data/car_database.h"
@@ -45,8 +47,11 @@ public:
     float wall_impulse() const override;
     const sim::Vehicle* sim_vehicle() const override;
     void begin_pit_stop(const sim::Quat& box) override;
+    void set_engine_condition(const sim::EngineCondition& c) override;
+    sim::EngineCondition engine_condition() const override;
     void set_reverse_request(bool on) override;
     void set_driver_kind(int kind) override;
+    void set_scripted_aids(const sim::ScriptedAids& a) override;
     float car_impulse() const override { return contact_; }
     float impact_ = 0, contact_ = 0;
 
@@ -76,7 +81,7 @@ EventStart event_start(const data::Event& ev) {
 }
 
 sim::Vec3 grid_back(const sim::Vec3& p, const sim::Quat& q, const sim::VehicleSetup& setup) {
-    // §9.2: the CoG is moved back from the slot by the CoG->front extent; the car
+    // physics §9.2: the CoG is moved back from the slot by the CoG->front extent; the car
     // origin sits cog_offset behind / below the CoG (horizontal part).
     float ext = setup.cog_front_extent;
     sim::Vec3 fwd = rotate(q, {0, 0, -1});
@@ -123,10 +128,6 @@ public:
         labels_ = cfg_.opponents;
         if (labels_.empty() && ev) labels_ = ev->entries;
         if (int(labels_.size()) > cfg_.max_opponents) labels_.resize(size_t(cfg_.max_opponents));
-        // ai.md §9.1/§9.2: the built-in set of the course category, then the event's overrides
-        // for each car's driveline class (physics.md §7 #21).
-        int set = cfg_.course_category == 1 || cfg_.course_category == 2 ? cfg_.course_category : 0;
-        const ai::DriverParams base = ai::DriverParams::builtin(set);
         if (ev) rubber_ = ai::RubberBand::from_event(*ev);
         int slots = std::max(track_.grid_count(), 1);
         struct Entry {
@@ -161,35 +162,33 @@ public:
             ai::adapt_spec_for_ai(e.spec);
             std::unique_ptr<sim::Vehicle> v = sim::Vehicle::create(e.spec);
             if (!v) continue;
-            v->set_cpu_driver(true); // the original's CPU clutch request, no driving aids
+            v->set_cpu_driver(true); // the original's CPU clutch request and AI aid block
             Opp o;
             o.label = e.label;
             o.model = e.model;
             int index = slot_of[i];
             track::Pose pose = index < slots ? track_.grid_pose(index)
                                              : track_.respawn_pose(track_.length() - 12.0f * float(index));
-            // §9.2: the slot point is the car's nose (moved back by its front extent).
+            // physics §9.2: the slot point is the car's nose (moved back by its front extent).
             pose.position = grid_back(pose.position, pose.orientation, v->setup());
             if (cfg_.start_kmh > 0) v->spawn_moving(pose.position, pose.orientation, cfg_.start_kmh / 3.6f);
             else v->reset(pose.position, pose.orientation); // standing start: no spawn hold
             o.v = v.get();
             o.world_index = world_.add(std::move(v));
-            ai::DriverParams params = base;
-            if (ev) {
-                // Driveline class: FR/MR/RR 0, FF 1, 4WD system 0 -> 1, system 3 -> 3, others 2.
-                const sim::DrivetrainSpec& d = e.spec.drivetrain;
-                int cls = d.drive == sim::Drive::FF ? 1
-                          : d.drive == sim::Drive::AWD ? (d.awd_system == 0 ? 1 : d.awd_system == 3 ? 3 : 2)
-                                                        : 0;
-                ai::apply_event(params, *ev, cls);
-            }
+            // ai §9.1/ai §9.2: the course's set for the car's driveline class (the built-in set of
+            // the course category when the course has none), then the event's overrides for that
+            // class; the set's aid block is what the physics reads for the car.
+            const int cls = ai::driveline_class(e.spec);
+            ai::DriverParams params = ai::course_params(track_.driver_sets(), cfg_.course_category, cls);
+            if (ev) ai::apply_event(params, *ev, cls);
+            o.v->set_scripted_aids(params.aids);
             o.driver = std::make_unique<ai::AiDriver>(course_, params, index);
             o.driver->reset(o.v->state());
             o.timer = std::make_unique<track::LapTimer>(track_);
             o.timer->set_lap1_from_go(true); // a race: every car's lap 1 from GO
             o.timer->update(pose.position, 0);
             o.prev = o.v->state();
-            // CPU pit stops (ai.md §13): only in races with tyre wear and a pit lane.
+            // CPU pit stops (ai §13): only in races with tyre wear and a pit lane.
             if (cfg_.wear.on()) {
                 o.pit = std::make_unique<PitLane>();
                 if (!o.pit->load(track_, int(opps_.size()) + 1)) o.pit.reset();
@@ -281,8 +280,8 @@ public:
         if (me2_ >= 0) order_.push_back(-2);
         for (size_t i = 0; i < opps_.size(); ++i) order_.push_back(int(i));
         rank();
-        LOG_INFO("Race field: %d opponents (event %s), player on grid slot %d", int(opps_.size()), cfg_.event.c_str(),
-                 player_slot());
+        LOG_INFO("Race field: %d opponents (event %s), grid %s, player on grid slot %d", int(opps_.size()),
+                 cfg_.event.c_str(), cfg_.grid_by_power ? "by power-to-weight" : "in order", player_slot());
         return true;
     }
 
@@ -316,6 +315,10 @@ public:
     const sim::VehicleState& opponent_prev_state(int i) const override { return opps_[size_t(i)].prev; }
     const sim::VehicleSetup& opponent_setup(int i) const override { return opps_[size_t(i)].v->setup(); }
     int opponent_laps(int i) const override { return opps_[size_t(i)].timer->laps_completed(); }
+    int opponent_lap_count(int i) const override {
+        const track::LapTimer& t = *opps_[size_t(i)].timer;
+        return lap_counter(t.lap_started(), t.laps_completed());
+    }
     double race_time() const override { return race_time_; }
     int position_of(int car) const {
         auto it = std::find(order_.begin(), order_.end(), car);
@@ -377,6 +380,7 @@ public:
     }
     void set_laps(int laps) override { laps_ = laps; }
     std::vector<int> take_pit_entries() override { return std::exchange(pit_entries_, {}); }
+    const std::vector<CarCrossing>& last_crossings() const override { return crossings_; }
     bool opponent_in_pits(int i) const override { const Opp& o = opps_.at(size_t(i)); return o.pit && o.pit->driving(); }
     Standing standing_of(int car) const {
         Standing s;
@@ -449,8 +453,10 @@ public:
     }
     const sim::Vehicle& player_vehicle() const { return world_.vehicle(me_); }
     void player_pit_stop(const sim::Quat& box) { world_.vehicle(me_).begin_pit_stop(box); }
+    void player_engine_condition(const sim::EngineCondition& c) { world_.vehicle(me_).set_engine_condition(c); }
     void player_reverse(bool on) { world_.vehicle(me_).set_reverse_request(on); }
     void player_driver_kind(int kind) { world_.vehicle(me_).set_driver_kind(kind); }
+    void player_scripted_aids(const sim::ScriptedAids& a) { world_.vehicle(me_).set_scripted_aids(a); }
     void set_dirt_course(bool dirt) {
         for (int i = 0; i < world_.size(); ++i) world_.vehicle(i).set_dirt_course(dirt);
     }
@@ -469,12 +475,12 @@ public:
                 const sim::Quat& q = v.state().orientation;
                 sim::Vec3 u{q.x, q.y, q.z}, c = v.setup().cog_offset;
                 sim::Vec3 t = u.cross(c) * 2.0f;
-                s.position = v.state().position + c + t * q.w + u.cross(t); // the CoG (the car's reference point in the physics spec)
+                s.position = v.state().position + c + t * q.w + u.cross(t); // the CoG (the car's reference point, ai §14)
             }
             s.time_scale = world_.time_scale(i);
         }
         double player_distance = player_timer_->race_distance();
-        // Rubber band (spec §14, pass mode 0): a chain from the leading human car along the
+        // Rubber band (ai §14, pass mode 0): a chain from the leading human car along the
         // ranking. Index 0 = player 1, 1 = player 2 (when present), then the opponents.
         std::vector<float> band;
         if (rubber_.enabled() && race_time_ >= 0) {
@@ -523,9 +529,7 @@ public:
             }
             ai::AiContext ctx{race_time_, snaps_, o.world_index};
             ctx.rank = int(&o - opps_.data()); // grid order (pole = 0) while the race has not started
-            for (const sim::World::Contact& k : world_.contacts())
-                if ((k.a == o.world_index && k.b >= 0) || (k.b == o.world_index && k.a >= 0)) ctx.body_contact = true;
-            // Countdown (ai.md §10): the clutch request is 0 until GO; the driver blips the throttle.
+            // Countdown (ai §10): the clutch request is 0 until GO; the driver blips the throttle.
             world_.vehicle(o.world_index).set_clutch_hold(race_time_ < 0);
             world_.vehicle(o.world_index).set_race_hold(race_time_ < 0);
             {
@@ -534,6 +538,7 @@ public:
                 world_.set_inputs(o.world_index, ai_in);
             }
             world_.vehicle(o.world_index).set_reverse_request(o.driver->reverse_request()); // backing out of walls
+            world_.vehicle(o.world_index).set_driver_kind(o.driver->kind());
             if (o.pit) { // armed by worn tyres (the "tires worn" flag): pit lane, stop, back to the line
                 sim::Vehicle& v = world_.vehicle(o.world_index);
                 const sim::VehicleTelemetry& t = v.telemetry();
@@ -544,20 +549,26 @@ public:
                 for (int k = 0; k < 4; ++k) pi.want_service = pi.want_service || t.tire_wear[size_t(k)] > v.tire_wear_params().fresh;
                 pi.race_over = o.finish >= 0 || (laps_ > 0 && o.timer->laps_completed() >= laps_ - 1);
                 pi.stopping = v.spawn_hold_active();
-                bool was = o.pit->driving();
                 PitLane::Out po = o.pit->update(pi);
                 if (po.entered) pit_entries_.push_back(int(&o - opps_.data()));
                 if (po.begin_stop) v.begin_pit_stop(po.box);
-                // Pit lane auto drive: the scripted driver kind (non-zero; spec physics.md §8.6).
-                v.set_driver_kind(po.auto_drive ? std::max(2, int(o.pit->state())) : 0);
-                if (po.auto_drive) {
-                    world_.set_inputs(o.world_index, po.in);
-                    o.brake = po.in.brake;
+                // The AI driver drives the pit lane itself (ai §13): the state's line (from the next
+                // tick) and driver kind (2 lane, 3 stop line, 4 leaving; physics §8.6); at the exit
+                // back to the main line and to racing.
+                if (po.line) o.driver->set_line(po.line, po.blend);
+                if (po.exited) o.driver->reset_recovery();
+                if (po.auto_drive || po.exited) o.driver->set_kind(po.kind);
+                v.set_driver_kind(o.driver->kind());
+                if (po.hold) { // the 5 s stop: held with the brake
+                    sim::ControlInputs held;
+                    held.brake = 1;
+                    world_.set_inputs(o.world_index, held);
+                    o.brake = 1;
                     v.set_reverse_request(false);
+                }
+                if (po.auto_drive) {
                     world_.set_time_scale(o.world_index, 1); // no rubber band in the pits
-                    o.last_progress = std::max(race_time_, 0.0); // not "lost" while in the pits
-                } else if (was) {
-                    o.driver->reset(v.state()); // back on the racing line
+                    o.respawn.hold(race_time_);              // not "lost" while in the pits
                 }
             }
             float scale = 1;
@@ -566,7 +577,7 @@ public:
             world_.set_time_scale(o.world_index, scale);
         }
         sim::ControlInputs pin = in;
-        // held on the grid until the start signal by the race hold (spec §9.3: in place, brakes off,
+        // held on the grid until the start signal by the race hold (physics §9.3: in place, brakes off,
         // the engine can rev), every car of the field alike
         world_.vehicle(me_).set_race_hold(race_time_ < 0);
         sim::Vec3 before = world_.vehicle(me_).state().velocity;
@@ -618,30 +629,23 @@ public:
                 o.crossed = o.timer->update(o.v->state().position, t);
                 continue;
             }
-            const sim::VehicleState& st = o.v->state();
-            // Off the road mesh: the centre and all four wheels for half a second (one probe can
-            // fall through a hairline crack between triangles).
-            auto off = [&](const sim::Vec3& p) {
-                sim::SurfaceHit hh = track_.probe(p.x, p.z, p.y + 3.0f);
-                return !hh.hit || p.y < hh.height - 5.0f;
-            };
-            bool all_off = off(st.position);
-            for (const sim::WheelState& w : st.wheels) all_off = all_off && off(w.contact);
-            o.off_mesh_ticks = all_off ? o.off_mesh_ticks + 1 : 0;
-            bool lost = o.off_mesh_ticks > 30 || !std::isfinite(st.position.x);
-            if (race_time_ > 0 && t - o.last_progress > 12.0) lost = true; // safety net, as ai::AiRace
-            lost = lost && cfg_.cpu_respawn; // [race] respawn = off: never (as the original)
-            if (lost) {
-                track::Pose p = track_.respawn_pose(o.timer->distance());
-                world_.vehicle(o.world_index).spawn(p.position, p.orientation);
-                o.timer->teleport(p.position);
-                o.driver->reset(o.v->state());
-                o.last_progress = t;
-                o.off_mesh_ticks = 0;
+            // The non-original safety respawn (ai §12; [race] respawn = off: never, as the original).
+            if (o.respawn.lost(track_, o.v->state(), race_time_) && cfg_.cpu_respawn) {
+                ai::respawn_car(world_.vehicle(o.world_index), *o.timer, *o.driver, track_);
+                o.respawn.respawned(race_time_);
             }
             o.crossed = o.timer->update(o.v->state().position, t);
-            double d = o.timer->race_distance();
-            if (d > o.best + 10) o.best = d, o.last_progress = t;
+            o.respawn.progress(o.timer->race_distance(), race_time_);
+        }
+        // This tick's split / line crossings in the last race order (the leader first).
+        crossings_.clear();
+        for (int car : order_) {
+            const track::LapTimer* tm = car == -1 ? player_timer_.get()
+                                        : car == -2 ? timer2_.get()
+                                                    : opps_[size_t(car)].timer.get();
+            if (!tm) continue;
+            for (const track::LapTimer::Crossing& c : tm->crossings())
+                crossings_.push_back({car, {c.point, c.line, c.lap, c.ms, c.split_ms}});
         }
         // Finishes at the line (finishes_at_line), judged in the last race order with the
         // leader first, so a car crossing on the tick the leader finishes finishes too. The
@@ -662,7 +666,12 @@ public:
                 // A remote car: when we saw it finish (its owner's claim is checked against it).
                 if (o.remote && o.observed_finish < 0 && (o.finish >= 0 || finishes(*o.timer)))
                     o.observed_finish = o.timer->last_crossing_time(), o.timer->freeze();
-                else if (!o.remote && o.finish < 0 && finishes(*o.timer)) o.finish = o.timer->last_crossing_time(), o.timer->freeze();
+                else if (!o.remote && o.finish < 0 && finishes(*o.timer)) {
+                    o.finish = o.timer->last_crossing_time(), o.timer->freeze();
+                    // The run-on after the finish (ai §1.1): the AI drives on, slower (kind 1).
+                    o.driver->set_params(ai::after_finish(o.driver->params()));
+                    if (o.driver->kind() == ai::kKindNormal) o.driver->set_kind(ai::kKindAi);
+                }
             }
         }
         rank();
@@ -676,9 +685,8 @@ private:
         std::unique_ptr<ai::AiDriver> driver;
         std::unique_ptr<track::LapTimer> timer;
         std::unique_ptr<PitLane> pit;
-        int off_mesh_ticks = 0;
+        ai::SafetyRespawn respawn;
         sim::VehicleState prev;
-        double last_progress = 0, best = 0;
         double finish = -1;
         bool crossed = false; // completed a lap on the last tick
         float brake = 0; // last tick's brake pedal
@@ -699,6 +707,7 @@ private:
     ai::RubberBand rubber_;
     std::vector<Opp> opps_;
     std::vector<int> pit_entries_;
+    std::vector<CarCrossing> crossings_;
     std::vector<RemoteHit> remote_hits_;
     std::vector<std::string> labels_;
     std::vector<ai::CarSnapshot> snaps_;
@@ -724,8 +733,11 @@ const sim::VehicleState& PlayerVehicle::state() const { return f_.player_vehicle
 const sim::VehicleSetup& PlayerVehicle::setup() const { return f_.player_vehicle().setup(); }
 const sim::Vehicle* PlayerVehicle::sim_vehicle() const { return &f_.player_vehicle(); }
 void PlayerVehicle::begin_pit_stop(const sim::Quat& box) { f_.player_pit_stop(box); }
+void PlayerVehicle::set_engine_condition(const sim::EngineCondition& c) { f_.player_engine_condition(c); }
+sim::EngineCondition PlayerVehicle::engine_condition() const { return f_.player_vehicle().engine_condition(); }
 void PlayerVehicle::set_reverse_request(bool on) { f_.player_reverse(on); }
 void PlayerVehicle::set_driver_kind(int kind) { f_.player_driver_kind(kind); }
+void PlayerVehicle::set_scripted_aids(const sim::ScriptedAids& a) { f_.player_scripted_aids(a); }
 float PlayerVehicle::boost() const { return f_.player_vehicle().telemetry().boost; }
 float PlayerVehicle::wall_impulse() const { return f_.player_vehicle().telemetry().wall_impulse; }
 

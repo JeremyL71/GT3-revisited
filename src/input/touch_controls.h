@@ -86,6 +86,13 @@ public:
     // controls: HUD elements inside it stay clear of the thumbs. The full
     // area when the controls are hidden. The steering zone doesn't count.
     TouchRect safe_area() const;
+    // The visible controls' drawn bounds (UI units), the steering zone left
+    // out; empty while the controls are hidden.
+    std::vector<TouchRect> control_bounds() const;
+    // `r` (UI units) moved up until it is clear of every visible control's
+    // touch area, so a button a screen draws there can still be tapped.
+    // Unchanged while the controls are hidden. The steering zone doesn't count.
+    TouchRect clear_above(TouchRect r) const;
     TouchLayout layout() const { return layout_; }
 
     // Finger input in UI coordinates. `pressure` is 0..1 as reported by the

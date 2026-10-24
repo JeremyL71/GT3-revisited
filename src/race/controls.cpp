@@ -40,7 +40,7 @@ sim::ControlInputs ControlMapper::update(const PadState& pad, double dt) {
     int dir = (pad.down(PadButton::Right) ? 1 : 0) - (pad.down(PadButton::Left) ? 1 : 0);
     float stick = stick_to_steer(pad.axis(PadAxis::LX), cfg_);
     // A held d-pad with the stick centred is the game's digital pad (kind 3): full lock is
-    // requested and the physics turns the wheel in at its digital rate (spec §4.4). The
+    // requested and the physics turns the wheel in at its digital rate (physics §4.4). The
     // stick is the analog pad (kind 2).
     if (dir != 0 && std::fabs(stick) < 0.05f) {
         in.steer = float(dir);

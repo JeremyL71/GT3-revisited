@@ -4,7 +4,8 @@
 // menu::flow::GtModeHooks: the GT mode menu's actions, its
 // "pre-check" popups, the code-filled text widgets (credits, days, prices,
 // license times, status page...), the garage list, race requests and
-// results. docs/dev/GT_MODE.md describes the mapping.
+// results. docs/dev/GT_MODE.md describes the mapping. The implementation is in
+// game/gt_mode_menu/, one file per concern around the private internal.h.
 //
 // install_gt_mode_menu() is called once by the app (src/app/screen_gtmode.cpp).
 // The game is loaded from the current save of the save library (save_library.h,
@@ -19,6 +20,7 @@
 
 #include "game/gt_mode.h"
 #include "menu/flow/game_hooks.h"
+#include "menu/flow/text_box.h"
 
 #include <functional>
 #include <map>
@@ -41,11 +43,29 @@ void save_license_run(const std::string& code, int medal, double seconds);
 // once; when it makes the ranking the name entry is queued as a presentation (run it with
 // GameFlow::start_presentations()). Returns the rank (-1 = not ranked / no session).
 int add_license_record(const std::string& code, double seconds);
-// A GT race's prize page (the event's cup for places 1-3, else the consolation prize; place
-// 0-based), queued for GameFlow::start_presentations() as the original shows it
-// straight after the results. False when the race has none (no trophy class / money,
-// championship rounds). Post the result with GameResult::prize_shown.
+// A finished machine-test run (M400 / M1000: its time in seconds; MMAX: its top speed in
+// km/h) with the ride car, recorded right after the run as the original does (gt_mode §17):
+// its ranking and the best of the test; a run that makes the ranking queues its name entry
+// as above. Returns the rank (-1 = not ranked / no session). Post the session's result with
+// GameResult::records_done.
+int add_machine_test_record(const std::string& code, double value);
+// A finished arcade time-trial challenge run (code AT<nn>0001, its best lap in seconds), the
+// same way (gt_mode §16): its ranking with the challenge's car and the name entry.
+int add_time_trial_record(const std::string& code, double seconds);
+// A free run (arcade time attack, GT Mode free run) that ended with a best lap (seconds) on
+// `course` in `car` (a car label), the same way (gt_mode §17): the course's ranking
+// ("ct:<course>") and the name entry.
+int add_course_time_trial_record(const std::string& course, double best_lap, const std::string& car);
+// A GT race's or championship round's prize page (the event's cup for places 1-3, else the
+// consolation prize; place 0-based), queued for GameFlow::start_presentations() as the
+// original shows it straight after the results, before the replay (presentation §F). False
+// when the race has none (no trophy class / money). Post the result with
+// GameResult::prize_shown.
 bool queue_race_prize(const std::string& code, int place);
+// An arcade single race won (race code "A<difficulty>..."): the difficulty's cup page, queued
+// the same way (presentation §F: right after the race, before its replay). False without a
+// session or a difficulty. Post the result with GameResult::prize_shown.
+bool queue_arcade_trophy(const std::string& race_code);
 // A finished GT single race (not a championship round): its place, prize and best result
 // written to the save at once (a copy of the game; the menus record it from the GameResult
 // when the race screen closes), as the original records a race before its replay.
@@ -60,9 +80,20 @@ void end_race_game_save();
 GtModeSession* gt_mode_session();
 // The car a "car_render_*" widget shows on a page: the dealer's focus car with
 // the chosen paint, the focused garage car, or the ride car (shops). False = none.
-// `dirt` (0..0.8): the car's dirt (the showroom floor reflects 1 - dirt of it).
+// `dirt` (0..0.8): the car's dirt (the showroom floor reflects 1 - dirt of it); during a car
+// wash the dirt the car had, until the wash is over.
 bool car_for_widget(const std::string& page, const std::string& widget_class, std::string& car, int& paint,
                     std::string* wheel = nullptr, float* dirt = nullptr);
+// The car wash spins the car (gt_mode §13.2): for 181 frames its showroom turntable gets an extra
+// kWashSpinPush of yaw acceleration (degrees / s², on top of the camera's own) once a frame.
+// `serial` is new for every wash; `pushes` counts the frames pushed so far, so a showroom
+// stepping in real time applies each push exactly once.
+struct CarWashSpin {
+    int serial = 0;
+    int pushes = 0;
+};
+CarWashSpin car_wash_spin();
+constexpr float kWashSpinPush = 10000.0f;
 // The prize model (".prm" path in the VOL) of the presentation on `page`: the
 // license card on "license_get", the championship trophy on "trophy_get"; ""
 // when none (or not yet faded in). `serial` changes with every new presentation
@@ -84,7 +115,7 @@ std::vector<std::string> permitted_car_names(const GtMode& gt, const std::string
 // GT-mode session or ride car.
 bool begin_setting(const std::string& event);
 // Prepares the records menu (menu/records.mbl) for a ranking key: "lic:<test>",
-// "mt:M400" / "mt:M1000" / "mt:MMAX", "at:<arcade time trial code>".
+// "mt:M400" / "mt:M1000" / "mt:MMAX", "at:<arcade time trial code>", "ct:<course>".
 bool begin_records(const std::string& key);
 // Creates the GT-mode session (disc data + save) if none exists yet, e.g. when
 // the settings menu is opened on its own. `read` loads disc files.
@@ -100,6 +131,11 @@ std::string current_save_path();
 void begin_snapshot_save(GameState s);
 // The snapshot waiting for the save page (nullptr = none; tests).
 const GameState* snapshot_save();
+// Tests only: forgets everything this module keeps between calls (the loaded disc data and
+// its reader, the session, queued presentations / sounds / popups / movies, the map pointer,
+// the save library and the snapshot), so the next GT-mode menus start as on a fresh launch,
+// e.g. with another disc or a synthetic data set. Hooks stay installed.
+void reset_gt_mode_menu_for_tests();
 
 class GtModeSession {
 public:
@@ -111,6 +147,9 @@ public:
     // The save the game is written to from now on (the library's current save).
     void set_save_path(std::string p) { save_path_ = std::move(p); }
     bool save(std::string* error = nullptr);
+    // False (a new game) when there is no readable save at save_path(); one that is there
+    // but cannot be read is moved aside first (set_aside_save, unless GT3R_GTMODE_NOSAVE),
+    // so the new game's saves do not replace it.
     bool load(std::string* error = nullptr);
 
     // Menu state the original keeps in its session block.
@@ -134,7 +173,7 @@ public:
     std::map<std::string, int> setting_entry;       // slider positions when the page opened (pinch_prev)
     bool setting_committed = false;                 // a commit hides pinch_prev until the page is rebuilt
     std::string records_key;                        // records menu: the ranking shown
-    bool name_started = false;                      // name entry: a key was pressed (the default name is replaced)
+    menu::flow::TextBox name_box;                   // record name entry: the name and its cursor
     // Guest garage (a friend's save loaded for Trade and the arcade guest class) and
     // whether the garage pages show it (the trade session).
     std::unique_ptr<GtMode> guest;

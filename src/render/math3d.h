@@ -2,7 +2,8 @@
 
 // Minimal 3D math for the renderer: column-major 4x4 matrices (same layout
 // as scene::Mesh::transform and GLSL/MSL uniforms), right-handed, Y up,
-// clip-space depth 0..1 (SDL_GPU uses that on every backend).
+// clip-space depth 0..1 (SDL_GPU uses that on every backend), reversed: 1 at the near
+// plane, 0 at the far plane (see perspective()).
 
 #include <array>
 #include <cmath>
@@ -61,10 +62,14 @@ Mat4 rotate_y(float radians);
 Mat4 rotate_z(float radians);
 // Rotation matrix of a unit quaternion (w, x, y, z).
 Mat4 rotate_quat(float w, float x, float y, float z);
-// Right-handed perspective, depth mapped to 0..1. `fovy` in radians.
+// Right-handed perspective, depth reversed: 1 at `znear`, 0 at `zfar`, like GT3's Z buffer (its
+// maximum at the near plane, every pass tested GEQUAL; the pipelines test GREATER_OR_EQUAL
+// against a clear of 0). A float depth buffer then resolves millimetres at any distance; the
+// usual 0..1 mapping resolved only w^2 x 6e-7 m at w m (1 cm at 130 m with a 0.1 m near
+// plane), and car decals flickered in the replays' telephoto shots. `fovy` in radians.
 Mat4 perspective(float fovy, float aspect, float znear, float zfar);
 // Off-centre perspective from the tangents of the four half angles (VR eyes; left and down
-// are negative for a frustum around the view axis), depth mapped to 0..1.
+// are negative for a frustum around the view axis), depth reversed as perspective().
 Mat4 frustum(float tan_left, float tan_right, float tan_down, float tan_up, float znear, float zfar);
 
 // A view's field of view as the tangents of its half angles (left and down negative), for

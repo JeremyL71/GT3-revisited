@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace gt3r::race {
 
@@ -94,6 +95,11 @@ void CameraRig::snap(const sim::VehicleState& s) {
 void CameraRig::update(const sim::VehicleState& s, const sim::VehicleSetup& setup, const PadState& pad, double dt) {
     float fdt = float(std::min(dt, 0.1));
     if (!snapped_) snap(s);
+    // The replay aim is for this update only.
+    const std::optional<render::Vec3> replay_aim = std::exchange(replay_aim_, std::nullopt);
+    const std::optional<ReplayDirector::Pair> replay_pair = std::exchange(replay_pair_, std::nullopt);
+    const std::optional<sim::VehicleState> replay_partner = std::exchange(replay_partner_, std::nullopt);
+    const std::vector<CarMount>* replay_mounts = std::exchange(replay_mounts_, nullptr);
     render::Vec3 pos = rv(s.position);
     sim::Vec3 fwd_s = rotate(s.orientation, {0, 0, -1}), up_s = rotate(s.orientation, {0, 1, 0});
     render::Vec3 fwd = rv(fwd_s), up = rv(up_s);
@@ -248,20 +254,49 @@ void CameraRig::update(const sim::VehicleState& s, const sim::VehicleSetup& setu
         break;
     }
     case CameraMode::Tv: {
-        render::Vec3 target = pos + render::Vec3{0, 0.7f, 0};
+        const render::Vec3 aim = replay_aim ? *replay_aim : pos;
+        render::Vec3 target = aim + render::Vec3{0, 0.7f, 0};
         director_record_ = -1;
+        replay_on_board_ = false;
         if (director_) {
-            ReplayDirector::Shot shot = director_->update(track_s_, lap_, pos, dt, 16.0f / 9.0f);
+            ReplayDirector::Shot shot =
+                director_->update(track_s_, lap_, aim, dt, 16.0f / 9.0f, replay_pair ? &*replay_pair : nullptr);
             director_record_ = shot.record;
-            if (shot.valid && shot.onboard) { // on-board record: the bumper view
-                eye_ = rv(s.position + rotate(s.orientation, {0, 0.62f, -setup.length * 0.5f + 0.15f}));
-                view_ = render::look_at(eye_, eye_ + fwd * 10.0f - up * 0.25f, up);
+            if (shot.valid && shot.onboard) { // mode 2's on-board cut: a bumper view on the partner's car
+                const bool other = shot.on_partner && replay_partner;
+                const sim::VehicleState& o = other ? *replay_partner : s;
+                const float length = other ? replay_partner_length_ : setup.length;
+                const render::Vec3 of = rv(rotate(o.orientation, {0, 0, -1})), ou = rv(rotate(o.orientation, {0, 1, 0}));
+                eye_ = rv(o.position + rotate(o.orientation, {0, 0.62f, -length * 0.5f + 0.15f}));
+                view_ = render::look_at(eye_, eye_ + of * 10.0f - ou * 0.25f, ou);
                 fovy_ = 0.9f;
                 break;
             }
-            if (shot.valid) {
+            // View mode 1's procedural cameras (presentation §G15) on the followed car, planned
+            // at the cut, moving at 60 Hz.
+            if (shot.valid && shot.procedural >= 0) {
+                const CameraCar cc = camera_car(s, setup);
+                if (director_->cut_serial() != proc_serial_) {
+                    proc_serial_ = director_->cut_serial();
+                    static const std::vector<CarMount> kNoMounts;
+                    proc_.start(director_->procedural_shot(), cc, ground_, replay_mounts ? *replay_mounts : kNoMounts);
+                    proc_acc_ = 0;
+                }
+                proc_acc_ += dt;
+                for (int n = 0; proc_acc_ >= 1.0 / 60.0 && n < 12; ++n) {
+                    proc_acc_ -= 1.0 / 60.0;
+                    proc_.step(cc);
+                }
+                if (proc_acc_ > 1.0 / 60.0) proc_acc_ = 0;
+                view_ = proc_.view(cc, ground_, float(proc_acc_ * 60.0));
+                eye_ = proc_.eye();
+                replay_on_board_ = proc_.on_board();
+                fovy_ = std::clamp(ReplayDirector::zoom_fovy(proc_.zoom()), 0.02f, 2.4f);
+                break;
+            }
+            if (shot.valid) { // a course shot; mode 1's roll about the view axis (Rz in eye space)
                 eye_ = shot.eye;
-                view_ = render::look_at(eye_, shot.target, {0, 1, 0});
+                view_ = render::rotate_z(shot.roll) * render::look_at(eye_, shot.target, {0, 1, 0});
                 fovy_ = std::clamp(shot.fovy, 0.02f, 2.4f);
                 break;
             }
@@ -305,6 +340,30 @@ bool CameraRig::handle_event(const SDL_Event& e) {
     case SDL_EVENT_MOUSE_WHEEL: orbit_dist_ = std::clamp(orbit_dist_ * std::exp(-e.wheel.y * 0.1f), 2.0f, 400.0f); return true;
     default: return false;
     }
+}
+
+void CameraRig::set_replay_aim(const render::Vec3& aim, const ReplayDirector::Pair* pair, const sim::VehicleState* partner,
+                               float partner_length) {
+    replay_aim_ = aim;
+    replay_pair_.reset();
+    if (pair) replay_pair_ = *pair;
+    replay_partner_.reset();
+    if (partner) replay_partner_ = *partner;
+    replay_partner_length_ = partner_length;
+}
+
+CameraCar CameraRig::camera_car(const sim::VehicleState& s, const sim::VehicleSetup& setup) {
+    CameraCar c;
+    const float q = setup.wheels[0].ride_height > 0 ? setup.wheels[0].ride_height : 0.13f;
+    c.pos = rv(s.position + rotate(s.orientation, {0, q, 0}));
+    c.velocity = rv(s.velocity);
+    c.yaw = heading_yaw(s.orientation);
+    c.pitch = pitch_of(s.orientation);
+    c.front = c.rear = setup.length * 0.5f;
+    c.half_width = setup.width * 0.5f;
+    const sim::Quat& o = s.orientation;
+    c.body = render::translate(c.pos) * render::rotate_quat(o.w, o.x, o.y, o.z);
+    return c;
 }
 
 render::Mat4 CameraRig::projection(float aspect) const { return render::perspective(fovy_, aspect, near_plane, far_plane); }

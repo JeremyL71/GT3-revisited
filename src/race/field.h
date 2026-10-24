@@ -36,8 +36,9 @@ struct FieldConfig {
     std::string second_player;
     std::shared_ptr<const sim::CarSpec> second_spec;
     double countdown = 3.0;             // seconds before the start signal (0 = rolling start: no hold)
-    // Course category (course table 34 +8: 0 tarmac, 1 wet Route 5, 2 dirt): picks the CPU drivers'
-    // built-in parameter set (ai.md §9.1) before the event's per-driveline-class overrides.
+    // Course category (course table 34 +8: 0 tarmac, 1 wet Route 5, 2 dirt): the CPU drivers' built-in
+    // parameter set where the course file has no set for a car's driveline class (ai §9.1); the
+    // event's per-class overrides come on top.
     int course_category = 0;
     // 2P battle options (the original's options record, docs/dev/RACE.md "Options"):
     // boost = catch-up for the trailing player as a time-step scale 1 + A x (gap - start) /
@@ -95,7 +96,7 @@ constexpr double kRollingAutoDrive = 5.0;
 constexpr float kRollingKmh = 80.0f;
 
 // Grid slot point -> car position: the slot marks the nose, so the car is moved back
-// along its heading by its front extent (physics spec §9.2).
+// along its heading by its front extent (physics §9.2).
 sim::Vec3 grid_back(const sim::Vec3& slot, const sim::Quat& heading, const sim::VehicleSetup& setup);
 // The same from a car spec (builds the vehicle's setup).
 sim::Vec3 grid_back(const sim::Vec3& slot, const sim::Quat& heading, const sim::CarSpec& spec);
@@ -122,6 +123,7 @@ public:
     virtual const sim::VehicleState& opponent_prev_state(int i) const = 0; // before the last tick (interpolation)
     virtual const sim::VehicleSetup& opponent_setup(int i) const = 0;
     virtual int opponent_laps(int i) const = 0;
+    virtual int opponent_lap_count(int i) const = 0; // lap_counter: 0 before the start line
 
     // Seconds since the start signal (< 0 during the countdown).
     virtual double race_time() const = 0;
@@ -172,6 +174,14 @@ public:
         double distance = 0;
     };
     virtual void set_laps(int laps) = 0;
+    // The split-point / line crossings of every car on the last tick, the cars taken in the
+    // race order before that tick's ranking (the leader first), as the original's crossing
+    // handler takes them (presentation §D6).
+    struct CarCrossing {
+        int car = -1; // as Standing::car
+        LapCrossing crossing;
+    };
+    virtual const std::vector<CarCrossing>& last_crossings() const = 0;
     // Opponents that entered the pit lane since the last call ("%s Pitting in...").
     virtual std::vector<int> take_pit_entries() = 0;
     virtual bool opponent_in_pits(int i) const = 0;
@@ -204,7 +214,7 @@ public:
     virtual bool opponent_ghost(int i) const { (void)i; return false; }
 };
 
-// The race rules of the original (presentation spec, "Race order and finish").
+// The race rules of the original (presentation §B9).
 // Ranking: more laps completed first; at equal laps two running cars by race distance, a
 // running car ahead of a finished one, two finished cars by finish time.
 bool ranks_ahead(const RaceField::Standing& a, const RaceField::Standing& b);
@@ -213,5 +223,8 @@ bool ranks_ahead(const RaceField::Standing& a, const RaceField::Standing& b);
 // finished, or the crossing is at or after the time limit (seconds, 0 = none). There is no
 // other finish: a car that stops short never finishes.
 bool finishes_at_line(int laps_completed, int race_laps, bool leader_finished, double race_time, double time_limit);
+// The game's lap counter of a car: 0 before its first crossing of the start line, then the lap
+// it is on (1 during lap 1). The replay cameras' lap variant comes from it (presentation §H6).
+constexpr int lap_counter(bool started, int completed) { return started ? completed + 1 : 0; }
 
 } // namespace gt3r::race

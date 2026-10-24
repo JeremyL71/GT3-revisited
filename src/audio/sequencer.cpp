@@ -288,6 +288,7 @@ void Sequencer::note_on(VoiceMixer& mixer, int t, u8 key, u8 velocity, s32 lengt
         p.adsr2 = r.adsr2;
         p.reverb = r.reverb();
         p.priority = r.priority;
+        p.bus = VoiceBus::Music; // the music volume scales it, never the effects volume (sound §2.4)
         s.voice = mixer.key_on(p);
     }
 }

@@ -15,15 +15,21 @@ namespace gt3r::render {
 
 namespace {
 
+// The depth targets' clear: the far plane (the depth is reversed, see render::perspective).
+constexpr float kFarDepth = 0.0f;
+
 // Uniform blocks; layouts match model.vert / model.frag (std140).
 struct VertexUniforms {
     float mvp[16];
     float model[16];
     float normal_mat[16];
+    float view_z[4]; // the view matrix's z row (eye-space z of a world point)
+    float fog[4];    // GT3 fog: x distance A, y 1 - minimum visibility, z = 1 on
 };
 // model.vert's VertexLighting (slot 1): GT3's VU lighting per vertex.
 struct VertexLighting {
-    float eye_dir[4]; // towards the viewer (world), w = 1: on
+    float eye_dir[4]; // towards the viewer (world), w = 1: on; w = 2: the viewer's position (local
+                      // viewer); w = 3 / 4: environment pass kind 2 / 3, xyz = the camera's position
     float light_dir[4][4];
     float light_diffuse[4][4];
     float light_specular[4][4];
@@ -32,6 +38,13 @@ struct VertexLighting {
     float mat_diffuse[4];
     float mat_specular[4];
     float mat_emission[4];
+    // Environment passes: the VU's rows (kind 2: the view rotation, x the modelview scale; kind 3:
+    // the panorama's yaw), the weight rows C0 / C1, and kind 3's constants (x = 0.875 - (g + 1) / 8,
+    // y = EC0 / 6, z = 0.5 + EC4).
+    float env_rows[3][4];
+    float env_c0[4];
+    float env_c1[4];
+    float env_pano[4];
 };
 struct FragmentUniforms {
     float light_dir[4];
@@ -71,8 +84,48 @@ struct FragmentUniforms {
 
 } // namespace
 
+std::array<u8, 3> post_grade_pixel(const DrawOptions::PostGrade& g, u8 r, u8 gr, u8 b) {
+    const float d = g.white - g.black, inv = d == 0 ? 0.0f : 1.0f / d;
+    auto table = [&](float i, int c) {
+        float t = (i / 255.0f - g.black) * inv;
+        if (i > 0.5f) t = std::clamp(t, 0.0f, 1.0f); // entry 0 unclamped
+        const float k = std::clamp(g.curve[c], 0.0f, 1.0f);
+        return std::floor(std::clamp(255.0f * (t * t + 2.0f * k * t * (1.0f - t)), 0.0f, 255.0f));
+    };
+    const float in[3] = {float(r), float(gr), float(b)}, w[3] = {0.30f, 0.59f, 0.11f};
+    const float sp = std::min(128.0f * g.saturation, 255.0f), m = std::max(128.0f - sp, 0.0f);
+    std::array<u8, 3> out{};
+    for (int c = 0; c < 3; ++c) {
+        float sum = 0;
+        for (int k = 0; k < 3; ++k) {
+            const float mk = c == k ? std::floor(std::clamp(sp + m * w[k], 0.0f, 255.0f)) : std::floor(m * w[k]);
+            sum += std::floor(table(in[k], c) * mk / 128.0f);
+        }
+        out[size_t(c)] = u8(std::min(sum, 255.0f));
+    }
+    return out;
+}
+
+std::array<u8, 3> sheen_vertex_bytes(const scene::Material& m, const Vec3& light, const float light_spec[3],
+                                     const Vec3& viewer, const Vec3& pos, const Vec3& normal) {
+    const Vec3 d = pos - viewer;
+    const Vec3 r = d - normal * (2.0f * dot(d, normal));
+    const float len = std::max(length(d), 1e-6f);
+    const float c = std::max(dot(normalize(light), r) / len, 0.0f);
+    // The program (exponent) comes from the shininess alone; Ms = 0 just adds nothing.
+    const float p = m.shininess < 6 ? 4.0f : m.shininess < 12 ? 8.0f : 16.0f;
+    std::array<u8, 3> out{};
+    for (int i = 0; i < 3; ++i) {
+        float b = std::floor(light_spec[i] * m.specular[i] * 128.0f * m.scale * std::pow(c, p));
+        out[size_t(i)] = u8(int(std::fmod(b, 256.0f)));
+    }
+    return out;
+}
+
 View3D::~View3D() {
     release_target();
+    if (quad_vb_) SDL_ReleaseGPUBuffer(ctx_.device(), quad_vb_);
+    if (quad_ib_) SDL_ReleaseGPUBuffer(ctx_.device(), quad_ib_);
     release_cube();
     release_offscreen();
     if (placeholder_cube_) SDL_ReleaseGPUTexture(ctx_.device(), placeholder_cube_);
@@ -82,10 +135,11 @@ void View3D::release_target() {
     if (wrapper_) SDL_DestroyTexture(wrapper_);
     wrapper_ = nullptr;
     SDL_GPUDevice* dev = ctx_.device();
-    for (SDL_GPUTexture** t : {&color_, &msaa_, &depth_}) {
+    for (SDL_GPUTexture** t : {&color_, &msaa_, &depth_, &scene_, &last_, &snap_}) {
         if (*t) SDL_ReleaseGPUTexture(dev, *t);
         *t = nullptr;
     }
+    last_valid_ = snap_valid_ = false;
     width_ = height_ = 0;
 }
 
@@ -156,15 +210,34 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
         sx = lr.w / float(lw);
         sy = lr.h / float(lh);
     }
-    sx *= ctx_.render_scale(); // < 1: render smaller, the 2D renderer upscales it
-    sy *= ctx_.render_scale();
-    int pw = std::max(1, int(std::lround(rect.w * sx))), ph = std::max(1, int(std::lround(rect.h * sy)));
-    if (opt.fixed_width > 0 && opt.fixed_height > 0) pw = opt.fixed_width, ph = opt.fixed_height;
-    if (!ensure_target(renderer, pw, ph)) return;
+    // The picture: render_scale < 1 renders smaller and the 2D renderer upscales it. The targets
+    // are sized for the largest scale (render_ceiling), so the dynamic scale only changes how much
+    // of them a frame uses.
+    const float scale = ctx_.render_scale();
+    const float alloc = std::clamp(std::max(scale, ctx_.render_ceiling()), 0.5f, 1.0f);
+    auto px = [](float v) { return std::max(1, int(std::lround(v))); };
+    int pw = px(rect.w * sx * scale), ph = px(rect.h * sy * scale);
+    int aw = px(rect.w * sx * alloc), ah = px(rect.h * sy * alloc);
+    if (opt.fixed_width > 0 && opt.fixed_height > 0) aw = pw = opt.fixed_width, ah = ph = opt.fixed_height;
+    if (!ensure_target(renderer, std::max(aw, pw), std::max(ah, ph))) return;
+    used_w_ = pw, used_h_ = ph;
     SDL_SetTextureScaleMode(wrapper_, opt.nearest ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR);
+    const SDL_GPUViewport used_viewport{0, 0, float(pw), float(ph), 0, 1};
+    const SDL_Rect used_rect{0, 0, pw, ph};
 
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(ctx_.device());
     if (!cmd) return;
+
+    // The dissolve's frozen picture: the last one shown.
+    if (opt.snapshot) {
+        snap_valid_ = last_valid_ && ensure_post(&snap_);
+        if (snap_valid_) {
+            snap_w_ = last_w_, snap_h_ = last_h_;
+            copy_picture(cmd, last_, snap_, last_w_, last_h_);
+        }
+    }
+    const bool post = post_wanted(opt) && ensure_post(&scene_);
+    SDL_GPUTexture* scene_target = post ? scene_ : color_;
 
     SDL_GPUColorTargetInfo ct{};
     ct.clear_color = {opt.clear[0], opt.clear[1], opt.clear[2], opt.clear[3]};
@@ -173,24 +246,56 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
     if (msaa_) {
         ct.texture = msaa_;
         ct.store_op = SDL_GPU_STOREOP_RESOLVE;
-        ct.resolve_texture = color_;
+        ct.resolve_texture = scene_target;
         ct.cycle_resolve_texture = true;
     } else {
-        ct.texture = color_;
+        ct.texture = scene_target;
         ct.store_op = SDL_GPU_STOREOP_STORE;
     }
     SDL_GPUDepthStencilTargetInfo dt{};
     dt.texture = depth_;
-    dt.clear_depth = 1.0f;
+    dt.clear_depth = kFarDepth;
     dt.load_op = SDL_GPU_LOADOP_CLEAR;
     dt.store_op = SDL_GPU_STOREOP_DONT_CARE;
     dt.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
     dt.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
     dt.cycle = true;
     SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &ct, 1, &dt);
+    SDL_SetGPUViewport(pass, &used_viewport);
+    SDL_SetGPUScissor(pass, &used_rect);
     frame_alpha_written_ = false;
     encode(cmd, pass, view, proj, eye, items, opt);
     SDL_EndGPURenderPass(pass);
+    if (post) {
+        // The finished picture (graded), then the frozen one and the last one over it.
+        SDL_GPUColorTargetInfo pt{};
+        pt.load_op = SDL_GPU_LOADOP_DONT_CARE;
+        if (msaa_) {
+            pt.texture = msaa_;
+            pt.store_op = SDL_GPU_STOREOP_RESOLVE;
+            pt.resolve_texture = color_;
+            pt.cycle_resolve_texture = true;
+        } else {
+            pt.texture = color_;
+            pt.store_op = SDL_GPU_STOREOP_STORE;
+        }
+        pt.cycle = true;
+        SDL_GPUDepthStencilTargetInfo pd = dt;
+        pass = SDL_BeginGPURenderPass(cmd, &pt, 1, &pd);
+        encode_post(cmd, pass, scene_, pw, ph, 1.0f, opt.post_grade.on ? &opt.post_grade : nullptr);
+        if (opt.dissolve > 0 && snap_valid_)
+            encode_post(cmd, pass, snap_, snap_w_, snap_h_, std::min(opt.dissolve, 1.0f), nullptr);
+        if (opt.trail > 0 && last_valid_)
+            encode_post(cmd, pass, last_, last_w_, last_h_, std::min(opt.trail, 1.0f), nullptr);
+        SDL_EndGPURenderPass(pass);
+    }
+    if (opt.keep_last && ensure_post(&last_)) {
+        copy_picture(cmd, color_, last_, pw, ph);
+        last_valid_ = true;
+        last_w_ = pw, last_h_ = ph;
+    } else if (!opt.keep_last) {
+        last_valid_ = false;
+    }
     if (capture_.count > 0) capture_frame(cmd);
     SDL_SubmitGPUCommandBuffer(cmd);
     if (capture_.count > 0 && capture_.frame == capture_.first + capture_.count) write_capture();
@@ -208,8 +313,113 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
         SDL_SetTextureBlendMode(wrapper_, kColourOnly);
     }
     SDL_SetTextureAlphaModFloat(wrapper_, std::clamp(opt.composite_alpha, 0.0f, 1.0f));
-    SDL_RenderTexture(renderer, wrapper_, nullptr, &rect);
+    // The used corner, upscaled. Linear filtering would blend the texel beyond its right and
+    // bottom edges (unused, the clear colour) into the last pixels: stop half a texel short.
+    const float inset = opt.nearest ? 0.0f : 0.5f;
+    const SDL_FRect src{0, 0, float(pw) - (pw < width_ ? inset : 0.0f), float(ph) - (ph < height_ ? inset : 0.0f)};
+    SDL_RenderTexture(renderer, wrapper_, &src, &rect);
     SDL_SetTextureAlphaModFloat(wrapper_, 1.0f);
+}
+
+bool View3D::post_wanted(const DrawOptions& o) const {
+    return o.post_grade.on || (o.dissolve > 0 && snap_valid_) || (o.trail > 0 && last_valid_);
+}
+
+// A picture-sized texture of the post-process passes (created on first use).
+bool View3D::ensure_post(SDL_GPUTexture** t) {
+    if (*t) return true;
+    if (width_ <= 0 || height_ <= 0) return false;
+    SDL_GPUTextureCreateInfo ti{};
+    ti.type = SDL_GPU_TEXTURETYPE_2D;
+    ti.width = u32(width_), ti.height = u32(height_);
+    ti.layer_count_or_depth = 1;
+    ti.num_levels = 1;
+    ti.format = GpuContext::kColorFormat;
+    ti.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    *t = SDL_CreateGPUTexture(ctx_.device(), &ti);
+    if (!*t) LOG_WARN("3D post-process target %dx%d: %s", width_, height_, SDL_GetError());
+    return *t != nullptr;
+}
+
+void View3D::copy_picture(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* from, SDL_GPUTexture* to, int w, int h) {
+    SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureLocation src{}, dst{};
+    src.texture = from, dst.texture = to;
+    SDL_CopyGPUTextureToTexture(cp, &src, &dst, u32(w), u32(h), 1, true); // the picture's corner
+    SDL_EndGPUCopyPass(cp);
+}
+
+// One picture (its picture_w x picture_h corner of a target-sized texture) over this frame's
+// picture through the model shader's post mode (params.w 5): sampled 1:1 when the sizes match
+// (scaled when the dynamic scale changed since it was taken), graded when `grade` is given,
+// blended at `alpha` (1: replaces).
+void View3D::encode_post(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, SDL_GPUTexture* picture, int picture_w,
+                         int picture_h, float alpha, const DrawOptions::PostGrade* grade) {
+    if (picture_w <= 0 || picture_h <= 0) return;
+    // The quad's texture coordinates span the whole texture: a viewport that many target-sizes
+    // across puts the picture's corner over this frame's (the whole target when the sizes match);
+    // the scissor keeps to this frame's.
+    SDL_GPUViewport vp{0, 0, float(width_), float(height_), 0, 1};
+    if (picture_w != used_w_ || picture_h != used_h_) {
+        vp.w = float(used_w_) * float(width_) / float(picture_w);
+        vp.h = float(used_h_) * float(height_) / float(picture_h);
+        // Past the smallest viewport limit Vulkan allows: an old picture from a much smaller scale.
+        if (vp.w > std::max(4096.0f, float(width_)) || vp.h > std::max(4096.0f, float(height_))) return;
+    }
+    const SDL_Rect sc{0, 0, used_w_, used_h_};
+    SDL_SetGPUViewport(pass, &vp);
+    SDL_SetGPUScissor(pass, &sc);
+    if (!quad_vb_) {
+        // Clip-space corners (an identity transform), texture rows from the top (SDL_GPU).
+        scene::Vertex v[4] = {};
+        const float xy[4][2] = {{-1, 1}, {1, 1}, {-1, -1}, {1, -1}}, uv[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+        for (int i = 0; i < 4; ++i) {
+            v[i].pos[0] = xy[i][0], v[i].pos[1] = xy[i][1], v[i].pos[2] = 0;
+            v[i].normal[2] = 1;
+            v[i].uv[0] = uv[i][0], v[i].uv[1] = uv[i][1];
+        }
+        const u32 idx[6] = {0, 2, 1, 1, 2, 3};
+        Uploader up(ctx_.device());
+        quad_vb_ = up.buffer(SDL_GPU_BUFFERUSAGE_VERTEX, v, sizeof(v));
+        quad_ib_ = up.buffer(SDL_GPU_BUFFERUSAGE_INDEX, idx, sizeof(idx));
+        up.submit();
+        if (!quad_vb_ || !quad_ib_) return;
+    }
+    PipelineKey key;
+    key.blend = alpha >= 1.0f ? BlendMode::Opaque : BlendMode::Alpha;
+    key.cull = CullMode::None;
+    key.depth_write = false;
+    SDL_GPUGraphicsPipeline* p = ctx_.pipeline(key);
+    if (!p) return;
+    SDL_BindGPUGraphicsPipeline(pass, p);
+    SDL_GPUBufferBinding vb{quad_vb_, 0}, ib{quad_ib_, 0};
+    SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
+    SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+    VertexUniforms vu{};
+    const Mat4 id;
+    std::copy(id.m.begin(), id.m.end(), vu.mvp);
+    std::copy(id.m.begin(), id.m.end(), vu.model);
+    std::copy(id.m.begin(), id.m.end(), vu.normal_mat);
+    SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof(vu));
+    VertexLighting off{};
+    SDL_PushGPUVertexUniformData(cmd, 1, &off, sizeof(off));
+    SDL_GPUTextureSamplerBinding sbs[3] = {{picture, ctx_.sampler(true, true)},
+                                           {placeholder_cube(), ctx_.sampler(true, true)},
+                                           {ctx_.white_texture(), ctx_.sampler(true, true)}};
+    SDL_BindGPUFragmentSamplers(pass, 0, sbs, 3);
+    FragmentUniforms fu{};
+    fu.params[0] = -1, fu.params[1] = 1, fu.params[3] = 5;
+    fu.tint[0] = fu.tint[1] = fu.tint[2] = 1, fu.tint[3] = alpha;
+    fu.light_dir[1] = 1;
+    if (grade) {
+        for (int i = 0; i < 3; ++i) fu.grade[i] = grade->curve[i];
+        fu.grade[3] = grade->saturation;
+        fu.grade2[0] = grade->black, fu.grade2[1] = grade->white, fu.grade2[2] = 1;
+    }
+    SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
+    SDL_DrawGPUIndexedPrimitives(pass, 6, 1, 0, 0, 0);
+    ++stats_.draw_calls;
 }
 
 bool View3D::draw_to(SDL_GPUTexture* target, int w, int h, const Mat4& view, const Mat4& proj, const Vec3& eye,
@@ -260,7 +470,7 @@ bool View3D::draw_to(SDL_GPUTexture* target, int w, int h, const Mat4& view, con
     }
     SDL_GPUDepthStencilTargetInfo dt{};
     dt.texture = o.depth;
-    dt.clear_depth = 1.0f;
+    dt.clear_depth = kFarDepth;
     dt.load_op = SDL_GPU_LOADOP_CLEAR;
     dt.store_op = SDL_GPU_STOREOP_DONT_CARE;
     dt.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
@@ -276,12 +486,12 @@ bool View3D::draw_to(SDL_GPUTexture* target, int w, int h, const Mat4& view, con
 void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Mat4& view, const Mat4& proj,
                     const Vec3& eye, const std::vector<DrawItem>& items, const DrawOptions& opt) {
     const Mat4 view_proj = proj * view;
-    // Wireframe lines are pulled slightly towards the camera to avoid z-fighting.
+    // Wireframe lines are pulled slightly towards the camera (to a larger depth) to avoid z-fighting.
     Mat4 line_proj = proj;
-    for (int c = 0; c < 4; ++c) line_proj.at(2, c) -= 1e-4f * proj.at(3, c);
+    for (int c = 0; c < 4; ++c) line_proj.at(2, c) += 1e-4f * proj.at(3, c);
     const Mat4 line_view_proj = line_proj * view;
 
-    // Frustum planes (clip depth 0..1): w+x, w-x, w+y, w-y, z, w-z.
+    // Frustum planes (clip depth 0..w, far..near): w+x, w-x, w+y, w-y, z, w-z.
     float planes[6][4];
     for (int i = 0; i < 4; ++i) {
         float r0 = view_proj.at(0, i), r1 = view_proj.at(1, i), r2 = view_proj.at(2, i), r3 = view_proj.at(3, i);
@@ -304,8 +514,6 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
     fu.fog_params[1] = 1.0f / std::max(opt.fog_end - opt.fog_start, 1e-3f);
     fu.fog_params[2] = opt.fog_max;
     fu.fog_params[3] = opt.fog_gt3 ? 1.0f : 0.0f;
-    for (int i = 0; i < 4; ++i) fu.grade[i] = opt.grade[i];
-    fu.grade2[0] = opt.grade_black, fu.grade2[1] = opt.grade_white, fu.grade2[2] = opt.grade_saturation_first ? 1.0f : 0.0f;
     for (int i = 0; i < 3; ++i) {
         fu.light_ambient[i] = opt.light_ambient[i], fu.light_diffuse[i] = opt.light_diffuse[i];
         fu.env_sky[i] = opt.env_sky[i], fu.env_horizon[i] = opt.env_horizon[i], fu.env_ground[i] = opt.env_ground[i];
@@ -391,10 +599,12 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
         if (pushed == &v && pushed_lines == lines) return;
         Mat4 mvp = (lines ? line_view_proj : view_proj) * v.world;
         Mat4 nm = transpose(inverse(v.world));
-        VertexUniforms vu;
+        VertexUniforms vu{};
         std::copy(mvp.m.begin(), mvp.m.end(), vu.mvp);
         std::copy(v.world.m.begin(), v.world.m.end(), vu.model);
         std::copy(nm.m.begin(), nm.m.end(), vu.normal_mat);
+        for (int i = 0; i < 4; ++i) vu.view_z[i] = view.at(2, i);
+        vu.fog[0] = opt.fog_start, vu.fog[1] = opt.fog_max, vu.fog[2] = opt.fog_gt3 ? 1.0f : 0.0f;
         SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof(vu));
         pushed = &v;
         pushed_lines = lines;
@@ -430,9 +640,8 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
             if (!v.item->frame_alpha) return;
             key.blend = BlendMode::Opaque, key.alpha = AlphaWrite::Only;
         } else if (v.item->frame_alpha && !key.coverage) {
-            bool sheen_pass = (p.flags & scene::kAdditive) && (p.flags & scene::kEnvironmentMap) && p.texture >= 0 &&
-                              !(p.flags & scene::kUnlit);
-            if (sheen_pass) key.blend = BlendMode::DestAlphaAdd; // Cs * Ad + Cd, alpha kept
+            if ((p.flags & scene::kAdditive) && (p.flags & scene::kDestAlphaAdd))
+                key.blend = BlendMode::DestAlphaAdd; // GS ALPHA 0x58: Cs * Ad + Cd, alpha kept
             else if (!(p.flags & scene::kKeepAlpha)) key.alpha = AlphaWrite::Write;
             frame_alpha_written_ = frame_alpha_written_ || key.alpha != AlphaWrite::Keep;
         }
@@ -446,7 +655,7 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
             textured = true;
         } else if (p.texture >= 0) {
             const GpuModel::TextureInfo& t = model->textures()[size_t(p.texture)];
-            if (t.texture) sb = {t.texture, ctx_.sampler(t.clamp_u, t.clamp_v)};
+            if (t.texture) sb = {t.texture, ctx_.sampler(t.clamp_u, t.clamp_v, t.no_mips)};
             textured = t.texture != nullptr;
         }
         SDL_GPUTextureSamplerBinding sbs[3] = {sb, {env_tex, ctx_.sampler(true, true)}, sphere_sb};
@@ -463,18 +672,23 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
         fu.params[1] = (p.flags & scene::kUnlit) ? 1.0f : 0.0f;
         // kAdditive | kEnvironmentMap: car reflection pass when kUnlit is set or nothing is
         // bound (the PS2 binds the env map at run time; a bound texture only supplies the
-        // per-pixel reflectivity in its alpha); otherwise the textured course road sheen.
+        // per-pixel reflectivity in its alpha).
         bool env_add = (p.flags & scene::kAdditive) && (p.flags & scene::kEnvironmentMap);
         bool reflection = env_add && ((p.flags & scene::kUnlit) || !textured);
-        bool sheen = env_add && !reflection;
+        // The course road sheen: GT3's specular-only VU program (scene::Material::specular_local).
+        bool sheen = p.material.valid && p.material.specular_local && !(p.flags & scene::kUnlit);
         fu.params[2] = reflection ? opt.reflection_strength
-                       : sheen    ? opt.sheen_strength
                        : (p.flags & scene::kEnvironmentMap) ? opt.env_strength
                                                             : 0.0f;
         fu.params[3] = reflection ? 3.0f : sheen ? 2.0f : 0.0f;
         // Prize scenes (.prm, DrawItem::sphere_map): a textured kEnvironmentMap primitive
         // carries its own sphere map, sampled from the view-space normal.
-        if (v.item->sphere_map && (p.flags & scene::kEnvironmentMap) && textured) {
+        // Course environment passes (kinds 2 and 3): UVs and colour weight per vertex
+        // (model.vert), then texture x vertex colour like any unlit packet.
+        const bool vertex_env = v.item->sphere_map && (p.flags & scene::kEnvironmentMap) && textured && p.env_kind != 0;
+        if (vertex_env) {
+            fu.params[1] = 1.0f, fu.params[2] = 0.0f, fu.params[3] = 0.0f;
+        } else if (v.item->sphere_map && (p.flags & scene::kEnvironmentMap) && textured) {
             fu.params[3] = 4.0f;
             // Additive layers (GS ALPHA 0x58: Cs * Ad + Cd) are weighted by the frame
             // buffer alpha the base pass wrote (1.0 on these models), not by the texel alpha.
@@ -516,7 +730,7 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
                 dirs[k][3] = on ? 1.0f : 0.0f;
             }
         }
-        if (reflection) fu.params[2] *= v.item->reflection_scale;
+        if (reflection && !vertex_env) fu.params[2] *= v.item->reflection_scale;
         fu.env_c0[3] = p.env_rows ? 1.0f : 0.0f;
         for (int i = 0; i < 3; ++i) fu.env_c0[i] = p.env_c0[i], fu.env_c1[i] = p.env_c1[i];
         const scene::Material& mt = p.material;
@@ -530,20 +744,56 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
             // The GS uses the lit colour as is without a texture (255 = 1.0) and as a MODULATE
             // factor with one (0x80 = 1.0): untextured packets show it at 128/255.
             fu.mat_emission[3] = textured ? 1.0f : 128.0f / 255.0f;
-            // GT3's VU kernels quantise the exponent: shininess < 6 -> 4, < 12 -> 8, else 16.
+            // GT3's VU kernels quantise the exponent: shininess < 6 -> 4, < 12 -> 8, else 16. The
+            // sheen's program is picked from the shininess alone (some course materials have
+            // Ms = 0 and a shininess of ~0: p 4, adding nothing).
             bool spec = mt.specular[0] > 0 || mt.specular[1] > 0 || mt.specular[2] > 0;
-            fu.mat_specular[3] = !spec ? 0.0f : mt.shininess < 6 ? 4.0f : mt.shininess < 12 ? 8.0f : 16.0f;
+            fu.mat_specular[3] = !spec && !sheen ? 0.0f : mt.shininess < 6 ? 4.0f : mt.shininess < 12 ? 8.0f : 16.0f;
         }
         fu.fog_color[3] = opt.fog && !background && !v.item->helper ? 1.0f : 0.0f;
         fu.tint[3] = std::max(v.item->alpha, 0.0f); // > 1 (blended items): the blend clamps
         // GT3's lighting runs per vertex (the VU), with the infinite viewer: the lights and
-        // material go to the vertex shader.
-        const bool vertex_lit = mt.valid && fu.params[1] < 0.5f && fu.params[3] < 0.5f;
-        if (vertex_lit || vl_on) {
+        // material go to the vertex shader. The sheen's program has a local viewer instead:
+        // GT3's light model viewer (0, 2, 0) in eye space, 2 m along the camera's up axis.
+        const bool vertex_lit = mt.valid && fu.params[1] < 0.5f && (fu.params[3] < 0.5f || sheen);
+        if (vertex_lit || vertex_env || vl_on) {
             VertexLighting vl{};
-            if (vertex_lit) {
+            if (vertex_env) {
+                // The VU's environment programs read the camera's position in object space
+                // through a rigid inverse of the modelview (the backdrop: scale s, so s^2 x camera).
+                const float s = v.item->modelview_scale;
+                for (int i = 0; i < 3; ++i) vl.eye_dir[i] = s * s * fu.camera_pos[i];
+                vl.eye_dir[3] = p.env_kind == 3 ? 4.0f : 3.0f;
+                for (int i = 0; i < 3; ++i) vl.env_c0[i] = p.env_c0[i], vl.env_c1[i] = p.env_c1[i];
+                vl.env_c0[3] = p.env_alpha[0], vl.env_c1[3] = p.env_alpha[1];
+                if (p.env_kind == 2) {
+                    for (int r = 0; r < 3; ++r)
+                        for (int i = 0; i < 3; ++i) vl.env_rows[r][i] = s * view.at(r, i);
+                } else {
+                    // Kind 3: yawed by 45 (g + 1) degrees about y, g from the sign of the summed
+                    // components of the op 0x31 point minus the camera, or of the camera's forward
+                    // (GT3 sums them instead of rotating them; 0 when the sum is positive, else 4).
+                    Vec3 d = p.env_point ? Vec3{p.env_point_pos[0] - fu.camera_pos[0], p.env_point_pos[1] - fu.camera_pos[1],
+                                                p.env_point_pos[2] - fu.camera_pos[2]}
+                                         : Vec3{-view.at(2, 0), -view.at(2, 1), -view.at(2, 2)};
+                    const float g = d.x + d.y + d.z > 0 ? 0.0f : 4.0f;
+                    const float phi = 0.78539816f * (g + 1.0f), c = std::cos(phi), sn = std::sin(phi);
+                    const float rows[3][3] = {{c, 0, -sn}, {0, 1, 0}, {sn, 0, c}};
+                    for (int r = 0; r < 3; ++r)
+                        for (int i = 0; i < 3; ++i) vl.env_rows[r][i] = rows[r][i];
+                    vl.env_pano[0] = 0.875f - (g + 1.0f) / 8.0f;
+                    vl.env_pano[1] = opt.panorama[0] / 6.0f;
+                    vl.env_pano[2] = 0.5f + opt.panorama[1];
+                }
+            } else if (vertex_lit) {
                 for (int i = 0; i < 3; ++i) vl.eye_dir[i] = view.at(2, i);
                 vl.eye_dir[3] = 1;
+                if (sheen) {
+                    constexpr float kViewerUp = 2.0f; // GT3's light model viewer (0, 2, 0) in eye space
+                    const float s = v.item->modelview_scale;
+                    for (int i = 0; i < 3; ++i) vl.eye_dir[i] = s * s * fu.camera_pos[i] + kViewerUp * s * view.at(1, i);
+                    vl.eye_dir[3] = 2;
+                }
                 const float* dirs[4] = {fu.light_dir, fu.light2_dir, fu.light3_dir, fu.light4_dir};
                 const float* difs[4] = {fu.light_diffuse, fu.light2_diffuse, fu.light3_diffuse, fu.light4_diffuse};
                 const float* spes[4] = {fu.light_specular, fu.light2_specular, fu.light3_specular, fu.light4_specular};
@@ -562,7 +812,7 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
                 std::copy(std::begin(fu.mat_emission), std::end(fu.mat_emission), vl.mat_emission);
             }
             SDL_PushGPUVertexUniformData(cmd, 1, &vl, sizeof(vl));
-            vl_on = vertex_lit;
+            vl_on = vertex_lit || vertex_env;
         }
         SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
         SDL_DrawGPUIndexedPrimitives(pass, p.index_count, 1, v.mesh->index_offset + p.first_index,
@@ -582,32 +832,44 @@ void View3D::encode(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, const Ma
     for (const Visible& v : vis)
         if (v.item->background && solid)
             for (const scene::Primitive& p : v.mesh->primitives) draw_prim(v, p);
-    // Opaque and alpha-tested.
-    for (const Visible& v : vis)
-        if (!v.item->background && (solid || v.item->helper))
-            for (const scene::Primitive& p : v.mesh->primitives) {
-                if (v.item->alpha < 1.0f) continue;
-                if (!prim_blended(p)) draw_prim(v, p);
-                else if (split(p)) draw_prim(v, p, 1);
-            }
-    // Blended: model order, or back to front by mesh distance.
+    auto draw_blended = [&](const Visible& v) {
+        for (const scene::Primitive& p : v.mesh->primitives)
+            if (prim_blended(p) || v.item->alpha < 1.0f) draw_prim(v, p, split(p) && v.item->alpha >= 1.0f ? 2 : 0);
+    };
+    // Opaque and alpha-tested, item by item; an in-order item's blended primitives follow its
+    // opaque ones, in model order, before the next item's opaque ones (DrawItem::in_order_join
+    // items count as part of the in-order item before them).
+    auto same_run = [&](size_t i) { // vis[i] belongs to the run of vis[i - 1]
+        const DrawItem* a = vis[i - 1].item;
+        const DrawItem* b = vis[i].item;
+        return a == b || (a->in_order && b->in_order && b->in_order_join);
+    };
+    size_t run = 0; // first entry of the current item (or joined items)
+    for (size_t i = 0; i < vis.size(); ++i) {
+        const Visible& v = vis[i];
+        if (i > 0 && !same_run(i)) run = i;
+        if (v.item->background || !(solid || v.item->helper)) continue;
+        for (const scene::Primitive& p : v.mesh->primitives) {
+            if (v.item->alpha < 1.0f) continue;
+            if (!prim_blended(p)) draw_prim(v, p);
+            else if (split(p)) draw_prim(v, p, 1);
+        }
+        if (v.item->in_order && (i + 1 == vis.size() || !same_run(i + 1)))
+            for (size_t k = run; k <= i; ++k) draw_blended(vis[k]);
+    }
+    // The other blended primitives: model order, or back to front by mesh distance.
     std::vector<const Visible*> blended;
     for (const Visible& v : vis)
-        if (!v.item->background && (solid || v.item->helper))
+        if (!v.item->background && !v.item->in_order && (solid || v.item->helper))
             for (const scene::Primitive& p : v.mesh->primitives)
                 if (prim_blended(p) || v.item->alpha < 1.0f) {
                     blended.push_back(&v);
                     break;
                 }
-    if (opt.sort_blended) // in-order items first (in model order), then the rest back to front
-        std::stable_sort(blended.begin(), blended.end(), [](const Visible* a, const Visible* b) {
-            if (a->item->in_order != b->item->in_order) return a->item->in_order;
-            return !a->item->in_order && a->dist > b->dist;
-        });
-    for (const Visible* v : blended)
-        for (const scene::Primitive& p : v->mesh->primitives)
-            if (prim_blended(p) || v->item->alpha < 1.0f)
-                draw_prim(*v, p, split(p) && v->item->alpha >= 1.0f ? 2 : 0);
+    if (opt.sort_blended)
+        std::stable_sort(blended.begin(), blended.end(),
+                         [](const Visible* a, const Visible* b) { return a->dist > b->dist; });
+    for (const Visible* v : blended) draw_blended(*v);
     // Wireframe.
     if (opt.wire != WireMode::Off)
         for (const Visible& v : vis) {
@@ -640,14 +902,14 @@ void View3D::capture_from_env() {
 void View3D::capture_frame(SDL_GPUCommandBuffer* cmd) {
     int k = capture_.frame++ - capture_.first;
     if (k < 0 || k >= capture_.count) return;
-    if (k == 0) capture_.w = width_, capture_.h = height_;
-    if (width_ != capture_.w || height_ != capture_.h) return;
+    if (k == 0) capture_.w = used_w_, capture_.h = used_h_;
+    if (used_w_ != capture_.w || used_h_ != capture_.h) return; // one size per capture
     SDL_GPUTextureCreateInfo ti{};
     ti.type = SDL_GPU_TEXTURETYPE_2D;
     ti.format = GpuContext::kColorFormat;
     ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
-    ti.width = u32(width_);
-    ti.height = u32(height_);
+    ti.width = u32(used_w_);
+    ti.height = u32(used_h_);
     ti.layer_count_or_depth = 1;
     ti.num_levels = 1;
     SDL_GPUTexture* t = SDL_CreateGPUTexture(ctx_.device(), &ti);
@@ -657,7 +919,7 @@ void View3D::capture_frame(SDL_GPUCommandBuffer* cmd) {
     SDL_GPUTextureLocation src{}, dst{};
     src.texture = color_;
     dst.texture = t;
-    SDL_CopyGPUTextureToTexture(cp, &src, &dst, u32(width_), u32(height_), 1, false);
+    SDL_CopyGPUTextureToTexture(cp, &src, &dst, u32(used_w_), u32(used_h_), 1, false);
     SDL_EndGPUCopyPass(cp);
 }
 
@@ -798,7 +1060,7 @@ SDL_GPUTexture* View3D::render_offscreen(int slot, int w, int h, const Mat4& vie
     }
     SDL_GPUDepthStencilTargetInfo dt{};
     dt.texture = o.depth;
-    dt.clear_depth = 1.0f;
+    dt.clear_depth = kFarDepth;
     dt.load_op = SDL_GPU_LOADOP_CLEAR;
     dt.store_op = SDL_GPU_STOREOP_DONT_CARE;
     dt.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
@@ -863,9 +1125,12 @@ SDL_GPUTexture* View3D::render_env_cube(const Vec3& pos, const std::vector<DrawI
     if (!ensure_cube(size)) return nullptr;
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(ctx_.device());
     if (!cmd) return nullptr;
-    // Standard cube-map face frames (direction, up), as the sampler addresses them.
+    // Standard cube-map face frames (direction, up), as the sampler addresses them: texel row 0
+    // of a side face is +Y, of +Y / -Y it is -Z / +Z. SDL_GPU stores a target's top row (NDC +Y)
+    // first, so that direction is each face camera's up (OpenGL's table negates them for its
+    // bottom-up rows; with the x mirror below it turned every face half a turn).
     static const Vec3 kDir[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-    static const Vec3 kUp[6] = {{0, -1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}, {0, -1, 0}, {0, -1, 0}};
+    static const Vec3 kUp[6] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
     // Cube faces are seen from inside, left-handed: mirror x in clip space.
     Mat4 proj = perspective(1.5707963f, 1.0f, 0.1f, std::max(opt.draw_distance, 10.0f) * 1.5f);
     for (int c = 0; c < 4; ++c) proj.at(0, c) = -proj.at(0, c);
@@ -898,7 +1163,7 @@ SDL_GPUTexture* View3D::render_env_cube(const Vec3& pos, const std::vector<DrawI
         cycle = false;
         SDL_GPUDepthStencilTargetInfo dt{};
         dt.texture = cube_depth_;
-        dt.clear_depth = 1.0f;
+        dt.clear_depth = kFarDepth;
         dt.load_op = SDL_GPU_LOADOP_CLEAR;
         dt.store_op = SDL_GPU_STOREOP_DONT_CARE;
         dt.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;

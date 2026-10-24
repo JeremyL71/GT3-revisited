@@ -8,6 +8,7 @@
 #include "vfs/vfs.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <utility>
 
@@ -18,7 +19,7 @@ namespace {
 using menu::flow::key_bit;
 using menu::flow::MenuKey;
 
-// Per view mode: allowed targets (bit per target), as in the game (spec presentation.md §G).
+// Per view mode: allowed targets (bit per target), as in the game (presentation §G).
 constexpr int kTargetMask[4] = {1, 4, 7, 1};
 constexpr int kDefaultTarget[4] = {0, 2, 2, 0};
 
@@ -56,7 +57,15 @@ int ReplaySettings::current_target() const {
     return target_allowed(m, target[size_t(m)]) ? target[size_t(m)] : default_target(m);
 }
 
-void ReplaySettings::cycle_mode(int dir) { mode = ((std::clamp(mode, 0, 3) + dir) % 4 + 4) % 4; }
+AttractView pick_attract_view(float r, int& since_avant_garde) {
+    AttractView v;
+    v.mode = r < 0.33f ? 0 : r < 0.66f ? 2 : 1;
+    if (since_avant_garde + 1 >= 4) v.mode = 1;
+    if (v.mode == 2) v.target = int(r * 100.0f) % 3;
+    if (v.mode == 1) v.target = 2, since_avant_garde = 0;
+    ++since_avant_garde;
+    return v;
+}
 
 ReplaySettings ReplaySettings::load(const IniDocument& cfg) {
     ReplaySettings s;
@@ -71,6 +80,8 @@ ReplaySettings ReplaySettings::load(const IniDocument& cfg) {
     if (auto v = get("replay_bgm")) s.bgm = to_lower(*v) != "off";
     if (auto v = get("replay_se")) s.se = to_lower(*v) != "off";
     if (auto v = get("replay_screen")) s.split = to_lower(*v) != "single";
+    if (auto v = get("replay_level")) s.level = std::clamp(float(std::atof(v->c_str())), 0.0f, 1.0f);
+    if (auto v = get("replay_music_cuts")) s.music_cuts = to_lower(*v) == "on" ? 1.0f : 0.0f;
     return s;
 }
 
@@ -82,6 +93,10 @@ void ReplaySettings::save(IniDocument& cfg) const {
     cfg.set("options", "replay_bgm", bgm ? "on" : "off");
     cfg.set("options", "replay_se", se ? "on" : "off");
     cfg.set("options", "replay_screen", split ? "split" : "single");
+    char lv[16];
+    std::snprintf(lv, sizeof(lv), "%.1f", double(level));
+    cfg.set("options", "replay_level", lv);
+    cfg.set("options", "replay_music_cuts", music_cuts >= 0.5f ? "on" : "off");
 }
 
 void ReplayOptions::open(const ReplaySettings& s, bool two_player) {
@@ -166,8 +181,9 @@ bool ReplayOptions::tick(u16 held) {
             return true;
         }
         switch (row_) {
-        case RowMode:
+        case RowMode: // (the avant-garde mode stores BGM on)
             s_.mode = c;
+            if (ReplaySettings::bgm_forced(c)) s_.bgm = true;
             col_[RowTarget] = s_.current_target();
             break;
         case RowTarget: s_.target[size_t(s_.mode)] = c; break;

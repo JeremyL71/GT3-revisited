@@ -23,6 +23,7 @@
 #include "game/net_car.h"
 #include "race/paint.h"
 #include "sim/car_spec.h"
+#include "sim/sim_types.h"
 
 #include <functional>
 #include <memory>
@@ -75,7 +76,7 @@ public:
     // The program's built-in record names (time-trial seeds, three per challenge: 30), read
     // from the disc's CORE.GT3 at load (empty when the program or its table is not found).
     std::vector<std::string> builtin_names;
-    // Arcade mode (spec §16). gcf tag 8: course lists per game ("SINGLE_RACE",
+    // Arcade mode (gt_mode §16). gcf tag 8: course lists per game ("SINGLE_RACE",
     // "TIME_ATTACK" = free run, "TWO_PLAYER", "I_LINK"), each course with its
     // unlock level 0..5.
     struct ArcadeCourse {
@@ -137,7 +138,7 @@ enum class Check {
 };
 const char* check_name(Check c);
 
-// Entry rules of one event for one car (spec gt_mode.md §8).
+// Entry rules of one event for one car (gt_mode §8).
 struct EntryResult {
     bool dirt_tires = false;   // dirt tyres required and not owned
     bool license = false;      // required license not held
@@ -206,7 +207,7 @@ public:
     // Adds the car (newest first) and pays; returns its garage index or -1.
     // The first car becomes the ride car.
     int buy_car(const std::string& car, int color = 0);
-    // Trade (spec §19): buying a friend's car from a guest garage. The model's flag bit 1
+    // Trade (gt_mode §19): buying a friend's car from a guest garage. The model's flag bit 1
     // refuses it (NotForBuy, e.g. the S2000 variants, Stratos, 996 GT3), then money
     // (catalogue price), then a full garage.
     Check can_buy_guest_car(const GarageCar& c) const;
@@ -253,10 +254,30 @@ public:
     bool wash();
     Check can_change_oil() const;
     bool change_oil();
-    // Engine output factor from the car's condition (break-in, wear, oil).
+    // Engine output factor from the car's condition (break-in, wear, oil; physics §10.3).
     static float engine_factor(const CarCondition& c);
-    // Adds distance driven by a garage car (odometer, wear, oil, totals).
-    void drive(int car_index, double metres);
+    // How used the oil is, 0 (fresh) .. 1 (used), as the oil change page shows it: after an oil
+    // change (O < 0) the share of its 300 km driven, (O + 300,000) / 300,000; from O = 0 (a new
+    // car's oil, or 300 km after a change, when O jumps to 300,000) O / 300,000, at most 1
+    // (gt_mode §13).
+    static float oil_age(float oil_m);
+
+    // --- Engine condition through a run (gt_mode §13.1, physics §10.3) ----------
+    // The runs that carry the car's engine condition and hand it back: GT races and
+    // championships, machine tests, free runs, arcade races. Licence tests, time trials and
+    // 2 Player Battle run with a fresh engine and hand nothing back.
+    static bool carries_engine_condition(const std::string& mode);
+    // The condition words a run of a garage car starts with (odometer in 2 m units).
+    static sim::EngineCondition run_condition(const CarCondition& c);
+    // The same words after `metres` driven forward in one piece (the race's counters
+    // advance this way tick by tick); for tests and the development fake race.
+    static sim::EngineCondition driven(sim::EngineCondition c, float metres);
+    // After such a run: the garage car (index into the garage; -1 = not a garage car)
+    // takes the words back, and the total distance grows by the odometer units the run
+    // added (2 m each).
+    void end_run(int car_index, const sim::EngineCondition& end, u32 odometer_added);
+    // Index of a car of this garage, -1 for any other car (a guest garage's, a copy).
+    int garage_index(const GarageCar& c) const;
 
     // --- Licenses ---------------------------------------------------------
     static int license_index_of(const std::string& code); // 0..5 for L0B/L0A/LIB/LIA/L0S/L0R, else -1
@@ -291,26 +312,46 @@ public:
     Award record_round(int place, const std::vector<int>& order = {});
     // Opponents of the current championship (car variant labels).
     const std::vector<std::string>& championship_field() const { return state_.championship.entrants; }
-    // Random opponents for a race (the original's pool draw, spec §20.4), cars - 1 of them.
+    // Random opponents for a race (the original's pool draw, gt_mode §20.4), cars - 1 of them.
     std::vector<std::string> pick_opponents(const std::string& code, GameRandom& rng = race_info_random());
 
-    // Records (the records menu): best results per key, best first.
+    // Records (the records menu): best results per key, best first (gt_mode §17). The new
+    // entry goes to the first place that is empty or whose value is not better, so it ranks
+    // ahead of an equal one; it gets the last name entered, the day and the clock's stamp.
     // Returns the rank the new entry got (0 = best), -1 when it did not make the list.
     int add_record(const std::string& key, double value, const std::string& car, bool ascending, size_t max);
+    // A finished machine-test run (`code` M400 / M1000: its time in seconds; MMAX: its top
+    // speed in km/h) with the ride car `car`: its ranking ("mt:<code>", 12 places) and the
+    // best of the test (GameState::machine). Returns the rank (-1 = not ranked).
+    int record_machine_test(const std::string& code, double value, const std::string& car);
+    // Course time trials (gt_mode §17): the free runs' rankings, one per course of the arcade
+    // TIME_ATTACK course list (its index = the save's slot, -1 = no ranking for the course).
+    int course_time_trial_index(const std::string& course) const;
+    // A free run (the arcade time attack or GT Mode's free run) that ended with a best lap
+    // (seconds) driven in `car`: its course's ranking ("ct:<course>", 12 places). Returns the
+    // rank (-1 = not ranked, no such course, or no lap).
+    int record_course_time_trial(const std::string& course, double best_lap, const std::string& car);
 
     // Championship trophy for the trophy_get presentation (menu/champ_NN.prm):
     // weighted random over the ten trophies, each weight + 165.333 x completion^3;
     // sets the trophy's flag. Returns 0..9. (record_round calls it for a title.)
     int pick_trophy();
-    // The GT-mode generator (spec §20.2): the menus step it once per frame; the
+    // The GT-mode generator (gt_mode §20.2): the menus step it once per frame; the
     // trophy and prize-car presentations open with a stir of 1..12 steps.
     void tick_random() { GameRandom::next(state_.rng); }
     void stir_random();
 
     // Prize cars a result unlocks (scans every prize set).
     std::vector<int> award_prizes(const std::string& code);
+    // A GT-mode code (gt_mode §23): GT races and championships (G...), endurance (E...),
+    // rally (D...), licences (L.B, L.A, L.S, L.R: tests and licence sets), machine tests
+    // (M4.., M1.., MM..); not arcade (A...) or anything else. Only a check with such a
+    // code can award the whole-game prize set (gtmode_complete).
+    static bool gt_mode_code(const std::string& code);
+    // Every GT-mode result slot (gcf section 4: 364 on this disc) won.
+    bool all_races_won() const;
     // Prize cars refused since the last call because the garage was full (the
-    // original's "Garage is full" page, spec gt_mode.md §18b).
+    // original's "Garage is full" page, gt_mode §18b).
     int take_prizes_refused() { return std::exchange(prizes_refused_, 0); }
     bool league_complete(const std::string& tier) const;
     float completion() const; // GT races + arcade clears + time trials + license tests, over their totals
@@ -322,7 +363,7 @@ public:
     float completion_percent() const;
     static std::string completion_file_text(float percent);
 
-    // --- Arcade progression (spec §16) ---------------------------------------
+    // --- Arcade progression (gt_mode §16) ---------------------------------------
     // Difficulty of an arcade race code (2nd character E/N/H/P -> 0..3), -1 otherwise.
     static int arcade_difficulty(const std::string& race_code);
     // Index of a course in the SINGLE_RACE list (= result slot), -1 if absent.
@@ -366,10 +407,10 @@ public:
     // defaults) and keeps the best rank; all ten at rank 0 award the
     // arcade_compulsory_complete prize car. Returns the rank (-1 = not ranked).
     int arcade_time_trial(const std::string& code, double seconds, const std::string& car);
-    // The arcade car filter's region test (spec §16): true = not offered in this region.
+    // The arcade car filter's region test (gt_mode §16): true = not offered in this region.
     bool arcade_car_region_hidden(const std::string& label) const;
     // A record name as shown: a name stored as one byte >= 0x80 (a seeded record's mark)
-    // is entry ~byte of the program's built-in name table (spec §16), "-" when the table
+    // is entry ~byte of the program's built-in name table (gt_mode §16), "-" when the table
     // has no such entry; any other name as it is.
     std::string record_name(const std::string& stored) const;
     // The mark the original stores as the name of the k-th (0..2) seeded record of time
@@ -380,7 +421,7 @@ public:
     }
     // True for a stored name that is such a mark (one byte >= 0x80).
     static bool is_record_mark(const std::string& name) { return name.size() == 1 && u8(name[0]) >= 0x80; }
-    // A new game's ranking of a time trial (spec §16): the race record's three default
+    // A new game's ranking of a time trial (gt_mode §16): the race record's three default
     // times (+0x1C4/+0x1C8/+0x1CC), each inserted before the first equal or slower time,
     // named with its mark (time_trial_seed_name(challenge, k)), no car, day 0. Empty for
     // an unknown code.
@@ -388,18 +429,20 @@ public:
     // The first n entries of a ranking ("at:", "mt:", "lic:" keys), as the race quick menus'
     // "Top 3" show them before and after each run (the original's time-trial and machine-test
     // drivers read entries 0..2 of the record: time and name): an arcade time trial with no
-    // ranking yet shows its seeded entries. ranking_name() is an entry's name as shown.
+    // ranking yet shows its seeded entries. ranking_name() is an entry's name as shown (an
+    // entry stored without a name shows none).
     std::vector<RankEntry> ranking_top(const std::string& key, size_t n) const;
-    std::string ranking_name(const RankEntry& e) const { return e.name.empty() ? state_.player_name : record_name(e.name); }
+    std::string ranking_name(const RankEntry& e) const { return record_name(e.name); }
 
     // --- Car spec bridge ------------------------------------------------------
-    // The physics spec of a garage car with its fitted parts, settings and
-    // engine condition.
+    // The physics spec of a garage car with its fitted parts and settings. The engine
+    // condition is not in it: a run carries the car's condition words (run_condition) and
+    // the menus' power figures apply the factor (power_peak).
     std::optional<sim::CarSpec> car_spec(const GarageCar& c, std::string* error = nullptr) const;
 
     // Garage display order (indices into state().garage) for a sort key:
     // 0 date (newest first), 1 name, 2 maker, 3 colour, 4 price, 5 distance,
-    // 6 power, 7 drive, 8 aspiration (the garage panel's keys, spec §5).
+    // 6 power, 7 drive, 8 aspiration (the garage panel's keys, gt_mode §5).
     std::vector<int> garage_order(int key) const;
     // The sort column text of a car for a key ("" for date / name).
     std::string sort_value(const GarageCar& c, int key) const;
@@ -422,7 +465,7 @@ private:
     int prizes_refused_ = 0;
 };
 
-// The original's draws on the GT-mode generator state (spec §20.3), one step each.
+// The original's draws on the GT-mode generator state (gt_mode §20.3), one step each.
 // Paint of a prize candidate without a fixed colour: int(count x unit + 0.5), count -> 0.
 int prize_paint_index(int count, u32& rng);
 // Prize-car pick: weights (at least 1) summed as PS2 floats; the first whose running
@@ -434,5 +477,13 @@ int pick_trophy_index(float completion, u32& rng);
 // Formatting helpers for the menus.
 std::string format_credits(s64 v);      // "18,000"
 std::string format_time_ms(u32 ms);     // "1'02.400" (as the original's menus)
+
+// Record stamps (RankEntry::stamp): the clock now, in seconds since 2000-01-01 00:00 local
+// time (at least 1, so it never reads as "none").
+u32 record_stamp_now();
+// A record's date on the records page (gt_mode §17.2): the stamp's calendar date as
+// "DD/MM/YY" (the NTSC-U order), "--/--/--" for no stamp. As the original converts it,
+// only the year 2000 gets February 29 (later leap years run on from February 28).
+std::string record_date_text(u32 stamp);
 
 } // namespace gt3r::game

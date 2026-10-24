@@ -17,9 +17,9 @@ bool RaceScreen::update_env_cube() {
     env_items_.clear();
     const SunParams& e = sun_.params();
     constexpr float kDeg = 3.14159265f / 180.0f;
-    // GT3's RotY(+0x28) RotX(+0x48) turn the other way round from ours (checked against the
-    // original: the rear glass reflects the dark dome, not its sun, on Trial Mountain).
-    render::Mat4 sky_rot = render::rotate_y(-e.sky_yaw * kDeg) * render::rotate_x(-e.sky_pitch * kDeg);
+    // GT3 turns the dome by RotX(Env0 +0x48) RotY(+0x28), right-handed and post-multiplied: the
+    // yaw first, then the pitch (presentation §I5; its painted glow then lies towards the sun).
+    render::Mat4 sky_rot = render::rotate_x(e.sky_pitch * kDeg) * render::rotate_y(e.sky_yaw * kDeg);
     // GT3's map: the dark reflection-only sky dome and slot 5 scenery on black, unfogged and
     // unlit (fallback: the drawn course).
     bool gt3_scene = course_scene_->add_env_items(env_items_, pos, sky_rot);
@@ -48,7 +48,6 @@ bool RaceScreen::update_env_cube() {
     o.fixed_width = o.fixed_height = 0;
     if (gt3_scene) {
         o.fog = false;
-        o.grade[3] = 0;
         o.quantize_rgb5 = true;
         for (int i = 0; i < 3; ++i) o.clear[i] = 0;
     }
@@ -81,10 +80,20 @@ void RaceScreen::draw_mirror(App& app, Ui& ui, const SDL_FRect& frame, const ren
     TyreSmoke::View sv = smoke_view(cam, mr.w / mr.h, 2.0f * std::atan(t));
     sv.forward = sv.forward * -1.0f; // the mirror looks back
     sv.far_m = 120;
-    collect_items(eye, cam_right(cam), p2, !p2, sv); // the own car would fill the view
+    collect_items(eye, cam_right(cam), p2, !p2, sv, true); // the own car would fill the view
     render::DrawOptions o = main;
     o.mirrored = true;
     o.draw_distance = 120;
+    // The mirror's own fog (Env0 +0xA90 RGB, +0xAA0 distance A, +0xAA4 minimum visibility b;
+    // A = 0: a constant visibility b), per vertex like the main view's.
+    const SunParams& env = sun_.params();
+    if (env.has_env && !no_course_fog_) {
+        o.fog = env.mirror_fog_b < 0.999f;
+        o.fog_gt3 = true;
+        o.fog_start = env.mirror_fog_a;
+        o.fog_max = std::clamp(1.0f - env.mirror_fog_b, 0.0f, 1.0f);
+        for (int i = 0; i < 3; ++i) o.fog_color[i] = std::clamp(env.mirror_fog_rgb[size_t(i)], 0.0f, 1.0f);
+    }
     if (original_res_) o.fixed_width = 240, o.fixed_height = 64;
     if (half) o.fixed_width = o.fixed_height = 0;
     render::Mat4 proj = render::perspective(2.0f * std::atan(t), mr.w / mr.h, 0.1f, 120.0f);
@@ -218,7 +227,7 @@ TyreSmoke::View RaceScreen::smoke_view(const CameraRig& c, float aspect, float f
 
 // Draw items seen from `eye`: course, every car, the ghost.
 void RaceScreen::collect_items(const render::Vec3& eye, const sim::Vec3& right, bool player,
-                               bool second, const TyreSmoke::View& smoke_v) {
+                               bool second, const TyreSmoke::View& smoke_v, bool mirror) {
     item_lights_.clear();
     if (shadows_on_) {
         auto apply = [this](CarVisual* v) {
@@ -229,7 +238,8 @@ void RaceScreen::collect_items(const render::Vec3& eye, const sim::Vec3& right, 
         for (const auto& v : opp_visuals_) apply(v.get());
     }
     items_.clear();
-    course_scene_->add_items(items_, eye);
+    course_scene_->add_items(items_, eye, mirror);
+    scenery_items_ = items_.size();
     billboards_.add_items(items_, {right.x, right.y, right.z});
     {
         const std::array<float, 3>& l = sun_.params().scene_light0_dir;
@@ -256,7 +266,7 @@ void RaceScreen::collect_items(const render::Vec3& eye, const sim::Vec3& right, 
     }
     if (field_)
         for (int i = 0; i < field_->opponents() && size_t(i) < opp_visuals_.size(); ++i)
-            if (opp_visuals_[size_t(i)])
+            if (opp_visuals_[size_t(i)] && i != hidden_opponent_)
             {
                 sim::VehicleState os =
                     interpolate(field_->opponent_prev_state(i), field_->opponent_state(i), step_.alpha());
@@ -276,9 +286,21 @@ void RaceScreen::collect_items(const render::Vec3& eye, const sim::Vec3& right, 
     if (((ghost_on_ && !replaying_ && track_->lap_started()) || logger_ghost) && !ghost_.empty() &&
         ghost_.state_at(ghost_t, 1.0 / step_.step(), gs)) {
         size_t first = items_.size();
-        car_visual_->add_items(items_, gs, vehicle_->setup(), eye);
+        CarLook ghost_look;
+        ghost_look.instance = 1; // its own morph geometry (the car's is drawn this frame too)
+        car_visual_->add_items(items_, gs, vehicle_->setup(), eye, ghost_look);
         for (size_t i = first; i < items_.size(); ++i) items_[i].alpha = 0.4f;
     }
+}
+
+HudRun RaceScreen::hud_run() const {
+    return two_player_                 ? HudRun::Battle
+           : machine_                  ? (machine_->timed() ? HudRun::MachineTime : HudRun::MachineSpeed)
+           : !license_event_.empty()   ? HudRun::License
+           : free_run_                 ? HudRun::FreePractice
+           : field_                    ? HudRun::Race
+           : solo_free_run()           ? HudRun::FreeRun
+                                       : HudRun::TimeTrial;
 }
 
 HudData RaceScreen::hud_data(int player) {
@@ -311,19 +333,23 @@ HudData RaceScreen::hud_data(int player) {
     d.gear = s.gear;
     d.automatic = in.automatic;
     if (!p2) d.hint_gear = hint_gear_, d.hint_blink = hint_blink_;
-    if (!p2 && camera_.intro())
-        for (char c : course_name_) d.intro_title += char(std::toupper(static_cast<unsigned char>(c)));
     // Odometer cluster and lamps (player 1's car; the 2P halves show no cluster).
     if (!p2) {
         d.trip_m = odometer_m_;
-        d.odometer_km = (car_odometer_m_ + odometer_m_) / 1000.0;
-        d.oil_lamp = car_oil_m_ + odometer_m_ >= 300000.0;
+        // The car's own odometer and oil counter as it drives (physics §10.3): in GT mode the
+        // garage car's words the run started with; the oil lamp lights once the oil is worn.
+        if (vehicle_->sim_vehicle()) {
+            const sim::EngineCondition c = vehicle_->engine_condition();
+            d.odometer_km = 2.0 * double(c.odometer) / 1000.0;
+            d.oil_lamp = sim::model::oil_worn(c.oil_m);
+        } else {
+            d.odometer_km = odometer_m_ / 1000.0;
+        }
         d.handbrake_lamp = in.handbrake;
         if (const sim::Vehicle* sv = vehicle_->sim_vehicle()) {
             const sim::AidsSpec& sp = sv->spec().aids;
             const sim::VehicleTelemetry& t = sv->telemetry();
-            bool tcs_on = sp.tcs_gain > 0, asm_on = sp.ascc_a_gain > 0 || sp.ascc_c_gain > 0 ||
-                                                       sp.ascc_d_gain > 0 || sp.ascc_e_gain > 0;
+            bool tcs_on = sp.tcs_gain > 0, asm_on = sim::model::asm_lamp_lit(sp);
             d.tcs_lamp = !tcs_on ? 0 : t.tcs_active ? 2 : 1;
             d.asm_lamp = asm_on ? 1 : 0;
             d.clutch_engaged = t.clutch_locked;
@@ -332,25 +358,58 @@ HudData RaceScreen::hud_data(int player) {
     d.rev_limiter = s.rev_limiter;
     d.throttle = in.throttle;
     d.brake = in.brake;
+    d.steer = in.steer;
     if (p2) {
         FieldLap l = field_lap2();
         d.lap = l.started ? l.laps + 1 : 0;
         d.lap_time = l.current, d.last_lap = l.last, d.best_lap = l.best, d.wrong_way = l.wrong_way;
     } else {
         d.lap = track_->lap_started() ? track_->laps_completed() + 1 : 0;
+        // A time trial stopped by a course-out / hit is not finished: its lap time runs on with
+        // the clock (presentation §D4).
         d.lap_time = track_->current_lap_time(field_ ? field_->race_time() : race_time_);
-        // Time trial stopped by a course-out / hit: the run's best lap, or dashes.
-        if (tt_failed_) d.lap_time = track_->best_lap_time();
         d.last_lap = track_->last_lap_time();
         d.best_lap = track_->best_lap_time();
         d.wrong_way = track_->wrong_way();
+        // Machine tests (presentation §D4): "Best" and "Time" for the time tests, the clock from
+        // GO, both at the time to the goal once it is reached; the top-speed test the speed
+        // lines.
+        if (machine_) {
+            d.lap_time = finished_ ? machine_time_ : race_time_;
+            d.best_lap = finished_ ? machine_time_ : -1;
+            d.best_kmh = hud_top_kmh_;
+        }
     }
-    // Arcade time trial: "Lap 1/1" (the capture), one timed lap per run on the HUD.
-    if (!field_ && from_menu_ && launch_.request.mode == "time_trial")
-        d.total_laps = std::max(1, race_laps_ > 0 && race_laps_ < 99 ? race_laps_ : 1);
+    // The layout (presentation §D4) and what its time lines show.
+    HudModeSelect sel;
+    sel.run = hud_run();
+    sel.event_laps = race_laps_;
+    sel.time_limit_min = time_limit_ > 0 ? int(time_limit_ / 60.0) : 0;
+    sel.wide = !app_ || !split_horizontal(*app_);
+    sel.play = replaying_ ? HudPlay::Replay : HudPlay::Live;
+    sel.battle_split_replay = replaying_ && two_player_ && replay_settings_.split;
+    d.mode = hud_mode(sel);
+    if (preset_.hud_mode >= 0 && !hud_layout(HudMode(preset_.hud_mode)).empty()) d.mode = HudMode(preset_.hud_mode);
+    d.live = !replaying_ && !attract_;
+    const LapList& laps = lap_lists_[p2 ? 1 : 0];
+    d.lap_times.assign(laps.recent.begin(), laps.recent.end());
+    d.laps_recorded = laps.count;
+    // Total / Time: the recorded laps and the current one, the recorded ones alone once the
+    // car has finished (a time trial's FAIL is no finish).
+    d.finished = p2 ? finished2_ : finished_ && !tt_failed_;
+    d.total_time = d.finished ? laps.sum : laps.sum + std::max(0.0, d.lap_time);
+    if (d.lap_time < 0 && !d.finished) d.total_time = laps.count > 0 ? laps.sum : -1;
+    // Record Lap / P.P. / Fastest: the session's fastest lap driven (every car's in races, the
+    // player's in solo runs; dashes until the first lap, kept across retries).
+    d.session_best = field_ ? (session_best_ms_ >= 0 ? double(session_best_ms_) / 1000.0 : -1)
+                            : (best_splits_.best_lap() >= 0 ? double(best_splits_.best_lap()) / 1000.0 : -1);
+    d.pole_icon = d.mode == HudMode::FreePractice; // alone on the course: the player's car
+    // The lap count's total: the event's laps in races, the arcade time trial's one lap
+    // (presentation §B7; the capture's "Lap 1/1"), none in free runs.
+    d.lap_list_lines = lap_list_lines(sel.run == HudRun::Race ? race_laps_ : 0);
+    if (sel.run == HudRun::TimeTrial && from_menu_ && launch_.request.mode == "time_trial") d.total_laps = kTimeTrialLaps;
     if (field_) {
         d.total_laps = race_laps_;
-        if (time_limit_ > 0) d.time_left = std::max(0.0, time_limit_ - std::max(0.0, field_->race_time()));
         d.cars = field_->opponents() + 1 + (field_->has_second() ? 1 : 0);
         if (p2) d.position = finished2_ ? finish_position2_ : field_->second_position();
         else d.position = finished_ ? finish_position_ : field_->player_position();
@@ -361,12 +420,20 @@ HudData RaceScreen::hud_data(int player) {
     } else if (tt_start_.countdown > 0 && (tt_start_.type == 0 || tt_start_.type == 1)) {
         // Licence / machine test standing start: the same count over the hold.
         d.countdown = tt_hold_ > 0 ? (tt_hold_ <= 3.0 ? tt_hold_ : -1) : (race_time_ < 1.0 ? 0 : -1);
+    } else if (flying_go_t_ >= 0) {
+        // Flying start: START for 1 s from the signal at the line (presentation §B2).
+        d.countdown = race_time_ - flying_go_t_ < 1.0 ? 0 : -1;
     }
     // Pit lane / flying start run-up: AUTO DRIVE; pit-in pop-up; tyre gauge when wear is on.
     d.auto_drive = !replaying_ && ((two_player_ && (p2 ? finished2_ : finished_)) || pit_.driving() || flying_runup());
-    if (pit_msg_time_ > 0) {
-        d.event_text = pit_msg_text_;
-        d.event_alpha = float(std::min(1.0, pit_msg_time_ * 2.0));
+    // The event display: lap time, splits, gaps, "+N Laps", "Pitting in..." (presentation §D6).
+    {
+        const EventDisplay& ev = event_display_[p2 ? 1 : 0];
+        for (const EventDisplay::Message* m : ev.visible()) d.events.push_back(*m);
+        const EventDisplay::Icon icon = ev.icon();
+        d.event_icon = icon.on;
+        d.event_icon_dx = icon.dx, d.event_icon_dy = icon.dy;
+        event_icon_car_[p2 ? 1 : 0] = icon.car;
     }
     if (!p2)
         if (const sim::Vehicle* sv = vehicle_->sim_vehicle())
@@ -385,20 +452,30 @@ HudData RaceScreen::hud_data(int player) {
         else if (!license_.rules().standing && license_.lap_counter() <= 0) d.lap_time = 0;
         else d.lap_time = std::max(0.0, race_time_ - double(license_.start_ms()) / 1000.0);
     }
-    d.car_name = car_.name;
+    d.car_name = ascii(car_.name);
     d.course_name = course_name_;
     d.camera = camera_mode_name(cam.mode());
-    d.show_map = true;
     d.split = two_player_;
     if (app_) {
         const TouchRect sa = app_->touch().safe_area(); // touch controls: keep the HUD clear of them
         d.safe_area = {sa.x, sa.y, sa.w, sa.h};
+        for (const TouchRect& c : app_->touch().control_bounds()) d.touch_controls.push_back({c.x, c.y, c.w, c.h});
     }
     bool failed = tt_failed_ || (!license_event_.empty() && license_.state() == LicenseRun::State::Failed);
     // "@finish" (4 s) on a race / time-trial finish; GT3's licence pass posts no finish
     // event (presentation.md A1), so licences show none, and none on a fail.
     if ((p2 ? finished2_ : finished_) && (p2 || !failed) && license_event_.empty()) d.finish_t = finish_wait_;
     if (two_player_) d.winner_player = p2 ? (p2_won_ ? 2 : 0) : (p1_won_ ? 1 : 0);
+    // The course name over the start (presentation §B3), on its own clock (not 2P: [?]). The
+    // countdown, START and FINISH are written into the same message in a live run, so once one
+    // shows the name is gone: a race's 10 s hold lets it play out first, a licence test's 4 s
+    // hold does not. Replays and demonstrations write none of them and keep it.
+    if (!replaying_ && !demo_ && (d.countdown >= 0 || d.finish_t >= 0)) title_clock_.stop();
+    if (!two_player_ && title_clock_.alpha() > 0) {
+        // Capitals as the original makes them (a-z only).
+        for (char c : title_name_) d.intro_title += c >= 'a' && c <= 'z' ? char(c - 'a' + 'A') : c;
+        d.title_alpha = title_clock_.alpha();
+    }
     return d;
 }
 
@@ -466,12 +543,8 @@ render::DrawOptions RaceScreen::draw_options() const {
         o.fog_start = env.fog_a;
         o.fog_max = std::clamp(1.0f - env.fog_b, 0.0f, 1.0f);
         for (int i = 0; i < 3; ++i) o.fog_color[i] = std::clamp(env.fog_rgb[size_t(i)], 0.0f, 1.0f);
-        if (env.grade) { // the colour-grade pass (Monte Carlo, reverse Deep Forest)
-            for (int i = 0; i < 3; ++i) o.grade[i] = env.grade_g[size_t(i)];
-            o.grade[3] = env.saturation;
-        }
     }
-    apply_shot_filter(o);
+    apply_post_pass(o);
     o.ambient = 0.5f;
     o.light_dir = {0.3f, 0.85f, 0.35f};
     o.env_strength = 0.25f;
@@ -479,6 +552,7 @@ render::DrawOptions RaceScreen::draw_options() const {
     // paint's material; see scene::Material).
     o.gt3_lighting = true;
     if (env.has_env && env.car_light_mask) env.day_car_lights(o); // Env0 car lights 0..3
+    if (env.has_env) o.panorama[0] = env.panorama[0], o.panorama[1] = env.panorama[1];
     // Reflections: the course's sky and horizon colours around the car (stand-in for GT3's
     // per-frame sphere map), GT3's Fresnel-like weight 1 - 0.8 cos.
     const float* sky = course_scene_->sky_color();
@@ -493,16 +567,19 @@ render::DrawOptions RaceScreen::draw_options() const {
 }
 
 void RaceScreen::render_drive(App& app, Ui& ui) {
+    app.note_race_scale();
+    upload_course_animations(); // once per frame
     float mh = float(Ui::kHeight), mw = mh * 4.0f / 3.0f;
     SDL_FRect menu_dst{(float(Ui::kWidth) - mw) / 2, 0, mw, mh};
     if (quick_) {
         ui.fill(0, 0, float(Ui::kWidth), float(Ui::kHeight), Color{0, 0, 0, 255});
         bool licence_box = preview_ && !license_event_.empty();
-        if (panel_ == Panel::None && (!licence_box || quick_menu_.on_root()) && app.gpu() && track_ && vehicle_) {
-            // The race scene behind the menu: GT3's licence menu draws it into the preview
-            // box (32, 58, 280, 210) of the menu frame, the other
-            // quick menus over the whole frame (presentation.md); their layouts are
-            // translucent there.
+        if (panel_ == Panel::None && (backdrop_ || preview_) && (!licence_box || quick_menu_.on_root()) && app.gpu() &&
+            track_ && vehicle_) {
+            // The race behind the menu (race::menu_backdrop): GT3's licence menu draws it into
+            // the preview box (32, 58, 280, 210) of the menu frame, the time trial's, free run's,
+            // machine test's and pre-race menus over the whole frame (presentation.md); their
+            // layouts are translucent there. The result menus have none (their own background).
             if (!view_) view_ = std::make_unique<render::View3D>(*app.gpu());
             float sx = menu_dst.w / 640.0f, sy = menu_dst.h / 448.0f;
             SDL_FRect box = licence_box ? SDL_FRect{menu_dst.x + 32 * sx, menu_dst.y + 58 * sy, 280 * sx, 210 * sy}
@@ -566,14 +643,26 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
     Uint64 h_e1 = SDL_GetTicksNS();
     hitch::env_ms = double(h_e1 - h_e0) / 1e6;
     render::Vec3 eye = camera_.eye();
-    collect_items(eye, cam_right(camera_), !camera_.onboard(), true,
-                  smoke_view(camera_, rect.w / rect.h, camera_.fovy())); // in-car view: own car not drawn
+    // In-car view: own car not drawn; a replay's on-board car mount: the followed car not drawn.
+    const bool mount_in = camera_.replay_on_board();
+    const bool followed_player = !(field_ && replay_focus_ >= 0);
+    hidden_opponent_ = mount_in && !followed_player ? replay_focus_ : -1;
+    collect_items(eye, cam_right(camera_), !camera_.onboard() && !(mount_in && followed_player), true,
+                  smoke_view(camera_, rect.w / rect.h, camera_.fovy()));
+    hidden_opponent_ = -1;
     Uint64 h_c1 = SDL_GetTicksNS();
     hitch::collect_ms = double(h_c1 - h_e1) / 1e6;
-    size_t scene_items = items_.size();
-    if (wet_.active()) add_wet_road(eye, rect.w / rect.h, o);
-    view_->draw(ui.renderer(), rect, camera_.view(), camera_.projection(rect.w / rect.h), eye, items_, o);
-    items_.resize(scene_items); // (the wet road's frame items belong to this view only)
+    const size_t wet_items = wet_.active() ? add_wet_road(eye, rect.w / rect.h, o) : 0;
+    // This view's post-process passes (presentation §G16): the dissolve's frozen picture at
+    // trunc(128 x^3) / 128, view mode 1's trail at trunc(128 a) / 128; every picture kept.
+    render::DrawOptions ov = o;
+    ov.keep_last = true;
+    ov.snapshot = dissolve_.snapshot;
+    dissolve_.snapshot = false;
+    ov.dissolve = dissolve_.weight();
+    ov.trail = std::floor(128.0f * director_.look().trail_weight()) / 128.0f;
+    view_->draw(ui.renderer(), rect, camera_.view(), camera_.projection(rect.w / rect.h), eye, items_, ov);
+    remove_wet_road(wet_items); // (the wet road's frame items belong to this view only)
     hitch::draw_ms = double(SDL_GetTicksNS() - h_c1) / 1e6;
     hitch::meshes = view_->stats().meshes_drawn;
     float sun_v = sun_visibility(eye, camera_.fovy(), rect.h);
@@ -582,8 +671,12 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
     auto occl = [this](const render::Vec3& a, const render::Vec3& b) {
         return course_scene_ && course_scene_->occluder().segment_blocked(a, b);
     };
-    lamps_.draw(ui.renderer(), rect, camera_.view(), eye, camera_.fovy(), occl);
-    if (car_lamps_.active()) car_lamps_.draw(ui.renderer(), rect, camera_.view(), eye, camera_.fovy(), lamp_cars(), occl);
+    // Lamp flares: in the original-resolution frame at its 448 lines (the PS2's soft, broken
+    // rays); otherwise crisp at the output resolution.
+    const float flare_lines = original_res_ && !split ? 448.0f : 0.0f;
+    lamps_.draw(ui.renderer(), rect, camera_.view(), eye, camera_.fovy(), occl, flare_lines);
+    if (car_lamps_.active())
+        car_lamps_.draw(ui.renderer(), rect, camera_.view(), eye, camera_.fovy(), lamp_cars(), occl, flare_lines);
     if (!replaying_ && camera_.onboard() && camera_.mirror() && !camera_.look_back() && (!split || horizontal))
         draw_mirror(app, ui, rect, o, false, split);
     if (split) {
@@ -614,19 +707,21 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
         analyzer_.draw(ui.renderer(), dst);
         return;
     }
-    if (post_replay_) ui.fill(0, 0, float(Ui::kWidth), float(Ui::kHeight), Color{0, 0, 0, 70}); // dimmed
     if (replaying_ && split) {
         // 2P replays: both halves, no HUD and no mark (the captures).
     } else if (((replaying_ && preset_.hud) || attract_ || (theater_ && demo_)) && !split) {
-        // Replays and the attract demo: the mark, the REPLAY OPTIONS items, the mode indicator.
-        hud_.draw_replay_mark(ui.renderer(), original_res_ ? &rect : nullptr, original_res_);
-        if (!attract_) draw_replay_items(ui, rect);
-        draw_mode_display(ui);
+        // Replays and the attract demo (presentation §G): the mark on its timer, in replays only
+        // while no ITEM is on, in the attract demo always; the REPLAY OPTIONS items and the title.
+        if (attract_ || !replay_settings_.items)
+            hud_.draw_replay_mark(ui.renderer(), mark_timer_.alpha(), original_res_ ? &rect : nullptr, original_res_);
+        if (!attract_) draw_replay_items(app, ui, rect);
     } else if (preset_.hud) {
         HudData d = hud_data(0);
         if (split) {
             hud_.draw_split(ui.renderer(), d, half1, horizontal);
+            draw_event_icons(app, 0);
             hud_.draw_split(ui.renderer(), hud_data(1), half2, horizontal);
+            draw_event_icons(app, 1);
             if (horizontal) ui.fill(0, half1.h - 1, float(Ui::kWidth), 2, Color{0, 0, 0, 255});
         } else {
             // Under the results panel: all but the lap / time block, drawn over it below.
@@ -637,6 +732,7 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
             } else {
                 hud_.draw(ui.renderer(), d);
             }
+            draw_event_icons(app, 0);
         }
         if (show_perf_) {
             char line[160];
@@ -712,8 +808,15 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
                                        race_text("RACEDISPLAY_TimeTrialFail", "FAIL"), -1.0,
                                        SDL_FRect{0, 0, float(Ui::kWidth), float(Ui::kHeight)});
         } else {
-            tt_overlay_.draw(ui.renderer(), hud_.fonts(), finish_wait_, track_->best_lap_time(), finish_record_rank_,
-                             false, menu_dst);
+            // Time trials: the best lap; machine tests: the time to the mark or the top speed.
+            TimeTrialOverlay::Data td;
+            td.rank = finish_record_rank_;
+            td.speed = machine_test_top_speed();
+            td.value = td.speed ? double(top_speed_kmh_) : machine_ ? machine_time_ : track_->best_lap_time();
+            td.imperial = imperial_;
+            // (After the top-speed test's EXIT it shows 0.1 s after the press, race/post_run.h.)
+            tt_overlay_.draw(ui.renderer(), hud_.fonts(), finish_wait_ + TimeTrialOverlay::kShowDelay - overlay_delay_, td,
+                             menu_dst);
         }
     } else if (finished2_ && two_player_ && !replaying_) {
         results_.draw(ui.renderer(), hud_.fonts(), result_rows(), finish_wait_, menu_dst);
@@ -724,9 +827,10 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
         std::string g = "GHOST " + Hud::format_time(ghost_time_);
         ui.text(std::floor(Ui::kWidth / 2.0f - Ui::text_width(g) / 2), 12, g, Color{170, 200, 255, 220});
     }
-    if (exit_transition_ > kExitHold) { // the accumulated wash: 1 - 0.5^n
-        float a = 1.0f - std::pow(0.5f, float(exit_transition_ - kExitHold));
-        ui.fill(0, 0, float(Ui::kWidth), float(Ui::kHeight), Color{0, 0, 0, u8(255 * a)});
+    if (exit_transition_ > kExitHold) { // the accumulated grey wash of the delayed fade-out (presentation §C1)
+        const SDL_FColor w = menu::flow::ScreenTransition::delay_fadeout_cover(exit_transition_);
+        const u8 g = u8(std::lround(255.0f * w.r));
+        ui.fill(0, 0, float(Ui::kWidth), float(Ui::kHeight), Color{g, g, g, u8(255 * w.a)});
     }
     if (toast_time_ > 0) {
         float w = std::ceil(Ui::text_width(toast_)) + 16;
@@ -738,8 +842,8 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
 
 // GT3's wet-road reflection (docs/dev/RACE.md) for the main view: the buffer (slot 9, mirrored cars, lamp
 // streaks) rendered and blurred, then the frame items (alpha clear, slot 13 mask, composite).
-void RaceScreen::add_wet_road(const render::Vec3& eye, const render::Mat4& view, const render::Mat4& proj,
-                              const render::Frustum& fr, const render::DrawOptions& o) {
+size_t RaceScreen::add_wet_road(const render::Vec3& eye, const render::Mat4& view, const render::Mat4& proj,
+                                const render::Frustum& fr, const render::DrawOptions& o) {
     wet_items_.clear();
     std::vector<WetRoad::Car> cars;
     auto add = [&](const CarVisual* v, const sim::VehicleState& s, const sim::VehicleSetup& su, size_t idx) {
@@ -761,7 +865,11 @@ void RaceScreen::add_wet_road(const render::Vec3& eye, const render::Mat4& view,
     }
     wet_.add_buffer_items(wet_items_, view, eye, cars);
     SDL_GPUTexture* t = wet_.render(*view_, view, proj, eye, wet_items_, o);
-    wet_.add_frame_items(items_, view, fr, t);
+    // GT3 composites it after the scenery, before the cars and their shadows (presentation §K, §I7).
+    std::vector<render::DrawItem> frame;
+    wet_.add_frame_items(frame, view, fr, t);
+    items_.insert(items_.begin() + std::ptrdiff_t(scenery_items_), frame.begin(), frame.end());
+    return frame.size();
 }
 
 // Every car's lamps for the glow pass: the player, player 2 and the opponents.

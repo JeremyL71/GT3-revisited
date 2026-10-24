@@ -1,6 +1,6 @@
 #pragma once
 
-// The car settings menu (menu/setting.mbl; spec gt_mode.md §14):
+// The car settings menu (menu/setting.mbl; gt_mode §14):
 // sliders over the car setup record's setting words of a garage car, the part
 // change pages (swap between owned parts) and the rules that lock settings
 // the fitted parts do not allow.

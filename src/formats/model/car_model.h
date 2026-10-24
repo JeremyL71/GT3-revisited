@@ -37,7 +37,7 @@ struct CarFile {
 // from the car parameter database (see wheel_spec.h). Axle 0 = front, 1 = rear.
 struct WheelSpec {
     float wheelbase = 2.5f;
-    float track[2] = {1.5f, 1.5f};    // centreline to centreline
+    float track[2] = {1.5f, 1.5f};    // hub to hub: the tread less twice its per-side offset
     float width[2] = {0.2f, 0.2f};    // tyre section width
     float radius[2] = {0.3f, 0.3f};   // tyre outer radius
     float sidewall[2] = {0.1f, 0.1f}; // sidewall height
@@ -74,12 +74,18 @@ struct CarModelOptions {
     bool reflection = true;    // include the environment-map (reflection) passes
     int paint = 0;             // colour index into the car's list in database/carcolor.db
     bool wheels = true;        // add wheels + generated tyres
+    bool menu_tyres = false;   // the menus' tyres (30 segments); else the race's for each LOD (tyre_model.h)
     // Another wheel to fit instead of the car's own: the contents of a wheel/<label>
     // file (the same GTTW format as the car file's wheel section). Empty = stock.
     ByteSpan wheel_override;
     std::optional<WheelSpec> wheel_spec; // placement; estimated from the body when absent
     bool brake = false;        // the brake-lamp branch of the node programs (lit lenses)
     CarBodyMod body_mod;       // mod cars: stretched or replaced body
+    // When set, the draws the car's callback morphs (mud flaps, aerials, steering) are left
+    // out of the body and built into these, one per LOD that has any (texture indices: the
+    // returned model's). Without it they are drawn with the callback's defaults
+    // (gtm1::kCarCallbackDefaults). Not for mod bodies.
+    std::vector<gtm1::MorphDraws>* morphs = nullptr;
 };
 
 // Number of distinct LOD branches node `node` takes (1 when it has no LOD switch).

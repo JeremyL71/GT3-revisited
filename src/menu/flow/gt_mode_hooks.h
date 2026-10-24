@@ -3,7 +3,7 @@
 // Hooks between the GT-mode menus (GameFlow, control "gt_mode") and the GT
 // Mode game logic (src/game/). The menus stay independent of the game state:
 // the game side registers these callbacks once (see
-// game/gt_mode_menu.cpp) and the flow calls them where the original's
+// game/gt_mode_menu/) and the flow calls them where the original's
 // GT mode menu runs its per-page code: item actions, confirm intercepts
 // (no money / no license popups), enable predicates, code-filled text
 // widgets (credits, days, car names, prices), race requests and results.
@@ -42,6 +42,11 @@ struct GtModeHooks {
     // Once per frame after the controller ticked (code-driven lists read
     // controller.fired()). Returns a sound effect name to play, or "".
     std::function<std::string(MenuController& ctl)> on_frame;
+    // Every frame, also while the controller is busy (confirm feedback, a page settling), right
+    // before on_frame: game code on its own clock (the car wash, the oil change), which may give
+    // back the controls a page took away (MenuController::give_control). Returns a sound effect
+    // name to play, or "".
+    std::function<std::string(MenuController& ctl)> on_tick;
     // A race is about to be requested: fill the event, car spec, course...
     std::function<void(GameRequest& r)> prepare_request;
     // Gameplay came back with a result (prizes, medals, odometer).
@@ -74,9 +79,11 @@ struct GtModeHooks {
     // A popup page to open after a consumed Finish action rebuilt its page
     // (e.g. "load_warning" after loading settings), or "".
     std::function<std::string()> take_popup;
-    // Record name entry (presentation page "name_entry"): delete the last character
-    // (Triangle / Square); true when one was deleted.
+    // Record name entry (presentation page "name_entry"): Back Space (Triangle / Square;
+    // TextBox::back_space), true when it plays its sound; and the text box's cursor, the
+    // characters before it (-1 = none: the caret after the text).
     std::function<bool()> name_backspace;
+    std::function<int()> name_cursor;
     // After a result (and its presentations): a movie to play first (the GT-mode
     // endings: "stream/ending_short_full.pss" / "stream/ending_long_full.pss"), or "".
     std::function<std::string()> take_movie;
@@ -149,5 +156,10 @@ inline const MenuImage* element_image(const MenuScene* scene, const Element& e) 
 }
 void set_gt_mode_widget_drawer(GtModeWidgetDrawer d);
 const GtModeWidgetDrawer& gt_mode_widget_drawer();
+// Frees what the widget drawer keeps between frames (models, 3D views, targets): called when
+// the menus hand over to a race, which needs the memory on 4 GB phones.
+using GtModeWidgetRelease = std::function<void(App& app)>;
+void set_gt_mode_widget_release(GtModeWidgetRelease f);
+const GtModeWidgetRelease& gt_mode_widget_release();
 
 } // namespace gt3r::menu::flow

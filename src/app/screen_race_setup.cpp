@@ -44,6 +44,8 @@ TrackPose RaceScreen::flying_pose(float metres_before) const {
 // (optional) is played back instead of driving.
 void RaceScreen::start(App& app, const Replay* replay) {
     error_.clear();
+    reset_session_best(); // a new visit: the runs and retries that follow share it
+    qm_items_ = {};       // ... and its quick menus' item switches (menus §11)
     // Speed unit: the game data's rule (GtData::imperial: the NTSC-U data set shows mph,
     // like its menus; mph when no GT-mode session exists); [race] units = kmh | mph overrides.
     imperial_ = true;
@@ -106,8 +108,7 @@ void RaceScreen::start(App& app, const Replay* replay) {
             if (car_.spec) sp = *car_.spec;
             else sp = sim::build_car_spec(db_, ca.label);
             if (sp) {
-                if (!asm_on_) sp->aids.ascc_flags = 0;
-                if (!tcs_on_) sp->aids.tcs_gain = 0;
+                sim::apply_aid_options(sp->aids, asm_on_, tcs_on_);
                 car_.spec = std::make_shared<const sim::CarSpec>(std::move(*sp));
             }
         }
@@ -120,6 +121,13 @@ void RaceScreen::start(App& app, const Replay* replay) {
         drop_vehicle();
         track_.reset();
         track_ = make_track(*app.vfs(), *course, ce.label);
+        // The road under a point, for view mode 1's procedural cameras (none off the road or on a wall).
+        camera_.set_ground([this](float x, float z, float y) -> std::optional<float> {
+            if (!track_) return std::nullopt;
+            const sim::SurfaceHit h = track_->query().probe(x, z, y);
+            if (!h.hit || h.normal.y < 0.05f) return std::nullopt;
+            return h.height;
+        });
         course_scene_ = std::make_unique<CourseScene>(*app.gpu(), *course, ce.label, preset_.sheen);
         // GT mode: the garage car's bought wheels.
         std::optional<Bytes> wheel_file;
@@ -142,6 +150,11 @@ void RaceScreen::start(App& app, const Replay* replay) {
         car_visual_ = std::make_unique<CarVisual>(*app.gpu(), *car_file, model, car_.wheels, preset_.paint,
                                                   wheel_file ? ByteSpan(*wheel_file) : ByteSpan{}, body_mod);
         course_name_ = ce.name;
+        // The start title shows the course table's name as it is: licence sections have their
+        // own ("Grand Valley Test Section"), and a course without one shows no title.
+        title_name_.clear();
+        for (const data::Course& c : db_.courses())
+            if (c.label == ce.label) title_name_ = c.name;
         course_label_for_dirt_ = ce.label;
         if (replay) {
             paint_seed_override_ = replay->paint_seed;
@@ -152,6 +165,7 @@ void RaceScreen::start(App& app, const Replay* replay) {
         if (!build_vehicle(app)) throw FormatError(error_);
         build_tv_cameras();
         gtrc_.reset();
+        director_ = ReplayDirector(); // (not left pointing at the old script)
         camera_.set_replay_director(nullptr);
         // The pre-race shot's camera move (StartingCamera: cameras/start.cam, record 0).
         camera_.set_start_shot(std::nullopt);
@@ -169,14 +183,22 @@ void RaceScreen::start(App& app, const Replay* replay) {
             if (app.gpu()) billboards_.load(*app.gpu(), cf.section(*course, 30), ce.label);
             // The sun and its glare (Env0, slot 32).
             sun_.load(*app.vfs(), app.renderer(), cf.section(*course, 32));
+            if (sun_.params().has_env && course_scene_) { // the course's own lit packets: its scene lights
+                render::ItemLights cl;
+                sun_.params().course_lights(cl);
+                course_scene_->set_lights(cl);
+            }
             point_lights_.load(cf.section(*course, course::kSlotRoad)); // night lamp list (point-light courses)
             if (app.gpu()) smoke_.load(*app.gpu(), cf.section(*course, 32), cf.section(*course, 26)); // tyre smoke / dust
             pylons_.load(app.gpu(), *course); // pylons / cones (GTRW list + slot 36 types)
             if (sun_.params().has_shadow) pylons_.set_shadow(sun_.params().shadow_rgb, sun_.params().shadow_alpha);
             if (app.gpu()) wet_.load(*app.gpu(), *app.vfs(), *course, cf.section(*course, 32)); // wet-road reflection
             if (point_lights_.active()) LOG_INFO("Race: %zu course lamps (point-light mode)", point_lights_.lamps().size());
-            lamps_.load(app.renderer(), cf.section(*course, 29), cf.section(*course, 32)); // street / stadium lamps
-            car_lamps_.load(app.renderer(), cf.section(*course, 32)); // car head / tail / brake lamp glows
+            // Street / stadium lamps (slot 29, the lists picked by slot 2's visibility lists).
+            std::optional<Bytes> flare = app.vfs()->read("race/flare.bin");
+            lamps_.load(app.renderer(), cf.section(*course, 29), cf.section(*course, 32), cf.section(*course, 2),
+                        flare ? ByteSpan(*flare) : ByteSpan{});
+            car_lamps_.load(app.renderer(), cf.section(*course, 32), flare ? ByteSpan(*flare) : ByteSpan{}); // car lamp glows
             LOG_INFO("Race: car models from %s, car lamp glows %s", car_folder_.c_str(), car_lamps_.active() ? "on" : "off");
             if (sun_.params().enabled)
                 LOG_INFO("Race: sun at elevation %.1f, azimuth %.1f, glare %.2f, style %d", sun_.params().elevation,
@@ -270,6 +292,7 @@ void RaceScreen::start(App& app, const Replay* replay) {
         if (!race_mode_) load_saved_ghost();
         restart();
     }
+    if (attract_) pick_attract_view(); // the demo's own view mode and target (presentation §G13)
     music_.reset(); // the race music starts with the first music_cues()
     // GT races, machine tests, licence tests, time trials and free runs open with their
     // quick menu (quick_menu_layout), as in the original.
@@ -291,6 +314,7 @@ void RaceScreen::start(App& app, const Replay* replay) {
     if (preset_.warp > 0) warp(app, preset_.warp);
     if (preset_.watch && !replaying_) {
         watch_replay();
+        apply_replay_presets();
         if (preset_.rwarp > 0) warp(app, preset_.rwarp);
     }
     if (preset_.save) save_current_replay();
@@ -302,11 +326,12 @@ void RaceScreen::start(App& app, const Replay* replay) {
     if (preset_.pause) open_pause(app);
     else paused_ = false;
     if (preset_.pause && preset_.pause_sel > 0) pause_menu_.set_cursor(preset_.pause_sel);
-    if (preset_.rmode >= 0 && (replaying_ || demo_)) {
-        ReplaySettings rs = replay_settings_;
-        rs.mode = std::clamp(preset_.rmode, 0, 3);
-        replay_settings_ = rs; // (not stored)
-        mode_display_t_ = kModeDisplaySeconds;
+    if (!preset_.watch) apply_replay_presets();
+    if (preset_.ritems >= 0 && (replaying_ || demo_)) replay_settings_.items = u8(preset_.ritems); // (not stored)
+    if (preset_.rcam >= 0 && replaying_) { // screenshots: a player view in the replay (2: the in-car view)
+        camera_.set_mode(CameraMode(std::clamp(preset_.rcam, 0, int(CameraMode::Count) - 1)));
+        camera_.snap(render_state_);
+        camera_.update(render_state_, vehicle_->setup(), PadState{}, 1.0 / 60.0);
     }
     if (preset_.ropts >= 0 && paused_ && (replaying_ || demo_)) {
         if (!replay_opts_loaded_) replay_opts_loaded_ = true, replay_opts_.load(*app.vfs(), app.renderer(), hud_.fonts());
@@ -317,9 +342,24 @@ void RaceScreen::start(App& app, const Replay* replay) {
     }
 }
 
+// Screenshots: the replay's view mode and target (not stored), from its start.
+void RaceScreen::apply_replay_presets() {
+    if (preset_.rmode < 0 && preset_.rtarget < 0) return;
+    if (!replaying_ && !demo_) return;
+    if (preset_.rmode >= 0) replay_settings_.mode = std::clamp(preset_.rmode, 0, 3);
+    if (preset_.rtarget >= 0) replay_settings_.target[size_t(replay_settings_.mode)] = std::clamp(preset_.rtarget, 0, 2);
+    director_.set_view_mode(replay_settings_.mode);
+    begin_replay_focus();
+}
+
 void RaceScreen::warp(App& app, double seconds) {
     int ticks = int(seconds / step_.step());
-    for (int i = 0; i < ticks && !(replaying_ && player_.done()); ++i) tick(app, PadState{});
+    const bool focus = replaying_ && field_ && !two_player_; // the followed car's logic goes on (60 Hz)
+    for (int i = 0; i < ticks && !(replaying_ && player_.done()); ++i) {
+        tick(app, PadState{});
+        if (focus)
+            for (focus_acc_ += step_.step() * 60.0; focus_acc_ >= 1.0 - 1e-9; focus_acc_ -= 1.0) step_replay_focus();
+    }
     if (replaying_ && player_.done()) {
         const sim::Vec3& a = vehicle_->state().position;
         bool exact = a.x == replay_.final_position.x && a.y == replay_.final_position.y && a.z == replay_.final_position.z;
@@ -368,18 +408,26 @@ void RaceScreen::load_saved_ghost() {
         if (r.best_lap > 0 && (!best || r.best_lap < best->best_lap)) best = &r;
     if (!best) return;
     bool exact = false;
-    GhostLap g = ghost_from_replay(*best, [&] { return make_vehicle(car_, &db_, *track_); }, &exact);
+    GhostLap g = ghost_from_replay(
+        *best,
+        [&] {
+            std::unique_ptr<RaceVehicle> v = make_vehicle(car_, &db_, *track_);
+            if (v) v->set_engine_condition(best->condition);
+            return v;
+        },
+        &exact);
     if (g.empty()) return;
     ghost_ = std::move(g);
     ghost_time_ = best->best_lap;
-    saved_best_ = best->best_lap;
     LOG_INFO("Race: ghost from saved replay, best lap %.3f s (%zu frames, %s)", best->best_lap, ghost_.size(),
              exact ? "reproduced exactly" : "NOT reproduced exactly");
 }
 
 void RaceScreen::restart() {
+    take_live_condition(); // the previous live run hands its engine condition on
     replaying_ = false;
     run_recorded_ = false;
+    retry_locked_ = false; // every run starts with RETRY available (presentation §E3)
     result_latch_.reset(); // a new live run
     latched_rows_.reset();
     TrackPose p = track_->grid_pose(0);
@@ -394,7 +442,7 @@ void RaceScreen::restart() {
     else if (race_mode_ && field_ && demo_start_kmh_ > 0) v0 = demo_start_kmh_ / 3.6f;
     else if (!race_mode_ && tt_start_.flying()) {
         v0 = tt_start_.initial_kmh / 3.6f;
-        // Physics spec §9: on the racing line (game line 6) at race progress -flying_m,
+        // physics §9: on the racing line (game line 6) at race progress -flying_m,
         // heading along the line over the next 10 m; the grid slot without the line.
         p = flying_pose(tt_start_.flying_m);
     } else if (!race_mode_ && preset_.at >= 0) { // debug: on the line, this far past the start, moving
@@ -403,7 +451,7 @@ void RaceScreen::restart() {
     }
     if (v0 > 0) {
         vehicle_->reset_moving(p, v0);
-    } else { // standing start: the slot marks the nose, no spawn hold (spec §9)
+    } else { // standing start: the slot marks the nose, no spawn hold (physics §9)
         if (const sim::Vehicle* sv = vehicle_->sim_vehicle()) p.position = grid_back(p.position, p.orientation, sv->setup());
         if (preset_.turn != 0) { // debug: q = rot_y(turn) * q
             float h = preset_.turn * 3.14159265f / 360.0f, c = std::cos(h), s = std::sin(h);
@@ -412,17 +460,39 @@ void RaceScreen::restart() {
         }
         vehicle_->place(p);
     }
+    seed_vehicle_condition(run_condition_, true);
     reset_run_state();
+    start_hud_clocks(0, v0);
     recorder_.begin(courses_[size_t(course_sel_)].label, cars_[size_t(car_sel_)].label,
                     controls_.config().automatic, preset_.paint, p, 1.0 / step_.step(), race_event_,
                     field_ ? field_->labels() : std::vector<std::string>{});
+    recorder_.set_engine_condition(run_condition_);
     if (two_player_ && field_ && field_->has_second()) recorder_.set_second_car(preset_.car2.empty() ? car_.label : preset_.car2);
     recorder_.set_start_speed(v0);
     recorder_.set_paint_seed(paint_seed_);
     begin_license();
 }
 
+void RaceScreen::take_live_condition() {
+    if (live_condition_ && has_condition_ && vehicle_ && vehicle_->sim_vehicle())
+        run_condition_ = vehicle_->engine_condition();
+    live_condition_ = false;
+}
+
+// A live run starts with run_condition_ (a mode that carries no condition: a fresh engine
+// every run); a replay with the condition its run started with.
+void RaceScreen::seed_vehicle_condition(const sim::EngineCondition& c, bool live) {
+    if (!vehicle_) return;
+    vehicle_->set_engine_condition(c);
+    live_condition_ = live;
+}
+
+sim::EngineCondition RaceScreen::live_condition() const {
+    return live_condition_ && vehicle_ && vehicle_->sim_vehicle() ? vehicle_->engine_condition() : run_condition_;
+}
+
 void RaceScreen::drop_vehicle() {
+    take_live_condition();
     pit_ = PitLane{};
     vehicle_ = nullptr;
     field_.reset();
@@ -440,6 +510,8 @@ bool RaceScreen::build_vehicle(App& app) {
             if (c.label == courses_[size_t(course_sel_)].label) dirt = c.surface == 2;
         vehicle_->set_dirt_course(dirt);
         net_.dirt = dirt;
+        // The AI aid block while the computer drives the player's car (run-up, pit lane, end of run).
+        vehicle_->set_scripted_aids(player_params(false).aids);
     }
     return ok;
 }
@@ -463,7 +535,7 @@ bool RaceScreen::build_vehicle_inner(App& app) {
             // Demo races (start type 0 with a speed): every car starts moving, no countdown.
             demo_start_kmh_ = es.type == 0 && es.initial_kmh > 0 ? es.initial_kmh : 0.0f;
             if (demo_start_kmh_ > 0) cfg.start_kmh = demo_start_kmh_, cfg.countdown = 0;
-            // Tyre wear: single player races, not on dirt courses (spec §8.1).
+            // Tyre wear: single player races, not on dirt courses (physics §8.1).
             bool dirt = false;
             for (const data::Course& c : db_.courses())
                 if (c.label == courses_[size_t(course_sel_)].label) dirt = c.surface == 2;
@@ -480,29 +552,19 @@ bool RaceScreen::build_vehicle_inner(App& app) {
         cfg.course_category = driver_param_set(db_, course_label_for_dirt_);
         // GT mode orders the grid by power-to-weight (strongest on pole, the player last).
         cfg.grid_by_power = from_menu_ && launch_.request.mode.rfind("go_", 0) == 0;
+        // A race replay's field as its run had it, wherever it is played (the theater has
+        // its own launch and today's settings).
+        if (replaying_ && replay_.grid_by_power) cfg.grid_by_power = *replay_.grid_by_power;
+        if (replaying_ && replay_.cpu_respawn) cfg.cpu_respawn = *replay_.cpu_respawn;
+        field_grid_by_power_ = cfg.grid_by_power, field_cpu_respawn_ = cfg.cpu_respawn;
         if (two_player_) {
             cfg.countdown = 0; // the original's 2P battle: no 3-2-1, the clock runs from the start
             cfg.second_player = preset_.car2.empty() ? car_.label : preset_.car2;
-            cfg.second_spec = launch_spec2_;
-            if (aids_options_apply_ && (!asm_on_ || !tcs_on_)) {
-                std::optional<sim::CarSpec> s2;
-                if (launch_spec2_) s2 = *launch_spec2_;
-                else s2 = sim::build_car_spec(db_, cfg.second_player);
-                if (s2) {
-                    if (!asm_on_) s2->aids.ascc_flags = 0;
-                    if (!tcs_on_) s2->aids.tcs_gain = 0;
-                    cfg.second_spec = std::make_shared<const sim::CarSpec>(std::move(*s2));
-                }
-            }
-            // 2P options: boost (catch-up), handicap, tyre damage (not on dirt).
-            if (app_) {
-                std::string boost = menu::flow::option_value(&app_->config(), "split_boost");
-                if (boost == "low") cfg.boost_amount = 0.15f, cfg.boost_start = 20, cfg.boost_full = 1000;
-                else if (boost == "high") cfg.boost_amount = 0.20f, cfg.boost_start = 10, cfg.boost_full = 200;
-                cfg.handicap_m = float(menu::flow::option_handicap(&app_->config()));
-                if (menu::flow::option_on(&app_->config(), "split_tire_damage") && cfg.course_category != 2)
-                    cfg.wear = sim::model::shipped_wear_params();
-            }
+            battle_ = replaying_ && replay_.battle ? *replay_.battle : live_battle(app, cfg.second_player, cfg.course_category);
+            cfg.second_spec = battle_.spec2;
+            cfg.boost_amount = battle_.boost_amount, cfg.boost_start = battle_.boost_start, cfg.boost_full = battle_.boost_full;
+            cfg.handicap_m = battle_.handicap_m;
+            if (battle_.tyre_damage) cfg.wear = sim::model::shipped_wear_params();
             cfg.opponents.clear();
             cfg.max_opponents = 0; // 2P battle: just the two players
         }
@@ -512,11 +574,11 @@ bool RaceScreen::build_vehicle_inner(App& app) {
         if (field_) {
             vehicle_ = &field_->player();
             car2_visual_.reset();
-            int paint2 = car2_paint_ >= 0 ? car2_paint_ : 1;
+            // Player 2's car as the battle has it (a garage car: its own model and bought wheels).
+            const int paint2 = battle_.paint2;
             std::string car2 = preset_.car2.empty() ? car_.label : preset_.car2;
-            // Player 2's garage car: its own model and bought wheels.
-            const std::string& model2 = from_menu_ && two_player_ ? launch_.request.car2_model : std::string();
-            const std::string& wheel2 = from_menu_ && two_player_ ? launch_.request.car2_wheel : std::string();
+            const std::string& model2 = battle_.model2;
+            const std::string& wheel2 = battle_.wheel2;
             if (field_->has_second() &&
                 (car2 != car_.label || paint2 != preset_.paint || !model2.empty() || !wheel2.empty())) {
                 if (const data::Car* c2 = db_.car(car2)) {
@@ -537,8 +599,11 @@ bool RaceScreen::build_vehicle_inner(App& app) {
             if (const track::Track* rt = track_->runtime()) pit_.load(*rt, 0);
             const data::Event* ev = db_.event(race_event_);
             race_laps_ = ev && ev->laps ? ev->laps : time_limit_ > 0 ? 0 : 3;
-            // 2P battle: the Options menu's lap count ([options] split_laps, default 2).
-            if (two_player_ && preset_.laps <= 0) race_laps_ = menu::flow::option_laps(&app.config());
+            // 2P battle: the Options menu's lap count ([options] split_laps, default 2), or the
+            // replay's.
+            if (two_player_ && replaying_ && replay_.battle) race_laps_ = replay_.battle->laps;
+            else if (two_player_ && preset_.laps <= 0) race_laps_ = menu::flow::option_laps(&app.config());
+            if (two_player_) battle_.laps = race_laps_;
             if (online_) race_laps_ = std::max(1, preset_.laps);
             field_->set_laps(race_laps_);
             race_opponents_ = field_->labels();
@@ -622,20 +687,53 @@ bool RaceScreen::build_vehicle_inner(App& app) {
     return vehicle_ != nullptr;
 }
 
+// A 2P battle as launched: player 2's car (its car page's, with the Options ASM / TCS off)
+// and the Options menu's catch-up boost, handicap and tyre damage (not on dirt); the laps are
+// set with the field.
+ReplayBattle RaceScreen::live_battle(App& app, const std::string& car2, int course_category) const {
+    ReplayBattle b;
+    b.spec2 = launch_spec2_;
+    if (aids_options_apply_ && (!asm_on_ || !tcs_on_)) {
+        std::optional<sim::CarSpec> s2;
+        if (launch_spec2_) s2 = *launch_spec2_;
+        else s2 = sim::build_car_spec(db_, car2);
+        if (s2) {
+            sim::apply_aid_options(s2->aids, asm_on_, tcs_on_);
+            b.spec2 = std::make_shared<const sim::CarSpec>(std::move(*s2));
+        }
+    }
+    const IniDocument* cfg = &app.config();
+    std::string boost = menu::flow::option_value(cfg, "split_boost");
+    if (boost == "low") b.boost_amount = 0.15f, b.boost_start = 20, b.boost_full = 1000;
+    else if (boost == "high") b.boost_amount = 0.20f, b.boost_start = 10, b.boost_full = 200;
+    b.handicap_m = float(menu::flow::option_handicap(cfg));
+    b.tyre_damage = menu::flow::option_on(cfg, "split_tire_damage") && course_category != 2;
+    if (car2_paint_ >= 0) b.paint2 = car2_paint_;
+    if (from_menu_) b.model2 = launch_.request.car2_model, b.wheel2 = launch_.request.car2_wheel;
+    return b;
+}
+
 void RaceScreen::reset_run_state() {
     script_time_ = 0;
     demo_drive_tick_ = 0;
     prev_ = vehicle_->state();
     render_state_ = prev_;
     race_time_ = 0;
-    machine_dist_ = 0, machine_time_ = -1, top_speed_kmh_ = 0;
+    machine_time_ = -1, top_speed_kmh_ = 0, hud_top_kmh_ = 0;
+    if (machine_) machine_->reset();
     tt_failed_ = false;
     tt_hold_ = !field_ && (tt_start_.type == 0 || tt_start_.type == 1) && !tt_start_.flying() ? tt_start_.countdown : 0;
-    // Lap 1 (presentation spec "Race order and finish"): a race times it from GO for every car
-    // (the HUD's lap time runs from GO), a standing licence test too (shown once past the line);
+    // The course's animations restart with every run; the start-signal lights follow the
+    // countdown (none for rolling and flying starts).
+    restart_course_animations(float(field_ ? std::max(0.0, -field_->race_time()) : tt_hold_));
+    vu0_random().init(Vu0Random::kRunSeed); // (as the game's run start: the cars' flap pendulums draw from it)
+    // Lap 1 (presentation §B9): a race times it from GO for every car
+    // (the HUD's lap time runs from GO), a standing licence test too (shown once past the line),
+    // a machine test too (its clock runs from GO, presentation §B7);
     // time trials, free runs and flying tests from the first line crossing.
     const bool standing_licence = !license_event_.empty() && !tt_start_.flying();
-    track_->lap_set_lap1_from_go(field_ || standing_licence, field_ != nullptr);
+    const bool machine = machine_.has_value();
+    track_->lap_set_lap1_from_go(field_ || standing_licence || machine, field_ != nullptr || machine);
     track_->lap_reset(0);
     track_->lap_update(vehicle_->state().position, 0);
     controls_.reset();
@@ -649,6 +747,9 @@ void RaceScreen::reset_run_state() {
     lap_ticks_ = 0;
     lap_begin_tick_ = 0;
     was_started_ = track_->lap_started();
+    flying_runup_ = flying_runup();
+    flying_go_t_ = -1;
+    run_session_record_ = false;
     finished_ = false;
     finish_position_ = 0;
     lap_times_.clear();
@@ -660,10 +761,11 @@ void RaceScreen::reset_run_state() {
     brake_lamps_.clear();
     hint_driver_.reset(), hint_course_.reset(); // rebuilt for this run
     runup_driver_.reset(), runup_course_.reset();
+    auto_driver_.reset(), end_of_run_ = false; // the pit lane / end-of-run driver
     finish_wait_ = 0;
     finish_menu_shown_ = false;
     all_done_at_ = -1;
-    post_replay_ = post_replay_done_ = false;
+    exit_finished_ = false, overlay_delay_ = race::kRecordOverlayDelay;
     p1_won_ = p2_won_ = false;
     finish_record_rank_ = -1;
     quick_ = false;
@@ -676,6 +778,7 @@ void RaceScreen::reset_run_state() {
         render_state2_ = field_->second_state();
         camera2_.snap(render_state2_);
     }
+    reset_lap_events();
 }
 
 // [race] respawn = off | cpu | all (default cpu): the non-original stuck fail-safe.

@@ -7,7 +7,7 @@ plugins {
 def quest = project.hasProperty('quest')
 
 // SDL3's Java glue and native sources come from one SDL checkout so the two
-// always match. fetch-sdl.sh (or fetch-sdl.ps1) creates it.
+// always match. fetch-sdl.sh creates it.
 def sdlDir = quest ? file(project.findProperty('SDL_XR_DIR') ?: "${rootDir}/third_party/SDL-xr")
                    : file(project.findProperty('SDL_DIR') ?: "${rootDir}/third_party/SDL")
 if (!file("${sdlDir}/android-project").exists()) {

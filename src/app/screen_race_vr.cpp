@@ -65,13 +65,18 @@ void RaceScreen::render_vr_eyes(App& app, Ui& ui, const render::DrawOptions& o) 
     collect_items(head_pos, right, own_car, true, sv);
     if (camera_.onboard()) // from inside the body: its bonnet, not its roof and windows
         for (size_t i = player_items_[0]; i < player_items_[1]; ++i) items_[i].single_sided = true;
-    const size_t scene_items = items_.size();
     const float fovy = std::atan(e0.tan_up) - std::atan(e0.tan_down);
     const float sun_v = sun_visibility(head_pos, fovy, float(e0.height));
     auto occl = [this](const render::Vec3& a, const render::Vec3& b) {
         return course_scene_ && course_scene_->occluder().segment_blocked(a, b);
     };
     const std::vector<CarLampGlows::Car> lamp_list = car_lamps_.active() ? lamp_cars() : std::vector<CarLampGlows::Car>{};
+    // The sky domes centred on each eye, not on the head between them: they are small (Route
+    // 11's is 33-51 m), so a shared centre put the sky at that distance in stereo, nearer than
+    // the scenery drawn over it. Centred on the eye it has no parallax: at infinity.
+    std::vector<std::pair<size_t, render::Mat4>> sky;
+    for (size_t k = 0; k < items_.size(); ++k)
+        if (items_[k].background) sky.emplace_back(k, items_[k].transform);
 
     for (int i = 0; i < 2; ++i) {
         const xr::Eye& e = x.eye(i);
@@ -80,9 +85,10 @@ void RaceScreen::render_vr_eyes(App& app, Ui& ui, const render::DrawOptions& o) 
         const render::Vec3 eye = world.transform_point({0, 0, 0});
         const render::Mat4 proj = e.projection(camera_.near_plane, camera_.far_plane);
         const render::Frustum fr{e.tan_left, e.tan_right, e.tan_down, e.tan_up};
+        for (const auto& [k, t] : sky) items_[k].transform = render::translate(eye - head_pos) * t;
         const SDL_FRect full{0, 0, float(e.width), float(e.height)};
         if (!vr_views_[i]) vr_views_[i] = std::make_unique<render::View3D>(*app.gpu());
-        if (wet_.active()) add_wet_road(eye, view, proj, fr, o);
+        const size_t wet_items = wet_.active() ? add_wet_road(eye, view, proj, fr, o) : 0;
         // Straight into the eye's canvas (no composite pass); the glows go on top with the 2D
         // renderer, whose work runs after this.
         auto* tex = static_cast<SDL_GPUTexture*>(
@@ -94,17 +100,18 @@ void RaceScreen::render_vr_eyes(App& app, Ui& ui, const render::DrawOptions& o) 
             SDL_RenderClear(r);
             vr_views_[i]->draw(r, full, view, proj, eye, items_, o);
         }
-        items_.resize(scene_items); // (the wet road's frame items belong to this eye only)
+        remove_wet_road(wet_items); // (the wet road's frame items belong to this eye only)
         sun_.draw(r, full, view, fr, sun_v);
         lamps_.draw(r, full, view, eye, fr, occl);
         if (car_lamps_.active()) car_lamps_.draw(r, full, view, eye, fr, lamp_list, occl);
-        if (exit_transition_ > kExitHold) { // the race -> menu wash, over the whole view
-            float a = 1.0f - std::pow(0.5f, float(exit_transition_ - kExitHold));
+        if (exit_transition_ > kExitHold) { // the race -> menu grey wash, over the whole view (presentation §C1)
+            const SDL_FColor w = menu::flow::ScreenTransition::delay_fadeout_cover(exit_transition_);
             SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-            SDL_SetRenderDrawColor(r, 0, 0, 0, u8(255 * a));
+            SDL_SetRenderDrawColorFloat(r, w.r, w.g, w.b, w.a);
             SDL_RenderFillRect(r, &full);
         }
     }
+    for (const auto& [k, t] : sky) items_[k].transform = t;
     hitch::meshes = vr_views_[0]->stats().meshes_drawn;
 
     // Back on the canvas: transparent, for the HUD panel.

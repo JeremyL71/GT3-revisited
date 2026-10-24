@@ -5,7 +5,11 @@
 #include "ai/ai_driver.h"
 #include "ai/ai_race.h"
 #include "game/data/car_database.h"
+#include "race/backend.h"
+#include "race/field.h"
+#include "sim/models.h"
 #include "track/track.h"
+#include "vfs/vfs.h"
 
 #include <cmath>
 #include <cstdio>
@@ -45,27 +49,25 @@ struct LapRun {
 };
 
 LapRun run_laps(const track::Track& t, const data::CarDatabase& db, const std::string& car, int laps, double limit,
-                ai::DriverParams p = ai::DriverParams::builtin(0)) {
-    if (const char* g = std::getenv("GT3R_AI_GRIP")) p.grip_scale = float(std::atof(g));
+                ai::DriverParams p) {
     if (std::getenv("GT3R_AI_CS")) p.counter_steer = true;
     if (const char* g = std::getenv("GT3R_AI_SLEW")) p.steer_rate = float(std::atof(g));
-    if (const char* g = std::getenv("GT3R_AI_BOOST")) p.boost_scale = float(std::atof(g));
     ai::AiRace race(t, db, {{car, p}});
     LapRun r;
     if (race.count() != 1) return r;
     while (race.time() < limit) {
         race.step();
         const auto& c = race.car(0);
-        r.max_stall = std::max(r.max_stall, race.time() - c.last_progress_time);
+        r.max_stall = std::max(r.max_stall, race.time() - c.last_progress_time());
         if (std::getenv("GT3R_AI_TRACE") && int(race.time() * 60) == 1) {
             const auto& g = c.driver->debug();
             std::printf("   grip %.2f m/s2 peak slip %.3f\n", g.grip, g.alpha_peak);
             ai::AiCourse co(t);
             const auto* l = co.line(co.resolve(6));
             for (size_t k = 0; k < l->points.size() && k < 12; ++k)
-                std::printf("   pt%zu s%.0f kind %d r %.0f b%d v%d slope %.3f bank %.3f grip %.2f\n", k, l->points[k].progress,
+                std::printf("   pt%zu s%.0f kind %d r %.0f b%d v%d slope %.3f bank %.3f surface %d\n", k, l->points[k].progress,
                             l->points[k].kind, l->points[k].radius, l->points[k].brake_adjust, l->points[k].speed_adjust,
-                            l->points[k].slope, l->points[k].bank, l->points[k].grip);
+                            l->points[k].slope, l->points[k].bank, l->points[k].surface);
         }
         static const double from = std::getenv("GT3R_AI_FROM") ? std::atof(std::getenv("GT3R_AI_FROM")) : -1;
         bool dense = from >= 0 && race.time() >= from && race.time() < from + 1.5;
@@ -73,10 +75,10 @@ LapRun run_laps(const track::Track& t, const data::CarDatabase& db, const std::s
             const auto& g = c.driver->debug();
             const auto& st = c.vehicle->state();
             std::printf("   t%6.1f s%6.0f v%5.1f g%d line%d pt%d mode%d st%d dr%d vc%5.1f vn%5.1f bd%5.0f/%4.0f thr%.2f brk%.0f "
-                        "eps%+5.2f ry%+5.2f a%+5.2f sat%.1f ov%.2f steer%+5.2f sa%+5.2f/%+5.2f yaw%+5.2f lat%5.1f pos(%.1f %.1f) wi%.0f\n",
+                        "eps%+5.2f ry%+5.2f a%+5.2f sat%.1f hit%u steer%+5.2f sa%+5.2f/%+5.2f yaw%+5.2f lat%5.1f pos(%.1f %.1f) wi%.0f\n",
                         race.time(), g.progress, st.speed_kmh, st.gear, g.line, g.next_point, g.mode, g.state, g.drive,
                         g.target_speed * 3.6, g.next_speed * 3.6, g.brake_distance, g.distance_to_point, g.throttle,
-                        g.brake, g.heading_error, g.desired_yaw, g.slip_wanted, g.saturation, g.oversteer, g.steer_angle, st.wheels[0].slip_angle, st.wheels[1].slip_angle, -st.angular_velocity.y, c.vehicle->telemetry().accel_local.x, st.position.x, st.position.z,
+                        g.brake, g.heading_error, g.desired_yaw, g.slip_wanted, g.saturation, g.hits, g.steer_angle, st.wheels[0].slip_angle, st.wheels[1].slip_angle, -st.angular_velocity.y, c.vehicle->telemetry().accel_local.x, st.position.x, st.position.z,
                         c.vehicle->telemetry().wall_impulse);
             if (std::getenv("GT3R_AI_TRACE_ENGINE"))
                 std::printf("     y %.2f susp %.2f rpm %.0f clutch %.2f locked %d torque %.0f wheels %.1f %.1f %.1f %.1f grounded %d%d%d%d surf %x %x %x %x\n",
@@ -148,7 +150,7 @@ TEST(ai_event_overrides) {
 TEST(ai_line_roles) {
     Disc* d = test::test_disc();
     if (!d) SKIP("needs GT3R_DISC");
-    // Main line evaluated every 5 m (spec §2.3) lies on the road mesh.
+    // Main line evaluated every 5 m (ai §2.3) lies on the road mesh.
     size_t on = 0, n = 0, worst_n = 0;
     float worst = 1;
     std::string worst_name;
@@ -171,6 +173,36 @@ TEST(ai_line_roles) {
     }
     std::printf("  main line on the road: %zu/%zu samples; worst %s (%zu off)\n", on, n, worst_name.c_str(), worst_n);
     CHECK(n > 0 && on >= n * 995 / 1000);
+}
+
+// The course files' AI driver parameter sets (slots 37-40, ai §9.1): decoded on every US course;
+// a set per driveline class on all but the course whose slots are empty, which takes the
+// built-in set of its category.
+TEST(ai_course_param_sets_disc) {
+    Disc* d = test::test_disc();
+    if (!d) SKIP("needs GT3R_DISC");
+    int files = 0, with_sets = 0, partial = 0, pit_other = 0;
+    std::string without;
+    for (const auto& e : d->volume().entries()) {
+        const std::string prefix = "courses/US/";
+        if (e.path.rfind(prefix, 0) != 0 || e.path.back() == '/') continue;
+        Bytes data = d->volume().read(e);
+        auto t = track::Track::from_course_file(data, e.path.substr(prefix.size()));
+        ++files;
+        int n = 0;
+        for (int c = 0; c < 4; ++c) n += t->driver_sets().for_class(c) != nullptr;
+        if (n == 4) ++with_sets;
+        else if (n == 0) without += (without.empty() ? "" : " ") + t->label();
+        else ++partial;
+        for (int c = 0; c < 4; ++c)
+            if (const auto* s = t->driver_sets().for_class(c)) {
+                ai::DriverParams p = ai::DriverParams::from_bytes(*s);
+                pit_other += std::fabs(p.pit_speed * 3.6f - 80) > 2.5f; // 78 or 80 km/h on the disc
+            }
+    }
+    std::printf("  %d course files: %d with four sets, %d partial, none on: %s; pit speeds other than 78-80: %d\n",
+                files, with_sets, partial, without.c_str(), pit_other);
+    CHECK(files == 80 && with_sets == 79 && partial == 0 && without == "L_circle60_wet1" && pit_other == 0);
 }
 
 // One car, two laps on every lap course of the US set.
@@ -206,12 +238,9 @@ TEST(ai_laps_all_courses) {
     auto worker = [&] {
         for (size_t k; (k = next++) < jobs.size();)
         {
-            // ai.md §9.1: the built-in set of the course category (1 wet Route 5, 2 dirt, else 0).
-            int set = 0;
-            for (const data::Course& c : db->courses())
-                if (c.label == jobs[k].name) set = c.surface == 1 || c.surface == 2 ? int(c.surface) : 0;
+            // ai §9.1: the course's set for the car's driveline class (no event overrides).
             jobs[k].result = run_laps(*jobs[k].track, *db, car, 2, 30.0 + jobs[k].track->length() / 8.0,
-                                      ai::DriverParams::builtin(set));
+                                      ai::race_params(*db, car, *jobs[k].track));
         }
     };
     std::vector<std::thread> pool;
@@ -245,9 +274,8 @@ TEST(ai_event_races) {
         std::vector<ai::AiRace::Entry> entries;
         for (const auto& name : ev->entries) {
             if (name.empty() || name == "-") continue;
-            ai::DriverParams p = ai::DriverParams::builtin(0);
-            ai::apply_event(p, *ev, 0);
-            entries.push_back({name, p});
+            // The course's set for each car's driveline class and the event's overrides for it.
+            entries.push_back({name, ai::race_params(*db, name, *t, ev)});
             if (entries.size() == 6) break;
         }
         // Car 0 stands in for the player (rubber-band reference).
@@ -265,15 +293,15 @@ TEST(ai_event_races) {
                 const auto& g = c.driver->debug();
                 const auto& st = c.vehicle->state();
                 std::printf("   t%6.1f s%6.0f v%5.1f g%d line%d pt%d mode%d st%d dr%d vc%5.1f vn%5.1f thr%.2f brk%.0f eps%+5.2f "
-                            "a%+5.2f sat%.1f ov%.2f steer%+5.2f c%.2f z%02X resp%d pos(%.0f %.0f) gw%d rpm%.0f\n",
+                            "a%+5.2f sat%.1f hit%u steer%+5.2f c%.2f z%02X resp%d pos(%.0f %.0f) gw%d rpm%.0f\n",
                             race.time(), g.progress, st.speed_kmh, st.gear, g.line, g.next_point, g.mode, g.state, g.drive,
                             g.target_speed * 3.6, g.next_speed * 3.6, g.throttle, g.brake, g.heading_error, g.slip_wanted,
-                            g.saturation, g.oversteer, g.steer_angle, g.contact, g.zones, c.respawns, st.position.x,
+                            g.saturation, g.hits, g.steer_angle, g.contact, g.zones, c.respawns, st.position.x,
                             st.position.z, g.gear_want, st.engine_rpm);
             }
             bool all = true;
             for (int i = 0; i < race.count(); ++i) {
-                max_stall = std::max(max_stall, race.time() - race.car(i).last_progress_time);
+                max_stall = std::max(max_stall, race.time() - race.car(i).last_progress_time());
                 all = all && race.car(i).timer->laps_completed() >= laps;
             }
             if (all) break;
@@ -298,9 +326,8 @@ TEST(ai_deterministic) {
     if (!db) SKIP("needs GT3R_DISC");
     auto t = load_course("trialmt");
     if (!t) SKIP("no trialmt");
-    std::vector<ai::AiRace::Entry> e = {{"r34_gtr_v_99", ai::DriverParams::builtin(0)},
-                                        {"r34_gtr_v_99", ai::DriverParams::builtin(0)},
-                                        {"r34_gtr_v_99", ai::DriverParams::builtin(0)}};
+    const ai::DriverParams p = ai::race_params(*db, "r34_gtr_v_99", *t);
+    std::vector<ai::AiRace::Entry> e = {{"r34_gtr_v_99", p}, {"r34_gtr_v_99", p}, {"r34_gtr_v_99", p}};
     ai::AiRace a(*t, *db, e), b(*t, *db, e);
     for (int i = 0; i < 60 * 40; ++i) {
         a.step();
@@ -350,4 +377,57 @@ TEST(ai_debug_line_walls) {
                     p.x, p.y, p.z, tp.lateral, tp.centre.y, top.height, low.hit ? "" : "-", low.hit ? low.height : 0.0f,
                     wc.wall, wc.hit ? 6.0f - wc.penetration : -1.0f);
     }
+}
+
+// A CPU pit stop driven by the AI driver itself (ai §13): with a wear curve that arms the car at
+// once (invented: fresh wear 0, "worn" below 1.01), the opponent enters at the stop line's point
+// 0, drives the pit lane line at the set's pit speed (driver kind 2), the stop line at 20 km/h
+// (3), stops in its box, leaves (4) and returns to racing (0).
+TEST(ai_cpu_pit_stop_disc) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    Vfs vfs(&disc->volume());
+    data::CarDatabase db;
+    CHECK(db.load(vfs));
+    Bytes course = disc->volume().read(*disc->volume().find("courses/US/trialmt"));
+    std::unique_ptr<race::RaceTrack> track = race::make_track(vfs, course, "trialmt");
+    CHECK(track->runtime() != nullptr);
+    race::FieldConfig cfg;
+    cfg.player = "r34_gtr_v_99";
+    cfg.opponents = {"r34_gtr_v_99"};
+    cfg.countdown = 0;
+    cfg.wear = sim::model::shipped_wear_params();
+    cfg.wear.fresh = 0;
+    cfg.wear.worn = 1.01f;
+    std::string err;
+    std::unique_ptr<race::RaceField> f = race::RaceField::create(*track, db, cfg, &err);
+    CHECK(f != nullptr);
+    if (!f) return;
+    f->set_laps(10);
+    const ai::DriverParams p = ai::course_params(track->runtime()->driver_sets(), 0,
+                                                 ai::driveline_class(f->opponent_vehicle(0)->spec()));
+    double entered = -1, stopped = -1, left = -1, back = -1;
+    float at_decision = -1, at_box = 0, last_kmh = 0, surface_top = 0;
+    int kinds = 0, last_kind = 0;
+    while (f->race_time() < 240 && back < 0) {
+        f->player().step(sim::ControlInputs{}, 1.0 / 60);
+        for (int i : f->take_pit_entries())
+            if (i == 0 && entered < 0) entered = f->race_time();
+        const sim::Vehicle& v = *f->opponent_vehicle(0);
+        int k = v.driver_kind();
+        kinds |= 1 << k;
+        if (k == 3 && last_kind == 2) at_decision = v.state().speed_kmh; // 25 m before the box
+        if (k == 3 && v.telemetry().on_pit_surface && at_decision >= 0) surface_top = std::max(surface_top, v.state().speed_kmh);
+        if (stopped < 0 && v.spawn_hold_active()) stopped = f->race_time(), at_box = last_kmh;
+        last_kmh = v.state().speed_kmh, last_kind = k;
+        if (left < 0 && stopped >= 0 && k == 4) left = f->race_time();
+        if (left >= 0 && k == 0 && !f->opponent_in_pits(0)) back = f->race_time();
+    }
+    std::printf("  CPU pit stop on trialmt: entered %.1f s, stopped %.1f s, leaving %.1f s, racing %.1f s; "
+                "%.1f km/h at the stop decision (set's pit speed %.0f + 2), at most %.1f km/h on the stop line, "
+                "%.1f km/h into the box; driver kinds seen %x\n",
+                entered, stopped, left, back, at_decision, p.pit_speed * 3.6f, surface_top, at_box, kinds);
+    CHECK(entered > 0 && stopped > entered && left > stopped && back > left);
+    CHECK(kinds == 0x1D); // 0, 2, 3, 4
+    CHECK(at_decision > 0 && at_decision < 100 && at_box < 30);
 }

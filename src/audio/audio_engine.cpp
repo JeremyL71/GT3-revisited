@@ -12,7 +12,8 @@ namespace gt3r {
 AudioEngine::AudioEngine() {
     // The game's sound init: effect mode 4 on both cores, EVOL 0x0FFF.
     voices_.set_reverb(SpuReverb::StudioC, 0x0FFF, 0x0FFF);
-    sequencer_.set_master_volume(std::min(int(music_volume_ * 16384), 0x3FFF));
+    voices_.set_bus_gain(VoiceBus::Music, music_volume_);
+    voices_.set_bus_gain(VoiceBus::Effects, sfx_volume_);
     // The sequencer runs inside the mixer at the game's 60 Hz, sample-exact.
     voices_.set_tick_hook([this] { sequencer_.update(voices_); }, sequencer_.samples_per_update());
 
@@ -23,7 +24,7 @@ AudioEngine::AudioEngine() {
         LOG_ERROR("Audio unavailable: %s", SDL_GetError());
         return;
     }
-    SDL_SetAudioStreamGain(music_stream_, music_volume_);
+    SDL_SetAudioStreamGain(music_stream_, stream_output_gain(stream_level_, music_volume_));
     SDL_ResumeAudioStreamDevice(music_stream_);
 
     SDL_AudioSpec vspec{SDL_AUDIO_S16, 2, int(VoiceMixer::kRate)};
@@ -32,8 +33,7 @@ AudioEngine::AudioEngine() {
         LOG_ERROR("Voice mixer unavailable: %s", SDL_GetError());
         return;
     }
-    SDL_SetAudioStreamGain(sfx_stream_, sfx_volume_);
-    SDL_ResumeAudioStreamDevice(sfx_stream_);
+    SDL_ResumeAudioStreamDevice(sfx_stream_); // unity gain: the volumes are the mixer's bus gains
 }
 
 AudioEngine::~AudioEngine() {
@@ -77,32 +77,34 @@ const std::vector<sound::MusicEntry>& AudioEngine::music_index(Vfs& vfs) {
     return music_index_;
 }
 
-bool AudioEngine::play_sequence(Vfs& vfs, int index) {
+bool AudioEngine::play_sequence(Vfs& vfs, int index, float volume) {
     if (!load_sequences(vfs)) return false;
     stop_stream();
+    // The request's level is the sequencer's music volume (music §6).
+    sequencer_.set_master_volume(bgm::sequence_volume(volume));
     if (!sequencer_.play(voices_, index)) return false;
     LOG_INFO("Playing sequence %d", index);
     return true;
 }
 
-bool AudioEngine::play_sequence(Vfs& vfs, const std::string& name) {
+bool AudioEngine::play_sequence(Vfs& vfs, const std::string& name, float volume) {
     // "bgm:<id>[:once]": a BGM-layer cue (streamed presentation music), played
     // "if different".
     if (name.rfind("bgm:", 0) == 0) {
         int id = std::atoi(name.c_str() + 4);
         bool loop = name.find(":once") == std::string::npos;
-        return bgm_.play_if_different(*this, vfs, id, 0, loop);
+        return bgm_.play_if_different(*this, vfs, id, 0, loop, volume);
     }
     if (!load_sequences(vfs)) return false;
     for (const sound::MusicEntry& e : music_index_)
-        if (e.name == name) return play_sequence(vfs, int(e.sequence));
+        if (e.name == name) return play_sequence(vfs, int(e.sequence), volume);
     LOG_ERROR("No sequenced music named %s", name.c_str());
     return false;
 }
 
 void AudioEngine::set_sfx_volume(float v) {
     sfx_volume_ = std::clamp(v, 0.0f, 1.0f);
-    if (sfx_stream_) SDL_SetAudioStreamGain(sfx_stream_, sfx_volume_);
+    voices_.set_bus_gain(VoiceBus::Effects, sfx_volume_);
 }
 
 void SDLCALL AudioEngine::feed_voices(void* user, SDL_AudioStream* stream, int additional, int) {
@@ -116,7 +118,7 @@ void SDLCALL AudioEngine::feed_voices(void* user, SDL_AudioStream* stream, int a
     SDL_PutAudioStreamData(stream, buf.data(), int(buf.size() * sizeof(s16)));
 }
 
-bool AudioEngine::play_music(Vfs& vfs, const std::string& path, bool loop) {
+bool AudioEngine::play_music(Vfs& vfs, const std::string& path, bool loop, float volume) {
     if (!music_stream_) return false;
     sequencer_.stop(voices_);
     std::unique_ptr<AdsStream> stream;
@@ -161,8 +163,10 @@ bool AudioEngine::play_music(Vfs& vfs, const std::string& path, bool loop) {
         music_ = std::move(stream);
         music_data_ = std::move(data);
         music_finished_ = false;
+        stream_level_ = volume;
     }
     SDL_UnlockAudioStream(music_stream_);
+    SDL_SetAudioStreamGain(music_stream_, stream_output_gain(volume, music_volume_));
     // A new piece always plays: a pause (the race pause) ends with the piece it paused.
     // Without this, leaving a race from its pause menu left the device paused and the
     // next race's music silent until the next pause / resume.
@@ -211,6 +215,37 @@ double AudioEngine::music_position() const {
     return music_ ? music_->position_seconds() : 0.0;
 }
 
+double AudioEngine::music_audible_position() const {
+    if (sequencer_.active() || !music_stream_) return music_position();
+    double pos = 0, rate = 0;
+    u32 ch = 0;
+    {
+        std::lock_guard lock(mutex_);
+        if (!music_) return 0.0;
+        pos = music_->position_seconds();
+        rate = music_->header().sample_rate;
+        ch = music_->header().channels;
+    }
+    if (rate <= 0 || ch == 0) return pos;
+    // Queued input (S16 at the stream's rate), then the device's own buffer.
+    const int queued = SDL_GetAudioStreamQueued(music_stream_);
+    if (queued > 0) pos -= double(queued) / (2.0 * ch * rate);
+    SDL_AudioSpec spec{};
+    int frames = 0;
+    if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(music_stream_), &spec, &frames) && frames > 0 && spec.freq > 0)
+        pos -= double(frames) / spec.freq;
+    return std::max(pos, 0.0);
+}
+
+void AudioEngine::set_stream_level(float level) {
+    {
+        std::lock_guard lock(mutex_);
+        if (stream_level_ == level) return;
+        stream_level_ = level;
+    }
+    if (music_stream_) SDL_SetAudioStreamGain(music_stream_, stream_output_gain(level, music_volume_));
+}
+
 double AudioEngine::music_length() const {
     if (int cur = sequencer_.current(); cur >= 0 && size_t(cur) < seq_loop_seconds_.size())
         return seq_loop_seconds_[size_t(cur)];
@@ -220,9 +255,13 @@ double AudioEngine::music_length() const {
 
 void AudioEngine::set_music_volume(float v) {
     music_volume_ = std::clamp(v, 0.0f, 1.0f);
-    if (music_stream_) SDL_SetAudioStreamGain(music_stream_, music_volume_);
-    // The game's music volume option sets the sequencer's global volume.
-    sequencer_.set_master_volume(std::min(int(music_volume_ * 16384), 0x3FFF));
+    float level;
+    {
+        std::lock_guard lock(mutex_);
+        level = stream_level_;
+    }
+    if (music_stream_) SDL_SetAudioStreamGain(music_stream_, stream_output_gain(level, music_volume_));
+    voices_.set_bus_gain(VoiceBus::Music, music_volume_);
 }
 
 void SDLCALL AudioEngine::feed(void* user, SDL_AudioStream* stream, int additional, int) {

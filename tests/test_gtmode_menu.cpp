@@ -10,6 +10,7 @@
 #include "vfs/vfs.h"
 
 #include <filesystem>
+#include <fstream>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -163,7 +164,15 @@ TEST(gtmode_menu_disc_buy_and_race) {
     res.finished = true;
     res.position = 1;
     res.cars = 6;
-    res.distance_km = 4.5;
+    // The run drove 4.5 km: the engine condition the race hands back (physics §10.3).
+    CHECK(r->car_condition && r->garage_car == 0);
+    {
+        const sim::EngineCondition end = game::GtMode::driven({r->car_odometer, r->car_wear_m, r->car_oil_m}, 4500);
+        res.car_condition = true;
+        res.car_odometer = end.odometer, res.odometer_added = end.odometer - r->car_odometer;
+        res.car_wear_m = end.wear_m, res.car_oil_m = end.oil_m;
+        res.garage_car = r->garage_car;
+    }
     post_game_result(res);
     f.game_finished();
     settle(f);
@@ -511,6 +520,206 @@ TEST(gtmode_menu_disc_pointer_shops) {
     CHECK(f.controller()->depth() == 1);
 }
 
+// The wheel shop's highlights (menus §5.3, §9.7). On the GT Auto page the Wheel Shop button's
+// highlight sits on the button, although the layout puts it 10 units to the right (the
+// playtest saw the pulsing normal look flash beside it). The makers' row highlights the focused
+// maker in the row. On each maker's page the focused tile alone is washed, once, on that tile,
+// and nothing of the page's own (parked) items shows on the screen; a hovering pointer still
+// moves the wash.
+TEST(gtmode_menu_disc_wheel_shop_highlights) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::install_gt_mode_menu();
+    Vfs vfs(&disc->volume());
+    GameFlow f(vfs_reader(vfs), "US");
+    f.start();
+    settle(f);
+    game::GtModeSession* s = game::gt_mode_session();
+    CHECK(s != nullptr);
+    if (!s) return;
+    s->gt().state().credits = 1000000;
+    CHECK(s->gt().buy_car("altezza_rs200_98") == 0);
+    choose(f, "gt_mode");
+    settle(f);
+    choose(f, "at_at");
+    CHECK(f.controller()->page_name() == "at/at");
+    auto near = [](float a, float b) { return std::fabs(a - b) < 0.01f; };
+    // Where a draw puts its element (its replacement box, else the element's own place).
+    auto origin = [](const menu::ElementDraw& d, float& x, float& y) {
+        x = d.has_box ? d.box.x : d.element->x + d.dx;
+        y = d.has_box ? d.box.y : d.element->y + d.dy;
+    };
+    // The focused button's looks over a pulse period: the highlight once a frame and the normal
+    // look over it, both where the list puts the button.
+    auto button_ok = [&]() {
+        const MenuController& c = *f.controller();
+        const MenuController::ItemState* it = c.focused();
+        SDL_FRect box{};
+        if (!it || !it->element || it->element->alt.empty() || !c.item_box(c.focus(), box)) return false;
+        bool ok = true;
+        int pulses = 0;
+        for (int i = 0; i < 30; ++i) {
+            f.tick(0);
+            int highlights = 0;
+            for (const menu::ElementDraw& d : f.draw_list()) {
+                if (d.kind != menu::ElementDraw::Kind::Element) continue;
+                if (d.element != it->element && d.element != &it->element->alt[0]) continue;
+                float x, y;
+                origin(d, x, y);
+                ok = ok && near(x, box.x) && near(y, box.y);
+                if (d.element != it->element) ++highlights;
+                else if (d.alpha > 0) ++pulses;
+            }
+            ok = ok && highlights == 1;
+        }
+        return ok && pulses > 0;
+    };
+    CHECK(f.controller()->set_focus("sl"));
+    const menu::Element& sl = *f.controller()->focused()->element;
+    CHECK(!sl.alt.empty() && near(sl.alt[0].x - sl.x, 10)); // the layout's highlight, beside the button
+    CHECK(button_ok());
+    choose(f, "sl");
+    CHECK(f.controller()->page_name() == "at/ws/ws");
+    // Each maker's tiles: the wash on the focused tile only.
+    auto tiles_ok = [&]() {
+        const MenuController& c = *f.controller();
+        const MenuController::ItemState* it = c.focused();
+        if (!it || !it->flow) return false;
+        const std::string wheel = it->flow->name.substr(0, it->flow->name.rfind('_'));
+        std::vector<menu::ElementDraw> list = f.draw_list();
+        const menu::ElementDraw* tile = nullptr;
+        for (const menu::ElementDraw& d : list)
+            if (d.element && d.has_box && d.element->name == wheel) tile = &d;
+        if (!tile) return false;
+        int washes = 0;
+        bool ok = true;
+        for (const menu::ElementDraw& d : list) {
+            if (d.kind == menu::ElementDraw::Kind::Fill && d.has_box && d.fill.r == 1 && d.fill.g == 1 &&
+                d.fill.b == 1 && d.fill.a < 1) {
+                ++washes;
+                ok = ok && near(d.box.x, tile->box.x) && near(d.box.y, tile->box.y) && near(d.box.w, tile->box.w) &&
+                     near(d.box.h, tile->box.h);
+            }
+            for (const MenuController::ItemState& item : c.items())
+                if (d.element && item.element &&
+                    (d.element == item.element || (!item.element->alt.empty() && d.element == &item.element->alt[0]))) {
+                    float x, y;
+                    origin(d, x, y);
+                    ok = ok && x >= 640; // parked: the page's own button art never shows
+                }
+        }
+        return ok && washes == 1;
+    };
+    int makers = 0, makers_ok = 0;
+    for (int m = 0; m < int(f.controller()->items().size()); ++m) {
+        f.controller()->set_focus(m);
+        CHECK(button_ok()); // the makers' row
+        press(f, MenuKey::Confirm);
+        if (f.controller()->page_name().rfind("at/ws/ws_", 0) != 0) {
+            CHECK(false);
+            break;
+        }
+        ++makers;
+        for (int i = 0; i < 30; ++i) f.tick(0);
+        bool ok = tiles_ok();
+        press(f, MenuKey::Right);
+        press(f, MenuKey::Right);
+        ok = ok && tiles_ok();
+        // A hovering pointer over the first tile moves the wash there.
+        float x = 0, y = 0;
+        for (const menu::ElementDraw& d : f.draw_list()) {
+            const std::string& first = f.controller()->items()[0].flow->name;
+            if (d.element && d.has_box && d.element->name == first.substr(0, first.rfind('_')))
+                x = d.box.x + d.box.w / 2, y = d.box.y + d.box.h / 2;
+        }
+        ok = ok && f.hover(x, y) && f.controller()->focus() == 0 && tiles_ok();
+        if (ok) ++makers_ok;
+        else std::printf("  %s: the wash is not on the focused tile alone\n", f.controller()->page_name().c_str());
+        press(f, MenuKey::Cancel);
+        CHECK(f.controller()->page_name() == "at/ws/ws");
+    }
+    CHECK(makers == 9 && makers_ok == makers);
+}
+
+// The car wash and the oil change on the disc's pages (gt_mode §13.2): after the button's confirm
+// feedback their progress popup ("Washing . . .", "Changing oil . . .") holds the controls, with
+// no "Complete" button and no key doing anything, until the wash (the car spun for 181 frames)
+// or the oil change (drained and refilled) is over; then "Complete" leads back to the shop.
+TEST(gtmode_menu_disc_wash_and_oil) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::install_gt_mode_menu();
+    Vfs vfs(&disc->volume());
+    GameFlow f(vfs_reader(vfs), "US");
+    f.start();
+    settle(f);
+    game::GtModeSession* s = game::gt_mode_session();
+    CHECK(s != nullptr);
+    if (!s) return;
+    s->gt().state().credits = 1000000;
+    CHECK(s->gt().buy_car("altezza_rs200_98") == 0);
+    game::GarageCar* ride = s->gt().state().ride_car();
+    CHECK(ride != nullptr);
+    if (!ride) return;
+    ride->cond.dirt = 0.5f;
+    ride->cond.oil_m = 200000;
+    choose(f, "gt_mode");
+    settle(f);
+    choose(f, "at_at");
+    CHECK(f.controller()->page_name() == "at/at");
+    auto drawn = [&](const char* name) {
+        for (const menu::ElementDraw& d : f.draw_list())
+            if (d.element && d.element->name == name) return true;
+        return false;
+    };
+    // Confirms the shop's button and runs until the controls come back: the frames the popup
+    // took them (after the button's confirm feedback) and gave them back, the frames its effect
+    // played, and whether the popup held them (no button, keys ignored).
+    struct Run {
+        int up = -1, back = -1;
+        std::vector<int> sounds;
+        bool held = true;
+    };
+    auto run = [&](const char* button, const char* popup, const char* sound) {
+        Run r;
+        CHECK(f.controller()->set_focus(button));
+        f.take_sounds();
+        f.tick(key_bit(MenuKey::Confirm));
+        for (int t = 1; t <= 600 && r.back < 0; ++t) {
+            const bool presses = t >= 60 && t < 160 && t % 10 == 0; // Confirm / Cancel while it runs
+            f.tick(presses ? key_bit(t % 20 ? MenuKey::Confirm : MenuKey::Cancel) : MenuKeys(0));
+            for (const std::string& se : f.take_sounds())
+                if (se == sound) r.sounds.push_back(t);
+            if (r.up < 0 && f.controller()->ignoring_control()) r.up = t;
+            if (r.up < 0) continue;
+            if (!f.controller()->ignoring_control()) r.back = t;
+            else if (f.controller()->page_name() != popup || drawn("end") || !drawn("base1")) r.held = false;
+        }
+        CHECK(f.controller()->page_name() == popup && drawn("end")); // "Complete"
+        return r;
+    };
+    choose(f, "gr");
+    CHECK(f.controller()->page_name() == "at/cw/cw");
+    Run wash = run("wash", "at/cw/cw_now", "car_wash");
+    CHECK(wash.up == 30 && wash.held && wash.back == 212 && (wash.sounds == std::vector<int>{31}));
+    CHECK(ride->cond.dirt == 0);
+    press(f, MenuKey::Confirm);
+    CHECK(f.controller()->page_name() == "at/at");
+    choose(f, "st");
+    CHECK(f.controller()->page_name() == "at/ot/ot");
+    Run oil = run("wash", "at/ot/ot_now", "oil");
+    CHECK(oil.up == 30 && oil.held && oil.back == 325 && (oil.sounds == std::vector<int>{62, 224}));
+    CHECK(ride->cond.oil_m == -300000);
+    press(f, MenuKey::Confirm);
+    CHECK(f.controller()->page_name() == "at/at");
+    unset_env("GT3R_GTMODE_SAVE");
+    unset_env("GT3R_GTMODE_NOSAVE");
+}
+
 TEST(gtmode_menu_disc_settings_sliders) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
@@ -615,9 +824,6 @@ TEST(gtmode_menu_disc_attract_mode) {
     CHECK(!f.attract() && f.controller()->page_name() == "root");
 }
 
-// A licence run with a medal: the race enters the record itself and runs the name entry
-// as a stand-alone presentation (the original asks right after the run); the result
-// posted later (records_done) does not add it again.
 // The race prize page shown from the race (before the replay): the prize counts down while the
 // balance (not yet credited) counts up; OK only once the count is done.
 TEST(gtmode_menu_disc_race_prize_page) {
@@ -652,6 +858,9 @@ TEST(gtmode_menu_disc_race_prize_page) {
     CHECK(f.exited());
 }
 
+// A licence run with a medal: the race enters the record itself and runs the name entry
+// as a stand-alone presentation (the original asks right after the run); the result
+// posted later records nothing.
 TEST(gtmode_menu_disc_license_run_name_entry) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
@@ -683,8 +892,10 @@ TEST(gtmode_menu_disc_license_run_name_entry) {
 TEST(gtmode_menu_disc_record_name_entry) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
-    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
-    set_env("GT3R_GTMODE_NOSAVE", "1");
+    const std::string path = (std::filesystem::temp_directory_path() / "gt3r_test_record_name.sav").string();
+    std::remove(path.c_str());
+    set_env("GT3R_GTMODE_SAVE", path.c_str());
+    set_env("GT3R_GTMODE_NOSAVE", "0");
     game::install_gt_mode_menu();
     Vfs vfs(&disc->volume());
     GameFlow f(vfs_reader(vfs), "US");
@@ -703,11 +914,15 @@ TEST(gtmode_menu_disc_record_name_entry) {
     for (int i = 0; i < 80 && !f.waiting_for_game(); ++i) f.tick(0);
     std::optional<GameRequest> r = f.take_request();
     CHECK(r.has_value() && r->race_code == "M400");
+    // The race records the run as it ends (gt_mode §17); here its name entry is still queued
+    // when the menus resume.
+    CHECK(game::add_machine_test_record("M400", 12.345) == 0);
     GameResult res;
     res.mode = "go_machine_test";
     res.race_code = res.event = "M400";
     res.finished = true;
     res.total_time = 12.345;
+    res.records_done = true;
     post_game_result(res);
     f.game_finished();
     settle(f);
@@ -755,10 +970,36 @@ TEST(gtmode_menu_disc_record_name_entry) {
     const auto& rank = s->gt().state().rankings["mt:M400"];
     CHECK(rank.size() == 1 && rank[0].name == "GTR" && rank[0].value == 12.345);
     CHECK(s->gt().state().player_name == "GTR");
+    // L1 / R1 move the text box's cursor: the caret (hidden "cursor") follows it.
+    auto caret_x = [&] {
+        for (const menu::ElementDraw& d : f.draw_list())
+            if (d.element && d.element->name == "cursor" && d.has_box) return d.box.x;
+        return -1.0f;
+    };
+    const float end_x = caret_x();
+    press(f, MenuKey::L1);
+    const float mid_x = caret_x();
+    press(f, MenuKey::R1);
+    CHECK(end_x > 0 && mid_x > 0 && mid_x < end_x && caret_x() == end_x && s->name_box.cursor == 3);
     CHECK(c->set_focus("free_command"));
     press(f, MenuKey::Confirm); // OK
     settle(f);
     CHECK(f.control() == "gt_mode" && f.controller()->page_name() == "mt/mt");
+    // The name is saved with the record once the page closes (the result was saved before it).
+    std::ifstream in(path);
+    std::string line;
+    bool record = false, player = false;
+    while (std::getline(in, line)) {
+        // "rank <key> <value> <car> <day> <name> <stamp>"
+        if (line.rfind("rank mt:M400 12.345 ", 0) == 0) {
+            const size_t name_at = line.find(" GTR ");
+            record = record || (name_at != std::string::npos && std::strtoul(line.c_str() + name_at + 5, nullptr, 10) != 0);
+        }
+        player = player || line == "player GTR";
+    }
+    CHECK(record && player);
+    std::remove(path.c_str());
+    set_env("GT3R_GTMODE_NOSAVE", "1");
 }
 
 // Arcade progression through the arcade menus: the pickers offer only the open
@@ -939,35 +1180,55 @@ TEST(gtmode_menu_disc_arcade_class_and_time_trial) {
     press(f, MenuKey::Cancel);
     press(f, MenuKey::Cancel);
     CHECK(f.controller()->page_name() == "ar/top");
-    // Time trial 1, a time under the record: name entry, then back to the arcade menu.
-    choose(f, "item2");
-    CHECK(f.controller()->page_name() == "ar/select_compulsory");
-    press(f, MenuKey::Confirm);
-    for (int i = 0; i < 80 && !f.waiting_for_game(); ++i) f.tick(0);
-    std::optional<GameRequest> r = f.take_request();
-    CHECK(r && r->mode == "time_trial" && r->course == "tt01");
-    GameResult res;
-    res.mode = "time_trial";
-    res.finished = true;
-    res.position = 1;
-    res.total_time = 80.0;
-    post_game_result(res);
-    f.game_finished();
-    settle(f);
-    CHECK(f.controller()->page_name() == "name_entry");
-    MenuController* c = f.controller();
-    CHECK(c->set_focus("free_cursor1"));
-    c->set_choice("free_cursor1", 9); // "Z" (row Q..Z)
-    press(f, MenuKey::Confirm);
-    CHECK(c->set_focus("free_command"));
-    press(f, MenuKey::Confirm); // OK
-    settle(f);
-    CHECK(f.control() == "arcade" && f.controller()->page_name() == "ar/top");
+    // Time trial 1 (gt_mode §17): a run under the record goes in when it ends, from the race
+    // screen (add_time_trial_record), and its name entry runs over the race; the result posted
+    // on leaving records nothing, so the arcade menu comes straight back.
+    auto time_trial = [&] {
+        choose(f, "item2");
+        CHECK(f.controller()->page_name() == "ar/select_compulsory");
+        press(f, MenuKey::Confirm);
+        for (int i = 0; i < 80 && !f.waiting_for_game(); ++i) f.tick(0);
+        std::optional<GameRequest> r = f.take_request();
+        CHECK(r && r->mode == "time_trial" && r->course == "tt01");
+    };
+    auto leave = [&](bool records_done) {
+        GameResult res;
+        res.mode = "time_trial";
+        res.finished = true;
+        res.position = 1;
+        res.total_time = res.best_lap = 79.0;
+        res.records_done = records_done;
+        post_game_result(res);
+        f.game_finished();
+        settle(f);
+        CHECK(f.control() == "arcade" && f.controller()->page_name() == "ar/top");
+    };
+    time_trial();
+    CHECK(game::add_time_trial_record("AT010001", 80.0) == 0);
+    {
+        GameFlow p(vfs_reader(vfs), "US");
+        CHECK(p.start_presentations());
+        settle(p);
+        CHECK(p.controller() && p.controller()->page_name() == "name_entry");
+        MenuController* c = p.controller();
+        CHECK(c->set_focus("free_cursor1"));
+        c->set_choice("free_cursor1", 9); // "Z" (row Q..Z)
+        press(p, MenuKey::Confirm);
+        CHECK(c->set_focus("free_command"));
+        press(p, MenuKey::Confirm); // OK
+        for (int i = 0; i < 60 && !p.exited(); ++i) p.tick(0);
+        CHECK(p.exited());
+    }
+    leave(true);
     const auto& rank = s->gt().state().rankings["at:AT010001"];
     CHECK(rank.size() == 4 && rank[0].value == 80.0 && rank[0].name == "Z" &&
           rank[1].name == game::GtMode::time_trial_seed_name(0, 0));
     CHECK(s->gt().state().arcade.at_best_rank[0] == 0);
     if (!rank.empty()) CHECK(rank[0].car == "motersport_elise_00");
+    // A visit the race recorded nothing from (an EXIT before the lap): its result neither.
+    time_trial();
+    leave(false);
+    CHECK(rank.size() == 4 && rank[0].value == 80.0);
 }
 
 // A championship win shows the trophy presentation (a random champ_NN.prm, the bonus

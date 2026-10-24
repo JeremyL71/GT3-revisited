@@ -23,11 +23,13 @@ ModelStats model_stats(const scene::Model& model, int lod) {
     return s;
 }
 
-GpuModel::GpuModel(GpuContext& ctx, const scene::Model& model) : device_(ctx.device()) {
-    std::vector<scene::Vertex> vertices;
-    std::vector<u32> indices;
-    for (const scene::Mesh& m : model.meshes) {
-        MeshInfo info;
+namespace {
+
+// Meshes -> one vertex and one index list, per-mesh draw info; `lines`: wireframe edge lists.
+void assemble(const std::vector<scene::Mesh>& meshes, size_t texture_count, bool lines,
+              std::vector<scene::Vertex>& vertices, std::vector<u32>& indices, std::vector<GpuModel::MeshInfo>& out) {
+    for (const scene::Mesh& m : meshes) {
+        GpuModel::MeshInfo info;
         info.transform = Mat4::from(m.transform);
         info.lod = m.lod;
         info.vertex_offset = s32(vertices.size());
@@ -59,23 +61,48 @@ GpuModel::GpuModel(GpuContext& ctx, const scene::Model& model) : device_(ctx.dev
                 indices.insert(indices.end(), {a, b, c});
             }
             q.index_count = u32(indices.size()) - info.index_offset - q.first_index;
-            if (q.texture >= int(model.textures.size())) q.texture = -1;
+            if (q.texture >= int(texture_count)) q.texture = -1;
             if (q.index_count) info.primitives.push_back(q);
         }
         // Unique edges for the wireframe view.
         info.line_first = u32(indices.size()) - info.index_offset;
-        std::unordered_set<u64> edges;
-        size_t tri_count = indices.size() - info.index_offset;
-        for (size_t i = info.index_offset; i < info.index_offset + tri_count; i += 3)
-            for (int e = 0; e < 3; ++e) {
-                u32 a = indices[i + e], b = indices[i + (e + 1) % 3];
-                if (a > b) std::swap(a, b);
-                if (edges.insert((u64(a) << 32) | b).second) indices.insert(indices.end(), {a, b});
-            }
+        if (lines) {
+            std::unordered_set<u64> edges;
+            size_t tri_count = indices.size() - info.index_offset;
+            for (size_t i = info.index_offset; i < info.index_offset + tri_count; i += 3)
+                for (int e = 0; e < 3; ++e) {
+                    u32 a = indices[i + e], b = indices[i + (e + 1) % 3];
+                    if (a > b) std::swap(a, b);
+                    if (edges.insert((u64(a) << 32) | b).second) indices.insert(indices.end(), {a, b});
+                }
+        }
         info.line_count = u32(indices.size()) - info.index_offset - info.line_first;
-        meshes_.push_back(std::move(info));
+        out.push_back(std::move(info));
     }
+}
 
+// Makes `buffer` hold at least `size` bytes, creating it or replacing it with one twice the size
+// (contents lost). True when it is now a new buffer.
+bool ensure_buffer(SDL_GPUDevice* device, SDL_GPUBufferUsageFlags usage, SDL_GPUBuffer*& buffer, u32& capacity,
+                   u32 size, bool& ok) {
+    ok = true;
+    if (buffer && capacity >= size) return false;
+    if (buffer) SDL_ReleaseGPUBuffer(device, buffer);
+    SDL_GPUBufferCreateInfo bi{};
+    bi.usage = usage;
+    bi.size = std::max(size, capacity * 2);
+    buffer = SDL_CreateGPUBuffer(device, &bi);
+    capacity = buffer ? bi.size : 0;
+    ok = buffer != nullptr;
+    return true;
+}
+
+} // namespace
+
+GpuModel::GpuModel(GpuContext& ctx, const scene::Model& model) : ctx_(&ctx), device_(ctx.device()) {
+    std::vector<scene::Vertex> vertices;
+    std::vector<u32> indices;
+    assemble(model.meshes, model.textures.size(), true, vertices, indices, meshes_);
     vertex_count_ = vertices.size();
     Uploader up(device_);
     if (!vertices.empty() && !indices.empty()) {
@@ -86,44 +113,107 @@ GpuModel::GpuModel(GpuContext& ctx, const scene::Model& model) : device_(ctx.dev
         TextureInfo ti;
         ti.clamp_u = t.clamp_u;
         ti.clamp_v = t.clamp_v;
-        if (t.width && t.height && t.rgba.size() >= size_t(t.width) * t.height)
-            ti.texture = up.texture_rgba(t.width, t.height, t.rgba.data(), true);
+        ti.no_mips = t.no_mips;
+        if (t.width && t.height && t.rgba.size() >= size_t(t.width) * t.height) {
+            ti.texture = ctx.acquire_texture(up, t.width, t.height, t.rgba.data());
+            ti.width = t.width, ti.height = t.height;
+        }
         if (!ti.texture) LOG_WARN("Texture '%s' (%ux%u) not uploaded", t.name.c_str(), t.width, t.height);
         textures_.push_back(ti);
     }
     if (!up.submit()) LOG_WARN("Model upload failed: %s", SDL_GetError());
 }
 
+// Each upload goes through staging_ (grown when too small), at 16-byte aligned offsets, into its
+// buffer from offset 0 with cycling: frames still drawing keep the old contents.
+bool GpuModel::stage(const Upload* uploads, int count) {
+    auto aligned = [](u32 v) { return (v + 15u) & ~15u; };
+    u32 total = 0;
+    for (int i = 0; i < count; ++i) total += aligned(uploads[i].size);
+    if (total == 0) return true;
+    if (!staging_ || staging_capacity_ < total) {
+        if (staging_) SDL_ReleaseGPUTransferBuffer(device_, staging_);
+        SDL_GPUTransferBufferCreateInfo ti{};
+        ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        ti.size = std::max(total, staging_capacity_ * 2);
+        staging_ = SDL_CreateGPUTransferBuffer(device_, &ti);
+        staging_capacity_ = staging_ ? ti.size : 0;
+        if (!staging_) return false;
+    }
+    auto* p = static_cast<u8*>(SDL_MapGPUTransferBuffer(device_, staging_, true));
+    if (!p) return false;
+    for (int i = 0, at = 0; i < count; at += int(aligned(uploads[i].size)), ++i)
+        std::memcpy(p + at, uploads[i].data, uploads[i].size);
+    SDL_UnmapGPUTransferBuffer(device_, staging_);
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device_);
+    if (!cmd) return false;
+    SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+    for (int i = 0, at = 0; i < count; at += int(aligned(uploads[i].size)), ++i) {
+        if (!uploads[i].size) continue;
+        SDL_GPUTransferBufferLocation src{staging_, u32(at)};
+        SDL_GPUBufferRegion dst{uploads[i].buffer, 0, uploads[i].size};
+        SDL_UploadToGPUBuffer(cp, &src, &dst, true);
+    }
+    SDL_EndGPUCopyPass(cp);
+    return SDL_SubmitGPUCommandBuffer(cmd);
+}
+
 bool GpuModel::update_vertices(const std::vector<scene::Vertex>& all) {
     if (!vertices_ || all.size() != vertex_count_) return false;
-    u32 size = u32(all.size() * sizeof(scene::Vertex));
-    SDL_GPUTransferBufferCreateInfo ti{};
-    ti.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    ti.size = size;
-    SDL_GPUTransferBuffer* t = SDL_CreateGPUTransferBuffer(device_, &ti);
-    if (!t) return false;
-    if (void* p = SDL_MapGPUTransferBuffer(device_, t, false)) {
-        std::memcpy(p, all.data(), size);
-        SDL_UnmapGPUTransferBuffer(device_, t);
+    const Upload u{vertices_, all.data(), u32(all.size() * sizeof(scene::Vertex))};
+    return stage(&u, 1);
+}
+
+bool GpuModel::update_textures(const std::vector<TextureUpdate>& updates) {
+    bool ok = true;
+    Uploader up(device_);
+    for (const TextureUpdate& u : updates) {
+        TextureInfo* t = u.index < textures_.size() ? &textures_[u.index] : nullptr;
+        if (!t || !t->texture || !u.rgba || u.rgba->size() != size_t(t->width) * t->height) {
+            ok = false;
+            continue;
+        }
+        if (ctx_->take_texture(t->texture)) {
+            up.update_rgba(t->texture, t->width, t->height, u.rgba->data(), true, true);
+        } else if (SDL_GPUTexture* own = up.texture_rgba(t->width, t->height, u.rgba->data(), true)) {
+            ctx_->release_texture(t->texture); // other models keep drawing the shared texels
+            t->texture = own;
+        } else {
+            ok = false;
+        }
     }
-    bool ok = false;
-    if (SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(device_)) {
-        SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
-        SDL_GPUTransferBufferLocation src{t, 0};
-        SDL_GPUBufferRegion dst{vertices_, 0, size};
-        SDL_UploadToGPUBuffer(cp, &src, &dst, true); // cycle: frames still drawing keep the old data
-        SDL_EndGPUCopyPass(cp);
-        ok = SDL_SubmitGPUCommandBuffer(cmd);
-    }
-    SDL_ReleaseGPUTransferBuffer(device_, t);
+    return up.submit() && ok;
+}
+
+GpuModel::GpuModel(GpuContext& ctx, const GpuModel& textures)
+    : ctx_(&ctx), device_(ctx.device()), texture_source_(&textures) {}
+
+bool GpuModel::update_geometry(const std::vector<scene::Mesh>& meshes) {
+    std::vector<scene::Vertex> vertices;
+    std::vector<u32> indices;
+    meshes_.clear();
+    assemble(meshes, textures().size(), false, vertices, indices, meshes_);
+    vertex_count_ = vertices.size();
+    const u32 vsize = u32(vertices.size() * sizeof(scene::Vertex)), isize = u32(indices.size() * sizeof(u32));
+    if (vsize == 0 || isize == 0) return true; // nothing drawn (meshes_ is empty too)
+    bool vok = true, iok = true;
+    ensure_buffer(device_, SDL_GPU_BUFFERUSAGE_VERTEX, vertices_, vertex_capacity_, vsize, vok);
+    // The index buffer only when its contents change (the animated nodes' usually don't).
+    if (ensure_buffer(device_, SDL_GPU_BUFFERUSAGE_INDEX, indices_, index_capacity_, isize, iok))
+        uploaded_indices_.clear();
+    Upload uploads[2] = {{vertices_, vertices.data(), vsize}, {indices_, indices.data(), isize}};
+    const bool same_indices = indices == uploaded_indices_;
+    bool ok = vok && iok && stage(uploads, same_indices ? 1 : 2);
+    if (ok && !same_indices) uploaded_indices_ = std::move(indices);
+    if (!ok) meshes_.clear(), uploaded_indices_.clear();
     return ok;
 }
 
 GpuModel::~GpuModel() {
+    if (staging_) SDL_ReleaseGPUTransferBuffer(device_, staging_);
     if (vertices_) SDL_ReleaseGPUBuffer(device_, vertices_);
     if (indices_) SDL_ReleaseGPUBuffer(device_, indices_);
-    for (TextureInfo& t : textures_)
-        if (t.texture) SDL_ReleaseGPUTexture(device_, t.texture);
+    for (TextureInfo& t : textures_) ctx_->release_texture(t.texture);
 }
 
 } // namespace gt3r::render

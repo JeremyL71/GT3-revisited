@@ -13,6 +13,7 @@
 #include "race/replay_options.h"
 #include "sim/car_spec_io.h"
 #include "sim/vehicle.h"
+#include "vfs/vfs.h"
 
 #include <SDL3/SDL.h>
 
@@ -102,7 +103,9 @@ TEST(replay_v7_theater_fields) {
     r.car_model = "ni0137", r.wheel = "rays_01";
     r.saved = 1760000000;
     r.spec = std::make_shared<const sim::CarSpec>(sim::CarSpec::test_car());
+    r.condition = {4321, -12345.5f, 300000}; // v8: the engine condition the run started with
     Replay q = Replay::parse(r.serialize());
+    CHECK(q.condition == r.condition);
     CHECK(q.comment == "My best" && q.kind == ReplayKind::GtRace && q.laps == 3 && q.total_time == 301.5);
     CHECK(q.power_ps == 330 && q.car_model == "ni0137" && q.wheel == "rays_01" && q.saved == 1760000000);
     CHECK(q.spec && sim::serialize_car_spec(*q.spec) == sim::serialize_car_spec(*r.spec));
@@ -110,6 +113,64 @@ TEST(replay_v7_theater_fields) {
     CHECK(std::string(replay_kind_name(ReplayKind::License)) == "License");
     r.spec.reset();
     CHECK(!Replay::parse(r.serialize()).spec); // no spec: the database car
+}
+
+// Replay format v9: the field's rules as the run had them (a GT race's grid by power-to-weight
+// is rebuilt from these in the theater); older files take the grid from their kind.
+TEST(replay_v9_field_rules) {
+    Replay r;
+    r.course = "trialmt", r.car = "r34_gtr_v_99", r.event = "Gsunday_e_0001";
+    r.kind = ReplayKind::ArcadeRace;
+    r.grid_by_power = true, r.cpu_respawn = false;
+    Replay q = Replay::parse(r.serialize());
+    CHECK(q.grid_by_power == std::optional<bool>(true) && q.cpu_respawn == std::optional<bool>(false));
+    // Not recorded stays not recorded (an old replay saved again from the theater).
+    r.grid_by_power.reset(), r.cpu_respawn.reset();
+    q = Replay::parse(r.serialize());
+    CHECK(!q.grid_by_power && !q.cpu_respawn);
+    // A v8 file (no rules byte; with no inputs it is the last byte): the grid from the kind.
+    auto as_v8 = [](const Replay& rp) {
+        Bytes b = rp.serialize();
+        b.pop_back();
+        const u32 v8 = 8;
+        std::memcpy(b.data() + 8, &v8, 4);
+        return Replay::parse(b);
+    };
+    r.kind = ReplayKind::GtRace;
+    q = as_v8(r);
+    CHECK(q.grid_by_power == std::optional<bool>(true) && !q.cpu_respawn);
+    r.kind = ReplayKind::Practice; // Quick race: the arcade single race's grid
+    CHECK(as_v8(r).grid_by_power == std::optional<bool>(false));
+
+    // 2P battle: the Options menu's settings and player 2's car as the run had them.
+    Replay p2;
+    p2.course = "trialmt", p2.car = "r34_gtr_v_99", p2.car2 = "supra_rz_97";
+    for (int i = 0; i < 3; ++i) p2.inputs.push_back(quantize(sim::ControlInputs{})), p2.inputs2.push_back(p2.inputs.back());
+    ReplayBattle b;
+    b.laps = 5;
+    b.boost_amount = 0.2f, b.boost_start = 10, b.boost_full = 200;
+    b.handicap_m = -35;
+    b.tyre_damage = true;
+    b.model2 = "to0050", b.wheel2 = "rays_02", b.paint2 = 4;
+    sim::CarSpec spec2 = sim::CarSpec::test_car();
+    spec2.aids.tcs_gain = 0;
+    b.spec2 = std::make_shared<const sim::CarSpec>(spec2);
+    p2.battle = b;
+    q = Replay::parse(p2.serialize());
+    CHECK(q.battle.has_value() && q.inputs2.size() == 3);
+    if (q.battle) {
+        const ReplayBattle& qb = *q.battle;
+        CHECK(qb.laps == 5 && qb.boost_amount == 0.2f && qb.boost_start == 10 && qb.boost_full == 200);
+        CHECK(qb.handicap_m == -35 && qb.tyre_damage && qb.model2 == "to0050" && qb.wheel2 == "rays_02" && qb.paint2 == 4);
+        CHECK(qb.spec2 && sim::serialize_car_spec(*qb.spec2) == sim::serialize_car_spec(spec2));
+    }
+    p2.battle->spec2.reset(); // the database car
+    q = Replay::parse(p2.serialize());
+    CHECK(q.battle && !q.battle->spec2);
+    // Not recorded (an older 2P replay saved again) stays not recorded.
+    p2.battle.reset();
+    q = Replay::parse(p2.serialize());
+    CHECK(!q.battle && q.car2 == "supra_rz_97" && q.inputs2.size() == 3);
 }
 
 // The theater's storage: one folder, newest first, delete, Edit file name, info texts.
@@ -208,10 +269,6 @@ TEST(replay_options_state) {
     CHECK(ReplaySettings::default_target(1) == 2 && ReplaySettings::default_target(3) == 0);
     ReplaySettings s;
     CHECK(s.mode == 0 && s.current_target() == 0 && s.items == 0 && s.bgm && s.se);
-    s.cycle_mode(-1);
-    CHECK(s.mode == 3);
-    s.cycle_mode(1);
-    CHECK(s.mode == 0);
     s.mode = 1, s.bgm = false;
     CHECK(s.bgm_on()); // avant-garde forces the BGM
 
@@ -245,6 +302,15 @@ TEST(replay_options_state) {
     press(MenuKey::Down), press(MenuKey::Right), press(MenuKey::Confirm); // SE off
     CHECK(!o.settings().se && o.settings().bgm);
     CHECK(!o.tick(key_bit(MenuKey::Cancel))); // closes
+    // Applying the avant-garde mode stores BGM on (it stays on in the other modes).
+    ReplaySettings quiet;
+    quiet.bgm = false;
+    o.open(quiet, false);
+    o.tick(0);
+    press(MenuKey::Right), press(MenuKey::Confirm);
+    CHECK(o.settings().mode == 1 && o.settings().bgm);
+    press(MenuKey::Left), press(MenuKey::Confirm);
+    CHECK(o.settings().mode == 0 && o.settings().bgm);
     // 2P: the SCREEN row.
     o.open(ReplaySettings{}, true);
     CHECK(o.rows() == 6 && o.cell(ReplayOptions::RowScreen, 1) == 1);
@@ -257,7 +323,7 @@ TEST(replay_options_state) {
     CHECK(rd.mode == 2 && rd.target[2] == 1 && rd.items == 9 && !rd.se && rd.bgm && !rd.split);
 }
 
-// The Analyzer: a replay's lap re-simulated into a trace (distances from the line), sectors.
+// The Analyzer: a replay's lap sampled tick by tick into a trace (distances from the line), sectors.
 TEST(analyzer_replay_lap) {
     FlatVehicle live;
     ReplayRecorder rec;
@@ -269,10 +335,26 @@ TEST(analyzer_replay_lap) {
     for (int i = 0; i < 600; ++i) live.step(rec.record(in), 1.0 / 60);
     rec.lap(5.0, 120, 420);
     Replay r = rec.replay();
-    // Distance along +z on a 400 m "lap".
+    // Distance along +z on a 400 m "lap"; the run played back as the race screen plays it.
     const float L = 400;
     auto dist = [&](const sim::Vec3& p) { return std::fmod(std::fabs(p.z) + 1000 * L, L); };
-    AnalyzerTrack t = analyze_replay(r, [] { return std::make_unique<FlatVehicle>(); }, dist, L);
+    auto sample = [&](const Replay& rp) {
+        const AnalyzerLap lap = analyzer_lap(rp);
+        LapSampler s(rp.tick_hz, L, lap.whole);
+        FlatVehicle v;
+        v.place(rp.start);
+        ReplayPlayer p(&rp);
+        while (!p.done() && p.tick() < lap.end) {
+            const u32 k = p.tick();
+            sim::ControlInputs pin = p.next_inputs();
+            if (k >= lap.begin) s.add(v.state(), pin, dist(v.state().position));
+            v.step(pin, 1.0 / rp.tick_hz);
+        }
+        return s.take(lap.whole ? -1 : rp.best_lap);
+    };
+    const AnalyzerLap lap = analyzer_lap(r);
+    CHECK(!lap.whole && lap.begin == 120 && lap.end == 420);
+    AnalyzerTrack t = sample(r);
     CHECK(t.trace.size() == 300 && t.ghost.size() == 300 && t.trace.time == 5.0);
     bool rising = true;
     for (size_t i = 1; i < t.trace.size(); ++i) rising = rising && t.trace.dist[i] >= t.trace.dist[i - 1];
@@ -282,8 +364,15 @@ TEST(analyzer_replay_lap) {
     // A replay without a lap: the whole run from 0.
     Replay whole = r;
     whole.best_lap = -1;
-    AnalyzerTrack w = analyze_replay(whole, [] { return std::make_unique<FlatVehicle>(); }, dist, L);
+    CHECK(analyzer_lap(whole).whole && analyzer_lap(whole).end == 600);
+    AnalyzerTrack w = sample(whole);
     CHECK(w.trace.size() == 600 && w.trace.dist[0] == 0.0f && std::fabs(w.trace.time - 10.0) < 1e-9);
+    // A lap whose first sample is just short of the line counts from 0, not from the lap length.
+    LapSampler ls(60.0, L, false);
+    sim::VehicleState s0;
+    ls.add(s0, in, L - 1.0f), ls.add(s0, in, 2.0f), ls.add(s0, in, 6.0f);
+    AnalyzerTrack short_start = ls.take(1.0);
+    CHECK(short_start.trace.dist[0] == 0.0f && short_start.trace.dist[1] == 2.0f && short_start.trace.dist[2] == 6.0f);
 
     // Sectors from the logger map's points, sorted, deduplicated, starting at 0.
     LoggerMap m;
@@ -323,7 +412,48 @@ TEST(analyzer_logger_map_parse) {
         m->width = 192, m->height = 128;
         auto [px, py] = m->project(10, 20);
         CHECK(px == 96 && py == 64);
+        // Turned maps: the origin comes off after the rotation (the picture's centre is the
+        // world point that rotates onto (ox, oz)).
+        m->rot = 3.14159265f;
+        auto [qx, qy] = m->project(-10, -20);
+        CHECK(std::fabs(qx - 96) < 1e-3f && std::fabs(qy - 64) < 1e-3f);
     }
     b[0] = 'X';
     CHECK(!LoggerMap::parse(b));
+}
+
+// LGM0 on the disc: every map's own sector points (positions along the lap) land on its
+// outline through LoggerMap::project, the turned courses too (trialmt -184.5 degrees).
+TEST(analyzer_logger_maps_disc) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    Vfs vfs(&disc->volume());
+    int maps = 0, points = 0, on_outline = 0, trialmt = -1;
+    for (const std::string& f : vfs.list_dir("logger")) {
+        std::optional<Bytes> b = vfs.read("logger/" + f);
+        std::optional<LoggerMap> m = b ? LoggerMap::parse(*b) : std::nullopt;
+        if (!m || m->width <= 0) continue;
+        ++maps;
+        // An outline pixel within 2 px.
+        auto near_outline = [&](float u, float v) {
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx) {
+                    int x = int(std::lround(u)) + dx, y = int(std::lround(v)) + dy;
+                    if (x < 0 || y < 0 || x >= m->width || y >= m->height) continue;
+                    u32 c = m->rgba[size_t(y) * size_t(m->width) + size_t(x)];
+                    if ((c >> 24) > 64 && (c & 0xFF) + ((c >> 8) & 0xFF) + ((c >> 16) & 0xFF) > 60) return true;
+                }
+            return false;
+        };
+        int hits = 0;
+        for (const auto& p : m->points) {
+            auto [u, v] = m->project(p[0], p[2]);
+            hits += near_outline(u, v);
+        }
+        points += int(m->points.size()), on_outline += hits;
+        if (f == "trialmt") trialmt = hits;
+    }
+    CHECK(maps == 81);
+    CHECK(on_outline * 100 >= points * 95); // 1347 of 1411 (the old GTCM-style formula: 1109)
+    CHECK(trialmt == 19);
 }

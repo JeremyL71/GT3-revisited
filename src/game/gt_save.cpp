@@ -1,7 +1,9 @@
 #include "game/gt_save.h"
 
 #include "base/file.h"
+#include "base/game_random.h"
 #include "formats/ps2/memcard.h"
+#include "race/race_playlist.h"
 
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_filesystem.h>
@@ -12,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <sstream>
 
 namespace gt3r::game {
@@ -59,7 +62,11 @@ std::string unesc(const std::string& s) {
     return o;
 }
 
-// All CarSettings ints in a fixed order (the order of the struct).
+// All CarSettings ints in a fixed order (the order of the struct): the native save's
+// settings / ssettings values and the PS2 car setup record's words (kEqSettingOffsets).
+// New fields must be appended at the end: read_settings() fills the fields from the front,
+// so saves written before keep loading with the new fields at their defaults (and
+// kEqSettingOffsets, indexed by this order, needs an entry or a bound for them).
 std::vector<int*> settings_fields(sim::CarSettings& s) {
     std::vector<int*> f;
     for (int& v : s.gears) f.push_back(&v);
@@ -79,6 +86,17 @@ std::vector<int*> settings_fields(sim::CarSettings& s) {
     f.push_back(&s.tcs);
     for (int& v : s.ascc) f.push_back(&v);
     return f;
+}
+
+// A settings / ssettings line's values, settings_fields() order. A save from before a field
+// was added has fewer (the rest keep their defaults), one from a newer build more (ignored).
+// False on a value that is not a number.
+bool read_settings(std::istream& in, sim::CarSettings& s) {
+    for (int* v : settings_fields(s)) {
+        if ((in >> std::ws).eof()) return true;
+        if (!(in >> *v)) return false;
+    }
+    return true;
 }
 
 std::string owned_hex(const std::bitset<88>& b) {
@@ -169,8 +187,9 @@ std::string at_code(size_t i) {
     return b;
 }
 
-// Ranking records (license 0x154, time trial 0x2A4, records 0x300) keep car names as
-// char[32]; an unused or built-in entry has 30 '-'.
+// Ranking records (license 0x154, time trial 0x2A4, records 0x300) keep a 32-byte block per
+// entry that the original encodes from the run after the name entry (30 characters, I: the
+// records page's entry code); an unused or built-in entry has 30 '-'.
 void put_dashes(Bytes& p, size_t o) { std::memset(&p[o], '-', 30); }
 
 std::string fixed_str(ByteSpan d, size_t o, size_t n) {
@@ -179,35 +198,119 @@ std::string fixed_str(ByteSpan d, size_t o, size_t n) {
     return s;
 }
 
+std::string read_code(ByteSpan d, size_t o) {
+    std::string s = fixed_str(d, o, 32);
+    return s.find_first_not_of('-') == std::string::npos ? std::string() : s;
+}
+
+void put_code(Bytes& p, size_t o, const std::string& code) {
+    if (code.empty()) return put_dashes(p, o);
+    std::memset(&p[o], 0, 32);
+    std::memcpy(&p[o], code.data(), std::min<size_t>(code.size(), 31));
+}
+
+// Course time-trial and machine-test rankings (0x300 each: u32 value[12], char name[12][16]
+// at +0x30, u64 car code[12] at +0xF0, u32 stamp[12] at +0x150, the 32-byte blocks at
+// +0x180). Times are ms ("no time" = empty); the top-speed test's speeds int(m/s x 1e5)
+// (0 = empty).
+constexpr size_t kRanking = 0x300;
+static_assert(kTimeTrial == kRanking * size_t(kCourseTimeTrials) && kMachine == kRanking * 3);
+
+std::vector<RankEntry> read_ranking(ByteSpan d, size_t r, bool speed, const data::CarDatabase& db) {
+    std::vector<RankEntry> out;
+    for (size_t k = 0; k < 12; ++k) {
+        const u32 v = rd32(d, r + 4 * k);
+        if (v == 0 || (!speed && v == kEmptyTime)) break;
+        RankEntry e;
+        e.value = speed ? double(v) * 1e-5 * 3.6 : v / 1000.0;
+        e.name = fixed_str(d, r + 0x30 + 16 * k, 16);
+        e.car = label_of(db, data::TableId::Car, rd64(d, r + 0xF0 + 8 * k));
+        e.stamp = rd32(d, r + 0x150 + 4 * k);
+        e.code = read_code(d, r + 0x180 + 32 * k);
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+// An empty time table is a new game's ("no time", 30 '-'); an empty speed table is all zero.
+void write_ranking(Bytes& p, size_t r, const std::vector<RankEntry>* rank, bool speed) {
+    for (size_t k = 0; k < 12; ++k) {
+        if (!rank || k >= rank->size()) {
+            if (!speed) {
+                wr32(p, r + 4 * k, kEmptyTime);
+                put_dashes(p, r + 0x180 + 32 * k);
+            }
+            continue;
+        }
+        const RankEntry& e = (*rank)[k];
+        wr32(p, r + 4 * k, speed ? u32(std::floor(e.value / 3.6 * 1e5 + 1e-6)) : u32(std::llround(e.value * 1000)));
+        std::memcpy(&p[r + 0x30 + 16 * k], e.name.data(), std::min<size_t>(e.name.size(), 15));
+        if (!e.car.empty()) wr64(p, r + 0xF0 + 8 * k, db::id_hash(e.car));
+        wr32(p, r + 0x150 + 4 * k, e.stamp);
+        put_code(p, r + 0x180 + 32 * k, e.code);
+    }
+}
+
+// The machine tests' tables follow the 44 course ones: 0-400 m, 0-1000 m, top speed.
+const char* const kMachineTests[3] = {"M400", "M1000", "MMAX"};
+
+// Arcade time trial i's car (CLASS_COMPULSORY entry i) as its base car (as GT mode enters it).
+std::string challenge_car(const GtData& data, size_t i) {
+    auto cls = data.arcade_classes.find("CLASS_COMPULSORY");
+    if (cls == data.arcade_classes.end() || i >= cls->second.size()) return {};
+    const std::string& label = cls->second[i].label;
+    for (const data::CarVariant& v : data.db.arcade_cars())
+        if (v.label == label) return v.car;
+    return label;
+}
+
 // Arcade time-trial ranking (0x2A4: u32 ms[12], char name[12][16], u32 stamp[12],
 // char car[12][32], s32 best rank). The new game's three built-in records per challenge
 // have the one-byte name mark 0xFF - 3 i - k (k-th record of challenge i, see
-// GtMode::time_trial_seed_ranking), the stamp 0x3264FD64 and no car (30 '-').
+// GtMode::time_trial_seed_ranking), the stamp 0x3264FD64 and no car (30 '-'). (That stamp is
+// the clock of the PS2 the reference new game was made on, 2026-10-16: the original stamps
+// the seeds with the new game's time; ours keep no such time.)
 constexpr u32 kBuiltinStamp = 0x3264FD64;
+// The last name entered (scalar block +0x70; gt_mode §12.2): up to 15 characters and a 0.
+constexpr size_t kNameField = 16;
 
 // The options block (0x888) of a new game, for saves that never came from the PS2 (a
 // zeroed block would turn all sound off and empty the music list). Read from a new
-// game saved by the original; only the first words are decoded: +0x00 screen (0 = 4:3),
-// +0x04 / +0x08 / +0x0C / +0x10 / +0x14 / +0x18 menu BGM / menu SE / race BGM / race
-// SE / replay BGM / replay SE (1 = on). The rest (vibration, assists, 2P battle, ghost,
-// GT FORCE, the button tables at +0x63C) is written as the new game has it (M).
+// game saved by the original; decoded: +0x00 screen (0 = 4:3), the sound switches
+// (1 = on) +0x04 menu BGM, +0x08 menu SE, +0x0C race BGM, +0x10 race SE, +0x54 replay
+// BGM, +0x58 replay SE, and the music list at +0x228. The rest (vibration, assists, 2P
+// battle, ghost, GT FORCE, the button tables at +0x63C) is written as the new game has
+// it (M).
 Bytes default_ps2_options(const GtData& data) {
     Bytes o(kOptions, 0);
     static const u32 kWords[25] = {0, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 2, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1};
     for (size_t i = 0; i < 25; ++i) wr32(o, 4 * i, kWords[i]);
     wr32(o, 0xD8, 2);
     wr32(o, 0xDC, 2);
-    wrf(o, 0x114, 0.1f);
-    // Favourite music list: count, then 64 entries {u64 id_hash(file), u8 0, u8 in the list,
-    // u8 order}; the original shuffles the order of a new game (here: index order).
-    const size_t songs = std::min<size_t>(data.race_songs.size(), 64);
-    wr32(o, 0x228, u32(songs));
-    o[0x22E] = 1;
-    wr32(o, 0x230, 0x456);
-    for (size_t k = 0; k < 64; ++k) {
-        if (k < songs) wr64(o, 0x238 + 16 * k, db::id_hash(data.race_songs[k]));
-        o[0x241 + 16 * k] = 1;
-        if (k < songs) o[0x242 + 16 * k] = u8(k);
+    set_ps2_replay_pad(o, {}); // 0.1, off
+    // The music list, kept as the race playlist (music §2.3, race::RacePlaylist): u32 song
+    // count, u16 cursor, u8 shuffle, u8 "no song listed", u16 seed, then 64 entries of 16
+    // bytes {u64 id_hash(file), u8 played, u8 in the list, s16 order}. A new game's list is
+    // shuffled from the first integer draw of the shared generator (gt_mode §20.1) in its
+    // start-up state; that leaves the seed 0x456, as in a new game saved by the original.
+    std::vector<u64> ids;
+    for (size_t k = 0; k < data.race_songs.size() && k < race::RacePlaylist::kMaxSongs; ++k)
+        ids.push_back(db::id_hash(data.race_songs[k]));
+    GameRandom boot;
+    const race::RacePlaylist list = race::RacePlaylist::with_songs(ids, u16(boot.int31()));
+    wr32(o, 0x228, u32(list.songs().size()));
+    wr16(o, 0x22C, list.cursor());
+    o[0x22E] = list.shuffle() ? 1 : 0;
+    o[0x22F] = list.has_songs() ? 0 : 1;
+    wr16(o, 0x230, list.seed());
+    for (size_t k = 0; k < race::RacePlaylist::kMaxSongs; ++k) {
+        const size_t e = 0x238 + 16 * k;
+        o[e + 9] = 1; // every entry of a new list is marked "in the list", used or not
+        if (k >= list.songs().size()) continue;
+        const race::RacePlaylist::Song& song = list.songs()[k];
+        wr64(o, e, song.id);
+        o[e + 8] = song.played ? 1 : 0;
+        wr16(o, e + 10, u16(song.order));
     }
     static const u8 kKeys[] = {12, 14, 13, 11, 16, 18, 17, 15, 19, 0,  12, 14, 13, 11, 16, 18, 17, 15, 19, 1,
                                12, 14, 13, 11, 16, 18, 17, 15, 19, 1,  12, 14, 13, 11, 16, 18, 17, 15, 19, 20,
@@ -267,7 +370,8 @@ std::string save_to_text(const GameState& s) {
     if (s.machine.top_speed > 0) o << "mtest max " << s.machine.top_speed << " " << esc(s.machine.car_top) << "\n";
     for (const auto& [key, v] : s.rankings)
         for (const RankEntry& r : v)
-            o << "rank " << esc(key) << " " << r.value << " " << esc(r.car) << " " << r.day << " " << esc(r.name) << "\n";
+            o << "rank " << esc(key) << " " << r.value << " " << esc(r.car) << " " << r.day << " " << esc(r.name) << " "
+              << r.stamp << " " << esc(r.code) << "\n";
     if (s.trophy_flags) o << "trophyflags " << s.trophy_flags << "\n";
     o << "player " << esc(s.player_name) << "\n";
     if (!s.file_comment.empty()) o << "fcomment " << esc(s.file_comment) << "\n";
@@ -318,8 +422,12 @@ GameState load_from_text(const std::string& text) {
         int version = 0;
         h >> magic >> version;
         if (magic != kMagic) throw FormatError("gtmode save: not a GT mode save");
-        if (version < 1 || version > kSaveVersion)
-            throw FormatError("gtmode save: unsupported version " + std::to_string(version));
+        // A newer version is refused, not read as far as it goes: versions only change for
+        // what older builds cannot read (new records are new keys, new car settings values
+        // are appended), and a misread game would be autosaved over the save.
+        if (version > kSaveVersion)
+            throw FormatError("gtmode save: from a newer version (" + std::to_string(version) + ")");
+        if (version < 1) throw FormatError("gtmode save: unsupported version " + std::to_string(version));
     }
     GameState s;
     GarageCar* car = nullptr;
@@ -361,8 +469,7 @@ GameState load_from_text(const std::string& text) {
             need(car && bool(l >> h));
             car->owned = owned_from_hex(h);
         } else if (key == "settings") {
-            need(car != nullptr);
-            for (int* v : settings_fields(car->settings)) need(bool(l >> *v));
+            need(car && read_settings(l, car->settings));
         } else if (key == "ref_final") {
             need(car && bool(l >> car->ref_final));
         } else if (key == "cond") {
@@ -387,8 +494,7 @@ GameState load_from_text(const std::string& text) {
             need(bool(l >> f.time >> f.power_ps >> c));
             f.comment = unesc(c);
         } else if (key == "ssettings") {
-            need(!s.setting_files.empty());
-            for (int* v : settings_fields(s.setting_files.back().settings)) need(bool(l >> *v));
+            need(!s.setting_files.empty() && read_settings(l, s.setting_files.back().settings));
         } else if (key == "mtest") {
             std::string which, label;
             double v;
@@ -402,6 +508,8 @@ GameState load_from_text(const std::string& text) {
             need(bool(l >> k >> r.value >> label >> r.day));
             r.car = unesc(label);
             if (std::string name; l >> name) r.name = unesc(name);
+            if (u32 stamp = 0; l >> stamp) r.stamp = stamp; // (saves before the stamps: none)
+            if (std::string code; l >> code) r.code = unesc(code);
             // A seeded time-trial record (no car) keeps the original's name mark. Older
             // saves named them "-" (or nothing), or 0xFF / 0xFE / 0xFD in every challenge:
             // those get the challenge's marks, by their order.
@@ -535,6 +643,25 @@ std::optional<GameState> read_save(const std::string& path, std::string* error) 
     }
 }
 
+std::string set_aside_save(const std::string& path, std::string* error) {
+    // When it happened (local time) in the name; a counter for the same second.
+    const std::time_t now = std::time(nullptr);
+    char stamp[32] = "";
+    if (const std::tm* tm = std::localtime(&now)) std::strftime(stamp, sizeof stamp, "-%Y%m%d-%H%M%S", tm);
+    const std::string base = path + ".unreadable" + stamp;
+    for (int i = 1; i < 1000; ++i) {
+        const std::string to = i == 1 ? base : base + "-" + std::to_string(i);
+        if (host_path_exists(to)) continue;
+        // A file that cannot be renamed (locked, immutable) is copied: its bytes are kept
+        // either way.
+        if (SDL_RenamePath(path.c_str(), to.c_str()) || SDL_CopyFile(path.c_str(), to.c_str())) return to;
+        if (error) *error = "cannot move " + path + " to " + to + ": " + SDL_GetError();
+        return {};
+    }
+    if (error) *error = "no free name for " + base;
+    return {};
+}
+
 // --- PS2 import / export ------------------------------------------------------------
 
 // Car setup record (0x1D0) <-> car label, parts, settings.
@@ -631,6 +758,7 @@ GameState import_ps2_save(ByteSpan file, const GtData& data) {
     s.trophies = rd32(d, 0xB0);
     s.prize_cars = rd32(d, 0xBC);
     s.rng = rd32(d, 0xCC);
+    s.player_name = fixed_str(d, 0x70, kNameField); // the last name entered (the name entry's start)
     // Arcade progression in the scalar block (block +0x3C..).
     s.arcade.course_level = std::clamp(int(rd32(d, 0x3C)), 0, 6);
     for (int k = 0; k < kArcadeCarLevels; ++k) s.arcade.car_flags[size_t(k)] = rd32(d, 0x40 + 4 * size_t(k)) != 0;
@@ -701,24 +829,38 @@ GameState import_ps2_save(ByteSpan file, const GtData& data) {
             if (ms == kEmptyTime || ms == 0) break;
             RankEntry e;
             e.value = ms / 1000.0;
+            e.stamp = rd32(d, r + 0xF0 + 4 * k);
             std::string name = fixed_str(d, r + 0x30 + 16 * k, 16);
+            e.code = read_code(d, r + 0x120 + 32 * k);
             if (u8(d[r + 0x30 + 16 * k]) >= 0x80) {
                 e.name = name.substr(0, 1); // a built-in record: its name mark, no car
             } else {
+                // (The record keeps no car: the challenge's, as GtMode::arcade_time_trial enters it.)
                 e.name = name;
-                std::string car = fixed_str(d, r + 0x120 + 32 * k, 32);
-                e.car = car.find_first_not_of('-') == std::string::npos ? std::string() : car;
-                for (const data::Car& c : db.cars())
-                    if (!car.empty() && c.name == car) {
-                        e.car = c.label;
-                        break;
-                    }
+                e.car = challenge_car(data, i);
             }
             rank.push_back(std::move(e));
         }
         if (!rank.empty()) s.rankings["at:" + at_code(i)] = std::move(rank);
     }
-    o += kAt + kTimeTrial + kMachine;
+    o += kAt;
+    // Course time trials (the TIME_ATTACK courses' slots) and machine tests.
+    if (auto ta = data.arcade_courses.find("TIME_ATTACK"); ta != data.arcade_courses.end())
+        for (size_t i = 0; i < ta->second.size() && i < size_t(kCourseTimeTrials); ++i)
+            if (std::vector<RankEntry> rank = read_ranking(d, o + kRanking * i, false, db); !rank.empty())
+                s.rankings["ct:" + ta->second[i].course] = std::move(rank);
+    for (size_t t = 0; t < 3; ++t) {
+        const bool speed = t == 2;
+        std::vector<RankEntry> rank = read_ranking(d, o + kRanking * (size_t(kCourseTimeTrials) + t), speed, db);
+        if (rank.empty()) continue;
+        // The best of each test (GameState::machine) is the ranking's first entry.
+        MachineRecords& m = s.machine;
+        if (t == 0) m.t400 = rank[0].value, m.car400 = rank[0].car;
+        if (t == 1) m.t1000 = rank[0].value, m.car1000 = rank[0].car;
+        if (t == 2) m.top_speed = rank[0].value, m.car_top = rank[0].car;
+        s.rankings[std::string("mt:") + kMachineTests[t]] = std::move(rank);
+    }
+    o += kTimeTrial + kMachine;
     if (const Gcf::Section* sec = data.gcf.section(15))
         for (size_t i = 0; i < sec->entries.size() && i < kPrizeFlags; ++i)
             if (d[o + i]) s.prizes_given.insert(sec->entries[i].name);
@@ -750,6 +892,7 @@ Bytes export_ps2_save(const GameState& s, const GtData& data) {
     wr32(p, 0xBC, s.prize_cars);
     wr32(p, 0xC8, 1); // region US
     wr32(p, 0xCC, s.rng);
+    std::memcpy(&p[0x70], s.player_name.data(), std::min(s.player_name.size(), kNameField - 1));
     wr32(p, 0x3C, u32(s.arcade.course_level));
     for (int k = 0; k < kArcadeCarLevels; ++k) wr32(p, 0x40 + 4 * size_t(k), s.arcade.car_flags[size_t(k)] ? 1 : 0);
     wr32(p, 0xC4, s.arcade.awards);
@@ -812,38 +955,42 @@ Bytes export_ps2_save(const GameState& s, const GtData& data) {
         if (auto it = s.rankings.find("at:" + at_code(i)); it != s.rankings.end()) rank = it->second;
         else rank = GtMode::time_trial_seed_ranking(db, at_code(i));
         for (size_t k = 0; k < 12; ++k) {
-            put_dashes(p, r + 0x120 + 32 * k);
             if (k >= rank.size()) {
                 wr32(p, r + 4 * k, kEmptyTime);
+                put_dashes(p, r + 0x120 + 32 * k);
                 continue;
             }
             const RankEntry& e = rank[k];
             wr32(p, r + 4 * k, u32(std::llround(e.value * 1000)));
+            wr32(p, r + 0xF0 + 4 * k, e.stamp);
+            put_code(p, r + 0x120 + 32 * k, e.code);
             if (e.car.empty() && GtMode::is_record_mark(e.name)) {
                 p[r + 0x30 + 16 * k] = u8(e.name[0]); // the stored mark, as the original wrote it
-                wr32(p, r + 0xF0 + 4 * k, kBuiltinStamp);
+                if (!e.stamp) wr32(p, r + 0xF0 + 4 * k, kBuiltinStamp);
             } else {
-                const std::string& name = e.name.empty() ? s.player_name : e.name;
-                std::memcpy(&p[r + 0x30 + 16 * k], name.data(), std::min<size_t>(name.size(), 15));
-                std::string car = e.car;
-                if (const data::Car* c = db.car(e.car); c && !c->name.empty()) car = c->name;
-                if (!car.empty()) {
-                    std::memset(&p[r + 0x120 + 32 * k], 0, 32);
-                    std::memcpy(&p[r + 0x120 + 32 * k], car.data(), std::min<size_t>(car.size(), 31));
-                }
+                std::memcpy(&p[r + 0x30 + 16 * k], e.name.data(), std::min<size_t>(e.name.size(), 15));
             }
         }
         wr32(p, r + 0x2A0, u32(s.arcade.at_best_rank[i]));
     }
     o += kAt;
-    // Course time-trial and machine-test rankings (0x300: as above plus u64 car codes at
-    // +0x120, car names at +0x180): empty as in a new game (the third machine-test
-    // ranking, top speed, is all zero there).
-    for (size_t i = 0; i < (kTimeTrial + kMachine) / 0x300 - 1; ++i)
-        for (size_t k = 0; k < 12; ++k) {
-            wr32(p, o + 0x300 * i + 4 * k, kEmptyTime);
-            put_dashes(p, o + 0x300 * i + 0x180 + 32 * k);
+    // Course time-trial rankings (slot = the course's place in the TIME_ATTACK list; the slots
+    // past it stay empty), then the machine tests'.
+    {
+        auto ranking = [&](const std::string& key) -> const std::vector<RankEntry>* {
+            auto it = s.rankings.find(key);
+            return it != s.rankings.end() && !it->second.empty() ? &it->second : nullptr;
+        };
+        const auto ta = data.arcade_courses.find("TIME_ATTACK");
+        for (size_t i = 0; i < size_t(kCourseTimeTrials); ++i) {
+            const bool listed = ta != data.arcade_courses.end() && i < ta->second.size();
+            write_ranking(p, o + kRanking * i, listed ? ranking("ct:" + ta->second[i].course) : nullptr, false);
         }
+        for (size_t t = 0; t < 3; ++t) {
+            const size_t r = o + kRanking * (size_t(kCourseTimeTrials) + t);
+            write_ranking(p, r, ranking(std::string("mt:") + kMachineTests[t]), t == 2);
+        }
+    }
     o += kTimeTrial + kMachine;
     if (const Gcf::Section* sec = data.gcf.section(15))
         for (size_t i = 0; i < sec->entries.size() && i < kPrizeFlags; ++i)
@@ -869,6 +1016,20 @@ Bytes export_ps2_save(const GameState& s, const GtData& data) {
     std::memcpy(&f[0x10], "Base", 4);
     std::memcpy(&f[kHeader], p.data(), psize);
     return f;
+}
+
+Ps2ReplayPad ps2_replay_pad(ByteSpan o) {
+    Ps2ReplayPad p;
+    if (o.size() < kOptions) return p;
+    p.level = rdf(o, 0x114);
+    p.music_cuts = rdf(o, 0x118);
+    return p;
+}
+
+void set_ps2_replay_pad(Bytes& o, const Ps2ReplayPad& p) {
+    if (o.size() < kOptions) o.resize(kOptions, 0);
+    wrf(o, 0x114, p.level);
+    wrf(o, 0x118, p.music_cuts);
 }
 
 Bytes ps2_thumbnail(const GameState& s, std::shared_ptr<const GtData> data) {

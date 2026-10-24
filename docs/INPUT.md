@@ -33,6 +33,7 @@ generic HID joysticks, wheels and pedals. Devices hot-plug at any time.
 | Feature | How it is used |
 |---|---|
 | Rumble | DS2 large motor → low-frequency motor, small motor → high-frequency motor |
+| Phone vibration (Android, off by default) | `[player1] phone_vibration = on` (Settings → Controls → Phone vibration): player 1's rumble on the device's own motor, only while the controls driving them have no rumble motor (built-in handheld controls, touch, a controller without motors). A controller that rumbles keeps it; the phone stays still |
 | Impulse triggers (Xbox One/Series) | `InputManager::set_trigger_rumble`, for brake/ABS feedback |
 | Player LEDs / light bars | Set to the player number |
 | Button labels | The UI shows Cross/Circle on PlayStation pads and A/B on Xbox pads |
@@ -48,13 +49,20 @@ generic HID joysticks, wheels and pedals. Devices hot-plug at any time.
 | `classic` | Exact DualShock 2 layout: triggers → L2/R2 |
 | `wheel` | Axis 0 steering, axes 1/2 pedals (resting at +1); typical Logitech layout |
 | `keyboard` | Keyboard only |
+| `quest` (VR builds only, their default) | `racing` with B as Triangle (back) and Y as Circle |
 
 These are menu pad presets. Every preset also includes the keyboard layout, so
 player 1 can always use the keyboard: arrows = D-pad, W/S = Cross/Square
 (ramped), A/D = left stick, Enter = Cross, Space = Circle, Esc/Backspace =
-Triangle, Q/E = L1/R1, Z/C = L2/R2, P = Start, Tab = Select, IJKL = right
-stick. (While driving with the modern layout the keyboard has its own race
-keys, below.)
+Triangle, Q/E = L1/R1, Z/C = L2/R2, F/G = L3/R3, P = Start, Tab = Select, IJKL
+= right stick. (While driving with the modern layout the keyboard has its own
+race keys, below.) On any screen, F11 toggles fullscreen and F12 saves a
+screenshot.
+
+`keyboard = off` stops the keyboard driving a player, except player 1 with a
+profile that has no controller bindings (the `keyboard` preset, or custom
+bindings with only keys): their keyboard stays live, so the game can't be left
+with no way to control it.
 
 ## Remapping in the app
 
@@ -75,7 +83,8 @@ saved to `config.ini` (`[playerN.bindings]` or `[playerN.race]`). Each player
 layout starts from that player's menu bindings.
 
 The **Settings** screen (Controls, Force feedback and Touch pages) edits the
-`[playerN]` preset/device/keyboard/race keys, every `[ffb]` key
+`[playerN]` preset/device/keyboard/race keys (and `[player1] phone_vibration`
+on Android), every `[ffb]` key
 and every `[touch]` key described below, applies them immediately and opens
 this rebinding screen from **Button mapping...**.
 
@@ -87,6 +96,7 @@ preset = racing        ; used when there is no [player1.bindings] section
 device = auto          ; or part of a device name, e.g. "DualSense" or "G29"
 keyboard = on
 race = modern          ; race layout (modern | gt3), used when there is no [player1.race]
+phone_vibration = off  ; Android, player 1 only: rumble on the device's own motor (see Native features)
 
 [player1.bindings]     ; the menu pad
 Cross  = pad.south | key.Return
@@ -154,7 +164,7 @@ The race pad's buttons keep GT3's meaning, and the race layout (per player:
 
 Respawn and the performance overlay are off controllers by default (under `gt3`
 the menu pad's Select and R3 do nothing in a race); bind them in a custom race
-layout from the Controllers screen if wanted.
+layout in **Controller setup** if wanted. Respawn works offline only.
 
 Change view cycles in-car (with mirror), in-car without mirror, chase and far
 chase; `[race] views = gt3` (Settings: Race views) keeps GT3's own two, in-car
@@ -167,6 +177,14 @@ buttons in both layouts. Configs from before per-player layouts used
 `[race] buttons = gt3 | ours | auto`; it is read once as the default
 (`ours` → `modern`; `auto` → `gt3` with the `classic` preset). The touch
 controls press the race pad's buttons directly.
+
+Replays, the pause window and the quick menus read the menu pad, as in GT3.
+Start opens the pause, in replays too. In a replay, Cross switches between the
+replay cameras and the view you drove with, and Up/Down change the followed car
+(TARGET MANUAL); in the Video view mode (REPLAY OPTIONS) Cross, Circle, L1 and R1
+cut to a new shot instead (presentation §G3). On a quick menu's main page,
+Triangle or Square leave at once as its EXIT, except in championships
+(presentation §C2).
 
 ## Force feedback (`ffb`)
 
@@ -214,7 +232,7 @@ Each screen picks a layout:
 | Layout | Controls |
 |---|---|
 | Menu (default) | D-pad (slide between directions), Cross / Circle / Square / Triangle, L1, R1, Select, Start. Taps away from the controls go to the screen underneath |
-| Driving (race screen) | Steering zone on the left half: put a finger down anywhere and drag sideways (the touch-down point is centre). Gas (Cross) and brake (Square) pedals on the right: the higher the finger on the pedal, the more pressure; a finger can slide from brake to gas. Shift up / down above the pedals, handbrake (Circle), and pause (Start), camera and respawn at the top; they press the race pad's buttons, so they work with any [race layout](#race-controls) |
+| Driving (race screen, while racing; its pause and quick menus use Menu) | Steering zone on the left half: put a finger down anywhere and drag sideways (the touch-down point is centre). Gas (Cross) and brake (Square) pedals on the right: the higher the finger on the pedal, the more pressure; a finger can slide from brake to gas. Shift up / down above the pedals, handbrake (Circle), and pause (Start), camera and respawn at the top; they press the race pad's buttons, so they work with any [race layout](#race-controls) (respawn: not under `gt3`) |
 
 ```ini
 [touch]
@@ -242,7 +260,11 @@ operated by tapping and dragging directly (tap a row, tab or button; drag a
 list to scroll; drag a slider; the Android back key goes back), so they use
 no on-screen controls (`TouchLayout::None`). `App::touch().safe_area()`
 returns the part of the 640×360 game area that the visible controls leave
-free (the whole area when they are hidden), so HUDs can inset themselves.
+free (the whole area when they are hidden), so HUDs can inset themselves,
+`App::touch().control_bounds()` lists the visible controls' drawn bounds (the
+race HUD keeps its corner blocks in place unless one would cover them), and
+`App::touch().clear_above()` moves a screen's own button up clear of them (the
+title menu's "GT3R menu" button goes above the D-pad).
 
 In GT3's own menus a tap on an item moves the cursor there and a second tap chooses it; a
 mouse (or a VR controller's pointer) focuses the item it hovers over, so one click chooses

@@ -9,6 +9,9 @@
 // A save's name is its GameState::file_comment (the original's file name, shown and
 // edited in File Operation) or, when that is empty, its file name without ".sav". File
 // names follow the names (sanitised for every file system, made unique with " 2", " 3").
+// No operation writes over another file: new files take free names, and an unreadable save
+// is listed (state nullopt) but never replaced; when it is the current one, the session
+// moves it aside before playing a new game in its place (GtModeSession::load).
 //
 // Earlier versions kept one save, <user data>/gtmode.sav, and a second "memory card
 // slot" next to it, gtmode_2.sav: migrate() copies them into the library the first time

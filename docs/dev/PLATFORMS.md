@@ -4,7 +4,7 @@ Status of each target, how to build and test it, and known issues. "Verified"
 means built *and* run here; "built" means compiled and unit-tested but not
 run interactively; "unverified" means neither.
 
-## Status (2026-10-16)
+## Status (2026-10-23)
 
 | Target | Compiler | Status | Evidence |
 |---|---|---|---|
@@ -17,7 +17,7 @@ run interactively; "unverified" means neither.
 | Windows x64 | MSVC 2022 | ✅ verified | CI (windows-2022) and a real PC (Windows 11): all tests pass with the disc, 3D (Vulkan, RTX 3080) and online races verified |
 | Android arm64 (API 36 emulator) | NDK 27 clang | ✅ verified | Boot → opening movie → title → Arcade → Time Trial → driving with Vulkan; touch controls, tilt, back, home/resume, rotation, file picker |
 | Android x86_64 | NDK 27 clang | ✅ built | Part of the same APK; not run |
-| Android real device | | ⚠️ unverified | Emulator only. Frame time must be measured on hardware (see below) |
+| Android real device | NDK 27 clang | ✅ verified | Galaxy A15 5G (Mali-G57 MC2, Android 16, 4 GB), the low-end baseline: menus, car select (~75 fps), Arcade races (35–55 fps). Races also on a Moto G Power 2024 (Imagination BXM), a Hiby R4 and a Galaxy S26 |
 | Meta Quest 3 (VR) | NDK 27 clang | ✅ verified | The Quest APK (`-Pquest`, SDL 3.6 development branch): menus on a virtual screen, stereo races at a steady 90 fps; see [VR](VR.md) |
 | iOS | | ❌ not started | SDL supports it; touch controls are already platform-neutral |
 
@@ -133,8 +133,7 @@ injected events register.
 Useful checks: `adb emu sensor set acceleration x:y:z` for tilt steering,
 `settings put system user_rotation N` (with `accelerometer_rotation 0`)
 for orientation, `logcat --pid=$(pidof org.gt3revisited.gt3r)` for the
-engine log ("Race perf" lines every 3 s with `[race] perf=1` or after
-pressing R3).
+engine log ("Race perf" lines every 3 s while racing).
 
 ## CI
 
@@ -145,8 +144,8 @@ pressing R3).
 - **android**: JDK 21, installs NDK 27.0.12077973 + CMake 3.22.1 with
   sdkmanager, fetches SDL, `assembleDebug`, uploads the APK.
 
-Validated locally with `actionlint`; the Linux job's commands were run in
-Docker, the Android job's on macOS. GitHub Actions itself was not run.
+Validated locally with `actionlint`. GitHub Actions runs it on every push and
+pull request; `v*` tags also run the package jobs and `release` (below).
 
 ## Release packages
 
@@ -157,22 +156,29 @@ system or Homebrew SDL.
 
 | Package | Contents | Build |
 |---|---|---|
-| macOS (arm64, macOS 12+) | `gt3r.app` (icon, Info.plist, `.iso` document type), `gt3tool`, README | `cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release -DGT3R_FETCH_SDL=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0`, build `gt3r gt3tool`, `cmake --install build-rel --prefix dist`, `ditto -c -k --keepParent` |
-| Windows x64 | `gt3r.exe` (icon resource), `gt3tool.exe`, `SDL3.dll`, README | same with `-DGT3R_SDL_SHARED=ON`; zip |
-| Linux x86_64 | `bin/gt3r`, `bin/gt3tool`, `share/applications/gt3r.desktop`, icon, README | same; `tar czf` (built on Ubuntu 22.04 for an older glibc) |
+| macOS (arm64, macOS 12+) | `gt3r.app` (icon, Info.plist, `.iso` document type, ad-hoc signature), `gt3tool`, README, LICENSE, `Barlow-OFL.txt` | `cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release -DGT3R_FETCH_SDL=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0`, build `gt3r gt3tool`, `cmake --install build-rel --prefix dist`, `ditto -c -k --keepParent` |
+| Windows x64 | `gt3r.exe` (icon resource), `gt3tool.exe`, `SDL3.dll`, README, LICENSE, `Barlow-OFL.txt` | same with `-DGT3R_SDL_SHARED=ON`; zip |
+| Linux x86_64 | `bin/gt3r`, `bin/gt3tool`, `share/applications/gt3r.desktop`, icon, README, LICENSE, `Barlow-OFL.txt` (`share/doc/gt3r`) | same; `tar czf` (built on Ubuntu 22.04 for an older glibc) |
 | Android | `gt3r-<tag>-android.apk`, signed with the project's release key (CI secrets; [android/README.md](../../android/README.md#release-signing)) | `./gradlew assembleRelease` |
 | Meta Quest | `gt3r-<tag>-quest.apk`, the VR build, same key | `android/fetch-sdl.sh --xr`, `./gradlew assembleRelease -Pquest` ([VR](VR.md)) |
 
 CI jobs `package`, `package-android` and `package-quest` build these on `v*` tags and manual
 runs (`workflow_dispatch`) and upload them as artifacts. The macOS app is
-not code-signed or notarized: first launch needs right-click → Open. The
+only ad-hoc signed (no developer certificate, not notarized): the first launch
+needs System Settings → Privacy & Security → Open Anyway (README, "Installing"). The
 icon is original artwork drawn by `packaging/make_icon.py` (also writes the
 Windows `.ico` and the Android launcher icons).
+
+On a `v*` tag, job `release` collects the packages into a draft GitHub Release
+under stable names (`gt3r-<platform>.<ext>`, e.g. `gt3r-windows-x64.zip`; see
+[ONLINE](ONLINE.md#versions-and-updates), "Downloads"), with `SHA256SUMS` and build
+provenance attestations; it is published after review.
 
 Verified locally: the macOS package (self-contained: `otool -L` shows only
 system frameworks; the bundle launches, `plutil -lint` OK); the Linux tarball
 and the Windows zip from a MinGW cross build in Docker (see below for what
-they contain). The MSVC-built Windows package and an AppImage are not made.
+they contain). Released packages are the CI jobs' (the Windows zip there is
+MSVC-built); an AppImage is not made.
 
 ## Windows / MSVC review
 
@@ -196,9 +202,10 @@ passed every test):
 - **Android frame time (emulator):** the API 36 arm64 emulator renders the
   race at 5–8 fps (120–200 ms/frame) at 2560×1600 with gfxstream Vulkan.
   CPU scene time is ~11 ms; MSAA 1 vs 4 makes no difference, so the
-  emulator's GPU translation is the bottleneck. Not representative; needs a
-  real device. `[video] render_scale` (auto ≈ 900 lines on mobile) brought
-  the 20:9 phone-shaped emulator from ~150 to ~88 ms per frame.
+  emulator's GPU translation is the bottleneck. Not representative of real
+  devices (see the table). `[video] render_scale` (auto ≈ 900 lines on
+  mobile) brought the 20:9 phone-shaped emulator from ~150 to ~88 ms per
+  frame.
 - **Touch overlay vs HUD:** resolved. Controls use the side bars on wide
   phones, and the race HUD insets (and on 16:9 shrinks) its meters into
   `App::touch().safe_area()`. Menus accept direct taps (tap to focus, tap
@@ -221,5 +228,8 @@ passed every test):
   How the effects *feel* has not been judged by a person yet. Xbox impulse
   triggers and wheel haptics are untested with real devices; the wheel force
   direction may need `[ffb] invert = on` on some wheels.
-- Real Linux desktop sessions and real Android devices are unverified (see
-  the table).
+- Real Linux desktop sessions are unverified (see the table).
+- **High-refresh displays:** every platform draws every display refresh by
+  default. Settings → Display → Limit to 60 fps (`[video] limit_60fps = on`)
+  draws every Nth refresh on 120 Hz and faster displays (120 Hz → 60 fps,
+  144 → 72) through SDL's main loop rate; checked on a 120 Hz Mac display.

@@ -22,14 +22,15 @@ that way, so please read them first.
    File layouts, constants, table values, algorithms described in prose and
    observed behaviour are fine to record. File formats go in
    [docs/FORMATS.md](docs/FORMATS.md) and [docs/formats/](docs/formats/);
-   how a system behaves and how ours implements it go in the notes in
-   [docs/dev/](docs/dev/).
+   how a system behaves goes in [docs/behaviour/](docs/behaviour/), and how
+   ours implements it in the notes in [docs/dev/](docs/dev/). Code comments
+   cite behaviour sections as `<page> §n` (for example `physics §4.2`).
 4. Anything you extract from your own disc while working (`gt3tool extract`,
    screenshots, logs) stays outside the repository.
 
 ## Building
 
-Requirements: CMake 3.21 or later, a C++20 compiler and SDL3 (3.2 or later;
+Requirements: CMake 3.21 or later, a C++20 compiler and SDL3 (3.4 or later;
 fetched and built by CMake if it is not installed). zlib is optional.
 
 ```bash
@@ -51,7 +52,9 @@ GT3R_DISC="/path/to/image.iso" ./build/gt3r_tests ai_    # tests whose name cont
 ```
 
 - The **unit tests** need no game data and run in CI on Linux, Windows and
-  macOS.
+  macOS. Some build small worlds in the disc's formats from invented values
+  (`tests/*_synth.h`, `tests/*_fixtures.h`) to run the physics, the AI and
+  the GT Mode menus without a disc.
 - The **disc tests** read your own disc image (`GT3R_DISC`) and check the
   decoders and game systems against real data: every file of a format
   parses, every car builds, races run, saves round-trip. They skip when no
@@ -80,7 +83,7 @@ To check a screen visually: `gt3r <iso> --screen <id> --shot out.png`.
 - One topic per pull request, with a description of what changed and how
   you verified it (tests, disc tests, screenshots of our own screens).
 - Add or update tests for behaviour changes, and update the docs that
-  describe the area (`docs/formats/`, `docs/dev/`, [MODDING](docs/MODDING.md)).
+  describe the area (`docs/behaviour/`, `docs/formats/`, `docs/dev/`, [MODDING](docs/MODDING.md)).
 - Say where behaviour deliberately differs from the original, and why.
 - CI must pass on all platforms.
 - By contributing you agree that your work is released under the

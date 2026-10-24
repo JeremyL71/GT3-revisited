@@ -32,6 +32,25 @@ GameRandom& race_info_random() {
     return r;
 }
 
+void Vu0Random::init(float seed) {
+    u32 bits;
+    std::memcpy(&bits, &seed, 4);
+    r = 0x3F800000u | (bits & 0x7FFFFFu);
+}
+
+float Vu0Random::next() {
+    const u32 feedback = ((r >> 4) ^ (r >> 22)) & 1u;
+    r = ((r << 1 | feedback) & 0x7FFFFFu) | 0x3F800000u;
+    float f;
+    std::memcpy(&f, &r, 4);
+    return f - 1.0f; // exact
+}
+
+Vu0Random& vu0_random() {
+    static Vu0Random r;
+    return r;
+}
+
 namespace {
 u32 (*g_hardware_source)() = nullptr;
 }

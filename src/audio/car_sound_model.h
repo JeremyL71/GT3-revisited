@@ -52,8 +52,8 @@ struct Wind {
 };
 
 // Wind/road noise on rn_01.es. u = forward speed (m/s), y = slipstream
-// factor 0..1 (physics spec §5.2), cd = the car's drag coefficient C_d (body
-// record +0x39 / 100, e.g. 0.35; physics spec §4.7).
+// factor 0..1 (physics §5.2), cd = the car's drag coefficient C_d (body
+// record +0x39 / 100, e.g. 0.35; physics §4.7).
 Wind wind(float u, float y, float cd);
 // The "in_car" loop (heard from the in-car view).
 Loop in_car(float u, float y, float cd);
@@ -68,10 +68,11 @@ Loop whine(bool enabled, int clutch_state, float torque, float ratio, float firs
 // reading the outputs.
 class Turbo {
 public:
-    // turbo: the car has a turbo model; throttle 0..1; prev_load / load:
-    // boost load before / after this step (physics spec §2.3);
+    // turbo: the car has a turbo model; throttle 0..1: the processed throttle
+    // (after TCS and the shift cut, so 0 through an upshift); prev_load / load:
+    // boost load before / after this step (physics §2.3);
     // torque: this step's engine torque (N m); lag0/lag1: stage lag states
-    // (physics spec §2.3).
+    // (physics §2.3).
     void step(bool turbo, float throttle, float prev_load, float load, float torque, int lag0, int lag1);
     void frame();
     void reset() { *this = Turbo{}; }
@@ -86,7 +87,7 @@ private:
     u8 level_ = 0;
     u16 spool_ = 0;
     bool fired_ = false; // blow-off played; re-armed above 90% throttle
-    float trigger_ = 0;  // raw trigger of the last step
+    float trigger_ = 0;  // raw blow-off trigger since the last frame()
     float blow_off_ = 0;
 };
 

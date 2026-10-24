@@ -46,7 +46,11 @@ tests all link it.
 The main thread runs input, game logic and rendering. SDL's audio thread
 pulls decoded music through `AudioEngine::feed`; movie playback decodes video
 on its own worker thread. `File::read_at` is
-mutex-protected, so the disc can be read from both threads.
+mutex-protected, so the disc can be read from both threads. On phones and
+tablets a background thread creates the 3D pipelines at start-up
+(`GpuContext::warm_pipelines`, [dev/RENDERING.md](dev/RENDERING.md)); the
+pipeline cache is mutex-protected. Online sessions receive on their own
+thread, and the update check runs on a detached one.
 
 ## Modules
 
@@ -60,6 +64,7 @@ mutex-protected, so the disc can be read from both threads.
 | `audio/` | SDL audio, SPU2-style voice mixer and reverb, sequencer, engine and ambience sounds |
 | `video/` | own MPEG-2 decoder and movie player (worker thread; [dev/MOVIES.md](dev/MOVIES.md)) |
 | `render/`, `scene/` | SDL_GPU device, shaders, model upload, showroom ([dev/RENDERING.md](dev/RENDERING.md)) |
+| `xr/` | VR headsets: the OpenXR session, head tracking and Touch controllers (Quest builds, `GT3R_XR`; [dev/VR.md](dev/VR.md)) |
 | `text/` | the game's fonts |
 | `sim/` | fixed-tick vehicle physics, car specs, collisions ([dev/PHYSICS.md](dev/PHYSICS.md)) |
 | `track/` | course runtime: road surface, walls, lap timing ([dev/TRACK.md](dev/TRACK.md)) |

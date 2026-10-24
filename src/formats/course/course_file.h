@@ -8,7 +8,7 @@
 //
 //   slot  tag    contents
 //   1     GTM1   main scenery model (nodes x chunks, 1-24 texture sets)
-//   2-4   Vls0   visibility lists for slot 1
+//   2-4   Vls0   visibility lists for slot 1 (see visibility.h; slot 2 in the main view)
 //   5     GTM1   secondary scenery model (road reflections / far detail)
 //   6-7   Vls0   visibility lists for slot 5
 //   9,13  GTM1   optional extra models (+ Vls0 in 10, 14)
@@ -18,9 +18,9 @@
 //   24    GTM1   low-resolution sky dome (secondary view pass only, not the main view)
 //   25    -      optional small table (28 of 320 files)
 //   26    Tex1   extra texture set
-//   27    GTM1   optional
+//   27    GTM1   licence course line (13 L_* files; see course_model.h)
 //   28    GTRW   road surface, walls, checkpoints, start grid (see road.h)
-//   29    GTFX   effects parameters
+//   29    GTFX   lamp glows: one lamp list per slot 1 node (see race/lamp_glows.h)
 //   30    BLBd   blob/shadow texture block
 //   31    -      AI driving lines (see ai_lines.h)
 //   32    Env0   environment (fog/light colours)
@@ -28,7 +28,8 @@
 //   34    GTRC   replay camera track
 //   35    CRSS   ?
 //   36    -      ?
-//   37-40 "sdd"  per-surface (sound/grip?) parameter blocks, 0x40 bytes each
+//   37-40 -      AI driver parameter sets, one per driveline class (see driver_sets.h);
+//                0 in the offset table = no set
 //
 // Region folders (US, JP, UK, EU) hold the same set of 80 courses; most files
 // are byte-identical across regions.
@@ -47,11 +48,13 @@ enum Slot : int {
     kSlotBackdrop = 22,
     kSlotSkyObject = 23,
     kSlotSky2 = 24,
+    kSlotCourseLine = 27,
     kSlotRoad = 28,
     kSlotAiLines = 31,
     kSlotEnv = 32,
     kSlotCourseMap = 33,
     kSlotReplayCameras = 34,
+    kSlotDriverSets = 37, // 37..40
     kSlotCount = 48,
 };
 

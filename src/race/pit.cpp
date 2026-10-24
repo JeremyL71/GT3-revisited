@@ -20,8 +20,7 @@ bool PitLane::load(const track::Track& t, int car_index) {
     int n = int(stop.points.size());
     if (lane.points.size() < 4 || n < 6 + car_index) return false;
     lane_ = t.racing_line(2, 2.0f); // game line 3: a lap through the pit lane
-    stop_ = t.racing_line(3, 1.0f); // game line 4: the stop line
-    if (lane_.size() < 4 || stop_.size() < 4) return false;
+    if (lane_.size() < 4) return false;
     length_ = t.length();
     auto at = [&](int i) {
         const course::Vec3& p = stop.points[size_t(i)].pos;
@@ -96,18 +95,27 @@ PitLane::Out PitLane::update(const In& in) {
     float to_box = box_ - dist;
     if (to_box < -length_ * 0.5f) to_box += length_;
     if (to_box > length_ * 0.5f) to_box -= length_;
+    auto go = [&](State st, int line, bool blend = false) {
+        state_ = st;
+        o.line = line;
+        o.blend = blend;
+    };
     switch (state_) {
     case Normal:
         if ((in.on_pit_surface && crossed(prev, dist, entry_)) || (in.armed && !in.race_over && crossed(prev, dist, entry0_))) {
-            state_ = Lane;
+            go(Lane, 3); // onto the pit lane line at once
             stopped_ = false;
             o.entered = true;
         }
         break;
     case Lane:
-        // Decision 25 m before the box.
-        if (to_box <= 25.0f && to_box > 0 && !in.race_over && in.want_service && s.speed_kmh < 100.0f) state_ = Stop;
-        else if (to_box < -0.5f && crossed(prev, dist, exit_)) state_ = Normal; // drove through
+        // Decision 25 m before the box: stop, or drive through on the pit lane line.
+        if (to_box <= 25.0f && to_box > 0) {
+            if (!in.race_over && in.want_service && s.speed_kmh < 100.0f) go(Stop, 4);
+            else go(Leaving, 3);
+        } else if (to_box < -0.5f && crossed(prev, dist, exit_)) { // (entered past the decision point)
+            go(Normal, 6, true);
+        }
         break;
     case Stop:
         if (!stopped_ && crossed(prev, dist, box_)) {
@@ -115,23 +123,17 @@ PitLane::Out PitLane::update(const In& in) {
             o.begin_stop = true;
             o.box = box_q_;
         } else if (stopped_ && !in.stopping && to_box < -0.5f) {
-            state_ = Leaving;
+            go(Leaving, 3);
         }
         break;
     case Leaving:
-        if (crossed(prev, dist, exit_)) state_ = Normal;
+        if (crossed(prev, dist, exit_)) go(Normal, 6, true);
         break;
     }
-    if (state_ == Normal) return o;
-    o.auto_drive = true;
-    if (in.stopping) {
-        o.in.brake = 1;
-        return o;
-    }
-    float pit = in.pit_speed_kmh + 2.0f;
-    if (state_ == Stop) o.in = follow(stop_, s, stopped_ ? pit : std::min(20.0f, std::max(5.0f, to_box * 2.0f)));
-    else if (state_ == Leaving) o.in = follow(stop_, s, pit);
-    else o.in = follow(lane_, s, pit);
+    o.exited = o.line == 6;
+    o.kind = int(state_);
+    o.auto_drive = state_ != Normal;
+    o.hold = o.auto_drive && in.stopping;
     return o;
 }
 

@@ -288,6 +288,36 @@ TEST(input_race_layout_per_player) {
     CHECK(input.race_pad(0).press(PadButton::Cross) == 90);
 }
 
+// The keyboard preset with the keyboard switched off left player 1 nothing to control the game
+// with. A profile only the keyboard can drive keeps player 1's keyboard live; the setting
+// itself is kept as the player chose it.
+TEST(input_keyboard_preset_never_locks_out) {
+    CHECK(make_preset("keyboard").keyboard_only());
+    CHECK(!make_preset("racing").keyboard_only() && !make_preset("classic").keyboard_only() &&
+          !make_preset("wheel").keyboard_only());
+    InputManager input;
+    input.load(IniDocument::parse("[player1]\npreset = keyboard\nkeyboard = off\n[player2]\npreset = keyboard\n"));
+    CHECK(!input.keyboard_enabled(0) && input.keyboard_fallback(0) && input.keyboard_active(0));
+    CHECK(!input.keyboard_enabled(1) && !input.keyboard_fallback(1)); // player 2 shares the keyboard: no fallback
+    auto press_return = [&] {
+        SDL_Event e{};
+        e.type = SDL_EVENT_KEY_DOWN;
+        e.key.scancode = SDL_SCANCODE_RETURN;
+        input.handle_event(e);
+        input.update(0.016);
+        return input.pad(0).down(PadButton::Cross);
+    };
+    CHECK(press_return()); // Return = Cross reaches player 1
+    CHECK(!input.pad(1).down(PadButton::Cross));
+    IniDocument out;
+    input.save(out);
+    CHECK(out.get("player1", "keyboard") == "off");
+    // A preset a controller can drive: the keyboard setting applies as before.
+    input.apply_preset(0, "racing");
+    CHECK(!input.keyboard_fallback(0) && !input.keyboard_active(0));
+    CHECK(!press_return());
+}
+
 TEST(touch_tap_shorter_than_a_frame) {
     TouchControls t;
     t.set_layout(TouchLayout::Menu);
@@ -364,6 +394,62 @@ TEST(touch_safe_area) {
     t.set_screen(0, 0, 640, 360);
     TouchRect m = t.safe_area();
     CHECK(m.x > 100 && m.x + m.w < 540);
+}
+
+TEST(touch_control_bounds) {
+    TouchControls t = driving();
+    CHECK(t.control_bounds().empty()); // hidden
+    t.note_touch();
+    const std::vector<TouchRect> b = t.control_bounds();
+    CHECK(b.size() + 1 == t.widgets().size()); // all but the steering zone
+    const Widget gas = *find_widget(t, Widget::Kind::Pedal, PadButton::Cross);
+    const Widget up = *find_widget(t, Widget::Kind::Button, PadButton::R2);
+    bool gas_seen = false, up_seen = false;
+    for (const TouchRect& r : b) {
+        gas_seen |= r.x == gas.x && r.y == gas.y && r.w == gas.w && r.h == gas.h;
+        up_seen |= r.x == up.x - up.w && r.y == up.y - up.w && r.w == 2 * up.w && r.h == 2 * up.w; // circle's box
+    }
+    CHECK(gas_seen && up_seen);
+    // The race HUD's corner blocks keep their places beside the driving layout at its normal
+    // size (16:9 and 20:9): the top corners hold no control down to the shift buttons.
+    for (float x1 : {640.0f, 710.0f}) {
+        t.set_screen(640 - x1, 0, x1, 360);
+        for (const TouchRect& r : t.control_bounds()) {
+            const bool top_left = r.x < 200 && r.y < 150, top_right = r.x + r.w > 500 && r.y < 150;
+            CHECK(!top_left && !top_right);
+        }
+    }
+}
+
+TEST(touch_clear_above_moves_buttons_off_controls) {
+    // The title menu's "GT3R menu" button, bottom of the left bar, on a 20:9 phone.
+    const TouchRect button{6, 314, 68, 22};
+    for (bool left_handed : {false, true}) {
+        TouchConfig cfg;
+        cfg.left_handed = left_handed; // face buttons in that corner instead of the D-pad
+        for (float size : {0.6f, 1.0f, 1.6f}) {
+            cfg.size = size;
+            TouchControls t;
+            t.configure(cfg);
+            t.set_layout(TouchLayout::Menu);
+            t.set_screen(-70, 0, 710, 360);
+            TouchRect hidden = t.clear_above(button);
+            CHECK(hidden.x == button.x && hidden.y == button.y); // hidden controls: left alone
+            t.note_touch();
+            TouchRect r = t.clear_above(button);
+            CHECK(r.x == button.x && r.w == button.w && r.h == button.h);
+            CHECK(r.y < button.y && r.y > 50); // above the corner cluster, below L1
+            // Nowhere on it is a touch taken by the controls.
+            for (float x = r.x; x <= r.x + r.w; x += 2)
+                for (float y = r.y; y <= r.y + r.h; y += 2) CHECK(!t.hit(x, y));
+        }
+    }
+    // Already clear: unchanged.
+    TouchControls t;
+    t.set_layout(TouchLayout::Menu);
+    t.note_touch();
+    TouchRect mid = t.clear_above({300, 150, 40, 20});
+    CHECK(mid.x == 300 && mid.y == 150);
 }
 
 TEST(touch_gt3_race_buttons) {

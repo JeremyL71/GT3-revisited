@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <sstream>
 
 using namespace gt3r;
 using namespace gt3r::game;
@@ -48,6 +49,13 @@ std::shared_ptr<const GtData> disc_data() {
     std::shared_ptr<const GtData> data = disc_data();                                                                  \
     if (!data) SKIP("needs GT3R_DISC")
 
+// A run of garage car i that drove `metres`: its engine condition back, the distance counted.
+void drive(GtMode& gt, int i, float metres) {
+    const sim::EngineCondition start = GtMode::run_condition(gt.state().garage[size_t(i)].cond);
+    const sim::EngineCondition end = GtMode::driven(start, metres);
+    gt.end_run(i, end, end.odometer - start.odometer);
+}
+
 } // namespace
 
 // --- Logic (no disc) ----------------------------------------------------------------
@@ -76,7 +84,7 @@ TEST(gtmode_power_peak_sweep) {
 }
 
 TEST(gtmode_engine_factor_floor) {
-    // Break-in holds 97 % below E = -300 km (physics spec §10.3); oil +5 % below -100 km.
+    // Break-in holds 97 % below E = -300 km (physics §10.3); oil +5 % below -100 km.
     CarCondition c;
     c.engine_wear_m = -400000, c.oil_m = 0;
     CHECK(std::fabs(GtMode::engine_factor(c) - 0.97f) < 1e-6f);
@@ -84,6 +92,25 @@ TEST(gtmode_engine_factor_floor) {
     CHECK(std::fabs(GtMode::engine_factor(c) - 0.985f) < 1e-6f);
     c.engine_wear_m = 0, c.oil_m = -200000;
     CHECK(std::fabs(GtMode::engine_factor(c) - 1.05f) < 1e-6f);
+}
+
+// How used the oil is on the oil page's gauge (gt_mode §13): 0 fresh .. 1 used, over the oil
+// change's 300 km, the same from a new car's O = 0; the counter as a run drives it.
+TEST(gtmode_oil_age) {
+    auto near = [](float a, float b) { return std::fabs(a - b) < 1e-6f; };
+    CHECK(near(GtMode::oil_age(-300000), 0));     // just changed
+    CHECK(near(GtMode::oil_age(-150000), 0.5f));  // 150 km on it
+    CHECK(near(GtMode::oil_age(0), 0));           // a new car's oil
+    CHECK(near(GtMode::oil_age(150000), 0.5f));
+    CHECK(near(GtMode::oil_age(300000), 1));      // used (the race HUD's oil lamp)
+    CHECK(near(GtMode::oil_age(450000), 1));
+    // Driven after a change: the counter stays in metres and climbs from -300 km; past 0 it
+    // jumps to the used value.
+    sim::EngineCondition c{0, 0, -300000};
+    c = GtMode::driven(c, 120000);
+    CHECK(c.oil_m == -180000 && near(GtMode::oil_age(c.oil_m), 0.4f));
+    c = GtMode::driven(c, 180000);
+    CHECK(c.oil_m == 300000 && near(GtMode::oil_age(c.oil_m), 1));
 }
 
 TEST(gtmode_completion_text_truncates) {
@@ -102,8 +129,23 @@ TEST(gtmode_format_credits) {
     CHECK(format_time_ms(62400) == "1'02.400");
 }
 
+// Record dates (records page): the stamp's date day / month / year, dashes without one; the
+// original's conversion gives only the year 2000 a February 29.
+TEST(gtmode_record_dates) {
+    CHECK(record_date_text(0) == "--/--/--");
+    CHECK(record_date_text(0x3264FD64) == "16/10/26"); // the reference new game: 2026-10-16 15:21:08
+    CHECK(record_date_text(1) == "01/01/00");
+    CHECK(record_date_text(59 * 86400) == "29/02/00" && record_date_text(60 * 86400) == "01/03/00");
+    const u32 y2028 = 7 * 1461 * 86400; // 2028-01-01, a leap year read with the common months
+    CHECK(record_date_text(y2028 + 58 * 86400) == "28/02/28" && record_date_text(y2028 + 59 * 86400) == "01/03/28");
+    CHECK(record_date_text(y2028 + 365 * 86400) == "32/12/28");
+    CHECK(record_date_text(y2028 + 366 * 86400) == "01/01/29");
+    // The clock: after the reference stamp, never 0.
+    CHECK(record_stamp_now() > 0x3264FD64);
+}
+
 TEST(gtmode_goods_table) {
-    // Goods ranges (spec §6.1).
+    // Goods ranges (gt_mode §6.1).
     CHECK(goods_info(1).table == 0 && goods_info(1).stage == 1);   // racing brakes
     CHECK(goods_info(51).table == 18 && goods_info(51).stage == 1); // sports suspension
     CHECK(goods_info(66).table == 28 && goods_info(66).stage == 12); // dirt tires
@@ -135,6 +177,67 @@ TEST(gtmode_engine_factor) {
     CHECK(std::fabs(GtMode::engine_factor(c) - 1.05f) < 1e-5f);
     c.oil_m = -50000;
     CHECK(std::fabs(GtMode::engine_factor(c) - 1.025f) < 1e-5f);
+}
+
+// gt_mode §13.1 / physics §10.3: the runs that carry a garage car's engine condition, the words
+// a run starts with, and what a finished run hands back (odometer, wear, oil, total distance).
+TEST(gtmode_engine_condition_run) {
+    for (const char* m : {"go_race", "go_machine_test", "go_free_run", "single_race", "free_run"})
+        CHECK(GtMode::carries_engine_condition(m));
+    for (const char* m : {"go_license", "time_trial", "two_player_battle", "go_preview", "theater_replay", ""})
+        CHECK(!GtMode::carries_engine_condition(m));
+    CarCondition c;
+    c.odometer_m = 1234.0, c.engine_wear_m = -12000, c.oil_m = -300000;
+    sim::EngineCondition w = GtMode::run_condition(c);
+    CHECK(w.odometer == 617 && w.wear_m == -12000 && w.oil_m == -300000);
+    // Driving: odometer in 2 m units (the odd metre waits), E capped, the fresh oil fading.
+    sim::EngineCondition d = GtMode::driven(w, 2501);
+    CHECK(d.odometer == 617 + 1250 && d.wear_m == -12000 + 2501 && d.oil_m == -300000 + 2501);
+    CHECK(GtMode::driven({0, 599000, 0}, 5000).wear_m == 600000);
+    CHECK(GtMode::driven({0, 0, -1000}, 1500).oil_m == 300000); // the oil bonus ran out: worn
+    CHECK(GtMode::driven(w, 0) == w);
+    // A run hands the words back to its garage car; the total grows by the units added.
+    auto data = std::make_shared<GtData>();
+    GtMode gt(data);
+    gt.state().garage.resize(2);
+    gt.state().garage[1].cond = c;
+    gt.end_run(1, d, d.odometer - w.odometer);
+    const CarCondition& b = gt.state().garage[1].cond;
+    CHECK(b.odometer_m == 2.0 * (617 + 1250) && b.engine_wear_m == d.wear_m && b.oil_m == d.oil_m);
+    CHECK(gt.state().distance_m == 2500.0 && gt.state().garage[0].cond.odometer_m == 0);
+    // An arcade car (no garage index): only the total distance.
+    gt.end_run(-1, {800, 0, 0}, 800);
+    CHECK(gt.state().distance_m == 4100.0 && gt.state().garage[1].cond.odometer_m == 2.0 * (617 + 1250));
+    CHECK(gt.garage_index(gt.state().garage[1]) == 1 && gt.garage_index(GarageCar{}) == -1);
+}
+
+// gt_mode §23: which codes are GT-mode results (the whole-game prize set's check).
+TEST(gtmode_code_classes) {
+    for (const char* c : {"Gsunday_e_0001", "Galtezza_e_0500", "Ejapan_gt_0001", "Dtahiti_0001", "L0B0001", "LIA0008",
+                          "L0S0000", "L0R0003", "M400", "M1000", "MMAX"})
+        CHECK(GtMode::gt_mode_code(c));
+    for (const char* c : {"ANCT0001", "ATAF0001", "A2P0001", "AT010001", "arcade_compulsory_complete",
+                          "gtmode_complete", "LXX0001", "MX", "", "X"})
+        CHECK(!GtMode::gt_mode_code(c));
+}
+
+// View mode 1's pad fields of the options block (presentation §G3): +0x114 the level (a new
+// game 0.1), +0x118 the music-timed cuts (off).
+TEST(gtmode_ps2_replay_pad_fields) {
+    Bytes o;
+    Ps2ReplayPad p = ps2_replay_pad(o);
+    CHECK(p.level == 0.1f && p.music_cuts == 0.0f);
+    set_ps2_replay_pad(o, {0.4f, 1.0f});
+    CHECK(o.size() == 0x888);
+    float f;
+    u32 v = rd32(o, 0x114);
+    std::memcpy(&f, &v, 4);
+    CHECK(f == 0.4f);
+    v = rd32(o, 0x118);
+    std::memcpy(&f, &v, 4);
+    CHECK(f == 1.0f);
+    p = ps2_replay_pad(o);
+    CHECK(p.level == 0.4f && p.music_cuts == 1.0f);
 }
 
 TEST(gtmode_save_text_roundtrip) {
@@ -179,6 +282,7 @@ TEST(gtmode_save_text_roundtrip) {
     s.machine.car400 = "r34_gtr_v_99";
     s.machine.top_speed = 301.5;
     s.machine.car_top = "zz2_00";
+    s.rankings["mt:M400"] = {RankEntry{12.345, "r34_gtr_v_99", 9, "ME", 0x3264FD64, "ABC DEF"}, RankEntry{13.0, "", 10, "", 0, ""}};
     s.ending_short_seen = true;
     // Setting files with their memory-card info (written / overwritten / deleted by the list).
     write_setting_file(s, c, -1, 1760000000, 280);
@@ -190,6 +294,11 @@ TEST(gtmode_save_text_roundtrip) {
     GameState t = load_from_text(text);
     CHECK(t.machine.t400 == 12.345 && t.machine.car400 == "r34_gtr_v_99" && t.machine.t1000 < 0);
     CHECK(t.machine.top_speed == 301.5 && t.machine.car_top == "zz2_00");
+    {
+        const std::vector<RankEntry>& r = t.rankings["mt:M400"];
+        CHECK(r.size() == 2 && r[0].name == "ME" && r[0].day == 9 && r[0].stamp == 0x3264FD64);
+        CHECK(r[1].name.empty() && r[1].car.empty() && r[1].stamp == 0);
+    }
     CHECK(t.ending_short_seen && !t.ending_long_seen);
     CHECK(t.credits == s.credits && t.day == 42 && t.races == 7 && t.wins == 3 && t.prize_money == 9000);
     CHECK(t.distance_m == 12345.5 && t.next_serial == 5 && t.rng == 0xDEADBEEF && t.ride == 0);
@@ -263,6 +372,168 @@ TEST(gtmode_save_time_trial_marks) {
     // The marks survive the native save as they are.
     GameState t = load_from_text(save_to_text(s));
     CHECK(t.rankings["at:AT020001"].size() == 4 && t.rankings["at:AT020001"][3].name == a[3].name);
+}
+
+// A car's settings line is read from the front: a save from before a CarSettings field was
+// appended has fewer values (the rest keep their defaults), one from a newer build more
+// (ignored). A value that is not a number still makes the save unreadable.
+TEST(gtmode_save_settings_line_tolerant) {
+    GameState s;
+    GarageCar c;
+    c.car = "r34_gtr_v_99";
+    c.settings.gears = {3280, 3827, 2360, 1685, 1312, 1000, 793, -999};
+    c.settings.final_drive = 3545;
+    c.settings.brake_front = 4;
+    c.settings.ascc = {1, 2, 3, 4};
+    s.garage.push_back(c);
+    write_setting_file(s, c, -1, 1760000000, 280);
+    const std::string text = save_to_text(s);
+    // The save with every settings / ssettings line cut to its first `keep` values + `extra`.
+    auto with_settings = [&](size_t keep, const std::string& extra) {
+        std::istringstream in(text);
+        std::string out, line;
+        while (std::getline(in, line)) {
+            if (line.rfind(" settings ", 0) == 0 || line.rfind(" ssettings ", 0) == 0) {
+                std::istringstream l(line);
+                std::string key, v;
+                l >> key;
+                line = " " + key;
+                for (size_t i = 0; i < keep && l >> v; ++i) line += " " + v;
+                line += extra;
+            }
+            out += line + "\n";
+        }
+        return out;
+    };
+    const sim::CarSettings defaults;
+    GameState older = load_from_text(with_settings(9, "")); // the gears and the final drive
+    CHECK(older.garage.size() == 1 && older.setting_files.size() == 1);
+    if (older.garage.size() == 1 && older.setting_files.size() == 1)
+        for (const sim::CarSettings* st : {&older.garage[0].settings, &older.setting_files[0].settings}) {
+            CHECK(st->gears == c.settings.gears && st->final_drive == 3545);
+            CHECK(st->brake_front == defaults.brake_front && st->ascc == defaults.ascc);
+        }
+    GameState none = load_from_text(with_settings(0, ""));
+    CHECK(none.garage.size() == 1 && none.garage[0].settings.gears == defaults.gears &&
+          none.garage[0].settings.brake_rear == defaults.brake_rear);
+    GameState newer = load_from_text(with_settings(1000, " 7 8 9"));
+    CHECK(newer.garage.size() == 1 && newer.garage[0].settings.ascc == c.settings.ascc &&
+          newer.garage[0].settings.brake_front == 4);
+    CHECK(save_to_text(newer) == text);
+    bool threw = false;
+    try {
+        load_from_text(with_settings(3, " x"));
+    } catch (const FormatError&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+// A version 1 save, written by hand in the layout this format has had since version 1 (not
+// generated by the writer): saves already written must keep loading, so a reader change that
+// breaks them fails here.
+TEST(gtmode_save_v1_fixture) {
+    static const char kV1[] =
+        "GT3R-GTMODE 1\n"
+        "credits 1234567\n"
+        "day 210\n"
+        "races 85\n"
+        "wins 40\n"
+        "prize_money 2500000\n"
+        "distance 987654.5\n"
+        "next_serial 4\n"
+        "trophies 12\n"
+        "prize_cars 3\n"
+        "rng 305419896\n"
+        "ride 1\n"
+        "car 2 nsx_s_zero_97 3 - Gsunday_e_0000\n"
+        " parts 123456789abcdef 0 0 0 0 0 0 0 0 0 0 0 2a 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+        " owned 1000000000000020000004\n"
+        " settings 3280 3827 2360 1685 1312 1000 793 -999 3545 0 50 3 2 0 0 0 0 0 0 0 0 12 8 110 115 128 128 65 60 "
+        "100 100 5 5 5 5 4 4 4 4 3 2 0 10 0 25 0 15 5 1 2 3 4\n"
+        " ref_final 4100\n"
+        " cond 120000.5 50000 -100000 0.25\n"
+        "car 3 r34_gtr_v_99 0 bbw004_g -\n"
+        " parts 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+        " owned 0000000000000000000000\n"
+        " settings 0 0 0 0 0 0 0 0 0 0 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
+        "0 0\n"
+        " ref_final 0\n"
+        " cond 0 -300000 0 0\n"
+        "wheel bbw004_g\n"
+        "wheel with%20space\n"
+        "setfile r34_gtr_v_99 200 3900\n"
+        " sparts 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1f\n"
+        " ssettings 3280 3827 2360 1685 1312 1000 793 -999 3900 0 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 128 128 0 0 0 0 0 0 "
+        "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 9\n"
+        " sinfo 1760000000 330 Grip%20set\n"
+        "mtest 400 12.345 r34_gtr_v_99\n"
+        "mtest max 301.5 zz2_00\n"
+        "rank lic:B-1 31.25 r34_gtr_v_99 12 MATT\n"
+        "trophyflags 65\n"
+        "player MATT\n"
+        "fcomment MY%20CAREER\n"
+        "ps2opt 00ff10\n"
+        "arcade 2 7 4096\n"
+        "abest 3 0\n"
+        "atrank 1 2\n"
+        "endings 1 0\n"
+        "license 0 0 2 31.25\n"
+        "license 5 7 0 118.5\n"
+        "race Gsunday_e_0001 0\n"
+        "race Gff_e_0002 3\n"
+        "prize Gsunday_e_0000\n"
+        "champ Galtezza_e_0500 1 2 Galtezza_e_0501 Galtezza_e_0502 2 a b 10 6 4\n"
+        "end\n";
+    GameState s = load_from_text(kV1);
+    CHECK(s.credits == 1234567 && s.day == 210 && s.races == 85 && s.wins == 40 && s.prize_money == 2500000);
+    CHECK(s.distance_m == 987654.5 && s.next_serial == 4 && s.trophies == 12 && s.prize_cars == 3);
+    CHECK(s.rng == 0x12345678 && s.ride == 1 && s.garage.size() == 2);
+    if (s.garage.size() == 2) {
+        const GarageCar& a = s.garage[0];
+        CHECK(a.serial == 2 && a.car == "nsx_s_zero_97" && a.color == 3 && a.wheel.empty() &&
+              a.origin == "Gsunday_e_0000");
+        CHECK(a.parts[0] == 0x123456789ABCDEFull && a.parts[12] == 42 && a.parts[26] == 0);
+        CHECK(a.owned.count() == 3 && a.owned.test(0) && a.owned.test(57) && a.owned.test(86));
+        const sim::CarSettings& st = a.settings;
+        CHECK(st.gears[0] == 3280 && st.gears[7] == -999 && st.final_drive == 3545 && st.front_torque == 50);
+        CHECK(st.brake_front == 3 && st.brake_rear == 2 && st.camber[0] == 12 && st.ride_height[1] == 115);
+        CHECK(st.toe[0] == 128 && st.spring[0] == 65 && st.motion_ratio[1] == 100 && st.damper[4] == 4);
+        CHECK(st.arb[0] == 3 && st.lsd[3] == 25 && st.lsd[5] == 15 && st.tcs == 5);
+        CHECK((st.ascc == std::array<int, 4>{1, 2, 3, 4})); // the 52nd value: every field read
+        CHECK(a.ref_final == 4100 && a.cond.odometer_m == 120000.5 && a.cond.engine_wear_m == 50000 &&
+              a.cond.oil_m == -100000 && a.cond.dirt == 0.25f);
+        const GarageCar& b = s.garage[1];
+        CHECK(b.car == "r34_gtr_v_99" && b.wheel == "bbw004_g" && b.origin.empty() && b.owned.none());
+        CHECK(b.settings.brake_front == 1 && b.cond.engine_wear_m == -300000);
+    }
+    CHECK((s.wheels == std::vector<std::string>{"bbw004_g", "with space"}));
+    CHECK(s.setting_files.size() == 1);
+    if (s.setting_files.size() == 1) {
+        const SettingFile& f = s.setting_files[0];
+        CHECK(f.car == "r34_gtr_v_99" && f.day == 200 && f.ref_final == 3900 && f.parts[26] == 0x1F);
+        CHECK(f.settings.final_drive == 3900 && f.settings.toe[1] == 128 && f.settings.ascc[3] == 9);
+        CHECK(f.time == 1760000000 && f.power_ps == 330 && f.comment == "Grip set");
+    }
+    CHECK(s.machine.t400 == 12.345 && s.machine.car400 == "r34_gtr_v_99" && s.machine.t1000 < 0);
+    CHECK(s.machine.top_speed == 301.5 && s.machine.car_top == "zz2_00");
+    const std::vector<RankEntry>& r = s.rankings["lic:B-1"];
+    CHECK(r.size() == 1 && r[0].value == 31.25 && r[0].car == "r34_gtr_v_99" && r[0].day == 12 && r[0].name == "MATT" &&
+          r[0].stamp == 0); // (a save from before the stamps)
+    CHECK(s.trophy_flags == 65 && s.player_name == "MATT" && s.file_comment == "MY CAREER");
+    CHECK((s.ps2_options == Bytes{0x00, 0xFF, 0x10}));
+    CHECK(s.arcade.course_level == 2 && s.arcade.car_flags[0] && s.arcade.car_flags[2] && !s.arcade.car_flags[3]);
+    CHECK(s.arcade.awards == 0x1000 && s.arcade.best[3] == 0 && s.arcade.best[4] == kArcadeNoPosition);
+    CHECK(s.arcade.at_best_rank[1] == 2 && s.ending_short_seen && !s.ending_long_seen);
+    CHECK(s.license_tests[0].medal == Medal::Bronze && s.license_tests[0].best_time == 31.25);
+    CHECK(s.license_tests[47].medal == Medal::Gold && s.license_tests[47].best_time == 118.5);
+    CHECK(s.license_tests[1].medal == Medal::None);
+    CHECK(s.race_best.size() == 2 && s.best_position("Gsunday_e_0001") == 0 && s.best_position("Gff_e_0002") == 3);
+    CHECK(s.prizes_given.size() == 1 && s.prizes_given.count("Gsunday_e_0000") == 1);
+    const Championship& c = s.championship;
+    CHECK(c.active() && c.series == "Galtezza_e_0500" && c.next == 1);
+    CHECK((c.races == std::vector<std::string>{"Galtezza_e_0501", "Galtezza_e_0502"}));
+    CHECK((c.entrants == std::vector<std::string>{"a", "b"}) && (c.points == std::vector<int>{10, 6, 4}));
 }
 
 // --- Disc data -----------------------------------------------------------------------
@@ -450,6 +721,29 @@ TEST(gtmode_disc_races_and_prizes) {
     CHECK(gt.state().wins == u32(2 * s->races.size()));
 }
 
+// gt_mode §23: the disc's whole-game set (gtmode_complete) loads with its one car in a random
+// paint, and a GT-mode win with all 364 results won gives it once (not 363).
+TEST(gtmode_disc_game_complete_prize) {
+    NEED_DATA();
+    const PrizeSet* set = data->prize_set("gtmode_complete");
+    CHECK(set && set->cars.size() == 1 && set->cars[0].car == "mclaren_mp4_4" && set->cars[0].color_id == -1);
+    CHECK(data->race_codes.size() == 364);
+    if (!set || data->race_codes.empty()) return;
+    GtMode gt(data);
+    for (const PrizeSet& p : data->prizes) gt.state().prizes_given.insert(p.name); // every other set given
+    gt.state().prizes_given.erase("gtmode_complete");
+    const std::string last = data->race_codes.back();
+    for (const std::string& c : data->race_codes)
+        if (c != last) gt.state().race_best[c] = 0;
+    CHECK(gt.award_prizes("Gsunday_e_0001").empty()); // 363 won
+    gt.state().race_best[last] = 0;
+    CHECK(gt.award_prizes("AEAT0001").empty());        // an arcade check
+    std::vector<int> got = gt.award_prizes("Gsunday_e_0001");
+    CHECK(got.size() == 1 && gt.state().garage.size() == 1 && gt.state().garage[0].car == "mclaren_mp4_4");
+    CHECK(gt.state().garage[0].origin == "gtmode_complete");
+    CHECK(gt.award_prizes("L0B0000").empty() && gt.state().garage.size() == 1); // once
+}
+
 TEST(gtmode_disc_entry_rules) {
     NEED_DATA();
     GtMode gt(data);
@@ -552,8 +846,10 @@ TEST(gtmode_disc_car_spec_bridge) {
     auto mine = gt.car_spec(c);
     CHECK(stock && mine);
     if (stock && mine) {
-        // A new car runs at 97 % (break-in).
-        CHECK(std::fabs(mine->peak_torque() / stock->peak_torque() - 0.97f) < 1e-3f);
+        // The spec has no engine condition in it (a run carries the words); the menus' power
+        // figure of a new car is 97 % (break-in).
+        CHECK(mine->peak_torque() == stock->peak_torque());
+        CHECK(std::fabs(gt.power_ps(c) / spec_power_ps(*stock) - 0.97f) < 1e-3f);
         // User settings reach the spec: final drive.
         c.cond.engine_wear_m = 0;
         c.settings.final_drive = 4000;
@@ -562,7 +858,7 @@ TEST(gtmode_disc_car_spec_bridge) {
         CHECK(tuned && std::fabs(tuned->peak_torque() - stock->peak_torque()) < 1e-2f);
     }
     // Odometer, totals and wear.
-    gt.drive(0, 1500.0);
+    drive(gt, 0, 1500);
     CHECK(gt.state().garage[0].cond.odometer_m == 1500.0 && gt.state().distance_m == 1500.0);
 }
 
@@ -574,7 +870,7 @@ TEST(gtmode_disc_ps2_save_roundtrip) {
     CHECK(gt.buy_part(81) && gt.fit_part(81));
     gt.buy_wheel("bbw004_g");
     gt.fit_wheel(0, "bbw004_g");
-    gt.drive(0, 12346);
+    drive(gt, 0, 12346);
     gt.record_race("Gsunday_e_0001", 0);
     gt.record_license("L0B0001", true, 35.0);
     for (const std::string& r : data->catalog.series_for("Gsunday_e_0001")->races) gt.record_race(r, 0);
@@ -639,8 +935,22 @@ TEST(gtmode_disc_ps2_new_game_layout) {
     // block turned the original's sound off and emptied its music list (PCSX2 check).
     const size_t opt = p.size() - 0x888;
     CHECK(rd32(p, opt) == 0 && rd32(p, opt + 4) == 1 && rd32(p, opt + 0x18) == 1);
+    // The sound switches: menu BGM / SE +0x04 / +0x08, race BGM / SE +0x0C / +0x10, replay
+    // BGM / SE +0x54 / +0x58.
+    for (size_t o : {0x04, 0x08, 0x0C, 0x10, 0x54, 0x58}) CHECK(rd32(p, opt + o) == 1);
     CHECK(!data->race_songs.empty() && rd32(p, opt + 0x228) == data->race_songs.size());
     CHECK(rd64(p, opt + 0x238) == db::id_hash(data->race_songs[0]) && p[opt + 0x241] == 1);
+    // The list is a new game's race playlist: shuffle on, the order shuffled from the shared
+    // generator's first draw, which leaves the seed a new game of the original stores.
+    CHECK(p[opt + 0x22E] == 1 && p[opt + 0x22F] == 0 && rd16(p, opt + 0x230) == 0x456);
+    {
+        std::vector<int> places(data->race_songs.size(), 0);
+        for (size_t k = 0; k < data->race_songs.size() && k < 64; ++k) {
+            const u16 order = rd16(p, opt + 0x242 + 16 * k);
+            if (order < places.size()) ++places[order];
+        }
+        CHECK(std::all_of(places.begin(), places.end(), [](int v) { return v == 1; }));
+    }
     // The idle championship and the ride index copy (+0x2C, -1 without a car).
     CHECK(rd32(p, 0x2C) == 0xFFFFFFFFu && rd64(p, 0xFB4C + 0x94) == ~0ull);
     // Import gives the built-in records back as rankings with their marks; a second export
@@ -681,10 +991,66 @@ TEST(gtmode_disc_ps2_rankings_and_options) {
     CHECK(r[1].name == GtMode::time_trial_seed_name(0, 0) && r[1].car.empty() && std::fabs(r[1].value - 85.553) < 1e-6);
     CHECK(s.arcade.at_best_rank[0] == 0);
     CHECK(s.ps2_options == opt);
-    // The player's record names the car by its catalogue name on the card.
+    // The records' stamps (the seeds: the reference new game's), the last name entered.
+    CHECK(r[0].stamp == gt.state().rankings["at:AT010001"][0].stamp && r[0].stamp != 0 && r[1].stamp == 0x3264FD64);
+    CHECK(s.player_name == "MATT");
+    // The record's 32-byte block (the original's encoded entry, which ours does not make: 30 '-')
+    // and, on import, the challenge's car (the record keeps none); a block read from a card is
+    // kept.
     Bytes p = ps2_payload(export_ps2_save(gt.state(), *data));
-    const data::Car* c = data->db.car(r[0].car);
-    CHECK(c && std::string(reinterpret_cast<const char*>(&p[0x531C + 0x120])) == c->name);
+    CHECK(std::string(reinterpret_cast<const char*>(&p[0x531C + 0x120])) == std::string(30, '-'));
+    std::string at01 = data->arcade_classes.at("CLASS_COMPULSORY")[0].label;
+    for (const data::CarVariant& v : data->db.arcade_cars())
+        if (v.label == at01) at01 = v.car;
+    CHECK(r[0].car == at01 && data->db.car(at01) && r[0].code.empty());
+    gt.state().rankings["at:AT010001"][0].code = "0123456789ABCDEFGHIJKLMNOPQRST";
+    Bytes coded = export_ps2_save(gt.state(), *data);
+    CHECK(std::string(reinterpret_cast<const char*>(&ps2_payload(coded)[0x531C + 0x120])) == "0123456789ABCDEFGHIJKLMNOPQRST");
+    CHECK(import_ps2_save(coded, *data).rankings["at:AT010001"][0].code == "0123456789ABCDEFGHIJKLMNOPQRST");
+    CHECK(std::string(reinterpret_cast<const char*>(&p[0x70])) == "MATT");
+    // At most 15 characters and the 0.
+    gt.state().player_name = "ABCDEFGHIJKLMNOPQ";
+    CHECK(import_ps2_save(export_ps2_save(gt.state(), *data), *data).player_name == "ABCDEFGHIJKLMNO");
+}
+
+// Course time trials (gt_mode §17): one 12-place ranking per course of the arcade TIME_ATTACK
+// list, entered with a free run's best lap; on the card at the course's place in the list
+// (44 slots after the arcade time trials), the machine tests' three after them.
+TEST(gtmode_disc_course_time_trials_and_save) {
+    NEED_DATA();
+    GtMode gt(data);
+    CHECK(gt.course_time_trial_index("super") == 0 && gt.course_time_trial_index("laguna") == 9 &&
+          gt.course_time_trial_index("r_slalom80r") == 35 && gt.course_time_trial_index("rome_circuit") < 0);
+    gt.state().player_name = "ME";
+    CHECK(gt.record_course_time_trial("laguna", 81.2344, "r34_gtr_v_99") == 0);
+    CHECK(gt.record_course_time_trial("laguna", 80.5, "r34_gtr_v_99") == 0);
+    CHECK(gt.record_course_time_trial("laguna", 80.5, "zz2_00") == 0); // ties go ahead
+    CHECK(gt.record_course_time_trial("laguna", 0, "r34_gtr_v_99") < 0 && gt.record_course_time_trial("nowhere", 70, "x") < 0);
+    CHECK(gt.record_course_time_trial("laguna", 4194.304, "r34_gtr_v_99") < 0); // past 0x3FFFFF ms
+    CHECK(gt.record_course_time_trial("r_slalom80r", 50, "r34_gtr_v_99") == 0);
+    for (int k = 0; k < 12; ++k) gt.record_course_time_trial("laguna", 90 + k, "r34_gtr_v_99");
+    const std::vector<RankEntry>& lag = gt.state().rankings["ct:laguna"];
+    CHECK(lag.size() == 12 && lag[0].car == "zz2_00" && lag[1].car == "r34_gtr_v_99" && lag[2].value == 81.234);
+    CHECK(lag[0].name == "ME" && lag[0].stamp != 0 && lag[11].value == 98);
+    CHECK(gt.record_machine_test("MMAX", 300.0, "zz2_00") == 0 && gt.record_machine_test("M1000", 24.5, "zz2_00") == 0);
+    Bytes file = export_ps2_save(gt.state(), *data);
+    Bytes p = ps2_payload(file);
+    const size_t ct = 0x531C + 0x1A68; // after the arcade time trials (no cars, 1 wheel)
+    const size_t lg = ct + 0x300 * 9;
+    CHECK(rd32(p, lg) == 80500 && rd32(p, lg + 4) == 80500 && rd32(p, lg + 8) == 81234 && rd32(p, lg + 44) == 98000);
+    CHECK(std::string(reinterpret_cast<const char*>(&p[lg + 0x30])) == "ME");
+    CHECK(rd64(p, lg + 0xF0) == db::id_hash("zz2_00") && rd32(p, lg + 0x150) == lag[0].stamp);
+    CHECK(p[lg + 0x180] == '-' && p[lg + 0x19D] == '-' && p[lg + 0x19E] == 0);
+    CHECK(rd32(p, ct) == 0x157529FF && rd32(p, ct + 0x300 * 43) == 0x157529FF && rd32(p, ct + 0x300 * 35) == 50000);
+    const size_t mt = ct + 0x8400;
+    CHECK(rd32(p, mt) == 0x157529FF && rd32(p, mt + 0x300) == 24500 && rd32(p, mt + 0x600) == 8333333); // m/s x 1e5
+    GameState s = import_ps2_save(file, *data);
+    const std::vector<RankEntry>& back = s.rankings["ct:laguna"];
+    CHECK(back.size() == 12 && back[0].car == "zz2_00" && back[0].name == "ME" && back[0].stamp == lag[0].stamp);
+    CHECK(std::fabs(back[2].value - 81.234) < 1e-9 && s.rankings["ct:r_slalom80r"].size() == 1 && !s.rankings.count("ct:super"));
+    CHECK(std::fabs(s.rankings["mt:MMAX"][0].value - 300.0) < 1e-3 && s.machine.car_top == "zz2_00");
+    CHECK(std::fabs(s.machine.top_speed - 300.0) < 1e-3 && s.machine.t1000 == 24.5 && s.machine.t400 < 0);
+    CHECK(export_ps2_save(s, *data) == file && export_ps2_save(load_from_text(save_to_text(s)), *data) == file);
 }
 
 TEST(gtmode_disc_ps2_save_containers) {
@@ -751,8 +1117,8 @@ TEST(gtmode_disc_demo_save) {
     CHECK(gt.buy_car("r34_gtr_v_99") == 0);
     gt.buy_part(79);
     gt.fit_part(79);
-    gt.drive(0, 123400);
-    gt.drive(1, 45600);
+    drive(gt, 0, 123400);
+    drive(gt, 1, 45600);
     CHECK(write_save(out, gt.state()));
 }
 
@@ -768,6 +1134,27 @@ TEST(gtmode_disc_miata_save) {
         if (c.name.find("Miata") != std::string::npos && gt.car_price(c.label) == 17000) miata = c.label;
     CHECK(!miata.empty() && gt.buy_car(miata) == 0);
     CHECK(gt.state().credits == 1000);
+    CHECK(write_save(out, gt.state()));
+}
+
+// Writes a save one result short of the whole game when GT3R_GTMODE_COMPLETE_SAVE names a
+// path (playtests of gt_mode §23): every GT-mode result won but Sunday Cup race 1, every other
+// prize set already given; winning that race gives the gtmode_complete car. The ride car is a
+// worn R34 with fresh oil (gt_mode §13.1: an endurance race shows the condition changing).
+TEST(gtmode_disc_complete_save) {
+    const char* out = std::getenv("GT3R_GTMODE_COMPLETE_SAVE");
+    if (!out || !*out) SKIP("set GT3R_GTMODE_COMPLETE_SAVE to write a playtest save");
+    NEED_DATA();
+    GtMode gt(data);
+    gt.state().credits = 1000000;
+    CHECK(gt.buy_car("r34_gtr_v_99") == 0);
+    gt.state().garage[0].cond.odometer_m = 580000, gt.state().garage[0].cond.engine_wear_m = 580000;
+    gt.state().garage[0].cond.oil_m = -300000;
+    for (const std::string& c : data->race_codes)
+        if (c != "Gsunday_e_0001") gt.state().race_best[c] = 0;
+    for (const PrizeSet& p : data->prizes)
+        if (p.name != "gtmode_complete") gt.state().prizes_given.insert(p.name);
+    for (int i = 0; i < 6 * 8; ++i) gt.state().license_tests[size_t(i)].medal = Medal::Gold;
     CHECK(write_save(out, gt.state()));
 }
 
@@ -828,7 +1215,7 @@ TEST(gtmode_disc_setting_files) {
     CHECK(back.ref_final == gt.state().setting_files.back().ref_final);
 }
 
-// --- Arcade progression (spec §16) ---------------------------------------------------
+// --- Arcade progression (gt_mode §16) ---------------------------------------------------
 
 namespace {
 
@@ -1060,6 +1447,9 @@ TEST(gtmode_disc_ranking_top) {
     gt.add_record("mt:M400", 15.0, "r34_gtr_v_99", true, 12);
     std::vector<RankEntry> mt = gt.ranking_top("mt:M400", 3);
     CHECK(mt.size() == 3 && mt[0].value == 12.9 && mt[2].value == 14.1 && gt.ranking_name(mt[0]) == "ME");
+    // An entry stored without a name shows none (not the current player name).
+    gt.state().rankings["mt:M400"][0].name.clear();
+    CHECK(gt.ranking_name(gt.ranking_top("mt:M400", 1)[0]).empty());
 }
 
 TEST(gtmode_disc_attract_demo_field) {

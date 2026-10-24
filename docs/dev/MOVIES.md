@@ -164,15 +164,16 @@ IDCT accuracy against the double-precision reference, a hand-encoded
 synthetic MPEG-2 stream (I/P/B, skipped macroblocks, reordering, PTS, a
 half-pel vector), a
 synthetic program stream for the demuxer (packs, padding, resync, private
-stream 1 sub-header), a synthetic movie with audio, and disc tests (skipped
+stream 1 sub-header), a synthetic movie with audio, a synthetic `ipua`
+archive, the field-split detector on synthetic frames, and disc tests (skipped
 without `GT3R_DISC`): `menu_bg2.pss` fully (360 frames), `opening.pss` start
-with audio, and the first frames of every movie. 9/9 pass with the disc
-(6 pass, 3 skip without), ~0.4 s. The IDCT meets every IEEE 1180 limit
+with audio, the first frames of every movie, and the course preview stills.
+12 tests: 8 run without the disc, 4 skip. The IDCT meets every IEEE 1180 limit
 (peak error 1, worst per-pixel MSE 0.017 vs 0.06, overall MSE ≤ 0.014 vs
 0.02, means ≤ 0.0035 / 0.00026 vs 0.015 / 0.0015).
 
 The Android
-target (`build-android`, libmain.so) builds with the movie code.
+build (`libmain.so`) includes the movie code.
 
 ## Performance
 

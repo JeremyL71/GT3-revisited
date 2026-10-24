@@ -23,6 +23,7 @@
 // E60..E68 x E6C, added (Cs + Cd), depth-tested against the buffer, no depth write.
 
 #include "base/bytes.h"
+#include "race/clut_animations.h"
 #include "race/lamp_glows.h"
 #include "render/view3d.h"
 #include "scene/model.h"
@@ -61,6 +62,8 @@ public:
     bool load(render::GpuContext& ctx, const Vfs& vfs, ByteSpan course, ByteSpan env0);
     bool active() const { return reflection_ != nullptr; }
     const WetRoadParams& params() const { return p_; }
+    // CLUT animations of the slot 9 texture sets.
+    ClutAnimations& clut_animations() { return cluts_; }
 
     // A car for the streaks: its lamps, model frame -> world (the body as drawn), the road
     // mirror under it (CarVisual::road_mirror), the lamp factor k/4 and the brake pedal now.
@@ -98,6 +101,7 @@ private:
     FrameQuads& frame_quads(const render::Frustum& fr);
     render::GpuContext* ctx_ = nullptr;
     WetRoadParams p_;
+    ClutAnimations cluts_;
     std::unique_ptr<render::GpuModel> reflection_, mask_;
     FrameQuads quads_[2];                       // the frame's alpha clear and composite, per view frustum
     u64 quad_uses_ = 0;

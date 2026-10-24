@@ -17,6 +17,7 @@
 // wall contact, lap timing rules).
 
 #include "formats/course/ai_lines.h"
+#include "formats/course/driver_sets.h"
 #include "formats/course/road.h"
 #include "sim/sim_types.h"
 
@@ -127,6 +128,10 @@ public:
     const std::string& label() const { return label_; }
     const course::Road& road() const { return road_; }
     const course::AiLines& ai_lines() const { return ai_; }
+    // The course's AI driver parameter sets (course file slots 37-40, ai §9.1); empty for
+    // tracks built from a road alone unless set.
+    const course::DriverSets& driver_sets() const { return driver_sets_; }
+    void set_driver_sets(const course::DriverSets& sets) { driver_sets_ = sets; }
     float length() const { return length_; }
 
     // --- surface (sim::TrackQuery) ------------------------------------------
@@ -190,6 +195,7 @@ private:
     std::string label_;
     course::Road road_;
     course::AiLines ai_;
+    course::DriverSets driver_sets_;
     float length_ = 0;
     std::vector<course::GridSlot> grid_;
     std::vector<course::Checkpoint> cps_; // sorted by distance
@@ -197,23 +203,46 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// The course's split points for the race display (presentation §D6): the road markers of
+// kind 2 with a second field of 0, in table order, at most 3 (with the line, 4 timing points
+// a lap). Every race course has 2 or 3.
+std::vector<float> display_checkpoints(const course::Road& road);
+
 // Lap timing for one car. Track distance is followed continuously (each
 // update searches near the previous distance), and the unwrapped progress
 // must climb through a whole lap length before the next start-line crossing
 // counts, so reversing over the line or cutting across the infield does not
 // count laps. Sectors split the lap into `sector_count` equal track-distance
 // parts unless set explicitly.
-// Times are the original's race clock (presentation spec "Race order and finish"): 1/3000 s
+// Times are the original's race clock (presentation §B9): 1/3000 s
 // units, a crossing timed at the clock before the tick plus trunc(f x the tick's units), f =
 // the tick's fraction at the line on track progress, ms = floor(units / 3). Every time is
 // whole milliseconds.
+//
+// Checkpoints (presentation §D6): the course's split points (display_checkpoints), crossed
+// in order once the car is on its timed laps and not frozen; only the next one counts (a
+// car that misses one gets no further splits that lap). Each update lists its checkpoint
+// and line crossings (crossings()), timed like the line.
 class LapTimer {
 public:
     explicit LapTimer(const Track& track, int sector_count = 3);
 
+    struct Crossing {
+        int point = 0;          // checkpoint index; at the line, the checkpoints passed this lap
+        bool line = false;      // a completed lap (not the first crossing that starts lap 1)
+        int lap = 0;            // laps completed before it (0 = the first lap)
+        long long ms = 0;       // race clock (ms)
+        long long split_ms = 0; // since the lap's start (at the line: the lap time)
+    };
+
     // Feed the car position every tick with the race clock in seconds after this tick's
     // advance (0 = GO). Returns true on the tick a lap was completed.
     bool update(const sim::Vec3& position, double time);
+    // The checkpoint and line crossings of the last update(), in order.
+    const std::vector<Crossing>& crossings() const { return crossings_; }
+    // Split points (track distances); by default the course's (display_checkpoints).
+    void set_checkpoints(std::vector<float> distances) { checkpoints_ = std::move(distances); }
+    const std::vector<float>& checkpoints() const { return checkpoints_; }
     // Resets to "before the start line".
     void reset(double time = 0);
     // Re-locates the car (after a respawn) without counting progress.
@@ -227,6 +256,11 @@ public:
     void freeze() { frozen_ = true; }
 
     void set_sector_distances(std::vector<float> ends); // ascending, last = lap length
+
+    // The race clock (ms) at which a mark at unwrapped progress `line` was passed between
+    // `before` and `after` on the tick from `t_prev` to `t` (clock seconds): the clock before
+    // the tick plus the truncated fraction of the tick, in 1/3000 s units, then floor(units / 3).
+    static long long crossing_ms(double before, double after, double line, double t_prev, double t);
 
     int laps_completed() const { return laps_; }
     bool lap_started() const { return started_; }
@@ -246,10 +280,8 @@ public:
     bool wrong_way() const { return wrong_way_; }
 
 private:
-    // The clock in whole ms at a time (floor(units / 3)), and the time of a line at unwrapped
-    // progress `line` passed between `before` and `after` on the tick from `t_prev` to `t`.
+    // The clock in whole ms at a time (floor(units / 3)).
     static long long clock_ms(double t);
-    static long long crossing_ms(double before, double after, double line, double t_prev, double t);
 
     const Track& track_;
     int sector_count_;
@@ -264,6 +296,9 @@ private:
     double last_lap_ = -1, best_lap_ = -1;
     int sector_ = 0;
     std::vector<double> sector_times_, last_sectors_;
+    std::vector<float> checkpoints_;
+    int next_cp_ = 0; // the checkpoint the car must cross next this lap
+    std::vector<Crossing> crossings_;
     double progress_ = 0;  // unwrapped track distance (0 = start line, lap k ends at k * length)
     float backwards_ = 0; // metres travelled backwards recently
     bool wrong_way_ = false;

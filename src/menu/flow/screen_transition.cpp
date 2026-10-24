@@ -1,5 +1,8 @@
 #include "menu/flow/screen_transition.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace gt3r::menu::flow {
 
 namespace {
@@ -7,6 +10,7 @@ namespace {
 constexpr int kIndicatorWait = 180;     // 3 s
 constexpr int kIndicatorPeriod = 32;    // frames per blink phase
 constexpr int kDelayFrames = 10;        // DelayFadeout
+constexpr float kDelayGrey = 12.8f / 255.0f; // DelayFadeout wash colour 0.1 (GS 12.8)
 constexpr int kLineStep = 16;           // Lineout sweep per frame (px from each edge)
 constexpr float kRowSpeed = 640.0f / 24.0f; // Combout sweep per frame
 constexpr float kRowStartMin = -320.0f;
@@ -15,6 +19,16 @@ constexpr float kRowStartMin = -320.0f;
 constexpr float gs_alpha(int a) { return a / 128.0f; }
 
 } // namespace
+
+LoadingPicture& race_loading_picture() {
+    static LoadingPicture slot;
+    return slot;
+}
+
+int LoadingPicture::frames_for(u64 elapsed_ns) {
+    const u64 n = elapsed_ns * 60 / 1000000000ull;
+    return int(std::clamp<u64>(n, 1, 600));
+}
 
 void ScreenTransition::start(TransitionType type) {
     type_ = type;
@@ -31,6 +45,11 @@ void ScreenTransition::start(TransitionType type) {
         rng_ = rng_ * 1103515245u + 12345u;
         r = kRowStartMin + (float((rng_ >> 8) & 0xFFFF) / 65536.0f) * -kRowStartMin;
     }
+}
+
+SDL_FColor ScreenTransition::delay_fadeout_cover(int frames) {
+    const int n = frames - kDelayFrames;
+    return {kDelayGrey, kDelayGrey, kDelayGrey, n > 0 ? 1.0f - std::pow(0.5f, float(n)) : 0.0f};
 }
 
 int ScreenTransition::settle_frames(TransitionType type) {
@@ -66,7 +85,7 @@ void ScreenTransition::draw_frame(SDL_Renderer* r, const SDL_FRect& dst) {
     case TransitionType::DelayFadeout:
         // Colour (0.1, 0.1, 0.1) at alpha 0.5 every frame.
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColorFloat(r, 12.8f / 255.0f, 12.8f / 255.0f, 12.8f / 255.0f, 0.5f);
+        SDL_SetRenderDrawColorFloat(r, kDelayGrey, kDelayGrey, kDelayGrey, 0.5f);
         rect(0, 0, 640, 448);
         break;
     case TransitionType::Lineout:

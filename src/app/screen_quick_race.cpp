@@ -33,6 +33,7 @@
 #include "menu/flow/game_hooks.h"
 #include "menu/flow/menu_set.h"
 #include "race/field.h"
+#include "race/results.h"
 #include "vfs/vfs.h"
 
 #include <algorithm>
@@ -596,6 +597,7 @@ private:
             std::string laps;
             race::EventStart st = race::event_start(*ev);
             if (e.kind == Kind::Machine) laps = code == "MMAX" ? "top speed run" : "standing start to the mark";
+            else if (e.kind == Kind::TimeAttack) laps = std::to_string(race::kTimeTrialLaps) + " lap"; // (presentation §B7)
             else if (ev->laps == 0 && st.time_limit_s > 0) laps = std::to_string(int(st.time_limit_s / 60 + 0.5)) + " minutes";
             else if (ev->laps) laps = std::to_string(ev->laps) + (ev->laps == 1 ? " lap" : " laps");
             if (!laps.empty()) line(e.kind == Kind::Race || e.kind == Kind::Arcade ? "Race" : "Run", laps);

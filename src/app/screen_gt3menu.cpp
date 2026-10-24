@@ -154,8 +154,9 @@ public:
             hover_.reset();
         }
         const bool title = on_title();
+        const UiRect gt3r_button = gt3r_menu_button(app);
         for (SDL_FPoint p : taps_) {
-            if (title && kGt3rButton.contains(p.x, p.y)) {
+            if (title && gt3r_button.contains(p.x, p.y)) {
                 taps_.clear();
                 app.pop();
                 return;
@@ -200,7 +201,7 @@ public:
         if (frame_) SDL_RenderTexture(app.renderer(), frame_, nullptr, &dst);
         // Our main menu (settings, mods, online, ...), in the bar beside the title menu.
         if (on_title()) {
-            const UiRect& b = kGt3rButton;
+            const UiRect b = gt3r_menu_button(app);
             ui.button(b, "GT3R menu", false, press_ && b.contains(press_->x, press_->y));
             if (!ui.touch()) ui.text_center_in(b.x, b.w, b.bottom() + 4, "SELECT", colors::kDim);
         }
@@ -225,8 +226,13 @@ public:
     bool update_prompts() const override { return on_title(); } // the update dialog, on the title page only
 
 private:
-    // The "GT3R menu" button, in the left bar beside the 4:3 picture (UI units).
-    static constexpr UiRect kGt3rButton{6, Ui::kHeight - 46, (Ui::kWidth - Ui::kHeight * 4.0f / 3.0f) / 2 - 12, 22};
+    // The "GT3R menu" button, in the left bar beside the 4:3 picture (UI units); above the
+    // on-screen D-pad while the touch controls are up, so a finger reaches it.
+    static UiRect gt3r_menu_button(App& app) {
+        const TouchRect r =
+            app.touch().clear_above({6, Ui::kHeight - 46, (Ui::kWidth - Ui::kHeight * 4.0f / 3.0f) / 2 - 12, 22});
+        return {r.x, r.y, r.w, r.h};
+    }
 
     bool on_title() const {
         return flow_ && flow_->controller() && !flow_->switching() && flow_->controller()->page_name() == "root" &&
@@ -403,7 +409,15 @@ private:
         if (auto m = flow_->take_music()) {
             menu_music_ = *m;
             if (m->empty() || !menu_bgm_on(app)) app.audio().stop_music();
-            else if (!app.audio().play_sequence(*app.vfs(), *m)) LOG_WARN("gt3menu: no sequence %s", m->c_str());
+            else if (!app.audio().play_sequence(*app.vfs(), *m, bgm::kMenuVolume)) // menu level (music §6)
+                LOG_WARN("gt3menu: no sequence %s", m->c_str());
+        }
+        // The Options music list's preview: the focused race song's intro, looping, at level 1.0,
+        // whatever the Menu BGM option (menus §10.1).
+        if (auto p = flow_->take_preview()) {
+            menu_music_.clear();
+            if (*p < 0) app.audio().bgm().stop(app.audio());
+            else app.audio().bgm().play_if_different(app.audio(), *app.vfs(), bgm::kRace, *p | bgm::kIntro, true, 1.0f);
         }
         if (auto r = flow_->take_request()) start_game(app, *r);
         ++pending_draws_;
@@ -421,10 +435,9 @@ private:
         flow_->set_options(&app.config(), [this, &app] {
             app.save_config();
             apply_options(app);
-            bool bgm = menu_bgm_on(app);
-            if (!bgm) app.audio().stop_music();
+            if (!menu_bgm_on(app)) app.audio().stop_music();
             else if (!menu_music_.empty() && !app.audio().sequence_playing())
-                app.audio().play_sequence(*app.vfs(), menu_music_);
+                app.audio().play_sequence(*app.vfs(), menu_music_, bgm::kMenuVolume);
         });
     }
 
@@ -446,6 +459,15 @@ private:
                       r.race_code.c_str(), r.course.c_str(), r.car.c_str());
         LOG_INFO("gt3menu: %s", buf);
         messages_.push_back({buf, 300});
+        if (const menu::flow::GtModeWidgetRelease& release = menu::flow::gt_mode_widget_release()) release(app);
+        // The race keeps this frame and its transition on screen while it loads (menus §6);
+        // the slot is emptied again once the request has been handed on.
+        menu::flow::LoadingPicture& loading = menu::flow::race_loading_picture();
+        loading.frame = frame_;
+        loading.transition = transition_;
+        struct Clear {
+            ~Clear() { menu::flow::race_loading_picture() = {}; }
+        } clear;
         transition_.stop();
         if (r.kind == GameRequest::Kind::PlayMovie) {
             // GT-mode endings: the movie screen pops itself; the menu then resumes.
@@ -510,7 +532,7 @@ private:
     std::map<std::string, SDL_Texture*> stills_;
 
     // A movie / still in a movie widget, modulated by the widget's corner colours (GS
-    // units: 0x80 = 1.0; e.g. the car page's movie fades out towards its top edge).
+    // units: 0x80 = 1.0; e.g. the car page's movie fades out towards its bottom edge).
     static void draw_modulated(SDL_Renderer* r, SDL_Texture* t, const SDL_FRect& src, const SDL_FRect& dst,
                                const Element& e, float alpha) {
         float tw = 0, th = 0;
@@ -526,7 +548,7 @@ private:
         for (int i = 0; i < 4; ++i) {
             SDL_FColor c{1, 1, 1, 1};
             if (e.colors) {
-                const auto& k = (*e.colors)[size_t(i)];
+                const auto& k = (*e.colors)[size_t(3 - i)]; // listed from the bottom-left (y up)
                 c = {std::min(1.0f, k.r / 128.0f), std::min(1.0f, k.g / 128.0f), std::min(1.0f, k.b / 128.0f),
                      std::min(1.0f, k.a / 128.0f)};
             }
@@ -534,6 +556,9 @@ private:
             v[i] = {pos[i], c, uv[i]};
         }
         static const int idx[6] = {0, 1, 2, 0, 2, 3};
+        // The movie's YUV texture has no alpha of its own and so no blending by default: the
+        // corner alphas fade it into the page.
+        SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
         SDL_RenderGeometry(r, t, v, 4, idx, 6);
     }
 

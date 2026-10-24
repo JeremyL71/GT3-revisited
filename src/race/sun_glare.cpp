@@ -53,6 +53,25 @@ void SunParams::day_car_lights(render::DrawOptions& o) const {
         for (int i = 0; i < 3; ++i) o.light_diffuse[i] = o.light_specular[i] = 0;
 }
 
+void SunParams::course_lights(render::ItemLights& out) const {
+    // GT3 lights the course with the enabled scene lights and a global ambient of 0; the light
+    // slots go, in light order, to the enabled lights with a non-zero diffuse or specular.
+    out = {};
+    for (size_t n = 0; n < 4; ++n) {
+        if (!((scene_light_mask >> n) & 1)) continue;
+        const SceneLight& l = scene_lights[n];
+        for (int i = 0; i < 3; ++i) out.ambient[i] += l.ambient[size_t(i)];
+        bool lit = false;
+        for (int i = 0; i < 3; ++i) lit = lit || l.diffuse[size_t(i)] != 0 || l.specular[size_t(i)] != 0;
+        render::Vec3 d{l.dir[0], l.dir[1], l.dir[2]};
+        if (!lit || render::length(d) < 1e-6f) continue;
+        d = render::normalize(d);
+        int k = out.count++;
+        out.dir[k][0] = d.x, out.dir[k][1] = d.y, out.dir[k][2] = d.z;
+        for (int i = 0; i < 3; ++i) out.diffuse[k][i] = l.diffuse[size_t(i)], out.specular[k][i] = l.specular[size_t(i)];
+    }
+}
+
 render::Vec3 SunParams::direction() const {
     float e = -elevation * 3.14159265f / 180.0f, a = -azimuth * 3.14159265f / 180.0f;
     return {std::sin(a) * std::cos(e), -std::sin(e), std::cos(a) * std::cos(e)};
@@ -77,8 +96,14 @@ SunParams SunParams::from_env0(ByteSpan b) {
     p.sky_yaw = f(0x28), p.sky_pitch = f(0x48);
     p.fog_a = f(0x70);
     p.fog_b = f(0x74);
+    if (b.size() >= 0xAA8) {
+        p.mirror_fog_rgb = {f(0xA90), f(0xA94), f(0xA98)};
+        p.mirror_fog_a = f(0xAA0);
+        p.mirror_fog_b = f(0xAA4);
+    }
     p.grade = (rd32(b, 0x10) & 0x80) != 0;
     p.grade_g = {f(0x980), f(0x984), f(0x988)};
+    p.grade_black = f(0x98C), p.grade_white = f(0x990);
     p.saturation = f(0x994);
     // Car light 0 (Env0 +0xD0: direction towards the light, w 0; +0xE0 ambient, +0xF0 diffuse,
     // +0x100 specular; enabled by flag bit 0) and the global ambient (+0xEF0).
@@ -117,6 +142,17 @@ SunParams SunParams::from_env0(ByteSpan b) {
     }
     p.car_light_mask = rd32(b, 0x10) & 0xF;
     if (b.size() >= 0xADC) p.scene_light0_dir = {f(0xAD0), f(0xAD4), f(0xAD8)};
+    p.scene_light_mask = (rd32(b, 0x10) >> 11) & 0xF;
+    if (b.size() >= 0xEC8) p.panorama = {f(0xEC0), f(0xEC4)};
+    for (size_t n = 0; n < 4; ++n) {
+        size_t o = 0xAD0 + 0x50 * n;
+        if (o + 0x40 > b.size()) break;
+        SceneLight& l = p.scene_lights[n];
+        l.dir = {f(o), f(o + 4), f(o + 8)};
+        l.ambient = {f(o + 0x10), f(o + 0x14), f(o + 0x18)};
+        l.diffuse = {f(o + 0x20), f(o + 0x24), f(o + 0x28)};
+        l.specular = {f(o + 0x30), f(o + 0x34), f(o + 0x38)};
+    }
     if (b.size() >= 0xAD0) {
         p.shade_ambient = {f(0xAC8), f(0xACC)};
         p.shade_diffuse = {f(0xAB4), f(0xABC)};

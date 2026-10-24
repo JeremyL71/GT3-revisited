@@ -48,8 +48,10 @@ public:
     // Opens the window: the button row, cursor on CONTINUE.
     void open(Kind kind);
     Kind kind() const { return kind_; }
-    // RETRY can be refused (the original disables it once the run's result is recorded).
+    // RETRY greyed out and unselectable (presentation §E3: a run that set a record, until
+    // the next run starts).
     void set_retry_enabled(bool on) { retry_enabled_ = on; }
+    bool retry_enabled() const { return retry_enabled_; }
 
     // One 60 Hz frame with the logical menu keys held (menu::flow::MenuKeys bits).
     // Keys held when the window opened count only after they were released.

@@ -20,6 +20,7 @@ def crop(aspect, margin, dx=0.0, dy=0.0):  # dx, dy: where the car sits, as a fr
     if h < (y1 - y0) * margin: h = (y1 - y0) * margin; w = h * aspect
     ox, oy = cx - dx * w, cy - dy * h
     return im.crop((int(ox - w / 2), int(oy - h / 2), int(ox + w / 2), int(oy + h / 2)))
-crop(640 / 448, 1.35, 0.07, -0.07)  # a little right and up: the name and price sit lower left.resize((640, 448), Image.LANCZOS).save(pic, optimize=True)
+# The car a little right and up: the name and price sit lower left.
+crop(640 / 448, 1.35, 0.07, -0.07).resize((640, 448), Image.LANCZOS).save(pic, optimize=True)
 crop(51 / 27, 1.04).resize((51, 27), Image.LANCZOS).save(thumb, optimize=True)
 print('car box', x0, y0, x1, y1)

@@ -7,6 +7,7 @@
 // scale).
 
 #include "ai/ai_driver.h"
+#include "ai/safety_respawn.h"
 #include "sim/track_walls.h"
 #include "sim/vehicle.h"
 #include "sim/world.h"
@@ -21,6 +22,13 @@ class CarDatabase;
 }
 
 namespace gt3r::ai {
+
+// The parameters of a CPU car in a race on `track` (ai §9.1, ai §9.2): the course's set for the
+// car's driveline class, else the built-in set of the course category (database course table),
+// then the event's overrides for that class when `ev` is given. The built-in set 0 when the car
+// cannot be built.
+DriverParams race_params(const data::CarDatabase& db, const std::string& car_label, const track::Track& track,
+                         const data::Event* ev = nullptr);
 
 class AiRace {
 public:
@@ -37,6 +45,8 @@ public:
     // One 1/60 s tick for every car.
     void step();
     double time() const { return time_; }
+    // The non-original safety respawn (ai §12; on by default).
+    void set_respawn(bool on) { respawn_ = on; }
 
     struct Car {
         std::string label;
@@ -44,10 +54,9 @@ public:
         std::unique_ptr<AiDriver> driver;
         std::unique_ptr<track::LapTimer> timer;
         float time_scale = 1;
-        int respawns = 0;     // safety respawns: left the road mesh, or no progress for 12 s
-        double last_progress_time = 0; // last time the race distance grew by 10 m
-        double best_distance = 0;
-        int off_mesh_ticks = 0; // consecutive steps with the car and all its wheels off the road mesh
+        int respawns = 0;     // safety respawns (SafetyRespawn)
+        SafetyRespawn watch;
+        double last_progress_time() const { return watch.last_progress(); } // last time the race distance grew by 10 m
     };
     int count() const { return int(cars_.size()); }
     const Car& car(int i) const { return cars_[size_t(i)]; }
@@ -65,6 +74,7 @@ private:
     sim::TrackWorld world_;
     RubberBand rubber_;
     int reference_;
+    bool respawn_ = true;
     std::unique_ptr<sim::World> sim_;
     std::vector<Car> cars_;
     int contacts_ = 0, contacts_inline_ = 0, overtakes_ = 0;

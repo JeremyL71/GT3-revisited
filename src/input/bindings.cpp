@@ -6,6 +6,7 @@
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cstdlib>
 
@@ -246,6 +247,13 @@ void Profile::add(std::string_view target, std::string_view sources) {
 
 void Profile::remove_target(const PadTarget& target) {
     std::erase_if(bindings, [&](const Binding& b) { return b.target == target; });
+}
+
+bool Profile::keyboard_only() const {
+    return std::none_of(bindings.begin(), bindings.end(), [](const Binding& b) {
+        return b.source.kind != InputSource::Kind::Key && b.source.kind != InputSource::Kind::Mouse &&
+               b.source.kind != InputSource::Kind::None;
+    });
 }
 
 const std::vector<std::string_view>& preset_names() {

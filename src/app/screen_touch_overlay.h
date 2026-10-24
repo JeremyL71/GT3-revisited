@@ -39,6 +39,10 @@ public:
     // Part of the 640x360 game area not covered by the touch controls (UI
     // units); the whole area while they are hidden. HUDs inset into it.
     TouchRect safe_area() const { return controls_.safe_area(); }
+    // The visible controls' drawn bounds (TouchControls::control_bounds).
+    std::vector<TouchRect> control_bounds() const { return controls_.control_bounds(); }
+    // A screen's own button moved up clear of the visible controls (TouchControls::clear_above).
+    TouchRect clear_above(TouchRect r) const { return controls_.clear_above(r); }
 
     TouchControls& controls() { return controls_; }
 
