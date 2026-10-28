@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -42,6 +43,16 @@ std::string version_mismatch(const GameVersion& ours, const GameVersion& host) {
         return "update required: the host has version " + host.number() + " (you have " + ours.number() + ")";
     return "the host has an older version (" + host.number() + ", you have " + ours.number() +
            "): the host needs to update";
+}
+
+// A game that speaks another online protocol (theirs) than this host: who must update. The text travels in Reject; a game
+// of protocol 3 or older shows it as it is ("The host refused: ...").
+std::string protocol_mismatch(u16 theirs) {
+    const std::string t = std::to_string(theirs), h = std::to_string(kProtocolVersion);
+    if (theirs < kProtocolVersion)
+        return "update required: the host has a newer version of the game (online protocol " + h + ", yours " + t +
+               "). Please update GT3 Revisited to play online";
+    return "the host has an older version of the game (online protocol " + h + ", yours " + t + "): the host needs to update";
 }
 
 namespace {
@@ -450,6 +461,10 @@ Writer Session::settings_msg() const {
     w.u16_(settings_.ghost_ping_ms);
     w.u8_(settings_.stock_only ? 1 : 0);
     w.u16_(settings_.max_ps);
+    w.u8_(settings_.car_class);
+    w.u8_(settings_.category);
+    w.u8_(settings_.drive);
+    w.u8_(settings_.aspiration);
     return w;
 }
 
@@ -691,8 +706,7 @@ Session::Conn* Session::accept_client(const Address& addr, u64 relay_key, ByteSp
         nc->close_at = now() + 3000;
         Writer w;
         w.u8_(u8(Msg::Reject));
-        w.str("different game version (protocol " + std::to_string(version) + ", host " +
-              std::to_string(kProtocolVersion) + ")");
+        w.str(protocol_mismatch(version));
         send_reliable(*nc, w);
         conns_.push_back(std::move(nc));
         return nullptr;
@@ -1227,7 +1241,7 @@ void Session::handle(Conn& c, ByteSpan msg, double arrived) {
             GameVersion theirs = parse_game_version(build).value_or(GameVersion{});
             std::string reject;
             if (!r.ok()) reject = "malformed hello";
-            else if (version != kProtocolVersion) reject = "different game version";
+            else if (version != kProtocolVersion) reject = protocol_mismatch(version);
             else if (!server_.valid() && compare_core(theirs, version_) != 0) reject = version_mismatch(theirs, version_);
             else if (phase_ != Phase::Lobby) reject = "a race is running";
             else if (int(players_.size()) >= kMaxPlayers) reject = "the session is full";
@@ -1413,6 +1427,11 @@ void Session::handle(Conn& c, ByteSpan msg, double arrived) {
     }
     case Msg::Reject: {
         std::string why = r.str();
+        // An older host (protocol 3 and before) says only "different game version (protocol <ours>, host <its>)".
+        if (unsigned theirs = 0, host = 0; std::sscanf(why.c_str(), "different game version (protocol %u, host %u)", &theirs, &host) == 2 &&
+                                          host < kProtocolVersion)
+            why = "the host has an older version of the game (online protocol " + std::to_string(host) + ", yours " +
+                  std::to_string(kProtocolVersion) + "): the host needs to update";
         LOG_WARN("Online: the host refused: %s", why.c_str());
         Event e;
         e.kind = Event::Kind::Rejected;
@@ -1480,6 +1499,12 @@ void Session::handle(Conn& c, ByteSpan msg, double arrived) {
         s.ghost_ping_ms = r.u16_();
         s.stock_only = r.u8_() & 1;
         s.max_ps = r.u16_();
+        if (r.remaining() >= 4) { // the further rules (a host without them: any car)
+            s.car_class = r.u8_();
+            s.category = r.u8_();
+            s.drive = r.u8_();
+            s.aspiration = r.u8_();
+        }
         if (!r.ok()) break;
         settings_ = s;
         Event e;

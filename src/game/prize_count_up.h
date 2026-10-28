@@ -20,7 +20,10 @@ struct PrizeCountUp {
     int wait = 0;             // frames waited before the first step
     int presses = 0;          // Confirm presses while counting
     int beep_n = 0;           // steps since the last beep (held at 3)
-    int delay = 120;          // frames before the count starts (trophy page 360)
+    // Frames before the count starts: program constants of the item's three constructors,
+    // 120 on the cup and consolation pages, 360 on the trophy page;
+    // the same in the NTSC-J program (PAL: 100 / 100 / 300 for 50 Hz).
+    int delay = 120;
     bool done() const { return state == 3; }
 };
 

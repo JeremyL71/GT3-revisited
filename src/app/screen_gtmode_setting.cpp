@@ -153,9 +153,8 @@ private:
                     d(app, r, e, box, alpha, flow_->controller()->page_name(), element_image(renderer_->drawing_scene(), e));
         });
         sounds_.load(*app.vfs());
-        const char* lang = std::getenv("GT3R_LANG");
         try {
-            flow_ = std::make_unique<GameFlow>(read, lang && *lang ? lang : "US");
+            flow_ = std::make_unique<GameFlow>(read, app.language());
             flow_->measure_text = font_measure(fonts_);
             if (shows) flow_->start_presentations();
             else if (round_) flow_->start_save_game();
@@ -249,14 +248,6 @@ std::unique_ptr<Screen> make_game_save_screen(const GameResult& r) { return std:
 
 std::unique_ptr<Screen> make_presentation_screen() {
     return std::make_unique<GtSettingScreen>("", "", "");
-}
-
-std::shared_ptr<const sim::CarSpec> gt_ride_car_spec() {
-    game::GtModeSession* s = game::gt_mode_session();
-    if (!s || !s->gt().state().ride_car()) return nullptr;
-    if (auto spec = s->gt().car_spec(*s->gt().state().ride_car()))
-        return std::make_shared<const sim::CarSpec>(std::move(*spec));
-    return nullptr;
 }
 
 GT3R_REGISTER_SCREEN(gtrecords, "gtrecords", "Records", "The records menu (rankings) for a key from GT3R_RECORDS_KEY.",

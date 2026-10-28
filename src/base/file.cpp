@@ -38,6 +38,7 @@ void File::read_at(u64 offset, void* out, size_t len) {
 }
 
 Bytes File::read_at(u64 offset, size_t len) {
+    if (offset > size_ || size_ - offset < len) throw FormatError("read past end of " + path_); // before allocating
     Bytes b(len);
     read_at(offset, b.data(), len);
     return b;

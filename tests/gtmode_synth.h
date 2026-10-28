@@ -384,19 +384,31 @@ inline const char* const kCoupe = "syn_coupe_01";  // ACME MOTORS, 12,000 Cr., 2
 inline const char* const kWagon = "syn_wagon_02";  // ACME MOTORS, 30,000 Cr., 3 paints, FF
 inline const char* const kRacer = "syn_racer_03";  // BETA WORKS, prize only (not for sale / buy)
 constexpr s64 kStartCredits = 25000;
+// Two wheels of the wheel shop (gtmode_synth_garage_wheel_list); the database has no wheel table.
+inline const char* const kRimA = "syn_rim_a";
+inline const char* const kRimB = "syn_rim_b";
 constexpr s64 kMufflerPrice = 1500;                  // muf_sports (goods 37) for the coupe
 constexpr int kTitleIdleSeconds = 2;
 // The oil gauge's colourings (r in the low byte): clean green, dirty brown.
 constexpr u32 kOilClean = 0xC000C000u, kOilDirty = 0xC0204080u;
 } // namespace world
 
-inline void add_database(std::map<std::string, Bytes>& files) {
+// The regional twins (gtmode_files(true)): two cars of the coupe's model offered by language
+// (region byte +0xF7: 2 = not in British English, 1 = only in British English) with names per
+// language (+0xE4 / +0xF2 / +0x100), their licence variants, and licence test S-1 driving the
+// first, the second in slot 1 (colours 0x101 / 0x102).
+namespace world {
+inline const char* const kTwinOpel = "opel_speedster_00";
+inline const char* const kTwinVauxhall = "vauxhall_vx220_00";
+} // namespace world
+
+inline void add_database(std::map<std::string, Bytes>& files, bool twins = false) {
     DbWriter d;
     enum { Body = 5, Drive = 13, Gear = 17, Susp = 18, Muffler = 20, Car = 30, Variant = 31, Event = 32,
            Regulation = 33, Course = 34, Arcade = 35 };
     // Cars: default parts (slot -> record), catalogue data.
     auto car = [&](const std::string& label, const std::string& name, const std::string& alt, const std::string& maker,
-                   u32 price, u8 flags, u8 category, const std::string& model, u8 drive) {
+                   u32 price, u8 flags, u8 category, const std::string& model, u8 drive) -> Bytes& {
         const std::string body = "rm_" + label, dt = "dt_" + label, su = "su_" + label, mu = "mu_" + label + "_0";
         Bytes& b = d.part(Body, body, label, 0, 0);
         p64(b, 0x18, d.id(model));
@@ -426,9 +438,22 @@ inline void add_database(std::map<std::string, Bytes>& files) {
         p8(c, 0xF0, flags);
         p8(c, 0xF1, category);
         p16(c, 0x104, d.uni(maker));
+        return c;
     };
     car(world::kCoupe, "Synthetic Coupe", "", "ACME MOTORS", 12000, 0, 0, "zz0001", 0);
     car(world::kWagon, "Synthetic Wagon", "Touring", "ACME MOTORS", 30000, 0, 0, "zz0002", 1);
+    if (twins) {
+        // Names per language (+0xF2 / +0xF4 Japanese, +0x100 / +0x102 British English).
+        auto names = [&](Bytes& c, const char* jp, const char* jp2, const char* uk, const char* uk2, u8 region) {
+            const u16 a = d.uni(jp), b = d.uni(jp2), e = d.uni(uk), f = d.uni(uk2);
+            p16(c, 0xF2, a), p16(c, 0xF4, b), p16(c, 0x100, e), p16(c, 0x102, f);
+            p8(c, 0xF7, region);
+        };
+        names(car(world::kTwinOpel, "Speedster", "Turbo", "OPEL", 20000, 0, 0, "zz0001", 3),
+              "\xA5\xB9\xA5\xD4", "", "Speedster (UK)", "Turbo (UK)", 2);
+        names(car(world::kTwinVauxhall, "VX220", "", "VAUXHALL", 20000, 0, 0, "zz0001", 3), "VX220", "", "VX220",
+              "", 1);
+    }
     car(world::kRacer, "Synthetic Racer", "", "BETA WORKS", 90000, 3, 1, "zz0003", 3);
     // The coupe's sports muffler (goods 37 = muffler stage 1).
     d.part(Muffler, "mu_syn_coupe_01_1", world::kCoupe, 1, u32(world::kMufflerPrice));
@@ -470,7 +495,7 @@ inline void add_database(std::map<std::string, Bytes>& files) {
         u16 bonus = 0;
         std::array<std::array<u8, 3>, 3> times{}; // {min, sec, centi -> ms x10}
     };
-    auto event = [&](const Ev& e) {
+    auto event = [&](const Ev& e) -> Bytes& {
         Bytes& r = d.record(Event, e.code);
         p64(r, 8, d.id(e.course));
         for (size_t k = 0; k < 32; ++k) p64(r, 0x10 + 8 * k, d.id(k < e.pool.size() ? e.pool[k] : std::string("-")));
@@ -488,6 +513,7 @@ inline void add_database(std::map<std::string, Bytes>& files) {
         for (size_t p = 0; p < 6; ++p) p16(r, 0x1D4 + 2 * p, e.prize[p]);
         p16(r, 0x1E2, e.bonus);
         p8(r, 0x1E5, e.league);
+        return r;
     };
     Ev g1;
     g1.code = "Gsyn_e_0001", g1.course = "syn_ring", g1.pool = {"syv_coupe_a", "syv_wagon_b"};
@@ -512,6 +538,22 @@ inline void add_database(std::map<std::string, Bytes>& files) {
             event(l);
         }
     }
+    if (twins) {
+        // Licence S-1: the Opel in slot 0, the Vauxhall in slot 1; S-2: the Opel alone, a slot-1
+        // colour all the same. Slot colours +0x110 (0xFFFFFFFF = none).
+        for (auto [v, base] : {std::pair<const char*, const char*>{"s1_opel", world::kTwinOpel},
+                               {"s1_vauxhall", world::kTwinVauxhall}})
+            p64(d.record(Variant, v), 8, d.id(base));
+        Ev s;
+        s.code = "L0S0001", s.course = "syn_pad", s.pool = {"s1_opel", "s1_vauxhall"};
+        s.cars = 1, s.license_kind = 1, s.launch = 50;
+        s.times = {{{0, 30, 0}, {0, 32, 50}, {0, 35, 0}}};
+        Bytes& s1 = event(s);
+        for (size_t k = 0; k < 32; ++k) p32(s1, 0x110 + 4 * k, k == 0 ? 0x101u : k == 1 ? 0x102u : 0xFFFFFFFFu);
+        s.code = "L0S0002", s.pool = {"s1_opel"};
+        Bytes& s2 = event(s);
+        for (size_t k = 0; k < 32; ++k) p32(s2, 0x110 + 4 * k, k == 0 ? 0x101u : k == 1 ? 0x102u : 0xFFFFFFFFu);
+    }
 
     files["database/paramdb_us.db"] = d.paramdb();
     files["database/paramstr_us.db"] = d.paramstr();
@@ -522,17 +564,20 @@ inline void add_database(std::map<std::string, Bytes>& files) {
 
 // carcolor.db: u32 model count +8, id table +0xC, colour definitions +0x10; models at
 // +0x18 {u64 model id, u32 count, u32 offset into the id table}; definitions {u32 count,
-// {u32 id, u32 name, u32 name (alternate), u32 rgb}}. carcolor.sdb: the names.
+// {u32 id, u32 name, u32 second name, u32 rgb}}. carcolor.sdb: the names.
 inline void add_colors(std::map<std::string, Bytes>& files) {
     struct Paint {
         u32 id;
         const char* name;
-        u32 rgb; // bytes R, G, B
+        u32 rgb;                     // bytes R, G, B
+        const char* second = nullptr; // the second name (Japanese), else the same
     };
     const std::vector<std::pair<std::string, std::vector<Paint>>> models = {
         {"zz0001", {{0x101, "Sky Mist", 0x00C0A080}, {0x102, "Ember Red", 0x002020C0}}},
         {"zz0002",
-         {{0x201, "Moss Green", 0x00208040}, {0x202, "Night Blue", 0x00602010}, {0x203, "Chalk White", 0x00F0F0F0}}},
+         {{0x201, "Moss Green", 0x00208040},
+          {0x202, "Night Blue", 0x00602010},
+          {0x203, "Chalk White", 0x00F0F0F0, "\xA5\xDB\xA5\xEF\xA5\xA4\xA5\xC8"}}},
         {"zz0003", {{0x301, "Racing Orange", 0x000080FF}}},
     };
     Bytes b(0x18 + 16 * models.size(), 0);
@@ -556,9 +601,10 @@ inline void add_colors(std::map<std::string, Bytes>& files) {
         size_t o = b.size();
         p32(b, o, p.id);
         p32(b, o + 4, u32(names.size()));
-        p32(b, o + 8, u32(names.size()));
-        p32(b, o + 12, p.rgb);
         names.push_back(p.name);
+        if (p.second) names.push_back(p.second);
+        p32(b, o + 8, u32(names.size() - 1));
+        p32(b, o + 12, p.rgb);
     }
     files["database/carcolor.db"] = b;
     files["database/carcolor.sdb"] = write_stdb(names);
@@ -651,7 +697,23 @@ inline void add_gt_mode_menus(std::map<std::string, Bytes>& files) {
     // Car wash / oil change: a page each whose button opens a progress popup that takes the
     // controls away (its "ignore_control" widget) until the wash / the oil change is over; the
     // car wash's 3D car; the oil gauge and its hidden clean and dirty colourings.
-    m.page("at/at", kCancel, "map", {}, "00cmn/status").item("cw", {}, "at/cw/cw").item("ot", {}, "at/ot/ot");
+    m.page("at/at", kCancel, "map", {}, "00cmn/status")
+        .item("cw", {}, "at/cw/cw")
+        .item("ot", {}, "at/ot/ot")
+        .item("ws", {}, "at/ws/ws");
+    // The wheel shop: one brand page of two wheels (tiles named after them), the purchase and
+    // fit questions.
+    m.page("at/ws/ws", kCancel, "at/at", {}, "00cmn/status").item("syn", {}, "at/ws/ws_syn");
+    m.page("at/ws/ws_syn", kCancel | 0x001, "at/ws/ws", {}, "00cmn/status")
+        .item(std::string(world::kRimA) + "_link", "set_focus_wheel_code", "00cmn/ws_buy_sure", 1, 660, 404, 52, 52)
+        .item(std::string(world::kRimB) + "_link", "set_focus_wheel_code", "00cmn/ws_buy_sure", 1, 660, 404, 52, 52)
+        .widget("menu_wheel_shop", "", "", 20, 124, 600, 52)
+        .widget("car_render_wheel_shop", "car_render_wheel_shop", "-", 0, 0, 640, 448)
+        .hidden(world::kRimA, {}, 294, 486, 52, 52)
+        .hidden(world::kRimB, {}, 294, 486, 52, 52)
+        .hidden("sold_out", {}, 294, 486, 52, 52);
+    m.page("00cmn/ws_buy_sure", kCancel).item("yes1", "buy_wheel", "00cmn/ws_fit_sure", 1).item("no1", {}, {}, 3);
+    m.page("00cmn/ws_fit_sure", kCancel).item("yes1", "fit_wheel", {}, 3).item("no1", {}, {}, 3);
     m.page("at/cw/cw", kCancel, "at/at", {}, "00cmn/status")
         .item("wash", "wash_car", "at/cw/cw_now", 1, 500, 300, 60, 60)
         .widget("car_render_car_wash", "car_render_car_wash", "-", 0, 0, 640, 448);
@@ -684,7 +746,9 @@ inline void add_gt_mode_menus(std::map<std::string, Bytes>& files) {
         .item(world::kWagon, "set_car_code", "cd/acme_wagon_car")
         .widget("syn_coupe_01_price", "goods_car_price", "-", 300, 400)
         .widget("syn_wagon_02_price", "goods_car_price", "-", 300, 376);
-    m.page("cd/cd_jp_beta", kCancel, "cd/cd_jp").item("_syn_racer_03", "set_car_code", "cd/beta_racer_car");
+    m.page("cd/cd_jp_beta", kCancel, "cd/cd_jp")
+        .item("_syn_racer_03", "set_car_code", "cd/beta_racer_car")
+        .widget("_syn_racer_03_price", "goods_car_price", "-", 300, 400);
     for (const char* p : {"cd/acme_coupe_car", "cd/acme_wagon_car", "cd/beta_racer_car"})
         m.page(p, kCancel, "return", {}, "00cmn/status")
             .item("buy", {}, "00cmn/cd_buy_sure", 1)
@@ -705,22 +769,53 @@ inline void add_gt_mode_menus(std::map<std::string, Bytes>& files) {
         m.page(p, kCancel).item("ok", {}, {}, 3);
     // Home: the garage list (code drawn) and the garage car page.
     m.page("hm/hm", kCancel, "map").item("hm_gr", {}, "hm/hm_gr").item("save", "go_save_in_home", {}, 2);
+    // (Both garage lists with their scroll bar left of the window and its hidden "pinch"; the
+    // trade list shows the guest garage.)
     m.page("hm/hm_gr", kCancel, "hm/hm")
         .item("car1", "set_garage_car", "hm/hm_car", 0, 40, 380, 300, 20)
         .widget("menu_garage", "window", "-", 40, 100, 420, 300)
+        .widget("scroll_bar", "scroll_bar", "", 20, 100, 8, 300)
         .hidden("maker", "MAKE", 350, 410, 80, 16)
         .hidden("price", "PRICE", 350, 410, 80, 16)
         .hidden("info", "-", 350, 0, 100, 20)
         .hidden("info_a", "-", 350, 0, 100, 20)
-        .hidden("mark", {}, 0, 0, 12, 12);
+        .hidden("mark", {}, 0, 0, 12, 12)
+        .hidden("pinch", {}, 0, 0, 8, 64);
+    m.page("hm/hm_gr_trade", kCancel, "hm/hm")
+        .item("car1", "set_garage_car_trade", "hm/hm_car", 0, 40, 380, 300, 20)
+        .widget("menu_garage_trade", "window", "-", 40, 100, 420, 300)
+        .widget("scroll_bar", "scroll_bar", "", 20, 100, 8, 300)
+        .hidden("maker", "MAKE", 350, 410, 80, 16)
+        .hidden("info", "-", 350, 0, 100, 20)
+        .hidden("info_a", "-", 350, 0, 100, 20)
+        .hidden("pinch", {}, 0, 0, 8, 64);
     m.page("hm/hm_car", kCancel, "hm/hm_gr", {}, "00cmn/status")
         .item("sell", {}, "hm/hm_sell_sure", 1)
         .item("ride", "ride_car")
+        .item("wheel", {}, "hm/hm_wheel")
         .widget("focused_carname", "focused_carname", "-", 300, 380)
         .widget("car_sell_price", "car_sell_price", "-", 300, 356)
         .widget("car_kilometrage", "car_kilometrage", "-", 300, 332)
         .widget("color_name_box", "color_name_box", "-", 300, 308);
     m.page("hm/hm_sell_sure", kCancel).item("yes1", "sell_car", "hm/hm_gr").item("no1", {}, {}, 3);
+    // The garage's wheel list: the page's one "wheel" item (parked above the screen; the list
+    // draws a frame of it per button), its window and scroll bar, the hidden tiles (the
+    // stock-wheel button's, the wheels', one named after the coupe's model), "mark" and "pinch".
+    m.page("hm/hm_wheel", kCancel | 0x001, "hm/hm_car", {}, "00cmn/status")
+        .item("wheel", "set_focus_wheel", "hm/hm_change_wheel_sure", 1, 0, 470, 60, 60)
+        .widget("car_render_wheel", "car_render_wheel", "-", 0, 0, 640, 448)
+        .widget("menu_wheel", "", "", 10, 89, 620, 72)
+        .widget("scroll_bar", "scroll_bar", "", 10, 72, 620, 12)
+        .hidden("default_wheel", {}, 380, 472, 52, 52)
+        .hidden(world::kRimA, {}, 294, 486, 52, 52)
+        .hidden(world::kRimB, {}, 294, 486, 52, 52)
+        .hidden("zz0001", {}, 294, 486, 52, 52)
+        .hidden("mark", {}, 140, 470, 60, 60)
+        .hidden("pinch", {}, 0, 0, 40, 12);
+    m.page("hm/hm_change_wheel_sure", kCancel, "hm/hm_wheel")
+        .item("yes1", "change_wheel", "hm/hm_wheel_changed", 1)
+        .item("no1", {}, {}, 3);
+    m.page("hm/hm_wheel_changed", 0, "hm/hm_change_wheel_sure").item("buy3", {}, "hm/hm_car");
     m.page("hm/hm_gr_panel", kCancel)
         .item("sort_name", "sort_name", {}, 3)
         .item("sort_price", "sort_price", {}, 3);
@@ -769,7 +864,9 @@ inline void add_gt_mode_menus(std::map<std::string, Bytes>& files) {
     m.page("00cmn/car_reguration", kCancel)
         .item("link_menu", {}, {}, 3, 60, 300, 300, 20)
         .widget("menu_regulated_car", "window", "-", 60, 120, 300, 200)
-        .hidden("no_regulated_car", "No Limitations", 60, 200, 300, 20);
+        .widget("scroll_bar", "scroll_bar", "", 370, 120, 10, 200)
+        .hidden("no_regulated_car", "No Limitations", 60, 200, 300, 20)
+        .hidden("pinch", {}, 0, 0, 10, 40);
     // Tune shop: one part page and the Purchase? -> Install now? -> Installed chain.
     m.page("ts/ts", kCancel, "map").item("bg2", {}, "ts/ts_eg");
     m.page("ts/ts_eg", kCancel, "ts/ts").item("item1", {}, "ts/ts_eg_muf_sp");
@@ -886,7 +983,7 @@ inline void add_presentation_menus(std::map<std::string, Bytes>& files) {
         MenuWriter m("records");
         m.page("records_free_tt", 0x100)
             .item("record_bar", {}, {}, 3, 40, 380, 560, 24)
-            .widget("menu_records", "window", "-", 40, 100, 560, 288)
+            .widget("menu_records", "window", "-", 40, 56, 560, 332)
             .el("hidden", "record_rank", "-", 40, 384, 30, 16)
             .el("hidden", "record_rank_shadow", "-", 41, 383, 30, 16)
             .el("hidden", "record_name", "-", 80, 384, 120, 16, false, 0)
@@ -1074,10 +1171,30 @@ inline void add_other_menus(std::map<std::string, Bytes>& files) {
     }
 }
 
-// Every file of the world, by VOL path.
-inline std::map<std::string, Bytes> gtmode_files() {
+// text/realtime.dat (MLTX, docs/formats/text.md) with the prize pages' word before "Cr.", in
+// the seven languages' pools (JP, US, BR, FR, GR, IT, SP; the Japanese one in the game encoding).
+inline void add_realtime_text(std::map<std::string, Bytes>& files) {
+    const std::string key = "PRIZE_RT_MSG_BONUS_PREFIX";
+    const char* const values[7] = {"\xBE\xDE\xB6\xE2", "Prize", "Prize", "Prix", "Preis", "Premio", "Precio"};
+    constexpr size_t kPool = 8;
+    const size_t keys = 0x14 + 8, pool = keys + key.size() + 1;
+    Bytes b(pool + 7 * kPool, 0);
+    std::memcpy(b.data(), "MLTX", 4);
+    p32(b, 4, 2);
+    p32(b, 8, u32(pool));
+    p32(b, 12, 1);
+    p32(b, 16, u32(kPool));
+    p32(b, 0x14, u32(keys));
+    p32(b, 0x18, 0);
+    std::memcpy(&b[keys], key.c_str(), key.size());
+    for (size_t l = 0; l < 7; ++l) std::memcpy(&b[pool + l * kPool], values[l], std::strlen(values[l]));
+    files["text/realtime.dat"] = b;
+}
+
+// Every file of the world, by VOL path (`twins`: with the regional twin cars, add_database).
+inline std::map<std::string, Bytes> gtmode_files(bool twins = false) {
     std::map<std::string, Bytes> f;
-    add_database(f);
+    add_database(f, twins);
     add_colors(f);
     add_gcf(f);
     add_gt_mode_menus(f);
@@ -1085,6 +1202,7 @@ inline std::map<std::string, Bytes> gtmode_files() {
     add_arcade_menus(f);
     add_other_menus(f);
     add_music(f);
+    add_realtime_text(f);
     return f;
 }
 

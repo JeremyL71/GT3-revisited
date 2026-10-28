@@ -50,14 +50,14 @@ public:
         bool have_db = app.vfs() && db->load(*app.vfs());
         for (const std::string& id : ids) {
             const data::Car* car = have_db ? db->car_by_model(id) : nullptr;
-            labels.push_back(car && !car->name.empty() ? id + "  " + car->name : id);
+            labels.push_back(car && !car->latin_name.empty() ? id + "  " + car->latin_name : id);
         }
         // Mod cars: "mod:<label>", their own body, rim and paint (GT3R_VIEWER_PAINT=<n>).
         if (have_db)
             for (const data::ModCar& m : db->mod_cars()) {
                 ids.push_back("mod:" + m.label);
                 const data::Car* c = db->car(m.label);
-                labels.push_back("mod:" + m.label + "  " + (c ? c->name : std::string()));
+                labels.push_back("mod:" + m.label + "  " + (c ? c->latin_name : std::string()));
             }
         app.pop();
         app.push(make_model_viewer("Car viewer", labels, [ids, db, have_db](App& a, size_t i) -> scene::Model {
@@ -78,10 +78,10 @@ public:
                 rim = opt.body_mod.wheel.empty() ? std::nullopt : a.vfs()->read("wheel/" + opt.body_mod.wheel);
                 if (rim) opt.wheel_override = *rim;
                 scene::Model m = load_car_model(*data, opt, label);
-                if (auto spec = sim::build_car_spec(*db, label); spec && spec->axle[0].susp.valid) {
+                if (auto spec = sim::build_car_spec(*db, label); spec && spec->axle[0].ride_height > 0) {
                     for (scene::Mesh& mesh : m.meshes)
-                        if (mesh.name.rfind("wheel_", 0) != 0) mesh.transform[13] += spec->axle[0].susp.ride_height;
-                    m.bounds_max[1] += spec->axle[0].susp.ride_height;
+                        if (mesh.name.rfind("wheel_", 0) != 0) mesh.transform[13] += spec->axle[0].ride_height;
+                    m.bounds_max[1] += spec->axle[0].ride_height;
                 }
                 return m;
             }
@@ -96,10 +96,10 @@ public:
             // Showroom pose (as the game's menus): the body rides q (ride height) above the
             // floor, the wheels stay on it.
             if (const data::Car* car = have_db ? db->car_by_model(ids[i]) : nullptr)
-                if (auto spec = sim::build_car_spec(*db, car->label); spec && spec->axle[0].susp.valid) {
+                if (auto spec = sim::build_car_spec(*db, car->label); spec && spec->axle[0].ride_height > 0) {
                     for (scene::Mesh& mesh : m.meshes)
-                        if (mesh.name.rfind("wheel_", 0) != 0) mesh.transform[13] += spec->axle[0].susp.ride_height;
-                    m.bounds_max[1] += spec->axle[0].susp.ride_height;
+                        if (mesh.name.rfind("wheel_", 0) != 0) mesh.transform[13] += spec->axle[0].ride_height;
+                    m.bounds_max[1] += spec->axle[0].ride_height;
                 }
             return m;
         }));

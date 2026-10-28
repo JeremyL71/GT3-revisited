@@ -3,6 +3,7 @@
 #include "base/file.h"
 #include "base/log.h"
 #include "formats/png_writer.h"
+#include "platform/render_scale.h"
 
 #include <algorithm>
 #include <cmath>
@@ -132,10 +133,12 @@ View3D::~View3D() {
 }
 
 void View3D::release_target() {
-    if (wrapper_) SDL_DestroyTexture(wrapper_);
-    wrapper_ = nullptr;
+    for (SDL_Texture** w : {&wrapper_, &half_wrapper_}) {
+        if (*w) SDL_DestroyTexture(*w);
+        *w = nullptr;
+    }
     SDL_GPUDevice* dev = ctx_.device();
-    for (SDL_GPUTexture** t : {&color_, &msaa_, &depth_, &scene_, &last_, &snap_}) {
+    for (SDL_GPUTexture** t : {&color_, &msaa_, &depth_, &scene_, &last_, &snap_, &half_}) {
         if (*t) SDL_ReleaseGPUTexture(dev, *t);
         *t = nullptr;
     }
@@ -172,29 +175,68 @@ bool View3D::ensure_target(SDL_Renderer* renderer, int w, int h) {
         release_target();
         return false;
     }
+    wrapper_ = wrap(renderer, color_, w, h);
+    if (!wrapper_) {
+        release_target();
+        return false;
+    }
+
+    width_ = w;
+    height_ = h;
+    samples_ = ctx_.msaa();
+    return true;
+}
+
+// `texture` (w x h) as an SDL_Renderer texture: replaces what is behind, scaled linearly.
+SDL_Texture* View3D::wrap(SDL_Renderer* renderer, SDL_GPUTexture* texture, int w, int h) {
+    SDL_Texture* t = nullptr;
 #if GT3R_HAVE_GPU_RENDERER
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, SDL_PIXELFORMAT_ABGR8888);
     SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STATIC);
     SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, w);
     SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, h);
-    SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER, color_);
-    wrapper_ = SDL_CreateTextureWithProperties(renderer, props);
+    SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_GPU_TEXTURE_POINTER, texture);
+    t = SDL_CreateTextureWithProperties(renderer, props);
     SDL_DestroyProperties(props);
 #else
-    (void)renderer;
+    (void)renderer, (void)texture, (void)w, (void)h;
 #endif
-    if (!wrapper_) {
+    if (!t) {
         LOG_WARN("Could not wrap the 3D target for the 2D renderer: %s", SDL_GetError());
-        release_target();
+        return nullptr;
+    }
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_NONE);
+    SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR); // render_scale < 1 upscales, > 1 scales down
+    return t;
+}
+
+// The supersampled picture at half size (created on first use), for SDL_BlitGPUTexture to halve
+// into and the 2D renderer to composite.
+bool View3D::ensure_half(SDL_Renderer* renderer) {
+    if (half_wrapper_) return true;
+    if (width_ <= 0 || height_ <= 0) return false;
+    const int w = (width_ + 1) / 2, h = (height_ + 1) / 2;
+    SDL_GPUTextureCreateInfo ti{};
+    ti.type = SDL_GPU_TEXTURETYPE_2D;
+    ti.width = u32(w), ti.height = u32(h);
+    ti.layer_count_or_depth = 1;
+    ti.num_levels = 1;
+    ti.format = GpuContext::kColorFormat;
+    ti.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    ti.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    half_ = SDL_CreateGPUTexture(ctx_.device(), &ti);
+    if (!half_) {
+        LOG_WARN("3D half-size target %dx%d: %s", w, h, SDL_GetError());
         return false;
     }
-    SDL_SetTextureBlendMode(wrapper_, SDL_BLENDMODE_NONE);
-    SDL_SetTextureScaleMode(wrapper_, SDL_SCALEMODE_LINEAR); // render_scale < 1 upscales
-
-    width_ = w;
-    height_ = h;
-    samples_ = ctx_.msaa();
+    half_wrapper_ = wrap(renderer, half_, w, h);
+    if (!half_wrapper_) {
+        SDL_ReleaseGPUTexture(ctx_.device(), half_);
+        half_ = nullptr;
+        return false;
+    }
+    half_w_ = w, half_h_ = h;
     return true;
 }
 
@@ -210,17 +252,32 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
         sx = lr.w / float(lw);
         sy = lr.h / float(lh);
     }
-    // The picture: render_scale < 1 renders smaller and the 2D renderer upscales it. The targets
-    // are sized for the largest scale (render_ceiling), so the dynamic scale only changes how much
-    // of them a frame uses.
-    const float scale = ctx_.render_scale();
-    const float alloc = std::clamp(std::max(scale, ctx_.render_ceiling()), 0.5f, 1.0f);
+    // The picture: render_scale < 1 renders smaller and the 2D renderer upscales it; above 1
+    // (supersampling) larger, within platform::supersample_limit, and it is scaled down. The
+    // targets are sized for the largest scale (render_ceiling), so the dynamic scale only changes
+    // how much of them a frame uses.
+    const float out_w = rect.w * sx, out_h = rect.h * sy; // on screen
+    const float limit = std::min(scale_cap_, platform::supersample_limit(out_w, out_h));
+    const float scale = std::min(ctx_.render_scale(), limit);
+    const float alloc = std::clamp(std::max(scale, ctx_.render_ceiling()), 0.5f, limit);
     auto px = [](float v) { return std::max(1, int(std::lround(v))); };
-    int pw = px(rect.w * sx * scale), ph = px(rect.h * sy * scale);
-    int aw = px(rect.w * sx * alloc), ah = px(rect.h * sy * alloc);
+    int pw = px(out_w * scale), ph = px(out_h * scale);
+    int aw = px(out_w * alloc), ah = px(out_h * alloc);
     if (opt.fixed_width > 0 && opt.fixed_height > 0) aw = pw = opt.fixed_width, ah = ph = opt.fixed_height;
-    if (!ensure_target(renderer, std::max(aw, pw), std::max(ah, ph))) return;
+    if (!ensure_target(renderer, std::max(aw, pw), std::max(ah, ph))) {
+        // Supersampled targets the GPU could not create (memory, size): smaller from the next frame.
+        if (alloc > 1.0f && opt.fixed_width <= 0) {
+            scale_cap_ = std::max(1.0f, alloc * 0.75f);
+            LOG_WARN("3D view: supersampling at most %d%% from now on", int(std::lround(scale_cap_ * 100)));
+        }
+        return;
+    }
     used_w_ = pw, used_h_ = ph;
+    // Supersampled targets are not cycled: SDL keeps a cycled target once for every frame in flight
+    // (about three copies), and 400% of 3840x2160 with 4x MSAA then needed over 20 GB, spilled out
+    // of a 10 GB RTX 3080's memory into system memory and drew a frame a second. Uncycled, SDL
+    // orders the frames' uses of each target with barriers (the GPU is the limit at that size).
+    const bool cycle = !(alloc > 1.0f && opt.fixed_width <= 0);
     SDL_SetTextureScaleMode(wrapper_, opt.nearest ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR);
     const SDL_GPUViewport used_viewport{0, 0, float(pw), float(ph), 0, 1};
     const SDL_Rect used_rect{0, 0, pw, ph};
@@ -233,7 +290,7 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
         snap_valid_ = last_valid_ && ensure_post(&snap_);
         if (snap_valid_) {
             snap_w_ = last_w_, snap_h_ = last_h_;
-            copy_picture(cmd, last_, snap_, last_w_, last_h_);
+            copy_picture(cmd, last_, snap_, last_w_, last_h_, cycle);
         }
     }
     const bool post = post_wanted(opt) && ensure_post(&scene_);
@@ -242,12 +299,12 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
     SDL_GPUColorTargetInfo ct{};
     ct.clear_color = {opt.clear[0], opt.clear[1], opt.clear[2], opt.clear[3]};
     ct.load_op = SDL_GPU_LOADOP_CLEAR;
-    ct.cycle = true;
+    ct.cycle = cycle;
     if (msaa_) {
         ct.texture = msaa_;
         ct.store_op = SDL_GPU_STOREOP_RESOLVE;
         ct.resolve_texture = scene_target;
-        ct.cycle_resolve_texture = true;
+        ct.cycle_resolve_texture = cycle;
     } else {
         ct.texture = scene_target;
         ct.store_op = SDL_GPU_STOREOP_STORE;
@@ -259,7 +316,7 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
     dt.store_op = SDL_GPU_STOREOP_DONT_CARE;
     dt.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
     dt.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
-    dt.cycle = true;
+    dt.cycle = cycle;
     SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &ct, 1, &dt);
     SDL_SetGPUViewport(pass, &used_viewport);
     SDL_SetGPUScissor(pass, &used_rect);
@@ -274,12 +331,12 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
             pt.texture = msaa_;
             pt.store_op = SDL_GPU_STOREOP_RESOLVE;
             pt.resolve_texture = color_;
-            pt.cycle_resolve_texture = true;
+            pt.cycle_resolve_texture = cycle;
         } else {
             pt.texture = color_;
             pt.store_op = SDL_GPU_STOREOP_STORE;
         }
-        pt.cycle = true;
+        pt.cycle = cycle;
         SDL_GPUDepthStencilTargetInfo pd = dt;
         pass = SDL_BeginGPURenderPass(cmd, &pt, 1, &pd);
         encode_post(cmd, pass, scene_, pw, ph, 1.0f, opt.post_grade.on ? &opt.post_grade : nullptr);
@@ -290,35 +347,52 @@ void View3D::draw(SDL_Renderer* renderer, const SDL_FRect& rect, const Mat4& vie
         SDL_EndGPURenderPass(pass);
     }
     if (opt.keep_last && ensure_post(&last_)) {
-        copy_picture(cmd, color_, last_, pw, ph);
+        copy_picture(cmd, color_, last_, pw, ph, cycle);
         last_valid_ = true;
         last_w_ = pw, last_h_ = ph;
     } else if (!opt.keep_last) {
         last_valid_ = false;
     }
     if (capture_.count > 0) capture_frame(cmd);
+    // Supersampled past twice the on-screen size: halved first by a linear blit (each pixel the
+    // mean of 2 x 2), so the 2D renderer's linear scaling, which reads 2 x 2 texels per pixel,
+    // still takes in every one (4x: a 4 x 4 box in all).
+    SDL_Texture* shown = wrapper_;
+    int sw = pw, sh = ph, tw = width_, th = height_;
+    if (opt.fixed_width <= 0 && (float(pw) > 2.0f * out_w + 0.5f || float(ph) > 2.0f * out_h + 0.5f) &&
+        ensure_half(renderer)) {
+        sw = (pw + 1) / 2, sh = (ph + 1) / 2;
+        SDL_GPUBlitInfo bi{};
+        bi.source.texture = color_, bi.source.w = u32(pw), bi.source.h = u32(ph);
+        bi.destination.texture = half_, bi.destination.w = u32(sw), bi.destination.h = u32(sh);
+        bi.load_op = SDL_GPU_LOADOP_DONT_CARE;
+        bi.filter = SDL_GPU_FILTER_LINEAR;
+        bi.cycle = cycle;
+        SDL_BlitGPUTexture(cmd, &bi);
+        shown = half_wrapper_, tw = half_w_, th = half_h_;
+    }
     SDL_SubmitGPUCommandBuffer(cmd);
     if (capture_.count > 0 && capture_.frame == capture_.first + capture_.count) write_capture();
 
     // Opaque pictures replace what is behind (texel alpha is reflectivity, not coverage);
     // a transparent clear or a partial composite blends over it.
     bool over = opt.clear[3] < 1.0f || opt.composite_alpha < 1.0f;
-    SDL_SetTextureBlendMode(wrapper_, over ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
+    SDL_SetTextureBlendMode(shown, over ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
     // DrawItem::frame_alpha left the PS2-style frame alpha in the target: copy the colour only
     // (the 2D frame keeps its own opaque alpha).
     if (!over && frame_alpha_written_) {
         static const SDL_BlendMode kColourOnly =
             SDL_ComposeCustomBlendMode(SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ZERO, SDL_BLENDOPERATION_ADD,
                                        SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_ADD);
-        SDL_SetTextureBlendMode(wrapper_, kColourOnly);
+        SDL_SetTextureBlendMode(shown, kColourOnly);
     }
-    SDL_SetTextureAlphaModFloat(wrapper_, std::clamp(opt.composite_alpha, 0.0f, 1.0f));
-    // The used corner, upscaled. Linear filtering would blend the texel beyond its right and
+    SDL_SetTextureAlphaModFloat(shown, std::clamp(opt.composite_alpha, 0.0f, 1.0f));
+    // The used corner, scaled. Linear filtering would blend the texel beyond its right and
     // bottom edges (unused, the clear colour) into the last pixels: stop half a texel short.
     const float inset = opt.nearest ? 0.0f : 0.5f;
-    const SDL_FRect src{0, 0, float(pw) - (pw < width_ ? inset : 0.0f), float(ph) - (ph < height_ ? inset : 0.0f)};
-    SDL_RenderTexture(renderer, wrapper_, &src, &rect);
-    SDL_SetTextureAlphaModFloat(wrapper_, 1.0f);
+    const SDL_FRect src{0, 0, float(sw) - (sw < tw ? inset : 0.0f), float(sh) - (sh < th ? inset : 0.0f)};
+    SDL_RenderTexture(renderer, shown, &src, &rect);
+    SDL_SetTextureAlphaModFloat(shown, 1.0f);
 }
 
 bool View3D::post_wanted(const DrawOptions& o) const {
@@ -342,11 +416,12 @@ bool View3D::ensure_post(SDL_GPUTexture** t) {
     return *t != nullptr;
 }
 
-void View3D::copy_picture(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* from, SDL_GPUTexture* to, int w, int h) {
+void View3D::copy_picture(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* from, SDL_GPUTexture* to, int w, int h,
+                          bool cycle) {
     SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
     SDL_GPUTextureLocation src{}, dst{};
     src.texture = from, dst.texture = to;
-    SDL_CopyGPUTextureToTexture(cp, &src, &dst, u32(w), u32(h), 1, true); // the picture's corner
+    SDL_CopyGPUTextureToTexture(cp, &src, &dst, u32(w), u32(h), 1, cycle); // the picture's corner
     SDL_EndGPUCopyPass(cp);
 }
 

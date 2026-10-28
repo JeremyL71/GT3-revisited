@@ -80,7 +80,7 @@ LapCheck drive_ai_line(const track::Track& t) {
 }
 
 int track_survey(Disc& disc, const Args& a) {
-    std::string prefix = !a.empty() && a[0] != "bench" ? a[0] : "courses/US/";
+    std::string prefix = !a.empty() && a[0] != "bench" ? a[0] : RegionData{disc.info().region}.course_path("", RegionData{disc.info().region}.default_language());
     bool bench = !a.empty() && a.back() == "bench";
     size_t files = 0, ok_grid = 0, ok_lap = 0, ok_probe = 0, game_index = 0;
     double total_ns = 0;
@@ -116,18 +116,18 @@ int track_survey(Disc& disc, const Args& a) {
         LapCheck lc = drive_ai_line(*t);
         int resp = 0, resp_on = 0, resp_wall = 0;
         for (float sd = 0; sd < t->length(); sd += 25.0f, ++resp) {
-            track::Pose rp = t->respawn_pose(sd);
+            track::Pose rp = t->centre_pose(sd);
             sim::SurfaceHit rh = t->probe(rp.position.x, rp.position.z, rp.position.y + 0.5f);
             bool good = rh.hit && track::surface_type(rh.surface) != track::Surface::Grass;
             resp_on += good;
-            if (!good && std::getenv("GT3R_TRACK_RESPAWN_V"))
+            if (!good && std::getenv("GT3R_TRACK_CENTRE_V"))
                 std::printf("    miss s=%.0f at (%.1f %.1f %.1f) hit %d surf 0x%x top %.1f\n", sd, rp.position.x,
                             rp.position.y, rp.position.z, rh.hit, rh.surface,
                             t->probe(rp.position.x, rp.position.z, 1e30f).height);
             resp_wall += t->wall_contact(rp.position + sim::Vec3{0, 0.5f, 0}, 1.5f).hit;
         }
-        if (std::getenv("GT3R_TRACK_RESPAWN"))
-            std::printf("  %s respawn %d on road %d near wall %d\n", t->label().c_str(), resp, resp_on, resp_wall);
+        if (std::getenv("GT3R_TRACK_CENTRE"))
+            std::printf("  %s centre-line poses %d on road %d near wall %d\n", t->label().c_str(), resp, resp_on, resp_wall);
         if (std::getenv("GT3R_TRACK_AI")) {
             for (const auto& l : t->ai_lines().lines) {
                 if (l.points.empty()) continue;

@@ -17,9 +17,16 @@
 
 namespace gt3r::game {
 
-constexpr int kMaxGarageCars = 200;  // save garage slots
-constexpr int kMaxWheels = 200;      // wheel inventory slots
-constexpr int kLicenseCount = 6;     // B, A, IB, IA, S, R (rally)
+// Program constants (the PAL and NTSC-J programs hold the same values):
+// - the garage's 200 cars: the dealer and trade checks (slti 0xC8), the
+//   prize-car page and the garage's slot search;
+// - the wheel inventory's 200 slots, the stock-wheel placeholder of a new game included (the
+//   slot search; GameState::wheels holds the bought ones);
+// - 6 licences (B, A, IB, IA, S, R = rally) of 8 tests: the completion count's loops
+//   and its total 48.
+constexpr int kMaxGarageCars = 200;
+constexpr int kMaxWheels = 200;
+constexpr int kLicenseCount = 6;
 constexpr int kTestsPerLicense = 8;
 
 // License ids in the original's order (records = license * 8 + test).
@@ -111,10 +118,16 @@ struct LicenseTestRecord {
 
 // Arcade mode progression. The original keeps it
 // in the same game state as GT mode (and saves it with it).
-constexpr int kArcadeCourses = 34;      // gcf tag-8 list SINGLE_RACE
-constexpr int kArcadeDifficulties = 4;  // easy, normal, hard, professional
+// The Single Race results: one per difficulty and course of the gcf SINGLE_RACE list (34
+// courses on every disc), record difficulty x <list size> + course; the save's
+// block has room for 144 (0xB40 bytes of 0x14-byte records). GtMode::arcade_course_count().
+constexpr int kArcadeResultSlots = 144;
+constexpr int kArcadeDifficulties = 4;  // easy, normal, hard, professional (< 4)
 constexpr int kArcadeCarLevels = 12;    // car unlock flags 1..12
-constexpr int kTimeTrials = 10;         // CLASS_COMPULSORY: AT010001..AT100001
+// The time trials (AT010001..AT100001, the gcf CLASS_COMPULSORY list): program constant, the
+// game state's 10 records (0x2A4 bytes each, the completion count's loop) and the
+// completion total 10.
+constexpr int kTimeTrials = 10;
 constexpr int kCourseTimeTrials = 44;   // course time-trial rankings in the PS2 save (TIME_ATTACK list order)
 constexpr int kArcadeNoPosition = 8;    // "no result" in the arcade blocks
 
@@ -125,9 +138,9 @@ struct ArcadeProgress {
     // 0x1000 << difficulty an arcade race won, 0x10000 a consolation prize, 0x20000 << medal
     // a license medal.
     u32 awards = 0;
-    // Best Single Race position per (difficulty, course): index difficulty * 34 + course
-    // (SINGLE_RACE order), 0 = won, kArcadeNoPosition = none.
-    std::array<int, kArcadeDifficulties * kArcadeCourses> best;
+    // Best Single Race position per (difficulty, course): index difficulty x the SINGLE_RACE
+    // list's size + course (list order), 0 = won, kArcadeNoPosition = none.
+    std::array<int, kArcadeResultSlots> best;
     std::array<int, kTimeTrials> at_best_rank;    // best time-trial rank, 0 = beat the record
     ArcadeProgress() {
         best.fill(kArcadeNoPosition);

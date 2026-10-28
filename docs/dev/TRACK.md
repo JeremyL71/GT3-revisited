@@ -104,9 +104,7 @@ course's mesh.
 - `probe_or_ground()` never misses. Off the mesh it returns the height of the
   nearest road vertex within 24 m (one below `y_max` if possible), or else the
   centre-line height, with an up normal. `hit` stays false so callers can still
-  apply off-road grip. Physics should treat a miss as `OffRoad` (grass-like grip)
-  at that height, and the race scene should respawn a car that stays off the
-  mesh.
+  apply off-road grip.
 - For reference, when the game's wheel query misses, the game sets the miss
   flag, uses surface 0 and keeps a fallback height derived from the car body.
   It does not fall back to scenery.
@@ -159,8 +157,8 @@ the edge of the road mesh: left edge, right edge, pit wall.
 - **Checked.** On trialmt, no point of the racing line comes within 1 m of a
   wall. Over all 80 courses, about 1.3% of racing-line samples do, mostly on
   the test-course oval, where the line hugs the outside wall.
-- **The game's own collision** is swept and polygon-based (physics §5.3; `src/sim/collision.*`).
-  `wall_contact()` is a simpler, sphere-based stand-in.
+- **The game's own collision** is swept and polygon-based (physics §5.3; `src/sim/collision_exact.*`).
+  `wall_contact()` is a simpler, sphere-based query for tools (`gt3tool track-survey`).
 
 ## Lap geometry
 
@@ -184,8 +182,8 @@ direction of travel; this was checked on every course.
   it: tarmac, kerb, dirt or paving, but not grass, gravel, sand or pit lane. The
   centre's height follows the previous gate, so it stays on a bridge or under
   one. `point_at(s, lateral)` and `direction_at(s)` evaluate this centre line.
-  `respawn_pose(s)` is the centre point, facing along the lap.
-  - **Checked.** Respawn poses every 25 m are on the racing surface for
+  `centre_pose(s)` is the centre point, facing along the lap.
+  - **Checked.** Centre-line poses every 25 m are on the racing surface for
     14,728 of 14,820 positions over all 80 courses. The misses are on parts of
     licence courses that have no road mesh, such as L_testcourse1 and the
     slalom courses.
@@ -228,8 +226,7 @@ direction of travel; this was checked on every course.
   `last_lap_time()` and `best_lap_time()` for completed laps.
 - **Wrong way.** `wrong_way()` turns on after 15 m of net backwards travel. It
   turns off after about 25 m forwards again (backwards travel is capped at 30 m).
-- **Respawn.** Call `teleport(position)` after a respawn. It re-locates the car
-  without adding progress.
+- **Teleport.** `teleport(position)` re-locates the car without adding progress.
 - **Checked.** In `track_all_us`, driving each course's racing line once from
   the pole slot records exactly one lap with monotonic progress on 78 of 78
   lap courses. L_circle60_dry1 and L_circle60_wet1 are excluded: their AI
@@ -243,5 +240,5 @@ direction of travel; this was checked on every course.
 | `probe` == brute-force `height_at` | 80/80 |
 | grid slots on road and facing along the lap | 80/80 |
 | one lap with monotonic progress along the racing line | 78/78 (2 circle tests have no lap line) |
-| respawn poses on the racing surface | 14,728/14,820 |
+| centre-line poses on the racing surface | 14,728/14,820 |
 | probe time | 18.7 ns mean (10.6–29.9 per course) |

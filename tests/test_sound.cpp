@@ -2,15 +2,22 @@
 
 #include "test_framework.h"
 
+#include "audio/audio_engine.h"
 #include "audio/engine_sound.h"
 #include "audio/voice_mixer.h"
 #include "formats/sound/engn.h"
 #include "formats/sound/inst.h"
 #include "vfs/vfs.h"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 #include <utility>
+
+#include <SDL3/SDL_hints.h>
+#include <SDL3/SDL_init.h>
 
 using namespace gt3r;
 using namespace gt3r::sound;
@@ -92,6 +99,48 @@ TEST(sound_mixer_loop_and_end) {
     m.set_pitch(a, 0x2000);
     m.stop(b);
     CHECK(m.active_voices() == 0);
+}
+
+TEST(sound_mixer_changes_while_rendering) {
+    // mix() renders a block from a copy of the voices without the lock. The game's changes
+    // made meanwhile must land after the block (as when they waited for it), not be lost when
+    // the rendered voices come back, and the block's own results (a one-shot ending) must stay.
+    Bytes loop;
+    put_frame(loop, 1, 0x06);
+    put_frame(loop, 1, 0x03);
+    Bytes shot;
+    put_frame(shot, 1, 0x00);
+    put_frame(shot, 1, 0x01);
+    VoiceMixer m;
+    VoiceParams p;
+    p.data = std::make_shared<const Bytes>(loop);
+    std::vector<VoiceId> held;
+    for (int i = 0; i < 40; ++i) held.push_back(m.key_on(p)); // many voices: a long block
+    p.data = std::make_shared<const Bytes>(shot);
+    VoiceId one_shot = m.key_on(p);
+    p.data = std::make_shared<const Bytes>(loop);
+    // The hook marks the start of the one block (it runs before the block renders).
+    std::atomic<bool> started{false};
+    m.set_tick_hook([&] { started = true; }, 1u << 30);
+    constexpr size_t kFrames = 4 * VoiceMixer::kRate;
+    std::vector<s16> out(2 * kFrames);
+    std::thread mixing([&] { m.mix(out.data(), kFrames); });
+    while (!started) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5)); // (most likely while it renders)
+    m.key_off(held[0]);
+    m.stop(held[1]);
+    VoiceId fresh = m.key_on(p);
+    m.set_reverb(SpuReverb::Hall, 0x1000, 0x1000);
+    CHECK(m.reverb_mode() == SpuReverb::Hall); // the game reads back what it set
+    CHECK(m.playing(fresh) && !m.playing(held[1]));
+    mixing.join();
+    m.set_tick_hook({}, 0);
+    CHECK(m.releasing(held[0]) || !m.playing(held[0]));
+    CHECK(!m.playing(held[1]));
+    CHECK(m.playing(fresh));
+    CHECK(m.playing(held[2]) && !m.releasing(held[2]));
+    CHECK(!m.playing(one_shot));
+    CHECK(m.reverb_mode() == SpuReverb::Hall && m.reverb_depth() == 0x1000);
 }
 
 TEST(sound_mixer_bus_gains) {
@@ -240,4 +289,35 @@ TEST(sound_engine_model) {
     es.stop(m);
     m.mix(buf.data(), 800);
     CHECK(m.active_voices() == 0);
+}
+
+// The output device setting on SDL's dummy driver (one device): a device that isn't connected
+// plays on the default; a named one opens explicitly; choosing the default again moves back.
+TEST(sound_output_device_choice) {
+    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
+    const bool init = SDL_InitSubSystem(SDL_INIT_AUDIO);
+    SDL_ResetHint(SDL_HINT_AUDIO_DRIVER);
+    if (!init) SKIP("no SDL dummy audio driver");
+    {
+        AudioEngine missing("No Such Headphones");
+        CHECK(missing.ok());
+        CHECK(missing.output_device() == "No Such Headphones");
+        CHECK(missing.output_device_id() == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK);
+
+        const std::vector<std::string> devs = AudioEngine::playback_devices();
+        CHECK(devs.size() == 1);
+        AudioEngine named(devs.empty() ? std::string() : devs[0]);
+        CHECK(named.ok());
+        CHECK(named.output_device_id() != SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK);
+        // The switch runs on the engine's own thread.
+        named.set_output_device("");
+        for (int i = 0; i < 200 && named.output_device_id() != SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(named.output_device_id() == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK);
+        named.set_output_device(devs.empty() ? std::string() : devs[0]);
+        for (int i = 0; i < 200 && named.output_device_id() == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(named.output_device_id() != SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK);
+    }
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
 }

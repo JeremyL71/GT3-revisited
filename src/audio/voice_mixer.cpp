@@ -88,6 +88,7 @@ constexpr s16 kGauss[512] = {
 
 VoiceMixer::VoiceMixer() {
     for (auto& v : voices_) v.gen = 1;
+    changes_.reserve(64);
 }
 
 VoiceMixer::Voice* VoiceMixer::find(VoiceId id) {
@@ -135,51 +136,92 @@ VoiceId VoiceMixer::key_on(const VoiceParams& p) {
     v.priority = p.priority;
     v.bus = u8(p.bus);
     v.age = ++clock_;
-    return VoiceId{u32(pick) | (v.gen << 8)};
+    const VoiceId id{u32(pick) | (v.gen << 8)};
+    if (rendering_) {
+        Change c(Change::Kind::KeyOn, id);
+        c.voice = v;
+        changes_.push_back(std::move(c));
+    }
+    return id;
 }
 
 u16 VoiceMixer::hardware_pitch(u16 game_pitch) { return u16(std::min<u32>((u32(game_pitch) * 0xEB3) >> 12, 0x4000)); }
 
 void VoiceMixer::key_off(VoiceId id) {
     std::lock_guard lock(mutex_);
-    if (Voice* v = find(id)) {
-        if (v->phase != Phase::Release) v->env_counter = 0;
-        v->phase = Phase::Release;
-    }
+    change({Change::Kind::KeyOff, id});
 }
 
 void VoiceMixer::stop(VoiceId id) {
     std::lock_guard lock(mutex_);
-    if (Voice* v = find(id)) {
-        v->phase = Phase::Off;
-        v->data.reset();
-    }
+    change({Change::Kind::Stop, id});
 }
 
 void VoiceMixer::stop_all() {
     std::lock_guard lock(mutex_);
-    for (auto& v : voices_) {
-        v.phase = Phase::Off;
-        v.data.reset();
-    }
+    change({Change::Kind::StopAll});
 }
 
 void VoiceMixer::set_pitch(VoiceId id, u16 pitch) {
     std::lock_guard lock(mutex_);
-    if (Voice* v = find(id)) v->hw_pitch = hardware_pitch(pitch);
+    change({Change::Kind::Pitch, id, pitch});
 }
 
 void VoiceMixer::set_volume(VoiceId id, s16 l, s16 r) {
     std::lock_guard lock(mutex_);
-    if (Voice* v = find(id)) {
-        v->target_l = l;
-        v->target_r = r;
-    }
+    change({Change::Kind::Volume, id, 0, l, r});
 }
 
 void VoiceMixer::set_priority(VoiceId id, u8 priority) {
     std::lock_guard lock(mutex_);
-    if (Voice* v = find(id)) v->priority = priority;
+    change({Change::Kind::Priority, id, priority});
+}
+
+// The table takes the change at once (the game's next calls see it). While a block renders
+// from its own copy, the change is also kept and made again on the rendered voices after it.
+// The reverb's are kept only: the block's reverb_ is the mixing thread's until it ends.
+void VoiceMixer::change(Change c) {
+    const bool reverb = c.kind == Change::Kind::Reverb || c.kind == Change::Kind::ReverbDepth;
+    if (!rendering_ || !reverb) apply(c);
+    if (rendering_) changes_.push_back(std::move(c));
+}
+
+void VoiceMixer::apply(const Change& c) {
+    using Kind = Change::Kind;
+    switch (c.kind) {
+    case Kind::KeyOn: voices_[c.id.value & 0xFF] = c.voice; return;
+    case Kind::StopAll:
+        for (auto& v : voices_) {
+            v.phase = Phase::Off;
+            v.data.reset();
+        }
+        return;
+    case Kind::Reverb:
+        if (c.value != reverb_.mode()) reverb_.set_mode(c.value);
+        reverb_.set_depth(c.l, c.r);
+        return;
+    case Kind::ReverbDepth: reverb_.set_depth(c.l, c.r); return;
+    default: break;
+    }
+    Voice* v = find(c.id);
+    if (!v) return;
+    switch (c.kind) {
+    case Kind::KeyOff:
+        if (v->phase != Phase::Release) v->env_counter = 0;
+        v->phase = Phase::Release;
+        break;
+    case Kind::Stop:
+        v->phase = Phase::Off;
+        v->data.reset();
+        break;
+    case Kind::Pitch: v->hw_pitch = hardware_pitch(u16(c.value)); break;
+    case Kind::Volume:
+        v->target_l = c.l;
+        v->target_r = c.r;
+        break;
+    case Kind::Priority: v->priority = u8(c.value); break;
+    default: break;
+    }
 }
 
 bool VoiceMixer::playing(VoiceId id) const {
@@ -226,23 +268,24 @@ void VoiceMixer::set_interpolation(Interpolation i) {
 
 void VoiceMixer::set_reverb(int mode, s16 depth_l, s16 depth_r) {
     std::lock_guard lock(mutex_);
-    if (mode != reverb_.mode()) reverb_.set_mode(mode);
-    reverb_.set_depth(depth_l, depth_r);
+    reverb_mode_ = mode, reverb_depth_ = depth_l;
+    change({Change::Kind::Reverb, {}, mode, depth_l, depth_r});
 }
 
 void VoiceMixer::set_reverb_depth(s16 depth_l, s16 depth_r) {
     std::lock_guard lock(mutex_);
-    reverb_.set_depth(depth_l, depth_r);
+    reverb_depth_ = depth_l;
+    change({Change::Kind::ReverbDepth, {}, 0, depth_l, depth_r});
 }
 
 int VoiceMixer::reverb_mode() const {
     std::lock_guard lock(mutex_);
-    return reverb_.mode();
+    return reverb_mode_;
 }
 
 s16 VoiceMixer::reverb_depth() const {
     std::lock_guard lock(mutex_);
-    return reverb_.depth_l();
+    return reverb_depth_;
 }
 
 void VoiceMixer::set_tick_hook(std::function<void()> hook, u32 samples_per_tick) {
@@ -343,6 +386,7 @@ void VoiceMixer::step_envelope(Voice& v) {
 }
 
 void VoiceMixer::mix(s16* out, size_t frames) {
+    std::lock_guard mixing(mix_mutex_);
     size_t done = 0;
     while (done < frames) {
         std::function<void()> hook;
@@ -359,26 +403,43 @@ void VoiceMixer::mix(s16* out, size_t frames) {
             }
         }
         if (hook) hook();
-        {
-            std::lock_guard lock(mutex_);
-            render(out + 2 * done, n);
-        }
+        render_block(out + 2 * done, n);
         done += n;
     }
 }
 
-void VoiceMixer::render(s16* out, size_t frames) {
-    const s32 master = s32(master_ * 4096.0f);
-    const bool gauss = interp_ == Interpolation::Gaussian;
+// One block: the voices as they are now, rendered without the lock; then the rendered voices
+// and, after them, the changes made meanwhile (in their order).
+void VoiceMixer::render_block(s16* out, size_t frames) {
+    BlockParams p;
+    {
+        std::lock_guard lock(mutex_);
+        block_ = voices_;
+        p.master = s32(master_ * 4096.0f);
+        p.gauss = interp_ == Interpolation::Gaussian;
+        p.bus_gain = bus_gain_;
+        rendering_ = true;
+    }
+    render(out, frames, p);
+    std::lock_guard lock(mutex_);
+    voices_.swap(block_);
+    rendering_ = false;
+    for (const Change& c : changes_) apply(c);
+    changes_.clear();
+}
+
+void VoiceMixer::render(s16* out, size_t frames, const BlockParams& p) {
+    const s32 master = p.master;
+    const bool gauss = p.gauss;
     const bool rev = reverb_.mode() != SpuReverb::Off;
     // Each bus sums its voices on its own and is scaled by its gain before the mix (a
     // gain of 1 leaves the sum unchanged), so the reverb return follows the gains too.
-    auto scaled = [this](const s32 (&sum)[2]) {
-        return s32((s64(sum[0]) * bus_gain_[0] + s64(sum[1]) * bus_gain_[1]) >> 16);
+    auto scaled = [&p](const s32 (&sum)[2]) {
+        return s32((s64(sum[0]) * p.bus_gain[0] + s64(sum[1]) * p.bus_gain[1]) >> 16);
     };
     for (size_t n = 0; n < frames; ++n) {
         s32 bus_l[2] = {}, bus_r[2] = {}, bus_wet_l[2] = {}, bus_wet_r[2] = {};
-        for (Voice& v : voices_) {
+        for (Voice& v : block_) {
             if (v.phase == Phase::Off) continue;
             // Advance the source position by pitch/0x1000 samples.
             v.counter += v.hw_pitch;

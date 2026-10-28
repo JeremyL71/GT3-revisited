@@ -6,8 +6,9 @@
 // Input (virtual pad, as in the US release): D-pad / left stick move,
 // Circle or Cross confirm, Triangle or Square go back. Cancel on the title
 // menu leaves the screen, as does the "GT3R menu" button drawn beside the
-// title menu (Select, or a click / tap): our main menu is underneath. With
-// the debug overlay on, Select cycles the menu language (disc folders).
+// title menu (Select, or a click / tap): our main menu is underneath. A mouse's
+// right click is Cancel. With the debug overlay on, Select cycles the menu
+// language (disc folders).
 //
 // Starting a race raises a menu::flow::GameRequest: a handler registered with
 // set_game_request_handler() runs it; otherwise the "race" screen (time trial)
@@ -97,6 +98,10 @@ MenuKeys key_from_name(const std::string& s) {
 
 class Gt3MenuScreen : public Screen {
 public:
+    // `language_page`: PAL's first start, the language page (menu/language.mbl); the choice
+    // goes to the config and the game starts (opening movie, title menu).
+    explicit Gt3MenuScreen(bool language_page = false) : language_page_(language_page) {}
+
     ~Gt3MenuScreen() override {
         movie_.stop();
         renderer_.reset();
@@ -119,6 +124,9 @@ public:
             float dx = e.button.x - press_->x, dy = e.button.y - press_->y;
             if (dx * dx + dy * dy <= 12.0f * 12.0f) taps_.push_back(*press_);
             press_.reset();
+        } else if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_RIGHT &&
+                   e.button.which != SDL_TOUCH_MOUSEID) {
+            back_click_ = true; // a right click goes back, as in our own screens
         }
     }
 
@@ -133,10 +141,20 @@ public:
     }
 
     void update(App& app, double dt) override {
-        if (!flow_) init(app);
+        if (!flow_ && !init_tried_) init_tried_ = true, init(app); // once: a failure shows its error (no retry every frame)
         if (!flow_) {
             if (app.menu().pressed(PadButton::Triangle)) app.pop();
             return;
+        }
+        if (language_page_) {
+            if (std::optional<std::string> code = flow_->take_language()) {
+                app.set_language(*code);
+                app.pop();
+                app.push_game_start();
+                return;
+            }
+        } else if (app.language() != lang_ && !in_game_) {
+            rebuild_flow(app); // chosen in the settings meanwhile
         }
         if (in_game_) {
             // Back from gameplay (the pushed screen was popped).
@@ -147,6 +165,7 @@ public:
         if (frozen_) {
             taps_.clear();
             hover_.reset();
+            back_click_ = false;
             return;
         }
         if (hover_) {
@@ -164,7 +183,16 @@ public:
             if (float mx, my; ui_to_menu(p, mx, my)) flow_->tap(mx, my);
         }
         taps_.clear();
-        MenuKeys keys = keys_from_pad(app.input().pad(0));
+        if (std::exchange(back_click_, false)) {
+            if (title) { // as Cancel on the title menu: our main menu
+                app.pop();
+                return;
+            }
+            flow_->back();
+        }
+        MenuKeys keys = keys_from_pad(app.input().menu_pad()); // player 1's (or any device's: menu_pad)
+        held_over_ &= keys; // keys held since another screen was on top: ignored until released
+        keys &= MenuKeys(~held_over_);
         flow_->set_player2_keys(keys_from_pad(app.input().pad(1))); // 2 Player car page
         // Select: next language available on the disc (development aid, only with the debug
         // overlay on: a stray Select / Tab must not switch a player's game to another language).
@@ -235,8 +263,8 @@ private:
     }
 
     bool on_title() const {
-        return flow_ && flow_->controller() && !flow_->switching() && flow_->controller()->page_name() == "root" &&
-               !flow_->controller()->busy();
+        return !language_page_ && flow_ && flow_->controller() && !flow_->switching() &&
+               flow_->controller()->page_name() == "root" && !flow_->controller()->busy();
     }
 
     std::string menu_music_; // the menu's current BGM sequence ("" = none)
@@ -246,14 +274,10 @@ private:
     };
 
     void init(App& app) {
-        if (const char* env = std::getenv("GT3R_LANG")) lang_ = env;
-        else lang_ = app.config().get("gt3menu", "lang").value_or("US");
-        languages_.clear();
-        for (int i = 0; kMenuLanguages[i]; ++i)
-            if (app.vfs()->exists(std::string("menu/") + kMenuLanguages[i] + "/gt_mode3.pmb"))
-                languages_.push_back(kMenuLanguages[i]);
-        if (std::find(languages_.begin(), languages_.end(), lang_) == languages_.end())
-            lang_ = languages_.empty() ? "US" : languages_.front();
+        lang_ = app.language();
+        languages_ = app.languages();
+        // The language page shows before a language is chosen: in the region's own (British English).
+        if (language_page_) lang_ = text::language_code(app.vfs()->region().default_language());
         renderer_ = std::make_unique<MenuRenderer>(app.renderer());
         // "mpeg" widgets show the background movie.
         // GT mode: 3D car renders on top of the widget's own art.
@@ -309,7 +333,7 @@ private:
             if (!movie_.texture()) return;
             SDL_FRect src, dst;
             movie_.picture_rects(box, src, dst); // handles field-split movies
-            // Car page steps: Blur2D over the background (a 3 x 3 box of offset copies).
+            // Car page steps: 2-D blur over the background (a 3 x 3 box of offset copies).
             float blur = flow_ && flow_->carousel() ? flow_->carousel()->blur : 0;
             if (blur > 0.01f) {
                 float px = blur * dst.w / 640.0f;
@@ -332,7 +356,8 @@ private:
             connect_options(app);
             game::install_replay_theater(app.data_dir(), app.vfs()); // Replay Theater files
             install_save_dialogs(app);                                // the save page's file dialogs
-            flow_->start();
+            if (language_page_) flow_->start("language", "root");
+            else flow_->start();
         } catch (const std::exception& e) {
             error_ = e.what();
             LOG_WARN("gt3menu: %s", e.what());
@@ -384,8 +409,13 @@ private:
         if (languages_.size() < 2) return;
         auto it = std::find(languages_.begin(), languages_.end(), lang_);
         size_t i = it == languages_.end() ? 0 : size_t(it - languages_.begin());
-        lang_ = languages_[(i + 1) % languages_.size()];
-        app.config().set("gt3menu", "lang", lang_);
+        app.set_language(languages_[(i + 1) % languages_.size()]);
+        rebuild_flow(app);
+    }
+
+    // The menus again in the game's current language, from the title.
+    void rebuild_flow(App& app) {
+        lang_ = app.language();
         renderer_->clear_cache();
         flow_ = std::make_unique<GameFlow>(vfs_reader(*app.vfs()), lang_);
         flow_->measure_text = font_measure(fonts_);
@@ -420,6 +450,13 @@ private:
             else app.audio().bgm().play_if_different(app.audio(), *app.vfs(), bgm::kRace, *p | bgm::kIntro, true, 1.0f);
         }
         if (auto r = flow_->take_request()) start_game(app, *r);
+        if (flow_->take_controller_settings()) {
+            // Our controller settings over the menus (Key Configuration): the menus wait on
+            // their page underneath and go on when it closes, without the keys still held then.
+            app.push(make_settings_screen(kSettingsTabControls, true));
+            held_over_ = MenuKeys(~0);
+            acc_ = 0;
+        }
         ++pending_draws_;
         draw_frame(app);
     }
@@ -446,6 +483,7 @@ private:
         movie_.stop();
         if (path.empty()) return;
         try {
+            movie_.set_audio_device(app.audio().output_device_id());
             movie_.start(video::open_movie(*app.vfs(), path), app.audio().music_volume());
         } catch (const std::exception& e) {
             LOG_WARN("gt3menu: movie %s: %s", path.c_str(), e.what());
@@ -581,16 +619,20 @@ private:
     int pending_draws_ = 1;
     double acc_ = 0;
     MenuKeys prev_keys_ = 0;
+    MenuKeys held_over_ = 0; // see update()
     std::optional<SDL_FPoint> press_; // left button / finger down, UI units
     std::vector<SDL_FPoint> taps_;    // taps since the last update()
     std::optional<SDL_FPoint> hover_; // the hovering pointer's last move since the last update()
+    bool back_click_ = false;         // a right click since the last update(): Cancel
     bool in_game_ = false;
     bool frozen_ = false;
     std::deque<MenuKeys> script_;
     std::vector<Message> messages_;
     std::string lang_ = "US";
     std::vector<std::string> languages_;
+    bool language_page_ = false;
     std::string error_;
+    bool init_tried_ = false;
 };
 
 } // namespace
@@ -598,5 +640,8 @@ private:
 GT3R_REGISTER_SCREEN(gt3menu, "gt3menu", "Game menus (interactive)",
                      "Navigate GT3's own menus: title, arcade, GT mode and options.", 15,
                      [] { return std::make_unique<Gt3MenuScreen>(); });
+GT3R_REGISTER_SCREEN(language, "language", "Language page",
+                     "PAL discs: the game's language page, then the opening movie and title menu.", 16,
+                     [] { return std::make_unique<Gt3MenuScreen>(true); });
 
 } // namespace gt3r

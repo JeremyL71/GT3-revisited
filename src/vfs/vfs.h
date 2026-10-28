@@ -59,6 +59,12 @@ public:
     std::vector<std::string> list_dir(const std::string& dir) const;
 
     Volume* base() const { return base_; }
+    // The disc's regional data set (NTSC-U when there is no disc).
+    RegionData region() const { return {base_ ? base_->region() : Region::America}; }
+    // The game's language (disc/region.h), which the app sets from its config; the region's
+    // own (RegionData::default_language) until then.
+    Language language() const { return language_ ? *language_ : region().default_language(); }
+    void set_language(Language l) { language_ = l; }
 
     // Virtual file listing the enabled mods' car definitions, one "<mod id>\t<host
     // path>" line each (ascending priority), so loaders that only get a reader
@@ -67,15 +73,30 @@ public:
     // Virtual file: the disc's packed program (CORE.GT3, Volume::read_program), for loaders
     // that read a reference table from it. Not moddable.
     static constexpr const char* kProgramFile = "disc/.core.gt3";
+    // Virtual file: the disc's region key ("jp", "us", "eu"; region_key), for loaders that
+    // only get a reader. Not moddable.
+    static constexpr const char* kRegionFile = "disc/.region";
+    // Virtual file: the game's language code ("US", "BR", ...; language()). Not moddable.
+    static constexpr const char* kLanguageFile = "disc/.language";
 
 private:
     void rebuild_index();
     Volume* base_;
+    std::optional<Language> language_;
     std::vector<ModInfo> mods_;
     std::map<std::string, std::string> overrides_; // vol path -> host path
     std::map<std::string, std::string> override_source_; // vol path -> mod id
 };
 
 std::string normalize_vfs_path(std::string_view path);
+
+// The region of a reader's disc (its Vfs::kRegionFile); NTSC-U when it has none.
+RegionData region_data(const std::function<std::optional<Bytes>(const std::string&)>& read);
+// The game's language through a reader (Vfs::kLanguageFile), else the region's own.
+Language language_of(const std::function<std::optional<Bytes>(const std::string&)>& read);
+
+// A course file's path: the one the game reads (RegionData::course_path in the language),
+// else another folder's that has it; "" when none does.
+std::string course_file_path(const Vfs& vfs, std::string_view label);
 
 } // namespace gt3r

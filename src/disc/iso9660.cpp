@@ -2,21 +2,44 @@
 
 #include "base/config.h"
 
+#include <cstring>
+
 namespace gt3r {
 
-Iso9660::Iso9660(File& file) : file_(file) {
-    if (file.size() < 17 * kSectorSize) throw FormatError("image too small to be ISO9660");
-    Bytes pvd = file.read_at(16 * kSectorSize, kSectorSize);
+namespace {
+bool has_pvd(File& file, u64 sector) {
+    if (file.size() < (sector + 1) * u64(kSectorSize)) return false;
+    const Bytes pvd = file.read_at(sector * kSectorSize, 6);
+    return pvd[0] == 1 && std::memcmp(&pvd[1], "CD001", 5) == 0;
+}
+} // namespace
+
+std::vector<std::unique_ptr<Iso9660>> iso_layers(File& file) {
+    std::vector<std::unique_ptr<Iso9660>> layers;
+    layers.push_back(std::make_unique<Iso9660>(file));
+    const u64 end = layers[0]->volume_bytes() / kSectorSize; // the first layer's sectors
+    for (u64 pvd : {end, end + 16, end - 16})
+        if (end > 32 && has_pvd(file, pvd)) {
+            layers.push_back(std::make_unique<Iso9660>(file, pvd - 16));
+            break;
+        }
+    return layers;
+}
+
+Iso9660::Iso9660(File& file, u64 base_sector) : file_(file), base_(base_sector) {
+    if (file.size() < (base_ + 17) * kSectorSize) throw FormatError("image too small to be ISO9660");
+    Bytes pvd = file.read_at((base_ + 16) * kSectorSize, kSectorSize);
     if (pvd[0] != 1 || std::memcmp(&pvd[1], "CD001", 5) != 0)
         throw FormatError("no ISO9660 primary volume descriptor");
     volume_id_ = std::string(trim(std::string_view(reinterpret_cast<char*>(&pvd[40]), 32)));
+    volume_bytes_ = u64(rd32(pvd, 80)) * rd16(pvd, 128);
     root_.lba = rd32(pvd, 156 + 2);
     root_.size = rd32(pvd, 156 + 10);
     root_.is_dir = true;
 }
 
 std::vector<Iso9660::Entry> Iso9660::read_dir(u32 lba, u32 size) const {
-    Bytes d = file_.read_at(u64(lba) * kSectorSize, size);
+    Bytes d = file_.read_at((base_ + lba) * kSectorSize, size);
     std::vector<Entry> out;
     size_t i = 0;
     while (i < d.size()) {
@@ -27,6 +50,7 @@ std::vector<Iso9660::Entry> Iso9660::read_dir(u32 lba, u32 size) const {
         }
         if (i + len > d.size() || len < 34) break;
         u8 name_len = d[i + 32];
+        if (33 + name_len > len) break; // a name longer than its record
         std::string name(reinterpret_cast<char*>(&d[i + 33]), name_len);
         bool special = name_len == 1 && (name[0] == 0 || name[0] == 1);
         if (!special) {
@@ -71,6 +95,6 @@ std::optional<Iso9660::Entry> Iso9660::find(const std::string& path) const {
     return cur;
 }
 
-Bytes Iso9660::read(const Entry& e) const { return file_.read_at(u64(e.lba) * kSectorSize, e.size); }
+Bytes Iso9660::read(const Entry& e) const { return file_.read_at(offset(e), e.size); }
 
 } // namespace gt3r

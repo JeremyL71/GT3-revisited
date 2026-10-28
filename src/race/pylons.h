@@ -30,10 +30,11 @@
 #include "render/view3d.h"
 #include "scene/model.h"
 #include "sim/sim_types.h"
-#include "sim/vehicle.h"
+#include "track/track.h"
 
 #include <array>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace gt3r::render {
@@ -82,9 +83,9 @@ public:
     // (Re)places every body on the ground (race start, retry).
     void reset(const sim::TrackQuery& ground);
     // One frame; cars[0..n). Returns a bit mask of the cars that touched a body this frame.
-    // `walls` (optional): the course walls awake bodies collide with.
+    // `walls`: the course's wall lines (track::Track::wall_lines) awake bodies collide with.
     unsigned step(const sim::TrackQuery& ground, const std::vector<Car>& cars, double dt,
-                  const sim::WorldQuery* walls = nullptr);
+                  std::span<const track::WallLine> walls = {});
     // The shadows' colour (Env0 +0xA60) and alpha scale (+0xA6C); without it no shadows.
     void set_shadow(const std::array<float, 3>& rgb, float alpha);
     // Shadows (projected along `light`, from Env0 +0xAD0) then bodies; `eye` for the depth nudge.
@@ -101,7 +102,7 @@ public:
 
 private:
     void ground_contact(Body& b, const Type& t, const sim::TrackQuery& ground);
-    void wall_contact(Body& b, const Type& t, const sim::Vec3& old_pos, const sim::WorldQuery& walls);
+    void wall_contact(Body& b, const Type& t, const sim::Vec3& old_pos, std::span<const track::WallLine> walls);
     render::GpuContext* ctx_ = nullptr;
     std::vector<Type> types_;
     std::vector<Record> records_;

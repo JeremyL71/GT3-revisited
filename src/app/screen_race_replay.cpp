@@ -5,6 +5,8 @@
 
 #include "app/screen_race_impl.h"
 
+#include "sim/exact/race_record.h"
+
 namespace gt3r::race_screen {
 
 Replay RaceScreen::finished_recording() const {
@@ -19,15 +21,22 @@ Replay RaceScreen::finished_recording() const {
                    : lap_times_.empty()    ? -1
                    : field_                ? sum
                                            : lap_times_.back();
-    r.spec = car_.spec;
-    if (field_) r.grid_by_power = field_grid_by_power_, r.cpu_respawn = field_cpu_respawn_; // the field it ran in
+    if (field_) r.grid_by_power = field_grid_by_power_; // the field it ran in
     if (two_player_ && field_ && field_->has_second()) r.battle = battle_;
     r.car_model = launch_model_;
     if (from_menu_) r.wheel = launch_.request.car_wheel;
-    // The power the menus show: the car's curve x the engine condition factor it started with.
-    const float f = sim::model::engine_condition_factor(r.condition.wear_m, r.condition.oil_m);
-    if (car_.spec) r.power_ps = game::spec_power_ps(*car_.spec, f);
-    else if (std::optional<sim::CarSpec> sp = sim::build_car_spec(db_, car_.label)) r.power_ps = game::spec_power_ps(*sp);
+    // The race's record (the setup, every frame's pads and the game's changes; format v11), which its playback runs again.
+    if (exact_field()) r.exact = exact_recording(*exact_field());
+    if (r.exact && r.exact->frames != r.ticks())
+        LOG_WARN("Replay: the race has %u frames, the run %u ticks", r.exact->frames, r.ticks());
+    // The power the menus show: the car's curve (a garage car's with its parts and settings) x the engine condition factor
+    // it started with.
+    const float f = sim::engine_condition_factor(r.condition.wear_m, r.condition.oil_m);
+    const ExactCarSource src = launch_source_.value_or(ExactCarSource{car_.label});
+    std::optional<sim::CarSpec> sp =
+        src.parts ? sim::build_car_spec(db_, src.label, *src.parts, src.settings.value_or(sim::stock_settings(db_, src.label, *src.parts)))
+                  : sim::build_car_spec(db_, src.label);
+    if (sp) r.power_ps = game::spec_power_ps(*sp, f);
     return r;
 }
 
@@ -56,20 +65,50 @@ void RaceScreen::watch_replay() {
     start_playback(finished_recording());
 }
 
+std::shared_ptr<const sim::exact::RaceRecord> RaceScreen::exact_playback() const {
+    if (replaying_) return replay_.exact;
+    if (demo_) return demo_record_;
+    return nullptr;
+}
+
+std::shared_ptr<const sim::exact::RaceRecord> RaceScreen::exact_ghost_source() const {
+    if (replaying_ || demo_ || !preset_.ghost || !whole_run_ghost()) return nullptr;
+    return ghost_record_;
+}
+
+bool RaceScreen::can_play(const Replay& r, std::string* why) {
+    if (!r.exact || !app_ || !load_program_data(*app_)) {
+        if (why) *why = "This replay cannot be played on this disc.";
+        return false;
+    }
+    if (r.exact->program != exact_data_->fingerprint()) {
+        if (why) *why = "This replay was recorded with another version of the game and cannot be played.";
+        return false;
+    }
+    return true;
+}
+
 void RaceScreen::start_playback(const Replay& r) {
+    if (std::string why; !can_play(r, &why)) {
+        LOG_WARN("Replay: %s", why.c_str());
+        toast(why);
+        return;
+    }
     take_live_condition(); // the live run's engine condition, before the replay's replaces it
     replay_ = r;
     player_ = ReplayPlayer(&replay_);
     replaying_ = true;
-    if (race_mode_ && app_) { // replays of races re-run the whole field from the grid
+    if (race_mode_) { // a race's replay: its field (the opponents' paints drawn again from the race's state)
         race_event_ = replay_.event;
         race_opponents_ = replay_.opponents;
         paint_seed_override_ = replay_.paint_seed;
-        build_vehicle(*app_);
     }
-    // As the live start: moving starts, else placed at rest without the spawn hold (physics §9).
-    if (replay_.start_speed > 0) vehicle_->reset_moving(replay_.start, replay_.start_speed);
-    else vehicle_->place(replay_.start);
+    // The recorded race, from its record.
+    if (!app_ || !build_vehicle(*app_)) { // (the recorded race could not be built: nothing is played)
+        replaying_ = false;
+        restart();
+        return;
+    }
     seed_vehicle_condition(replay_.condition, false);
     reset_run_state();
     replay_finish_.reset();

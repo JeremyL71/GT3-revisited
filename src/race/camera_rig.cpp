@@ -125,7 +125,7 @@ void CameraRig::update(const sim::VehicleState& s, const sim::VehicleSetup& setu
         lag_pitch_ = wrap(lag_pitch_ + lag_pitch_w_ * h);
     }
     if (lag_time_ > 1.0 / 60.0) lag_time_ = 0;
-    // GT3's in-car vibration (OnBoardCamera, view point 0 only), once per 60 Hz camera update.
+    // GT3's in-car vibration (on-board camera, view point 0 only), once per 60 Hz camera update.
     // Amplitude A = sum over the wheels of |slip ratio| 0.3 + |slip angle| / (pi/2), at most 3;
     // speed factor S = speed clamped to 10..120 km/h over 120 km/h. On about half the updates
     // each axis is kicked by (r - 0.5) A 250 through the shaker lag (v' = (du - 12 v)/60, x' = v/60);

@@ -27,6 +27,19 @@ bool on_event(const MenuEvent& e, std::vector<std::string>& log) {
             s->trade = false;
         }
         if (e.page == "00cmn/car_reguration") s->regulated_cursor = 0;
+        // The vertical lists are placed at once when their page opens (ListRows).
+        if (e.page == "hm/hm_gr" || e.page == "hm/hm_gr_trade" || e.page == "00cmn/car_reguration" ||
+            e.page == "records_free_tt")
+            ms.list_off = {}, ms.list_pin = {};
+        // The garage's wheel list starts on the entry the car wears (the stock-wheel button for a
+        // car on its own wheels), else on its first button (gt_mode §7; WheelButtonList).
+        if (starts(e.page, "at/ws/ws_")) ms.shop_row = {}; // a brand page's row is placed at once
+        if (e.page == "hm/hm_wheel") {
+            const GarageCar* car = wheel_page_car(*s);
+            s->wheel_cursor = std::max(0, car ? worn_wheel_entry(gt.state(), *car) : 0);
+            s->wheel_row_set = false; // (the row placed at once)
+            ms.wheel_pin = {};
+        }
         if (starts(e.page, "set/adjast_")) {
             // Slider markers: the value each slider had when the page opened.
             s->setting_entry.clear();
@@ -52,8 +65,9 @@ bool on_event(const MenuEvent& e, std::vector<std::string>& log) {
         // Name entry (gt_mode §17.1): the chosen key's character goes in at the text box's cursor
         // (at most 15 characters; the box started with the last name entered).
         if (RankEntry* r = named_entry()) {
-            auto ch = gt.data().name_chars.find(e.item);
-            if (s->name_box.insert(ch != gt.data().name_chars.end() ? ch->second : std::string())) {
+            const std::map<std::string, std::string>& chars = gt.data().name_entry_chars(ms.lang);
+            auto ch = chars.find(e.item);
+            if (s->name_box.insert(ch != chars.end() ? ch->second : std::string())) {
                 ms.sounds.push_back("cursor");
                 r->name = gt.state().player_name = s->name_box.text;
             }
@@ -142,13 +156,13 @@ bool on_event(const MenuEvent& e, std::vector<std::string>& log) {
         } else if (a == "buy_wheel") {
             gt.buy_wheel(s->focus_wheel);
         } else if (a == "fit_wheel") {
-            gt.fit_wheel(gt.state().ride, s->focus_wheel);
+            gt.fit_shop_wheel(s->focus_wheel);
         } else if (a == "set_focus_wheel") {
-            // The chosen inventory wheel (cursor) for the focused garage car.
+            // The chosen list entry (wheel_cursor) for the focused garage car.
         } else if (a == "change_wheel") {
-            const auto& w = gt.state().wheels;
-            std::string wheel = s->wheel_cursor >= 0 && s->wheel_cursor < int(w.size()) ? w[size_t(s->wheel_cursor)] : "";
-            gt.fit_wheel(s->garage_focus, wheel);
+            // GT3's change_wheel: the car takes the chosen entry's wheel, the
+            // placeholder putting it back on its own wheels.
+            gt.fit_wheel(s->garage_focus, wheel_list_entry(gt.state(), s->wheel_cursor));
         } else if (a == "wash_car") {
             // The car is then washed spinning, its effect coming with the spin (widget_art.cpp).
             const GarageCar* ride = gt.state().ride_car();
@@ -174,7 +188,10 @@ bool on_event(const MenuEvent& e, std::vector<std::string>& log) {
                                                "distance", "power", "drive", "aspiration"};
             for (int k = 0; k < 9; ++k)
                 if (a.substr(5) == keys[k]) s->sort_key = k;
+            // The list is made again in the new order, on its first car and placed at once
+            // (as GT3's garage list rebuilds itself).
             s->garage_cursor = 0;
+            ms.list_off = {}, ms.list_pin = {};
         }
         return false;
     }

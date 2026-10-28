@@ -160,7 +160,7 @@ TEST(track_synthetic_geometry) {
     // points away from the ring centre, so the inside is negative.
     TrackPosition in = t.locate(ring(1.0f, kR - 5));
     CHECK(in.lateral < -4 && in.lateral > -6);
-    Pose rp = t.respawn_pose(200);
+    Pose rp = t.centre_pose(200);
     CHECK(t.probe(rp.position.x, rp.position.z, rp.position.y + 1).hit);
     CHECK(rp.forward.x * t.direction_at(200).x + rp.forward.z * t.direction_at(200).z > 0.99f);
 }
@@ -230,7 +230,7 @@ TEST(track_synthetic_laps) {
     CHECK(w.wrong_way());
     for (float s = -20; s < 30; s += 1) w.update(t.point_at(s, 0), time += 0.02);
     CHECK(!w.wrong_way() && w.laps_completed() == 0);
-    // Teleport (respawn) keeps the lap count and does not add progress.
+    // Teleport keeps the lap count and does not add progress.
     double before = w.race_distance();
     w.teleport(t.point_at(32, 0));
     CHECK(near(float(w.race_distance() - before), 3, 0.6f)); // last update was at s = 29
@@ -288,7 +288,7 @@ namespace {
 
 struct CourseResult {
     bool grid_ok = false, lap_ok = false, probe_ok = false;
-    int respawns = 0, respawns_on_road = 0; // every 25 m: on the racing surface
+    int centre_poses = 0, centre_on_road = 0; // every 25 m: on the racing surface
 };
 
 CourseResult check_course(const Track& t, bool licence, bool verbose) {
@@ -350,10 +350,10 @@ CourseResult check_course(const Track& t, bool licence, bool verbose) {
     }
     r.probe_ok = bad == 0;
     for (float sd = 0; sd < t.length(); sd += 25.0f) {
-        Pose rp = t.respawn_pose(sd);
+        Pose rp = t.centre_pose(sd);
         sim::SurfaceHit h = t.probe(rp.position.x, rp.position.z, rp.position.y + 0.5f);
-        ++r.respawns;
-        r.respawns_on_road += h.hit && surface_type(h.surface) != Surface::Grass &&
+        ++r.centre_poses;
+        r.centre_on_road += h.hit && surface_type(h.surface) != Surface::Grass &&
                               surface_type(h.surface) != Surface::Gravel && surface_type(h.surface) != Surface::Sand;
     }
     if (!r.probe_ok && verbose) std::printf("  %s: %d probe mismatches\n", t.label().c_str(), bad);
@@ -407,7 +407,7 @@ TEST(track_all_us) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
     size_t files = 0, grid = 0, lap = 0, lap_expected = 0, probe = 0, loaded = 0;
-    int respawns = 0, respawns_ok = 0;
+    int centre_poses = 0, centre_ok = 0;
     size_t lines = 0, closed = 0, points = 0, corners = 0, sensors = 0, other_flags = 0;
     for (const auto& e : disc->volume().entries()) {
         if (e.path.rfind("courses/US/", 0) != 0) continue;
@@ -429,7 +429,7 @@ TEST(track_all_us) {
         probe += r.probe_ok;
         lap_expected += lap_line;
         lap += lap_line && r.lap_ok;
-        respawns += r.respawns, respawns_ok += r.respawns_on_road;
+        centre_poses += r.centre_poses, centre_ok += r.centre_on_road;
         for (const WallLine& l : t->wall_lines()) {
             ++lines;
             closed += l.closed;
@@ -446,8 +446,8 @@ TEST(track_all_us) {
     // Every polyline is a closed loop; corner flags are common. The US disc
     // has no sensor-flagged wall points at all.
     CHECK(lines > 0 && closed == lines && corners > 1000 && sensors == 0 && other_flags == 0);
-    std::printf("  respawn poses on the racing surface: %d/%d\n", respawns_ok, respawns);
-    CHECK(respawns_ok >= respawns * 99 / 100);
+    std::printf("  centre-line poses on the racing surface: %d/%d\n", centre_ok, centre_poses);
+    CHECK(centre_ok >= centre_poses * 99 / 100);
     std::printf("  %zu US courses: loaded %zu, grid ok %zu, one lap along the racing line %zu/%zu, probe ok %zu\n",
                 files, loaded, grid, lap, lap_expected, probe);
     CHECK(files == 80 && loaded == files && grid == files && probe == files);

@@ -123,8 +123,8 @@ system's own re-centring (hold the Meta button) resets it to LOCAL's new origin.
 **Input.** OpenXR actions on `/interaction_profiles/oculus/touch_controller`
 feed an SDL virtual gamepad, "Meta Quest Touch": sticks, analog triggers, A B X Y,
 grips as shoulders, stick clicks, Menu as Start; its rumble goes to the
-controllers' haptics. The `quest` preset (the default in VR builds) is `racing`
-with B as Triangle (back) and Y as Circle. The race's modern layout then gives
+controllers' haptics. VR builds' gamepad layout (`quest`) is the gamepad
+layout with B as Triangle (back) and Y as Circle. The race's modern layout then gives
 right trigger throttle, left trigger brake, A/X shift up/down, Y view, B
 handbrake, left grip reverse, right stick click look back. With
 `[vr] steering = wheel` both grips squeezed grab a steering wheel: the roll of
@@ -135,6 +135,8 @@ right trigger reads 0 while it points there). Like a mouse it hovers: in the gam
 item under it is focused (fixed pages, horizontal scrolling rows, which then hold still, the
 GT Mode garage rows and wheel shop tiles), so one click chooses; on vertical scrolling
 selectors and the arcade pickers' strip a click moves the cursor and a second chooses.
+The online lobby's pages take it the same way (docs/dev/ONLINE.md "Pickers": rows and
+tiles follow it, "<" ">" and the footer's actions are buttons).
 
 Two Android details: SDL drops joystick input while its window lacks keyboard
 focus, which the invisible window in an immersive app never has

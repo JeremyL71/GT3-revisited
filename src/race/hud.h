@@ -137,8 +137,9 @@ public:
     Hud(const Hud&) = delete;
     Hud& operator=(const Hud&) = delete;
 
-    // Loads fonts and the display images; missing assets fall back to placeholders.
-    void load(const Vfs& vfs, SDL_Renderer* r);
+    // Loads fonts and the display images (race/<language>/display.imgs, else the US, UK or
+    // JP set); missing assets fall back to placeholders.
+    void load(const Vfs& vfs, SDL_Renderer* r, const std::string& language = "US");
     // Course map (course file slot 33, "GTCM"); empty span clears it.
     void set_course_map(SDL_Renderer* r, ByteSpan gtcm);
     // 2P battle half (digital speed, bar tachometer "meter_mini", mini-map at 70 %, no round

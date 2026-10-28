@@ -59,34 +59,64 @@ float Engine::curve_peak_ps() const {
     return best;
 }
 
-bool CarDatabase::load(const Vfs& vfs, const std::string& suffix) {
-    return load([&](const std::string& p) { return vfs.read(p); }, suffix); // the reader serves mods/.cars
+// A switch over the byte with the
+// language tests 0, 1, 2 and not 0 or 1; values
+// over 8 offer the car. The NTSC-J program has no filter.
+bool car_region_offered(u8 region_byte, Language lang) {
+    const bool br = lang == Language::BR, us = lang == Language::US, jp = lang == Language::JP;
+    const bool eu = is_european(lang);
+    switch (region_byte) {
+    case 1: return br;
+    case 2: return !br;
+    case 3: return us;
+    case 4: return !us;
+    case 5: return eu;
+    case 6: return !eu;
+    case 7: return jp;
+    case 8: return !jp;
+    default: return true;
+    }
 }
 
-bool CarDatabase::load(const Volume& vol, const std::string& suffix) {
+// The name and second string: language 0 the
+// record's +0xF2 / +0xF4, language 2 +0x100 / +0x102, else +0xE4 / +0xE6.
+CarNameFields car_name_fields(Language lang) {
+    if (lang == Language::JP) return {0xF2, 0xF4};
+    if (lang == Language::BR) return {0x100, 0x102};
+    return {0xE4, 0xE6};
+}
+
+bool CarDatabase::load(const Vfs& vfs, std::optional<std::string> suffix) {
+    // The reader serves mods/.cars and the region file.
+    return load([&](const std::string& p) { return vfs.read(p); }, std::move(suffix));
+}
+
+bool CarDatabase::load(const Volume& vol, std::optional<std::string> suffix) {
     return load(
         [&](const std::string& p) -> std::optional<Bytes> {
             const Volume::Entry* e = vol.find(p);
             if (!e) return std::nullopt;
             return vol.read(*e);
         },
-        suffix);
+        suffix ? std::move(suffix) : std::optional<std::string>(RegionData{vol.region()}.db_suffix()));
 }
 
-bool CarDatabase::load(const Reader& read, const std::string& requested) {
-    // A data set without the requested regional files (synthetic test worlds) uses the US one.
-    const std::string suffix =
-        requested != "_us" && !read("database/paramdb" + requested + ".db") ? std::string("_us") : requested;
+bool CarDatabase::load(const Reader& read, std::optional<std::string> suffix_opt) {
     auto need = [&](const std::string& path) {
         auto b = read(path);
         if (!b) throw FormatError(path + " not found");
         return std::move(*b);
     };
-    region_ = suffix == "_eu" ? 2 : suffix.empty() ? 0 : 1;
+    const std::string suffix = suffix_opt ? *suffix_opt : region_data(read).db_suffix();
+    std::optional<Language> lang;
+    if (std::optional<Bytes> b = read(Vfs::kLanguageFile)) lang = text::language_from_code(std::string(b->begin(), b->end()));
+    language_ = lang.value_or(suffix == "_eu" ? Language::BR : suffix.empty() ? Language::JP : Language::US);
     extra_records_.clear();
     mod_cars_.clear();
     mod_makers_.clear();
     mod_car_errors_.clear();
+    unsupported_ = false;
+    paramdb_.clear();
     try {
         paramdb_ = need("database/paramdb" + suffix + ".db");
         Bytes str = need("database/paramstr" + suffix + ".db");
@@ -112,6 +142,7 @@ bool CarDatabase::load(const Reader& read, const std::string& requested) {
                               "RACE_MODE_MAX_SPEED_CHALLENGE", "RACE_MODE_DEMO", "RACE_MODE_TIME_TRIAL",
                               "RACE_MODE_FREE_PRACTICE", "RACE_MODE_REPLAY", "RACE_MODE_LOGGER"})
             names_.add(m);
+        if (suffix == "_eu") us_medal_times(read);
         decode();
         // Mod cars (game/data/mod_cars.h), listed by the VFS: "<mod id>\t<host path>" lines.
         if (auto list = read(Vfs::kModCarsList)) {
@@ -136,11 +167,38 @@ bool CarDatabase::load(const Reader& read, const std::string& requested) {
         }
     } catch (const std::exception& e) {
         error_ = e.what();
+        unsupported_ = !paramdb_.empty() && dynamic_cast<const FormatError*>(&e) != nullptr; // there, but not GT3's layout
         LOG_ERROR("CarDatabase: %s", error_.c_str());
         return false;
     }
     error_.clear();
     return true;
+}
+
+// Races run 60 steps a second on every disc, so on a PAL disc the licence tests' and the time attack's medal times (event
+// +0x1C4 / +0x1C8 / +0x1CC: gold, silver, bronze) are the US release's, set for its 60 Hz runs: the PAL release retuned 39
+// of them for its 50 Hz runs. The PAL disc carries the US database too (paramdb_us.db, the same file as the US disc's);
+// only these three words are taken from it, every other field stays the PAL database's (docs/COMPATIBILITY.md).
+void CarDatabase::us_medal_times(const Reader& read) {
+    constexpr size_t kMedals = 0x1C4, kMedalsEnd = 0x1D0;
+    const std::optional<Bytes> us = read("database/paramdb_us.db");
+    if (!us) return; // no US copy: the disc's own times
+    const std::vector<ByteSpan> tables = db::parse_archive(*us);
+    if (tables.size() != size_t(TableId::Count)) return;
+    const db::Table events = db::Table::parse(tables[size_t(TableId::Event)]);
+    int n = 0;
+    for (size_t i = 0; i < events.size(); ++i) {
+        const ByteSpan* mine = record(TableId::Event, events.id_of(i));
+        const ByteSpan theirs = events.records[i];
+        if (!mine || mine->size() < kMedalsEnd || theirs.size() < kMedalsEnd ||
+            std::equal(theirs.begin() + kMedals, theirs.begin() + kMedalsEnd, mine->begin() + kMedals))
+            continue;
+        Bytes r(mine->begin(), mine->end());
+        std::copy(theirs.begin() + kMedals, theirs.begin() + kMedalsEnd, r.begin() + kMedals);
+        put_record(TableId::Event, std::move(r));
+        ++n;
+    }
+    LOG_INFO("CarDatabase: the US medal times for %d events (database/paramdb_us.db)", n);
 }
 
 const ByteSpan* CarDatabase::record(TableId t, u64 id) const {
@@ -211,18 +269,21 @@ void CarDatabase::decode() {
     event_index_.clear();
     model_index_.clear();
 
+    const CarNameFields names = car_name_fields(language_);
     for (ByteSpan r : table(TableId::Car).records) {
         if (r.size() < 264) throw FormatError("car record too small");
         Car c;
         c.label = label(rd64(r, 0));
         for (size_t i = 0; i < c.parts.size(); ++i) c.parts[i] = rd64(r, 8 + i * 8);
         c.maker_id = rd16(r, 0xE0);
-        c.name = pu(r, 0xE4);
-        c.name_alt = pu(r, 0xE6);
+        c.name = pu(r, names.name);
+        c.name_alt = pu(r, names.second);
+        c.latin_name = language_ == Language::JP ? pu(r, 0xE4) : c.name;
+        c.latin_name_alt = language_ == Language::JP ? pu(r, 0xE6) : c.name_alt;
         if (c.label.empty()) c.label = ps(r, 0xE8);
         c.year = rd16(r, 0xEA);
         c.price = rd32(r, 0xEC);
-        c.flags = rd16(r, 0xF0);
+        c.flags = r[0xF0];
         c.maker = pu(r, 0x104);
         c.bytes = r;
         car_index_[c.label] = cars_.size();
@@ -284,7 +345,6 @@ void CarDatabase::decode() {
         e.race_mode = label(rd64(r, 0x1E8));
         e.laps = r[0x199];
         e.cars_in_race = r[0x1B5];
-        for (size_t k = 0; k < e.prize.size(); ++k) e.prize[k] = rd16(r, 0x1D0 + k * 2);
         e.bytes = r;
         event_index_[e.label] = events_.size();
         events_.push_back(std::move(e));

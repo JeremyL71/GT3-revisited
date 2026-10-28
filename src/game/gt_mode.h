@@ -29,6 +29,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -49,8 +50,8 @@ struct PrizeSet {
 class GtData {
 public:
     using Reader = std::function<std::optional<Bytes>(const std::string&)>;
-    // Loads database/paramdb_us.db (+ strings), gameconf/product.gcf,
-    // database/carcolor.db and menu/gt_mode.mbl. Returns false with error().
+    // Loads the disc region's data set (disc/region.h: database/paramdb<suffix>.db + strings,
+    // the game config), database/carcolor.db and menu/gt_mode.mbl. Returns false with error().
     bool load(const Reader& read);
     const std::string& error() const { return error_; }
 
@@ -68,11 +69,24 @@ public:
     std::vector<Demo> demos;          // gcf section 12, attract mode
     std::vector<std::string> race_songs; // bgm/ads.inf race_* files ("race_a01.ads"), index order
     int title_idle_seconds = 20;      // gcf section 0, first word: title idle time before attract mode
-    std::map<std::string, std::string> name_chars; // name entry page: item -> character (menu/US/name_entry1.pmb)
-    // Units of the menus' figures: the NTSC-U release shows miles, HP and ft-lb, the
-    // others metric (picked by the loaded database's region at load).
-    bool imperial = true;
-    int region = 1;       // the game's region index (0 JP, 1 US, 2 EU, other): the loaded database's
+    // Name entry page: item -> character, per language (menu/<lang>/name_entry1.pmb).
+    std::map<std::string, std::map<std::string, std::string>> name_chars;
+    // The characters of `lang`'s name entry page, else the region's own language's.
+    const std::map<std::string, std::string>& name_entry_chars(const std::string& lang) const;
+    // The game's language (disc/region.h) and what it decides: the menus' units (miles, HP
+    // and ft.lb in US English; imperial(): units.mph or the player's speed_unit), money x100
+    // in Japanese (money(): every price, prize and game-config sum GtData and GtMode hand out
+    // is scaled, as the program's readers do when its language test finds 0), and
+    // the arcade car filter's language index.
+    Region region = Region::America; // the disc's release (its PS2 save names and versions)
+    Language language = Language::US;
+    Units units = language_units(Language::US);
+    // Speeds in mph and distances in miles: the player's speed unit, else the language's.
+    bool imperial() const { return speed_unit().value_or(units.mph); }
+    int money_scale = 1;
+    // A sum as the disc stores it (a car or part price, a prize in credits, a game-config
+    // value) as the game shows and pays it: x money_scale (32-bit, as the program multiplies).
+    u32 money(u32 stored) const { return stored * u32(money_scale); }
     // The program's built-in record names (time-trial seeds, three per challenge: 30), read
     // from the disc's CORE.GT3 at load (empty when the program or its table is not found).
     std::vector<std::string> builtin_names;
@@ -98,22 +112,40 @@ public:
     };
     std::map<std::string, std::vector<ArcadeCar>> arcade_classes;
 
-    u32 starting_credits() const;     // gcf "initial" (18,000 on NTSC-U)
-    u32 car_wash_price() const;       // 50
-    u32 oil_change_price() const;     // 250
-    u32 wheel_price() const;          // 500
+    // The game config's sums (gcf tag 10), scaled (money()): a new game's credits ("initial")
+    // and the wheel shop / car wash / oil change prices, read by name as the program does.
+    // load() refuses a game config without one of them (the program has no
+    // fallback: its lookup reads the missing entry's value through a null pointer).
+    u32 starting_credits() const { return initial_credits_; }
+    u32 car_wash_price() const { return car_wash_price_; }
+    u32 oil_change_price() const { return oil_change_price_; }
+    u32 wheel_price() const { return wheel_price_; }
+    // The prize pages' word before "Cr." in what is left to count ("%s Cr. %s",
+    // prize_remain_text), game text: the realtime text PRIZE_RT_MSG_BONUS_PREFIX of
+    // text/realtime.dat in the language ("Prize", "Prix", "Preis", ...), else (an empty value,
+    // or the NTSC-J disc's file, which has no such key) the program's built-in default, read
+    // from CORE.GT3 (the kanji for prize money in every release).
+    std::string prize_prefix;
     const PrizeSet* prize_set(const std::string& name) const;
+    // A prize candidate as the car_get roll sees it in the game's language (docs/dev/GT_MODE.md "Language",
+    // prize_car_label): a swapped label has no fixed colour.
+    PrizeCar prize_candidate(const PrizeCar& pc) const;
     // carcolor.db (via race::CarColors): the paint list of a car's model.
     int color_count(const std::string& car) const;
     int color_index(const std::string& car, int color_id) const; // 0 when unknown
     u32 color_id(const std::string& car, int index) const;       // 0xFFFFFFFF when out of range
     u32 color_rgb(u32 id) const;                                // bytes R, G, B
-    std::string color_name(u32 id) const;                       // carcolor.sdb, "" when unknown
+    // carcolor.sdb, "" when unknown: the name the language shows (color_name_field; game
+    // text), and the first name (Latin letters in every data set) for the app's own screens.
+    std::string color_name(u32 id) const;
+    std::string color_name_latin(u32 id) const;
     std::string model(const std::string& car) const;            // body model id ("ni0137")
 
 private:
+    u32 initial_credits_ = 0, car_wash_price_ = 0, oil_change_price_ = 0, wheel_price_ = 0;
+    std::string name_language_ = "US";
     race::CarColors colors_;
-    std::map<u32, std::string> color_names_;
+    std::map<u32, std::pair<std::string, std::string>> color_names_; // id -> {the language's, the first}
     std::string error_;
 };
 
@@ -195,14 +227,18 @@ public:
     GameState& state() { return state_; }
     const GameState& state() const { return state_; }
 
-    // New game: 18,000 Cr (gcf "initial"), day 1, empty garage.
+    // New game: the game config's starting credits (GtData::starting_credits), day 1, empty
+    // garage.
     void new_game();
 
     // --- Cars ----------------------------------------------------------
-    s64 car_price(const std::string& car) const; // catalogue price (car +0xEC)
+    s64 car_price(const std::string& car) const; // catalogue price (car +0xEC, scaled: GtData::money)
     u8 car_flags(const std::string& car) const;  // car +0xF0: 1 not for buy, 2 not for sell, 4 no wheel change
     u8 car_category(const std::string& car) const; // car +0xF1: 0 production, 1 race, 2 rally
-    s64 sell_price(const GarageCar& c) const;    // price / 4
+    s64 sell_price(const GarageCar& c) const;    // car_price / 4
+    // A part's price as the tune shop charges it (the part record's price, scaled);
+    // part_offer() applies it.
+    u32 part_price(u32 stored) const { return data_->money(stored); }
     Check can_buy_car(const std::string& car) const;
     // Adds the car (newest first) and pays; returns its garage index or -1.
     // The first car becomes the ride car.
@@ -244,12 +280,16 @@ public:
     // and "HP" (NTSC-U) or "PS": "325HP", "325 HP".
     std::string power_text(float ps, const char* sep = "") const;
     // A catalogue power (car database, PS) in the data set's unit, truncated.
-    int catalogue_power(float ps) const { return display_power(ps, data_->imperial); }
+    int catalogue_power(float ps) const { return display_power(ps, data_->units); }
 
     // --- Wheels, wash, oil -----------------------------------------------
     Check can_buy_wheel(const std::string& wheel) const;
     bool buy_wheel(const std::string& wheel);
     bool fit_wheel(int car_index, const std::string& wheel); // "" = stock
+    // The wheel shop's "fit it?" after the purchase question (action fit_wheel): the ride car
+    // takes the focused wheel by name whether or not the inventory holds it, and nothing is
+    // charged. Only a purchase refused for want of a free slot leaves it out of the inventory.
+    bool fit_shop_wheel(const std::string& wheel);
     Check can_wash() const;
     bool wash();
     Check can_change_oil() const;
@@ -297,6 +337,10 @@ public:
     Check can_enter(const std::string& code) const; // ride car + entry rules
     bool series_unlocked(const std::string& code) const; // F1 needs the S license
     bool tuned(const GarageCar& c) const;
+    // The same test for any car's parts and settings: a part other than the stock car's (the last
+    // slot not counted), or settings other than its stock ones.
+    static bool tuned(const data::CarDatabase& db, const std::string& car, const std::array<u64, 27>& parts,
+                      const sim::CarSettings& settings);
     // Entering a race / test / machine test / free run costs one day.
     void enter() { ++state_.day; }
     // Single race result: place 0-based (-1 = retired). Pays the place prize,
@@ -366,8 +410,15 @@ public:
     // --- Arcade progression (gt_mode §16) ---------------------------------------
     // Difficulty of an arcade race code (2nd character E/N/H/P -> 0..3), -1 otherwise.
     static int arcade_difficulty(const std::string& race_code);
+    // The courses of the SINGLE_RACE list that have results (all of them: 34 on every disc;
+    // at most the save's kArcadeResultSlots / 4).
+    int arcade_course_count() const;
     // Index of a course in the SINGLE_RACE list (= result slot), -1 if absent.
     int arcade_course_index(const std::string& course) const;
+    // The best Single Race place of course `course` at difficulty `d` (0..3), as the original
+    // keeps them: ArcadeProgress::best[d x arcade_course_count() + course]; kArcadeNoPosition
+    // out of range.
+    int arcade_best(int d, int course) const;
     // gcf unlock level of a course (-1 = not an arcade course).
     int arcade_course_level(const std::string& course) const;
     bool arcade_course_open(const std::string& course) const;
@@ -394,7 +445,7 @@ public:
     bool arcade_group_won(int g, int d) const;
     // Every course won at exactly difficulty `d`.
     bool arcade_all_won_at(int d) const;
-    int arcade_completion() const; // Clear Status count, 0..102
+    int arcade_completion() const; // Clear Status count: 3 per course of the SINGLE_RACE list
     // Endings (ar/goodies "Goal"): any ending / the long one available.
     bool arcade_ending_open() const;
     bool arcade_long_ending_open() const;
@@ -475,15 +526,22 @@ int pick_weighted(const std::vector<int>& weights, u32& rng);
 int pick_trophy_index(float completion, u32& rng);
 
 // Formatting helpers for the menus.
-std::string format_credits(s64 v);      // "18,000"
+std::string format_credits(s64 v);      // "18,000": digits grouped by ',' in every language
+// The game's money texts (its own format strings, the same in every language and release):
+// "Cr. %s" ("Cr. 18,000": the dealer's car price with the string, the
+// prize pages' balance) and the prize pages' amount left to
+// count, "%s Cr. %s" with the language's prefix (GtData::prize_prefix):
+// "Prize Cr. 991".
+std::string credits_text(s64 v);
+std::string prize_remain_text(std::string_view prefix, s64 v);
 std::string format_time_ms(u32 ms);     // "1'02.400" (as the original's menus)
 
 // Record stamps (RankEntry::stamp): the clock now, in seconds since 2000-01-01 00:00 local
 // time (at least 1, so it never reads as "none").
 u32 record_stamp_now();
 // A record's date on the records page (gt_mode §17.2): the stamp's calendar date as
-// "DD/MM/YY" (the NTSC-U order), "--/--/--" for no stamp. As the original converts it,
+// "DD/MM/YY" ("YY/MM/DD" in Japanese), "--/--/--" for no stamp. As the original converts it,
 // only the year 2000 gets February 29 (later leap years run on from February 28).
-std::string record_date_text(u32 stamp);
+std::string record_date_text(u32 stamp, Language lang = Language::US);
 
 } // namespace gt3r::game

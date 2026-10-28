@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 
 namespace gt3r::video {
 
@@ -14,6 +15,12 @@ namespace {
 constexpr size_t kMaxQueuedFrames = 6;
 constexpr double kAudioLead = 0.25; // seconds of audio kept queued in the SDL stream
 constexpr size_t kAudioChunk = 2048;
+constexpr double kAudioJump = 0.1; // seconds off the audio position: jump there (after a stall)
+// A picture (a frame, or a field of a field-split movie) is shown when the clock is at most this
+// much before its time, so a refresh that comes a little early does not leave it for the next.
+constexpr double kEarly = 0.002;
+
+u64 now_ns(const std::function<u64()>& now) { return now ? now() : SDL_GetTicksNS(); }
 } // namespace
 
 MoviePlayer::~MoviePlayer() {
@@ -38,7 +45,8 @@ void MoviePlayer::begin(std::unique_ptr<Movie> movie, float volume, double start
     volume_ = volume;
     start_seconds_ = std::max(0.0, start_seconds);
     clock_ = start_seconds_;
-    last_ticks_ = SDL_GetTicksNS();
+    shown_time_ = start_seconds_;
+    last_ticks_ = now_ns(now_);
     stats_ = {};
     quit_ = false;
     paused_ = false;
@@ -51,7 +59,9 @@ void MoviePlayer::begin(std::unique_ptr<Movie> movie, float volume, double start
 
     if (info_.has_audio) {
         SDL_AudioSpec spec{SDL_AUDIO_S16, int(info_.audio_channels), int(info_.audio_rate)};
-        audio_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+        audio_ = SDL_OpenAudioDeviceStream(device_, &spec, nullptr, nullptr);
+        if (!audio_ && device_ != SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) // unplugged since
+            audio_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
         if (audio_) {
             SDL_SetAudioStreamGain(audio_, volume_);
             SDL_ResumeAudioStreamDevice(audio_);
@@ -197,6 +207,23 @@ MoviePlayer::Stats MoviePlayer::stats() const {
     return stats_;
 }
 
+std::string MoviePlayer::summary() const {
+    const Stats st = stats();
+    char b[256];
+    std::string av;
+    if (st.audio) {
+        av = ", A/V within " + std::to_string(int(std::lround(st.av_error_ms_max))) + " ms";
+        if (st.resyncs)
+            av += " (" + std::to_string(st.resyncs) + (st.resyncs == 1 ? " jump" : " jumps") +
+                  " back in sync after a stall)";
+    }
+    std::snprintf(b, sizeof b, "%dx%d %.2f fps%s, %.2f s: %llu frames shown, %llu dropped, %s clock%s", info_.width,
+                  info_.height, info_.frame_rate, field_split_ ? " (2 fields/frame)" : "", clock_,
+                  (unsigned long long)st.shown, (unsigned long long)st.dropped, st.audio ? "audio" : "wall",
+                  av.c_str());
+    return b;
+}
+
 void MoviePlayer::picture_rects(const SDL_FRect& display, SDL_FRect& src, SDL_FRect& dst) const {
     float w = float(tex_w_), h = float(tex_h_);
     src = {0, 0, w, h};
@@ -209,11 +236,19 @@ void MoviePlayer::picture_rects(const SDL_FRect& display, SDL_FRect& src, SDL_FR
     // (second). Drawing frame rows [0, H-1) resp. [1, H) keeps both inside
     // their own half: half-height minus half a line of source, and one frame
     // row less of destination.
-    double period = info_.frame_rate > 0 ? 1.0 / info_.frame_rate : 1.0 / 30.0;
-    bool second = clock_ - shown_time_ >= period * 0.5;
+    const bool second = second_field();
     float half = h / 2, row = display.h / h;
     src = {0, (second ? half : 0) + 0.25f, w, half - 0.5f};
     dst = {display.x, display.y + (second ? row : 0), display.w, display.h - row};
+}
+
+bool MoviePlayer::second_field() const {
+    if (!field_split_) return false;
+    // The second field's time, by the same early rule as the frames': with 29.97 fps at 60 Hz a
+    // refresh that took a frame up to 2 ms early came 16.67 ms later just before its second
+    // field, so for seconds at a time only first fields were shown.
+    const double period = info_.frame_rate > 0 ? 1.0 / info_.frame_rate : 1.0 / 30.0;
+    return clock_ + kEarly - shown_time_ >= period * 0.5;
 }
 
 void MoviePlayer::draw(SDL_Renderer* renderer, const SDL_FRect& display) const {
@@ -223,12 +258,20 @@ void MoviePlayer::draw(SDL_Renderer* renderer, const SDL_FRect& display) const {
     SDL_RenderTexture(renderer, texture_, &src, &dst);
 }
 
+double audio_clock_correction(double err, double step) {
+    if (std::abs(err) > kAudioJump) return err;
+    return err * std::min(1.0, step / (std::abs(err) > 0.03 ? 0.25 : 2.0));
+}
+
+double movie_display_aspect(const MovieInfo& info) {
+    if (info.width <= 0 || info.height <= 0) return 4.0 / 3.0;
+    const bool pal = std::abs(info.frame_rate - 25.0) < 0.5;
+    const double frame_lines = pal ? 512.0 : 448.0; // the display frame that fills the 4:3 picture
+    return double(info.width) / double(info.height) * (frame_lines / 480.0);
+}
+
 SDL_FRect MoviePlayer::fit_4_3(float x, float y, float w, float h) const {
-    // PS2 movies fill a 4:3 TV picture; 640x448 has a pixel aspect of 448/480,
-    // PAL's 640x512 (25 fps) one of 512/480.
-    const bool pal = info_.frame_rate > 0 && info_.frame_rate < 26.0;
-    float aspect = info_.height > 0 ? float(info_.width) / float(info_.height) * ((pal ? 512.0f : 448.0f) / 480.0f)
-                                    : 4.0f / 3.0f;
+    const float aspect = float(movie_display_aspect(info_));
     float dw = w, dh = w / aspect;
     if (dh > h) {
         dh = h;
@@ -238,7 +281,7 @@ SDL_FRect MoviePlayer::fit_4_3(float x, float y, float w, float h) const {
 }
 
 bool MoviePlayer::update(SDL_Renderer* renderer) {
-    u64 now = SDL_GetTicksNS();
+    u64 now = now_ns(now_);
     double dt = double(now - last_ticks_) / 1e9;
     last_ticks_ = now;
     if (!movie_) return false;
@@ -255,13 +298,18 @@ bool MoviePlayer::update(SDL_Renderer* renderer) {
     // Clock: audio position while audio is playing, wall clock otherwise.
     bool audio_live = audio_ && !(audio_done_ && SDL_GetAudioStreamQueued(audio_) == 0);
     if (!paused_) {
-        // The audio position only moves when the device pulls a buffer
-        // (10-20 ms steps), so advance by wall time and steer gently toward it.
-        clock_ += std::min(dt, 0.1);
+        // Wall time, steered toward the audio position (audio_clock_correction).
+        const double step = std::min(dt, 0.1);
+        clock_ += step;
         if (audio_live) {
             double err = audio_clock() - clock_;
-            if (std::abs(err) > 0.1) clock_ += err;
-            else clock_ += err * 0.05;
+            const bool jump = std::abs(err) > kAudioJump;
+            clock_ += audio_clock_correction(err, step);
+            if (stats_.shown > 0) {
+                std::lock_guard lock(mutex_);
+                if (jump) ++stats_.resyncs;
+                else stats_.av_error_ms_max = std::max(stats_.av_error_ms_max, std::abs(err) * 1000.0);
+            }
         }
     }
 
@@ -273,7 +321,7 @@ bool MoviePlayer::update(SDL_Renderer* renderer) {
         while (!ready_.empty()) {
             const Frame& f = ready_.front();
             double t = info_.start_pts >= 0 ? double(f.pts - info_.start_pts) / 90000.0 : 0.0;
-            bool due = t <= clock_ + 0.002 || (stats_.shown == 0 && !have);
+            bool due = t <= clock_ + kEarly || (stats_.shown == 0 && !have);
             if (!due) break;
             if (have) {
                 ++stats_.dropped;

@@ -56,6 +56,26 @@ constexpr u16 kFeedback = 0x0C0;   // confirm feedback: 0 none, 0x40 decide glow
 constexpr u16 kCancel = 0x100;     // Triangle/Square goes back
 } // namespace page_flag
 
+// A horizontal button row (button list, menus §4.6): buttons of the given widths `kRowGap`
+// apart; centred when the row fits the window, else left / right aligned near the ends and the
+// focused button (at `scroll`, eased between buttons) centred in between. Returns the row's x
+// offset from the window's left edge; `x` = each button's left edge in the row, `total` = the
+// row's width. The controller places its horizontal selectors with it; code-drawn rows too.
+constexpr float kRowGap = 4.0f;
+float row_layout(const std::vector<float>& widths, float scroll, float window_w, std::vector<float>& x, float& total);
+// A vertical button list (button list, menus §4.6): buttons of the given heights `kRowGap` apart;
+// at the top of the window while the list fits it (a vertical list that fits is not centred),
+// else held at the window's top / bottom edge near the ends and the focused button (at
+// `focus`) centred in between. Returns the list's top from the window's top edge, downwards
+// (0 or less while it scrolls); `y` = each button's top in the list, `total` = the list's
+// height. The code-drawn lists (the garage, Cars Permitted, the records) are placed with it.
+float column_layout(const std::vector<float>& heights, float focus, float window_h, std::vector<float>& y,
+                    float& total);
+// One frame of a list's easing (GT3's button list, 0.3): 30 % of the way from
+// `value` to `target`. The selectors ease their scroll position (in items) and a horizontal
+// row its offset (row_layout's result for the focused button) this way.
+float ease_scroll(float value, float target);
+
 class MenuController {
 public:
     explicit MenuController(const MenuSet& set);
@@ -82,8 +102,14 @@ public:
     // --- Hooks (the original's per-page tables filled by control code) -----
     // Initial focus for a page; return -1 for the default rules.
     std::function<int(const std::string& page)> initial_focus;
+    // The item a page opens on when initial_focus has none (by name; "" or an item the page does
+    // not list: the default rules), e.g. the wheel shop's brand pages on the car's wheel.
+    std::function<std::string(const std::string& page)> initial_item;
     // Enable predicate; disabled items stay focusable but refuse confirm.
     std::function<bool(const std::string& page, const MblItem& item)> enabled;
+    // Items a page's list leaves out (no button is built; the ones after it close up), e.g. the
+    // GT-mode dealer pages by the game's language. Null = every item.
+    std::function<bool(const std::string& page, const MblItem& item)> listed;
     // Confirm intercept (a per-page popup hook, menus §3 step 1):
     // return a page name to open it as a popup instead of running the item
     // (e.g. "00cmn/no_money"); "" = run the item normally.
@@ -172,6 +198,10 @@ private:
         float pulse = 0.25f;
         float scroll = 0; // list scroll position (in items), eases towards focus
         bool pinned = false; // a hovering pointer moved the focus: the scroll stays put (hover())
+        // A horizontal selector's row offset in its window (row_layout), easing towards the
+        // focused button's (GT3 eases the offset, not the focus); not yet placed: none.
+        float row_off = 0;
+        bool row_off_set = false;
         std::vector<LayerInst> layers;
         std::map<std::string, int> layer_override;
     };
@@ -195,6 +225,12 @@ private:
     void emit(MenuEvent::Kind k, std::string action, std::string item = {}, int child = -1);
     void sound(const char* name) { sounds_.push_back(name); }
     void step_layers(Level& lv);
+    // A horizontal selector's row (its window, each item's left edge, the row's width) and the
+    // offset it eases towards (the focused item's); false for other pages.
+    bool horizontal_row(const Level& lv, const Element*& window, std::vector<float>& x, float& total,
+                        float& target) const;
+    // The row's offset as drawn now (row_off, or the target before the first frame).
+    float row_offset(const Level& lv, float target) const { return lv.row_off_set ? lv.row_off : target; }
     void add_level_draws(std::vector<ElementDraw>& out, const Level& lv, bool is_top) const;
     float fade_alpha(const Element& e, u32 since) const;
     float dying_alpha(const Element& e, const LayerInst& li) const;

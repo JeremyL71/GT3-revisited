@@ -5,7 +5,6 @@
 #include "app/app.h"
 #include "app/screen_registry.h"
 #include "formats/bgm_index.h"
-#include "game/data/car_database.h"
 
 #include <algorithm>
 #include <map>
@@ -141,112 +140,10 @@ private:
     int playing_ = -1;
 };
 
-class ModsScreen : public Screen {
-public:
-    void update(App& app, double) override {
-        Vfs& vfs = *app.vfs();
-        const MenuInput& m = app.menu();
-        int n = int(vfs.mods().size());
-        if (n) sel_ = std::clamp(sel_ + m.vertical(), 0, n - 1);
-        if (m.pressed(PadButton::Cross) && n) {
-            const ModInfo& mod = vfs.mods()[sel_];
-            bool on = !mod.enabled;
-            app.config().set("mods", mod.id, on ? "on" : "off");
-            vfs.set_mod_enabled(mod.id, on);
-            app.save_config();
-            cars_loaded_ = false;
-        }
-        if (m.pressed(PadButton::Square)) {
-            vfs.scan_mods(app.mods_dir(), &app.config());
-            cars_loaded_ = false;
-        }
-        if (m.pressed(PadButton::Start)) SDL_OpenURL(("file://" + app.mods_dir()).c_str());
-        if (m.pressed(PadButton::Triangle)) app.pop();
-    }
-
-    void render(App& app, Ui& ui) override {
-        ui.header("MODS", "Higher priority wins");
-        const auto& mods = app.vfs()->mods();
-        if (mods.empty()) {
-            ui.text_center(120, "No mods installed.", colors::kText);
-            ui.text_center(140, "Put mods in:", colors::kDim);
-            std::string dir = app.mods_dir();
-            if (dir.size() > 76) dir = "..." + dir.substr(dir.size() - 73);
-            ui.text_center(154, dir, colors::kAccent);
-            ui.text_center(176, "Each mod: mod.ini + files/<path inside GT3.VOL>", colors::kDim);
-            ui.text_center(188, "See docs/MODDING.md", colors::kDim);
-        }
-        for (size_t i = 0; i < mods.size(); ++i) {
-            const ModInfo& mod = mods[i];
-            float y = 30 + i * 26.0f;
-            if (int(i) == sel_) ui.fill(4, y - 3, Ui::kWidth - 8, 24, colors::kHighlight);
-            ui.text(10, y, mod.enabled ? "[x]" : "[ ]", mod.enabled ? colors::kGood : colors::kDim);
-            ui.text(44, y, mod.name + (mod.version.empty() ? "" : "  v" + mod.version), colors::kText);
-            std::string counts = std::to_string(mod.files.size()) + " files";
-            if (!mod.cars.empty()) counts += "  " + std::to_string(mod.cars.size()) + " cars";
-            ui.text_right(Ui::kWidth - 10, y, counts + "  prio " + std::to_string(mod.priority), colors::kDim);
-            std::string desc = mod.description.empty() ? mod.author : mod.description;
-            if (desc.size() > 70) desc = desc.substr(0, 67) + "...";
-            ui.text(44, y + 10, desc, colors::kDim);
-        }
-        if (sel_ >= 0 && size_t(sel_) < mods.size() && !mods[size_t(sel_)].cars.empty())
-            render_cars(app, ui, mods[size_t(sel_)], 30 + mods.size() * 26.0f + 8);
-        ui.footer("Cross: enable/disable   Square: rescan   Start: open folder   Triangle: back");
-    }
-
-private:
-    // The selected mod's cars (mods/<id>/cars/*.ini): what loaded, and why the
-    // others did not. The database is reloaded whenever the mod set changes.
-    void render_cars(App& app, Ui& ui, const ModInfo& mod, float y) {
-        if (!cars_loaded_) {
-            cars_loaded_ = true;
-            db_ok_ = db_.load(*app.vfs());
-        }
-        ui.text(10, y, "Cars in " + mod.name + (mod.enabled ? "" : " (disabled)"), colors::kAccent);
-        y += 14;
-        for (const std::string& file : mod.cars) {
-            if (y > Ui::kHeight - 40) break;
-            std::string base = file.substr(file.find_last_of('/') + 1);
-            std::string err;
-            for (const std::string& e : db_.mod_car_errors())
-                if (e.rfind(file + ": ", 0) == 0) err = e.substr(file.size() + 2);
-            const data::ModCar* car = nullptr;
-            for (const data::ModCar& c : db_.mod_cars())
-                if (c.file == file) car = &c;
-            if (!db_ok_) {
-                ui.text(20, y, base, colors::kDim);
-            } else if (car) {
-                const data::Car* c = db_.car(car->label);
-                auto sm = c ? db_.summarize(*c) : data::CarDatabase::Summary{};
-                char line[160];
-                std::snprintf(line, sizeof(line), "%s %s %u, %s%s %.0f kW %u kg, shell %s", sm.maker.c_str(), sm.name.c_str(),
-                              sm.year, sm.drive.c_str(), car->electric ? " EV" : "", sm.power_ps / 1.35962, sm.weight_kg,
-                              car->donor.c_str());
-                std::string t = line;
-                if (t.size() > 76) t = t.substr(0, 73) + "...";
-                ui.text(20, y, t, colors::kGood);
-            } else if (!err.empty()) {
-                std::string t = base + ": " + err;
-                if (t.size() > 76) t = t.substr(0, 73) + "...";
-                ui.text(20, y, t, colors::kBad);
-            } else {
-                ui.text(20, y, base + (mod.enabled ? ": replaced by another mod" : ""), colors::kDim);
-            }
-            y += 11;
-        }
-    }
-
-    int sel_ = 0;
-    data::CarDatabase db_;
-    bool cars_loaded_ = false, db_ok_ = false;
-};
-
 } // namespace
 
 std::unique_ptr<Screen> make_jukebox_screen() { return std::make_unique<JukeboxScreen>(); }
-std::unique_ptr<Screen> make_mods_screen() { return std::make_unique<ModsScreen>(); }
 
-GT3R_REGISTER_PLAYER_SCREEN(mods, "mods", "Mods", "Enable or disable installed mods.", 5, [] { return make_mods_screen(); });
 GT3R_REGISTER_PLAYER_SCREEN(jukebox, "jukebox", "Music jukebox", "Play the soundtrack streamed from your disc.", 6,
                      [] { return make_jukebox_screen(); });
 

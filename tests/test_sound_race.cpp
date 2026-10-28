@@ -5,7 +5,7 @@
 // levels, and the race playlist.
 
 #include "test_framework.h"
-#include "sim_fixtures.h"
+#include "exact_drive.h"
 
 #include "audio/audio_engine.h"
 #include "audio/bgm.h"
@@ -24,9 +24,9 @@
 #include "menu/flow/game_flow.h"
 #include "menu/flow/menu_sound.h"
 #include "race/car_sfx.h"
+#include "race/license.h"
 #include "race/race_audio.h"
 #include "race/race_playlist.h"
-#include "sim/vehicle.h"
 #include "vfs/vfs.h"
 
 #include <algorithm>
@@ -300,15 +300,12 @@ TEST(sound_car_sfx_per_wheel_voices) {
     std::vector<s16> out(2 * 4800);
     m.mix(out.data(), 4800);
     CHECK(m.active_voices() == 0);
-    // Cars without telemetry (stand-ins) estimate from the state: same model functions.
-    sim::WheelState slide;
-    slide.slip_angle = 0.3f;
-    slide.load = 3000;
-    slide.angular_velocity = 90;
-    WheelSound e = CarSfx::estimate_wheel(slide, setup.wheels[0], 30);
-    float lat = 30 * std::sin(0.3f);
-    CHECK(close(e.smoke, sim::model::slip_intensity(0, lat, 0, 27, 3000, 0.6f)) &&
-          close(e.pitch, sim::model::skid_pitch(0, lat, 0, 27, 0.6f)));
+    // A car without telemetry makes no tyre sound.
+    CarSfx none;
+    none.bind({loop_bank(12900)}, tyre_index());
+    st.telemetry = nullptr;
+    none.update(sfx, m, st);
+    CHECK(m.active_voices() == 0);
 }
 
 TEST(sound_music_and_effects_trim) {
@@ -427,6 +424,38 @@ TEST(sound_bgm_ids) {
             ++seen[size_t(track)];
         }
     CHECK(std::all_of(seen.begin(), seen.end(), [](int v) { return v == 1; }));
+}
+
+// A licence run's end, as GT3 plays it (music §3.1): its judging posts the failed event for a course-out and for a time
+// slower than bronze, live and in the run's replay or demonstration alike, and the fail jingle answers it; a medal plays its
+// medal jingle live (nothing at the finish) and the finish jingle in a replay or demonstration.
+TEST(sound_race_licence_jingles) {
+    using race::RaceMusic;
+    using Op = RaceMusic::Action::Op;
+    // The jingle at the run's end (-1 none) for an outcome, live (License) or replayed / demonstrated (LicenseReplay).
+    auto end_jingle = [](RaceMusic::Kind kind, const race::LicenseOutcome& o) {
+        RaceMusic m;
+        RaceMusic::Cues c;
+        c.kind = kind, c.start_type = 3;
+        m.decide(c, false);
+        c.finished = true, c.failed = race::license_fail_jingle(o), c.medal = o.medal;
+        for (const RaceMusic::Action& a : m.decide(c, false))
+            if (a.op == Op::Play) return a.id;
+        return -1;
+    };
+    const race::LicenseOutcome slow = race::license_outcome(0, 41007, true, -1);  // TIME EXPIRED
+    const race::LicenseOutcome out = race::license_outcome(-1, 0x157529FF, true, -1); // FAIL
+    const race::LicenseOutcome gold = race::license_outcome(2, 34950, false, -1);
+    for (RaceMusic::Kind k : {RaceMusic::Kind::License, RaceMusic::Kind::LicenseReplay}) {
+        CHECK(end_jingle(k, slow) == bgm::kFail); // live, and its replay's end
+        CHECK(end_jingle(k, out) == bgm::kFail);
+    }
+    CHECK(end_jingle(RaceMusic::Kind::License, gold) == -1); // the medal jingle follows (sound_race_music_cues)
+    CHECK(end_jingle(RaceMusic::Kind::LicenseReplay, gold) == bgm::kFinish);
+    // A demonstration without a medal (its judged result 0 or -1): the fail jingle; with one, the finish jingle.
+    for (int result : {0, -1, 4})
+        CHECK(end_jingle(RaceMusic::Kind::LicenseReplay, race::license_outcome(result, 50000, true, -1)) ==
+              (result == 4 ? bgm::kFinish : bgm::kFail));
 }
 
 // The race's music cue sequence: start jingle,
@@ -715,6 +744,54 @@ TEST(sound_race_music_start_after_quick_menu) {
     }
 }
 
+// RETRY from the pause window over a failed run: the run's music stops (RaceMusic::stop, which
+// starts the next cues afresh) and the new run plays its own start, never the paused piece.
+TEST(sound_race_music_pause_retry) {
+    using race::RaceMusic;
+    using Op = RaceMusic::Action::Op;
+    using A = RaceMusic::Action;
+    using V = std::vector<A>;
+    for (int start_type : {3, 1}) { // a flying licence test, one from rest
+        RaceMusic m;
+        RaceMusic::Cues c;
+        c.kind = RaceMusic::Kind::License;
+        c.start_type = start_type;
+        CHECK(m.decide(c, false).empty());
+        c.finished = c.failed = true;
+        CHECK((m.decide(c, false) == V{A{Op::Play, bgm::kFail, false}}));
+        c.paused = true; // the fail screen, paused
+        CHECK((m.decide(c, true) == V{A{Op::Pause}}));
+        m.reset(); // RETRY: the stop
+        c = RaceMusic::Cues{};
+        c.kind = RaceMusic::Kind::License;
+        c.start_type = start_type;
+        c.holding = true; // the new run's hold (a flying test's run-up)
+        V start = m.decide(c, false);
+        CHECK((start == (start_type == 1 ? V{A{Op::Play, bgm::kStartShort, false}} : V{})));
+        for (int i = 0; i < 120; ++i) CHECK(m.decide(c, start_type == 1).empty());
+        c.holding = false; // the signal: no race music in licence tests
+        CHECK((m.decide(c, false) == (start_type == 1 ? V{A{Op::Stop}} : V{})));
+        CHECK(m.decide(c, false).empty());
+    }
+    {   // A time trial voided, paused, retried: silence over the run-up, a race song from the line.
+        RaceMusic m;
+        RaceMusic::Cues c;
+        c.start_type = 3;
+        CHECK((m.decide(c, false) == V{A{Op::Play, bgm::kRace, false, bgm::kRaceSongVolume}}));
+        c.finished = c.failed = true;
+        CHECK((m.decide(c, true) == V{A{Op::Play, bgm::kFail, false}}));
+        c.paused = true;
+        CHECK((m.decide(c, true) == V{A{Op::Pause}}));
+        m.reset();
+        c = RaceMusic::Cues{};
+        c.start_type = 3;
+        c.holding = true;
+        CHECK(m.decide(c, false).empty());
+        c.holding = false;
+        CHECK((m.decide(c, false) == V{A{Op::Play, bgm::kRace, false, bgm::kRaceSongVolume}}));
+    }
+}
+
 // Each music request's level (music §6): race songs 0.5 live and 0.7 in replays,
 // jingles and the demo track 1.0, the quick menus the menu level 0.8; the quick menus
 // follow the Menu BGM switch, not the race's.
@@ -866,33 +943,37 @@ TEST(sound_replay_theater_music) {
     CHECK(menu::flow::page_music("gt_mode", "lc/lc_b") == "license01");
 }
 
-// Full throttle through the gears in the synthetic turbo car (invented values,
-// sim_fixtures.h): the processed throttle drops to 0 in every upshift, so every
-// upshift with the load above 0.8 fires the blow-off (sound §7.5). The pad's
-// throttle, held at 1, never would.
+// Full throttle through the gears in a turbo car (the R34 on the machine tests' straight, the game's own physics): the
+// processed throttle drops to 0 in every upshift, so every upshift with the load above 0.8 fires the blow-off (sound §7.5).
+// The pad's throttle, held at 1, never would. Needs the disc.
 TEST(sound_turbo_blow_off_on_upshift) {
-    sim::CarSpec spec = test::synthetic_spec_car(sim::Drive::FR);
-    auto car = sim::Vehicle::create(spec);
-    CHECK(car && spec.engine.turbo.on);
-    if (!car) return;
-    test::FlatGround ground;
-    car->reset({}, {});
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    data::CarDatabase db;
+    CHECK(db.load(disc->volume()));
+    test::StraightRun run = test::straight_run(*disc, db, "r34_gtr_v_99");
+    CHECK(run.field != nullptr);
+    if (!run.field) return;
+    race::RaceVehicle& car = run.field->player();
+    CHECK(car.facts() && car.facts()->turbo);
     sim::ControlInputs in;
     in.throttle = 1;
+    in.controller_kind = 2;
     car_sound::Turbo processed, pad;
     float prev_load = 0;
-    int gear = car->state().gear, upshifts = 0, fired = 0, fired_pad = 0, late = 0, last_shift = -100;
+    int gear = car.state().gear, upshifts = 0, fired = 0, fired_pad = 0, late = 0, last_shift = -100;
     float loudest = 0;
-    for (int i = 0; i < 60 * 25; ++i) {
-        car->step(in, ground, 1.0f / 60.0f);
-        race::CarExtraSounds::Step st = race::CarExtraSounds::step_inputs(*car);
+    for (int i = 0; i < 60 * 20; ++i) {
+        run.step(in);
+        if (run.field->race_time() <= 0) continue; // (the start's hold)
+        race::CarExtraSounds::Step st = race::CarExtraSounds::step_inputs(*car.telemetry(), car.facts()->turbo);
         processed.step(st.turbo, st.throttle, prev_load, st.load, st.torque, st.lag0, st.lag1);
         pad.step(st.turbo, in.throttle, prev_load, st.load, st.torque, st.lag0, st.lag1);
         prev_load = st.load;
         processed.frame();
         pad.frame();
-        if (car->state().gear > gear) ++upshifts, last_shift = i;
-        gear = car->state().gear;
+        if (car.state().gear > gear && gear >= 1) ++upshifts, last_shift = i;
+        gear = car.state().gear;
         if (processed.blow_off() > 0) {
             ++fired;
             late += i - last_shift > 2; // fires on the shift itself

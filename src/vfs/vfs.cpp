@@ -125,6 +125,16 @@ std::optional<Bytes> Vfs::read(const std::string& path) const {
         return Bytes(text.begin(), text.end());
     }
     if (p == kProgramFile) return base_ ? base_->read_program() : std::nullopt;
+    if (p == kRegionFile) {
+        if (!base_) return std::nullopt;
+        std::string key = region_key(base_->region());
+        return Bytes(key.begin(), key.end());
+    }
+    if (p == kLanguageFile) {
+        if (!base_ && !language_) return std::nullopt;
+        std::string code = text::language_code(language());
+        return Bytes(code.begin(), code.end());
+    }
     if (auto it = overrides_.find(p); it != overrides_.end()) return read_host_file(it->second);
     if (base_)
         if (const Volume::Entry* e = base_->find(p)) return base_->read(*e);
@@ -183,6 +193,28 @@ std::vector<std::string> Vfs::list_dir(const std::string& dir) const {
     std::vector<std::string> out(dirs.begin(), dirs.end());
     out.insert(out.end(), files.begin(), files.end());
     return out;
+}
+
+RegionData region_data(const std::function<std::optional<Bytes>(const std::string&)>& read) {
+    if (std::optional<Bytes> b = read ? read(Vfs::kRegionFile) : std::nullopt)
+        if (std::optional<Region> r = region_from_key(std::string(b->begin(), b->end()))) return {*r};
+    return {};
+}
+
+Language language_of(const std::function<std::optional<Bytes>(const std::string&)>& read) {
+    if (std::optional<Bytes> b = read ? read(Vfs::kLanguageFile) : std::nullopt)
+        if (std::optional<Language> l = text::language_from_code(std::string(b->begin(), b->end()))) return *l;
+    return region_data(read).default_language();
+}
+
+std::string course_file_path(const Vfs& vfs, std::string_view label) {
+    std::string own = vfs.region().course_path(label, vfs.language());
+    if (vfs.exists(own)) return own;
+    for (const char* dir : {"courses/", "courses/US/", "courses/UK/", "courses/EU/", "courses/JP/"}) {
+        std::string p = dir + std::string(label);
+        if (vfs.exists(p)) return p;
+    }
+    return {};
 }
 
 } // namespace gt3r

@@ -31,54 +31,6 @@ bool contains_ci(const std::string& hay, const std::string& needle) {
     return to_lower(hay).find(to_lower(needle)) != std::string::npos;
 }
 
-Profile load_profile(const IniDocument& cfg, const std::string& section) {
-    Profile custom;
-    custom.name = "custom";
-    if (const IniDocument::Section* b = cfg.find(section))
-        for (const auto& [target, sources] : b->entries) custom.add(target, sources);
-    return custom;
-}
-
-void save_profile(IniDocument& cfg, const std::string& section, const Profile* prof) {
-    auto& sections = cfg.sections();
-    std::erase_if(sections, [&](const IniDocument::Section& s) { return s.name == section; });
-    if (!prof) return;
-    // Group alternatives for the same target onto one line.
-    IniDocument::Section& out = cfg.get_or_add(section);
-    for (const Binding& b : prof->bindings) {
-        std::string key = b.target.to_string();
-        auto it = std::find_if(out.entries.begin(), out.entries.end(), [&](auto& kv) { return kv.first == key; });
-        if (it == out.entries.end())
-            out.entries.emplace_back(key, b.source_with_options());
-        else
-            it->second += " | " + b.source_with_options();
-    }
-}
-
-void bind_into(Profile& prof, const PadTarget& target, const InputSource& source, bool replace) {
-    // Clear both the full axis and its halves when replacing an axis binding.
-    if (replace) {
-        prof.remove_target(target);
-        if (target.kind == PadTarget::Kind::Axis && target.half == InputSource::Half::Full) {
-            PadTarget t = target;
-            t.half = InputSource::Half::Positive;
-            prof.remove_target(t);
-            t.half = InputSource::Half::Negative;
-            prof.remove_target(t);
-        }
-    }
-    Binding b;
-    b.target = target;
-    b.source = source;
-    // A full stick axis bound to a full pad axis drops the captured half.
-    if (target.kind == PadTarget::Kind::Axis && target.half == InputSource::Half::Full && source.is_analog())
-        b.source.half = InputSource::Half::Full;
-    if (source.kind == InputSource::Kind::PadAxis || source.kind == InputSource::Kind::JoyAxis)
-        if (target.kind == PadTarget::Kind::Axis) b.options.deadzone = 0.08f;
-    prof.bindings.push_back(b);
-    prof.name = "custom";
-}
-
 // [playerN] race; before it existed, [race] buttons = gt3 | ours | auto (auto: GT3's layout
 // with the classic preset) chose the race buttons for everyone.
 std::string initial_race_layout(const IniDocument& cfg, const std::string& sec, const std::string& preset) {
@@ -87,14 +39,18 @@ std::string initial_race_layout(const IniDocument& cfg, const std::string& sec, 
     return b == "gt3" || (b == "auto" && preset == "classic") ? "gt3" : "modern";
 }
 
+// The pad's layout, keyboard included: any_device_pad() reads every controller and the keyboard with it.
+const Profile& pad_layout() {
+    static const Profile prof = make_preset(pad_preset());
+    return prof;
+}
+
 } // namespace
 
 InputManager::InputManager() {
     for (int i = 0; i < kMaxPlayers; ++i) {
-        players_[i].profile = make_preset(default_preset());
-        players_[i].preset = std::string(default_preset());
-        players_[i].race_profile = make_race_preset("modern", default_preset());
         players_[i].keyboard = (i == 0);
+        players_[i].bindings.player2 = (i == 1); // player 2's keys apart from player 1's
     }
     int count = 0;
     if (SDL_JoystickID* ids = SDL_GetJoysticks(&count)) {
@@ -129,25 +85,26 @@ void InputManager::load(const IniDocument& cfg) {
     for (int i = 0; i < kMaxPlayers; ++i) {
         Player& p = players_[i];
         std::string sec = section_name(i);
-        p.preset = cfg.get(sec, "preset").value_or(std::string(default_preset()));
-        p.device_filter = cfg.get(sec, "device").value_or("auto");
+        // Before the Controller choice, `preset` (racing / classic / wheel / keyboard, quest in VR
+        // builds) chose the bindings and `device` the device; their one custom set was the preset's.
+        const std::string preset = to_lower(cfg.get(sec, "preset").value_or("racing"));
+        const std::string device = cfg.get(sec, "device").value_or("auto");
+        const std::optional<std::string> controller = cfg.get(sec, "controller");
+        p.bindings = PlayerBindings{};
+        p.bindings.player2 = (i == 1);
+        bool controller_inputs = false;
+        if (controller) p.bindings.load(cfg, sec);
+        else controller_inputs = p.bindings.load_old(cfg, sec);
+        p.bindings.race_layout = initial_race_layout(cfg, sec, preset);
+        // keyboard: Keyboard only, unless its custom bindings had controller inputs (its device
+        // stays). wheel with a named device: that device keeps the wheel layout whatever SDL says.
+        p.device_filter = controller ? *controller
+                          : preset == "keyboard" && !controller_inputs ? kKeyboardOnly : device;
+        if (p.device_filter.empty()) p.device_filter = "auto";
+        p.wheel_device = controller ? cfg.get(sec, "wheel_device").value_or("")
+                         : preset == "wheel" && device != "auto" ? device : "";
         if (auto kb = cfg.get(sec, "keyboard")) p.keyboard = to_lower(*kb) == "on" || *kb == "1";
         if (i == 0) set_phone_vibration(to_lower(cfg.get(sec, "phone_vibration").value_or("off")) == "on");
-        p.profile = make_preset(p.preset);
-        p.custom_bindings = false;
-        if (Profile custom = load_profile(cfg, section_name(i, ".bindings")); !custom.bindings.empty()) {
-            p.profile = std::move(custom);
-            p.custom_bindings = true;
-        }
-        p.ramp_values.assign(p.profile.bindings.size(), 0.0f);
-        p.race_layout = initial_race_layout(cfg, sec, p.preset);
-        p.race_profile = make_race_preset(p.race_layout, p.preset);
-        p.race_custom = false;
-        if (Profile custom = load_profile(cfg, section_name(i, ".race")); !custom.bindings.empty()) {
-            p.race_profile = std::move(custom);
-            p.race_custom = true;
-        }
-        p.race_ramps.assign(p.race_profile.bindings.size(), 0.0f);
     }
     assign_devices();
 }
@@ -157,73 +114,92 @@ void InputManager::save(IniDocument& cfg) const {
     for (int i = 0; i < kMaxPlayers; ++i) {
         const Player& p = players_[i];
         std::string sec = section_name(i);
-        cfg.set(sec, "preset", p.preset);
-        cfg.set(sec, "device", p.device_filter);
+        cfg.set(sec, "controller", p.device_filter);
+        if (!p.wheel_device.empty()) cfg.set(sec, "wheel_device", p.wheel_device);
+        // Older builds choose by these: the kind in use as their preset.
+        const bool kb_only = keyboard_only(i);
+        cfg.set(sec, "preset", kb_only ? "keyboard" : p.kind == DeviceKind::Wheel ? "wheel"
+                               : pad_preset() == "quest" ? "quest" : "racing");
+        cfg.set(sec, "device", kb_only ? "auto" : p.device_filter);
         cfg.set(sec, "keyboard", p.keyboard ? "on" : "off");
         if (i == 0) cfg.set(sec, "phone_vibration", phone_vibration_ ? "on" : "off");
-        cfg.set(sec, "race", p.race_layout);
-        save_profile(cfg, section_name(i, ".bindings"), p.custom_bindings ? &p.profile : nullptr);
-        save_profile(cfg, section_name(i, ".race"), p.race_custom ? &p.race_profile : nullptr);
+        cfg.set(sec, "race", p.bindings.race_layout);
+        p.bindings.save(cfg, sec);
     }
 }
 
-void InputManager::apply_preset(int player, std::string_view preset) {
-    Player& p = players_[player];
-    p.preset = std::string(preset);
-    p.profile = make_preset(preset);
-    p.custom_bindings = false;
-    p.ramp_values.assign(p.profile.bindings.size(), 0.0f);
-    if (!p.race_custom) set_race_layout(player, p.race_layout); // the race layout of this device kind
-    assign_devices();
+bool InputManager::is_custom(int player) const {
+    const Player& p = players_[player];
+    return p.bindings.custom(p.kind, false);
 }
 
-void InputManager::bind(int player, const PadTarget& target, const InputSource& source, bool replace) {
-    Player& p = players_[player];
-    bind_into(p.profile, target, source, replace);
-    p.custom_bindings = true;
-    p.ramp_values.assign(p.profile.bindings.size(), 0.0f);
+bool InputManager::is_race_custom(int player) const {
+    const Player& p = players_[player];
+    return p.bindings.custom(p.kind, true);
 }
 
-void InputManager::clear_target(int player, const PadTarget& target) {
+void InputManager::refresh(Player& p) {
+    p.menu = p.bindings.combined(p.kind, false);
+    p.race_reads_menu = p.bindings.race_reads_menu(p.kind);
+    p.race = p.race_reads_menu ? Profile{} : p.bindings.combined(p.kind, true);
+    p.ramp_values.clear(); // other bindings: their ramps start at rest
+    p.race_ramps.clear();
+}
+
+bool InputManager::has_custom(int player, bool race) const {
+    const Player& p = players_[player];
+    return p.bindings.has_custom(p.kind, race);
+}
+
+void InputManager::use_custom(int player, bool race) {
     Player& p = players_[player];
-    p.profile.remove_target(target);
-    p.profile.name = "custom";
-    p.custom_bindings = true;
-    p.ramp_values.assign(p.profile.bindings.size(), 0.0f);
+    p.bindings.use_custom(race);
+    refresh(p);
+}
+
+void InputManager::reset_bindings(int player) {
+    Player& p = players_[player];
+    p.bindings.reset(p.kind, false);
+    refresh(p);
+}
+
+bool InputManager::bind(int player, const PadTarget& target, const InputSource& source, bool replace) {
+    Player& p = players_[player];
+    if (!p.bindings.bind(p.kind, false, target, source, replace)) return false;
+    if (source.device.empty()) refresh(p);
+    else assign_devices(); // the other player's Auto can't keep the device this binding names
+    return true;
+}
+
+void InputManager::clear_target(int player, const PadTarget& target, BindingSet set) {
+    Player& p = players_[player];
+    p.bindings.clear(p.kind, false, target, set);
+    assign_devices(); // a device it named may be free again (refreshes every player)
 }
 
 void InputManager::set_race_layout(int player, std::string_view layout) {
     Player& p = players_[player];
-    p.race_profile = make_race_preset(layout, p.preset);
-    p.race_layout = p.race_profile.name;
-    p.race_custom = false;
-    p.race_ramps.assign(p.race_profile.bindings.size(), 0.0f);
-}
-
-bool InputManager::race_uses_menu_pad(int player) const {
-    const Player& p = players_[player];
-    return !p.race_custom && p.race_layout == "gt3";
+    p.bindings.set_race_layout(p.kind, layout);
+    refresh(p);
 }
 
 const Profile& InputManager::race_profile(int player) const {
-    return race_uses_menu_pad(player) ? players_[player].profile : players_[player].race_profile;
+    const Player& p = players_[player];
+    return p.race_reads_menu ? p.menu : p.race;
 }
 
-void InputManager::bind_race(int player, const PadTarget& target, const InputSource& source, bool replace) {
+bool InputManager::bind_race(int player, const PadTarget& target, const InputSource& source, bool replace) {
     Player& p = players_[player];
-    if (race_uses_menu_pad(player)) p.race_profile = p.profile; // the original layout, as it stands
-    bind_into(p.race_profile, target, source, replace);
-    p.race_custom = true;
-    p.race_ramps.assign(p.race_profile.bindings.size(), 0.0f);
+    if (!p.bindings.bind(p.kind, true, target, source, replace)) return false;
+    if (source.device.empty()) refresh(p);
+    else assign_devices(); // the other player's Auto can't keep the device this binding names
+    return true;
 }
 
-void InputManager::clear_race_target(int player, const PadTarget& target) {
+void InputManager::clear_race_target(int player, const PadTarget& target, BindingSet set) {
     Player& p = players_[player];
-    if (race_uses_menu_pad(player)) p.race_profile = p.profile;
-    p.race_profile.remove_target(target);
-    p.race_profile.name = "custom";
-    p.race_custom = true;
-    p.race_ramps.assign(p.race_profile.bindings.size(), 0.0f);
+    p.bindings.clear(p.kind, true, target, set);
+    assign_devices();
 }
 
 void InputManager::add_device(SDL_JoystickID id) {
@@ -252,6 +228,9 @@ void InputManager::add_device(SDL_JoystickID id) {
     }
     const char* name = d.gamepad ? SDL_GetGamepadName(d.gamepad) : SDL_GetJoystickName(d.joystick);
     d.name = name ? name : "Unknown device";
+    d.wheel = SDL_GetJoystickTypeForID(id) == SDL_JOYSTICK_TYPE_WHEEL;
+    if (const char* serial = SDL_GetJoystickSerial(d.joystick)) d.serial = serial;
+    if (const char* path = SDL_GetJoystickPath(d.joystick)) d.path = path;
     LOG_INFO("Input device connected: %s (%s)", d.name.c_str(), d.gamepad ? "gamepad" : "joystick");
     devices_.push_back(std::move(d));
 }
@@ -274,6 +253,7 @@ const InputManager::Device* InputManager::find_device(SDL_JoystickID id) const {
 
 void InputManager::assign_devices() {
     std::vector<SDL_JoystickID> taken;
+    const std::vector<DeviceId> ids_now = device_ids();
     auto is_taken = [&](SDL_JoystickID id) { return std::find(taken.begin(), taken.end(), id) != taken.end(); };
     // Named filters first, so "auto" players don't steal a named device.
     for (int pass = 0; pass < 2; ++pass) {
@@ -282,30 +262,53 @@ void InputManager::assign_devices() {
             bool is_auto = p.device_filter == "auto" || p.device_filter.empty();
             if ((pass == 0) == is_auto) continue;
             p.device = 0;
-            bool wants_wheel = p.preset == "wheel";
-            for (const Device& d : devices_) {
-                if (is_taken(d.id)) continue;
-                bool match = is_auto ? (wants_wheel ? !d.gamepad : d.gamepad != nullptr)
-                                     : contains_ci(d.name, p.device_filter);
-                if (match) {
-                    p.device = d.id;
-                    taken.push_back(d.id);
-                    break;
+            if (is_auto) {
+                // Devices other players' tagged bindings use aren't handed out either.
+                std::vector<std::string> others;
+                for (int j = 0; j < kMaxPlayers; ++j)
+                    if (j != i)
+                        for (const std::string& tag : players_[j].bindings.devices()) others.push_back(tag);
+                const std::vector<bool> reserved = reserved_devices(ids_now, others);
+                std::vector<SDL_JoystickID> ids; // the devices no other player has
+                std::vector<AutoRank> ranks;
+                for (size_t k = 0; k < devices_.size(); ++k) {
+                    const Device& d = devices_[k];
+                    if (is_taken(d.id) || reserved[k]) continue;
+                    ids.push_back(d.id);
+                    ranks.push_back(d.wheel ? AutoRank::Wheel : d.gamepad ? AutoRank::Gamepad : AutoRank::Other);
                 }
+                if (int at = pick_auto_device(ranks); at >= 0) p.device = ids[size_t(at)];
+            } else if (!keyboard_only(i)) {
+                for (const Device& d : devices_)
+                    if (!is_taken(d.id) && contains_ci(d.name, p.device_filter)) {
+                        p.device = d.id;
+                        break;
+                    }
             }
-            if (const Device* d = find_device(p.device); d && d->gamepad) SDL_SetGamepadPlayerIndex(d->gamepad, i);
+            const Device* d = find_device(p.device);
+            p.kind = device_kind(d != nullptr, d && d->gamepad, d && d->wheel,
+                                 !is_auto && !p.wheel_device.empty() && p.device_filter == p.wheel_device);
+            refresh(p);
+            if (p.device) taken.push_back(p.device);
+            if (d && d->gamepad) SDL_SetGamepadPlayerIndex(d->gamepad, i);
         }
     }
 }
 
 bool InputManager::keyboard_fallback(int player) const {
     const Player& p = players_[player];
-    return player == 0 && !p.keyboard && p.profile.keyboard_only();
+    return player == 0 && !p.keyboard && p.menu.keyboard_only();
 }
 
 void InputManager::set_device_filter(int player, std::string filter) {
     players_[player].device_filter = filter.empty() ? "auto" : std::move(filter);
     assign_devices();
+}
+
+std::vector<DeviceId> InputManager::device_ids() const {
+    std::vector<DeviceId> out;
+    for (const Device& d : devices_) out.push_back({d.name, d.serial, d.path});
+    return out;
 }
 
 std::vector<std::string> InputManager::device_names() const {
@@ -315,28 +318,82 @@ std::vector<std::string> InputManager::device_names() const {
 }
 
 std::string InputManager::device_name(int player) const {
-    const Device* d = find_device(players_[player].device);
-    if (d) return d->name;
+    if (const Device* d = find_device(players_[player].device)) return d->name;
     return keyboard_active(player) ? "Keyboard" : "No device";
 }
 
+const InputManager::Device* InputManager::find_tagged(const std::string& tag, SDL_JoystickID controller) const {
+    int own = -1;
+    for (size_t i = 0; i < devices_.size(); ++i)
+        if (controller && devices_[i].id == controller) own = int(i);
+    const int at = resolve_device_tag(device_ids(), tag, own);
+    return at < 0 ? nullptr : &devices_[size_t(at)];
+}
+
+std::string InputManager::tag_of(SDL_JoystickID id) const {
+    for (size_t i = 0; i < devices_.size(); ++i)
+        if (devices_[i].id == id) return device_tag(device_ids(), i);
+    return {};
+}
+
+std::string InputManager::capture_tag(SDL_JoystickID id) const {
+    return id == players_[capture_player_].device ? std::string() : tag_of(id);
+}
+
+const InputManager::Device* InputManager::tagged_steering(const Player& p) const {
+    for (const Binding& b : (p.race_reads_menu ? p.menu : p.race).bindings)
+        if (b.target.kind == PadTarget::Kind::Axis && b.target.axis == PadAxis::LX && b.source.is_analog() &&
+            !b.source.device.empty())
+            if (const Device* d = find_tagged(b.source.device, p.device); d && !d->gamepad && d->wheel) return d;
+    return nullptr;
+}
+
+bool InputManager::wheel_steering(int player) const {
+    const Player& p = players_[player];
+    return tagged_steering(p) != nullptr || p.kind == DeviceKind::Wheel;
+}
+
 std::string InputManager::describe(int player, const InputSource& src) const {
+    // Another device's input names it first ("Wireless Controller 2: Right trigger").
     const Device* d = find_device(players_[player].device);
-    if (src.kind == InputSource::Kind::PadButton && d && d->gamepad) {
-        switch (SDL_GetGamepadButtonLabel(d->gamepad, static_cast<SDL_GamepadButton>(src.code))) {
-        case SDL_GAMEPAD_BUTTON_LABEL_A: return "A";
-        case SDL_GAMEPAD_BUTTON_LABEL_B: return "B";
-        case SDL_GAMEPAD_BUTTON_LABEL_X: return "X";
-        case SDL_GAMEPAD_BUTTON_LABEL_Y: return "Y";
-        case SDL_GAMEPAD_BUTTON_LABEL_CROSS: return "Cross";
-        case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: return "Circle";
-        case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: return "Square";
-        case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: return "Triangle";
+    std::string prefix;
+    InputSource own = src;
+    if (!src.device.empty()) {
+        d = find_tagged(src.device);
+        prefix = device_tag_label(device_ids(), src.device);
+        if (prefix.size() > 24) prefix = prefix.substr(0, 22) + "..";
+        prefix += ": ";
+        own.device.clear();
+    }
+    if (std::string_view paddle = own.paddle_name(); !paddle.empty()) return prefix + std::string(paddle);
+    const char* half = own.half == InputSource::Half::Positive ? " +" : own.half == InputSource::Half::Negative ? " -" : "";
+    switch (own.kind) {
+    case InputSource::Kind::Key: return std::string("Key ") + SDL_GetScancodeName(static_cast<SDL_Scancode>(own.code));
+    case InputSource::Kind::PadAxis: {
+        static const char* const kAxes[] = {"Left stick X", "Left stick Y", "Right stick X", "Right stick Y",
+                                            "Left trigger", "Right trigger"};
+        if (own.code >= 0 && own.code < 6) return prefix + kAxes[own.code] + half;
+        break;
+    }
+    case InputSource::Kind::JoyAxis: return prefix + "Axis " + std::to_string(own.code) + half;
+    case InputSource::Kind::JoyButton: return prefix + "Button " + std::to_string(own.code);
+    case InputSource::Kind::PadButton:
+        if (!d || !d->gamepad) break;
+        switch (SDL_GetGamepadButtonLabel(d->gamepad, static_cast<SDL_GamepadButton>(own.code))) {
+        case SDL_GAMEPAD_BUTTON_LABEL_A: return prefix + "A";
+        case SDL_GAMEPAD_BUTTON_LABEL_B: return prefix + "B";
+        case SDL_GAMEPAD_BUTTON_LABEL_X: return prefix + "X";
+        case SDL_GAMEPAD_BUTTON_LABEL_Y: return prefix + "Y";
+        case SDL_GAMEPAD_BUTTON_LABEL_CROSS: return prefix + "Cross";
+        case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: return prefix + "Circle";
+        case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: return prefix + "Square";
+        case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: return prefix + "Triangle";
         default: break;
         }
+        break;
+    default: break;
     }
-    if (src.kind == InputSource::Kind::Key) return std::string("Key ") + SDL_GetScancodeName(static_cast<SDL_Scancode>(src.code));
-    return src.to_string();
+    return prefix + own.to_string();
 }
 
 void InputManager::handle_event(const SDL_Event& e) {
@@ -355,13 +412,16 @@ void InputManager::handle_event(const SDL_Event& e) {
             key_latch_[size_t(e.key.scancode)] = true;
         }
         if (capturing_ && !e.key.repeat) {
-            captured_ = InputSource{InputSource::Kind::Key, int(e.key.scancode)};
+            // Esc and Android Back cancel the capture.
+            if (e.key.scancode != SDL_SCANCODE_ESCAPE && e.key.scancode != SDL_SCANCODE_AC_BACK)
+                captured_ = InputSource{InputSource::Kind::Key, int(e.key.scancode)};
             capturing_ = false;
         }
         break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
         if (capturing_) {
             captured_ = InputSource{InputSource::Kind::PadButton, int(e.gbutton.button)};
+            captured_->device = capture_tag(e.gbutton.which);
             capturing_ = false;
         }
         break;
@@ -369,6 +429,7 @@ void InputManager::handle_event(const SDL_Event& e) {
         // Gamepads report through the gamepad event above.
         if (capturing_ && !SDL_IsGamepad(e.jbutton.which)) {
             captured_ = InputSource{InputSource::Kind::JoyButton, int(e.jbutton.button)};
+            captured_->device = capture_tag(e.jbutton.which);
             capturing_ = false;
         }
         break;
@@ -378,6 +439,7 @@ void InputManager::handle_event(const SDL_Event& e) {
             u8 dir = (v & SDL_HAT_UP) ? SDL_HAT_UP : (v & SDL_HAT_RIGHT) ? SDL_HAT_RIGHT
                    : (v & SDL_HAT_DOWN) ? SDL_HAT_DOWN : SDL_HAT_LEFT;
             captured_ = InputSource{InputSource::Kind::JoyHat, int(e.jhat.hat), dir};
+            captured_->device = capture_tag(e.jhat.which);
             capturing_ = false;
         }
         break;
@@ -385,7 +447,8 @@ void InputManager::handle_event(const SDL_Event& e) {
     }
 }
 
-void InputManager::begin_capture() {
+void InputManager::begin_capture(int player) {
+    capture_player_ = std::clamp(player, 0, kMaxPlayers - 1);
     capturing_ = true;
     captured_.reset();
     // Record resting positions so pedals that rest at +/-1 and slightly
@@ -426,48 +489,70 @@ void InputManager::update_tilt(Player& p, const Device* dev) {
     p.tilt = std::clamp(roll / kTiltRange, -1.0f, 1.0f);
 }
 
-float InputManager::read_source(const Player& p, const Device* dev, const InputSource& src) const {
-    float v = 0.0f;
+std::optional<float> InputManager::read_source(const Player& p, const Device* dev, bool keyboard,
+                                               const InputSource& src) const {
+    if (!src.device.empty() && src.kind != InputSource::Kind::Key && src.kind != InputSource::Kind::Mouse &&
+        src.kind != InputSource::Kind::Tilt) {
+        dev = find_tagged(src.device, p.device); // another device than the Controller; not connected: nothing
+        if (!dev) return std::nullopt;
+    }
     switch (src.kind) {
-    case InputSource::Kind::None: return 0.0f;
+    case InputSource::Kind::None: return std::nullopt;
     case InputSource::Kind::Key: {
-        if (!keyboard_active(int(&p - players_.data()))) return 0.0f;
+        if (!keyboard) return std::nullopt;
         int n = 0;
         const bool* keys = SDL_GetKeyboardState(&n);
         bool latched = size_t(src.code) < key_latch_.size() && key_latch_[size_t(src.code)];
         return ((src.code < n && keys[src.code]) || latched) ? 1.0f : 0.0f;
     }
     case InputSource::Kind::Mouse:
-        if (!keyboard_active(int(&p - players_.data()))) return 0.0f;
+        if (!keyboard) return std::nullopt;
         return (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_MASK(src.code)) ? 1.0f : 0.0f;
     case InputSource::Kind::PadButton:
-        return dev && dev->gamepad && SDL_GetGamepadButton(dev->gamepad, SDL_GamepadButton(src.code)) ? 1.0f : 0.0f;
+        if (!dev || !dev->gamepad || !SDL_GamepadHasButton(dev->gamepad, SDL_GamepadButton(src.code))) return std::nullopt;
+        return SDL_GetGamepadButton(dev->gamepad, SDL_GamepadButton(src.code)) ? 1.0f : 0.0f;
     case InputSource::Kind::PadAxis:
-        if (!dev || !dev->gamepad) return 0.0f;
-        v = normalize_axis(SDL_GetGamepadAxis(dev->gamepad, SDL_GamepadAxis(src.code)));
-        break;
+        if (!dev || !dev->gamepad || !SDL_GamepadHasAxis(dev->gamepad, SDL_GamepadAxis(src.code))) return std::nullopt;
+        return normalize_axis(SDL_GetGamepadAxis(dev->gamepad, SDL_GamepadAxis(src.code)));
     case InputSource::Kind::JoyButton:
-        return dev && SDL_GetJoystickButton(dev->joystick, src.code) ? 1.0f : 0.0f;
+        if (!dev || src.code >= SDL_GetNumJoystickButtons(dev->joystick)) return std::nullopt;
+        return SDL_GetJoystickButton(dev->joystick, src.code) ? 1.0f : 0.0f;
     case InputSource::Kind::JoyAxis:
-        if (!dev || src.code >= SDL_GetNumJoystickAxes(dev->joystick)) return 0.0f;
-        v = normalize_axis(SDL_GetJoystickAxis(dev->joystick, src.code));
-        break;
+        if (!dev || src.code >= SDL_GetNumJoystickAxes(dev->joystick)) return std::nullopt;
+        return normalize_axis(SDL_GetJoystickAxis(dev->joystick, src.code));
     case InputSource::Kind::JoyHat:
-        return dev && (SDL_GetJoystickHat(dev->joystick, src.code) & src.hat_dir) ? 1.0f : 0.0f;
-    case InputSource::Kind::Tilt: v = p.tilt; break;
+        if (!dev || src.code >= SDL_GetNumJoystickHats(dev->joystick)) return std::nullopt;
+        return (SDL_GetJoystickHat(dev->joystick, src.code) & src.hat_dir) ? 1.0f : 0.0f;
+    case InputSource::Kind::Tilt: return p.tilt;
     }
-    return v;
+    return std::nullopt;
 }
 
 void InputManager::evaluate(Player& p, double dt) {
     const Device* dev = find_device(p.device);
+    const bool keyboard = keyboard_active(int(&p - players_.data()));
     update_tilt(p, dev);
-    evaluate_profile(p, dev, p.profile, p.ramp_values, p.state, dt);
-    if (!p.race_custom && p.race_layout == "gt3") p.race_state = p.state;
-    else evaluate_profile(p, dev, p.race_profile, p.race_ramps, p.race_state, dt);
+    evaluate_profile(p, dev, keyboard, p.menu, p.ramp_values, p.state, dt);
+    if (p.race_reads_menu) p.race_state = p.state;
+    else evaluate_profile(p, dev, keyboard, p.race, p.race_ramps, p.race_state, dt);
 }
 
-void InputManager::evaluate_profile(const Player& p, const Device* dev, const Profile& prof,
+void InputManager::evaluate_any_device(double dt) {
+    static const Player none{}; // no overlay, no tilt
+    std::vector<PadState> pads = {players_[0].state};
+    PadState s;
+    evaluate_profile(none, nullptr, true, pad_layout(), any_ramps_, s, dt); // the keyboard
+    pads.push_back(s);
+    std::vector<float> ramps; // the controller bindings have none
+    for (const Device& d : devices_) {
+        if (!d.gamepad) continue;
+        evaluate_profile(none, &d, false, pad_layout(), ramps, s, dt);
+        pads.push_back(s);
+    }
+    any_pad_ = merge_pads(pads);
+}
+
+void InputManager::evaluate_profile(const Player& p, const Device* dev, bool keyboard, const Profile& prof,
                                     std::vector<float>& ramps, PadState& s, double dt) const {
     float button_val[kPadButtonCount] = {};
     bool button_digital[kPadButtonCount] = {};
@@ -477,7 +562,14 @@ void InputManager::evaluate_profile(const Player& p, const Device* dev, const Pr
     for (size_t bi = 0; bi < prof.bindings.size(); ++bi) {
         const Binding& b = prof.bindings[bi];
         const BindingOptions& o = b.options;
-        float v = read_source(p, dev, b.source);
+        // A source that isn't there is left out, not read as 0: `pedal` and `invert` would
+        // turn that 0 into a press (the wheel preset with no wheel held Cross and Square).
+        std::optional<float> read = read_source(p, dev, keyboard, b.source);
+        if (!read) {
+            ramps[bi] = 0.0f;
+            continue;
+        }
+        float v = *read;
 
         if (b.source.is_analog()) {
             if (o.invert) v = -v;
@@ -560,18 +652,28 @@ void InputManager::update(double dt) {
                 bool trigger = d->gamepad && (a == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || a == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
                 s.half = trigger ? InputSource::Half::Full
                                  : (delta > 0 ? InputSource::Half::Positive : InputSource::Half::Negative);
+                s.device = capture_tag(id);
                 captured_ = s;
             }
         }
         if (captured_) capturing_ = false;
     }
     for (Player& p : players_) evaluate(p, dt);
+    evaluate_any_device(dt);
+    {
+        const Device* d = find_device(players_[0].device);
+        menu_rescue_ = !menus_drivable(players_[0].menu, d && d->gamepad, d && !d->gamepad,
+                                       keyboard_active(0) && SDL_HasKeyboard());
+    }
     std::fill(key_latch_.begin(), key_latch_.end(), false);
 
     time_ += dt;
     for (Player& p : players_) {
-        if (const Device* d = find_device(p.device)) {
-            if (p.ffb_age < 0.25) ffb_.apply(d->id, d->gamepad, d->joystick, brake_trigger(p), p.ffb, time_);
+        // The Controller, and a wheel Steer is bound to on another device (its forces).
+        const Device* steer = tagged_steering(p);
+        for (const Device* d : {find_device(p.device), steer}) {
+            if (!d || (d == steer && d->id == p.device)) continue;
+            if (p.ffb_age < 0.25) ffb_.apply(d->id, d->gamepad, d->joystick, d == steer ? -1 : brake_trigger(p), p.ffb, time_);
             else ffb_.stop(d->id);
         }
         p.ffb_age += dt;
@@ -584,10 +686,9 @@ void InputManager::set_force_feedback(int player, const ForceFeedbackState& stat
 }
 
 int InputManager::brake_trigger(const Player& p) const {
-    const Profile& race = !p.race_custom && p.race_layout == "gt3" ? p.profile : p.race_profile;
-    for (const Binding& b : race.bindings)
+    for (const Binding& b : (p.race_reads_menu ? p.menu : p.race).bindings)
         if (b.target.kind == PadTarget::Kind::Button && b.target.button == PadButton::Square &&
-            b.source.kind == InputSource::Kind::PadAxis &&
+            b.source.kind == InputSource::Kind::PadAxis && b.source.device.empty() &&
             (b.source.code == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || b.source.code == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER))
             return b.source.code;
     return -1;
@@ -598,6 +699,65 @@ bool use_phone_vibrator(bool enabled, int player, bool device_rumbles) {
 }
 
 float phone_vibration_strength(const PadRumble& r) { return std::max(r.large / 255.0f, r.small ? 0.6f : 0.0f); }
+
+std::vector<bool> reserved_devices(const std::vector<DeviceId>& devices, const std::vector<std::string>& tags) {
+    std::vector<bool> out(devices.size(), false);
+    for (const std::string& tag : tags)
+        if (int at = find_device_tag(devices, tag); at >= 0) out[size_t(at)] = true;
+    return out;
+}
+
+DeviceKind device_kind(bool connected, bool gamepad, bool wheel, bool named_wheel) {
+    if (!connected) return DeviceKind::Keyboard;
+    if (gamepad) return DeviceKind::Pad;
+    return wheel || named_wheel ? DeviceKind::Wheel : DeviceKind::Joystick;
+}
+
+bool menus_drivable(const Profile& menu, bool pad, bool joystick, bool keys) {
+    auto readable = [&](const InputSource& s) {
+        if (!s.device.empty()) return false; // another device's: not counted
+        switch (s.kind) {
+        case InputSource::Kind::Key:
+        case InputSource::Kind::Mouse: return keys;
+        case InputSource::Kind::PadButton:
+        case InputSource::Kind::PadAxis: return pad;
+        case InputSource::Kind::JoyButton:
+        case InputSource::Kind::JoyAxis:
+        case InputSource::Kind::JoyHat: return joystick;
+        default: return false;
+        }
+    };
+    auto bound = [&](auto is_target) {
+        return std::any_of(menu.bindings.begin(), menu.bindings.end(),
+                           [&](const Binding& b) { return is_target(b.target) && readable(b.source); });
+    };
+    const bool confirm = bound([](const PadTarget& t) { return t.kind == PadTarget::Kind::Button && t.button == PadButton::Cross; });
+    const bool move = bound([](const PadTarget& t) {
+        return t.kind == PadTarget::Kind::Button ? t.button == PadButton::Up || t.button == PadButton::Down
+                                                 : t.axis == PadAxis::LY;
+    });
+    return confirm && move;
+}
+
+int pick_auto_device(const std::vector<AutoRank>& devices) {
+    for (AutoRank rank : {AutoRank::Wheel, AutoRank::Gamepad, AutoRank::Other})
+        if (auto it = std::find(devices.begin(), devices.end(), rank); it != devices.end())
+            return int(it - devices.begin());
+    return -1;
+}
+
+PadState merge_pads(const std::vector<PadState>& pads) {
+    PadState out;
+    auto off_rest = [](u8 v) { return std::abs(int(v) - 128); };
+    for (const PadState& p : pads) {
+        out.connected |= p.connected;
+        out.buttons |= p.buttons;
+        for (size_t i = 0; i < kPadButtonCount; ++i) out.pressure[i] = std::max(out.pressure[i], p.pressure[i]);
+        for (size_t i = 0; i < kPadAxisCount; ++i)
+            if (off_rest(p.axes[i]) > off_rest(out.axes[i])) out.axes[i] = p.axes[i];
+    }
+    return out;
+}
 
 void InputManager::set_rumble(int player, const PadRumble& r) {
     Player& p = players_[player];

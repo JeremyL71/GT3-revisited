@@ -110,6 +110,10 @@ public:
     void set_versions(const Versions& v) { versions_ = v; }
     const Versions& versions() const { return versions_; }
     void set_log(std::function<void(const std::string&)> f) { log_ = std::move(f); }
+    // Players' IPs in the log (gt3r-relay --log-ips) instead of daily tags (ip_tag; the default).
+    void set_log_ips(bool on) { log_ips_ = on; }
+    // Each player's country after the tag / IP ("a1b2c3d4 (BR)"; "??" when unknown; gt3r-relay --geoip).
+    void set_log_country(std::function<std::string(const Address&)> f) { country_ = std::move(f); }
     Stats stats() const;
     void reset_peak() { stats_.peak_channel_bytes_per_s = 0; }
     QueueInfo queue_info(const std::string& code, double now) const;
@@ -209,13 +213,16 @@ private:
     u64 window(double now) const;
     u64 cookie(const Address& a, u64 window) const;
     static std::string ip_key(const Address& a); // 16 bytes: the IP (IPv6: its /64)
-    static std::string ip_of(const Address& a);  // for the log
+    std::string ip_tag(const Address& a);        // a keyed hash of ip_key, new key each UTC day
+    static std::string ip_of(const Address& a);  // the IP, no port
+    std::string who(const Address& a); // for the log: the tag (or IP) and the country
     IpSlot& slot(const Address& a);
 
     UdpSocket sock_;
     Limits limits_;
     Versions versions_;
     std::function<void(const std::string&)> log_;
+    std::function<std::string(const Address&)> country_;
     std::function<void(const Address&, ByteSpan)> send_hook_;
     std::map<std::string, Session> sessions_; // by code
     std::unordered_map<u64, std::string> by_token_;          // session token -> code
@@ -230,6 +237,9 @@ private:
     std::vector<IpSlot> ip_slots_;
     Bucket all_msgs_, all_misses_, all_idle_;
     u8 cookie_key_[16] = {}, slot_key_[16] = {}, rng_key_[16] = {}; // random per process
+    u8 tag_key_[16] = {}; // ip_tag's, for UTC day tag_day_ (never written anywhere)
+    long long tag_day_ = -1;
+    bool log_ips_ = false;
     u64 rng_counter_ = 0, serial_ = 0;
     double last_expire_ = 0;
     Stats stats_;

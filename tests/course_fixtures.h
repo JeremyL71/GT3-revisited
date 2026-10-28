@@ -156,11 +156,8 @@ inline course::AiLines make_ai_lines() {
     return ai;
 }
 
-// The course's AI driver parameter set (course file slots 37-40, ai::DriverParams::from_bytes),
-// INVENTED for this course and the spec-path test car: corner speed 70 % and no corner bonus (the
-// car's placeholder lateral curves hold about 0.75 g while its tyre records rate 1.5 g, so the
-// planner's 100 % would overdrive every arc), pit speed 60 km/h; otherwise the built-in set's
-// bytes. The same set for every driveline class.
+// The course's AI driver parameter set (course file slots 37-40), INVENTED for this course: corner speed 70 % and no
+// corner bonus, pit speed 60 km/h; otherwise the built-in set's bytes. The same set for every driveline class.
 inline course::DriverSets make_driver_sets() {
     const course::DriverSets::Set set = {100, 70, 100, 24, 100, 0, 90, 15, 40, 0, 0, 10, 0, 60, 100, 0, 9, 0, 60};
     course::DriverSets sets;

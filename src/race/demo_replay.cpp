@@ -15,8 +15,7 @@ public:
         for (int i = 0; i < n; ++i) {
             size_t byte = pos_ >> 3;
             u32 bit = 0;
-            if (byte < d_.size()) bit = (d_[byte] >> (7 - (pos_ & 7))) & 1;
-            else overrun_ = true;
+            if (byte < d_.size()) bit = (d_[byte] >> (7 - (pos_ & 7))) & 1; // (zeros past the end)
             v = (v << 1) | bit;
             ++pos_;
         }
@@ -34,14 +33,10 @@ public:
         s32 v = kBase[k] + s32(read(int(2 * k + 1)));
         return neg ? -v : v;
     }
-    bool overrun() const { return overrun_; }
-    size_t pos() const { return pos_; }
-    void seek(size_t p) { pos_ = p, overrun_ = false; }
 
 private:
     ByteSpan d_;
     size_t pos_ = 0;
-    bool overrun_ = false;
 };
 
 // Field order in the bitstream with its change-mask bit and width.
@@ -90,46 +85,65 @@ std::optional<DemoReplay> DemoReplay::parse(ByteSpan file, std::string* error) {
     r.time_ms = rd32(body, 0x78);
     r.automatic = body[0x518 + 0x1F8] == 0;
     r.car_record.assign(body.begin() + 0x518, body.begin() + 0x518 + 0x1D0);
+    for (size_t k = 0; k < 8; ++k) r.condition[k] = rd32(body, 0x518 + 0x1D0 + 4 * k);
+    r.eq_1e8 = rd32(body, 0x518 + 0x1F0);
+    r.grid_slot = s32(rd32(body, 0x518 + 0x1F4));
+    r.pedal_style = body[0x518 + 0x1F8], r.spec_flag = body[0x518 + 0x1F9], r.wheel_type = body[0x518 + 0x1FA];
+    r.asm_on = body[0x518 + 0x1FB] != 0, r.tcs_on = body[0x518 + 0x1FC] != 0;
     if (rd32(body, kHeader) != 0) return fail("recorder mode is not a single input stream");
     size_t off = kHeader + 4;
     u32 total = rd32(body, off), blen = rd32(body, off + 4);
     size_t padded = (size_t(blen) + 3) & ~size_t(3);
     if (blen < 8 || off + padded > body.size()) return fail("bad stream length");
-    BitReader bits(ByteSpan(body).subspan(off + 8, padded - 8));
+    // As GT3 plays it back: reading goes on past the block into the rest of the save (then zeros), where a
+    // stream that runs out early reads the bytes that follow.
+    BitReader bits(ByteSpan(body).subspan(off + 8));
     std::array<s32, 9> st{};
     s32 prev_steer = 0;
     u32 run = 0;
-    bool exhausted = false;
     for (u32 f = 1; f < total; ++f) {
         s32 cur = st[kSteer], p = prev_steer;
         prev_steer = cur;
         if (std::abs(cur) >= 16) st[kSteer] = std::clamp(2 * cur - p, -0x1000, 0x1000);
         if (run) {
             --run;
-        } else if (!exhausted) {
-            size_t save = bits.pos();
+        } else {
             u32 mask = bits.gamma() - 1;
-            std::array<s32, 9> next = st;
             for (size_t i = 0; i < kFields.size(); ++i)
-                if (mask & kFields[i].bit) next[i] = wrap(next[i] + bits.delta(), kFields[i]);
-            u32 rn = bits.gamma() - 1;
-            if (bits.overrun()) { // the data ran out: hold the values
-                exhausted = true;
-                bits.seek(save);
-            } else {
-                st = next, run = rn;
-            }
+                if (mask & kFields[i].bit) st[i] = wrap(st[i] + bits.delta(), kFields[i]);
+            run = bits.gamma() - 1;
         }
         DemoFrame df;
         df.flags = u8(st[0]);
         df.kind = u8(st[1]);
         df.shift = s8(st[2]);
         df.steer = s16(st[kSteer]);
+        df.abs_steer = s16(st[4]);
         df.throttle = s16(st[5]);
         df.brake = s16(st[6]);
+        df.back = s16(st[7]);
+        df.third = s16(st[8]);
         r.frames.push_back(df);
     }
     return r;
+}
+
+sim::exact::PadFrame DemoReplay::pad_frame(size_t i) const {
+    sim::exact::PadFrame p;
+    if (i >= frames.size()) return p;
+    const DemoFrame& f = frames[i];
+    p.flags = f.flags, p.kind = f.kind, p.shift = f.shift, p.steer = f.steer;
+    p.throttle = u16(f.throttle), p.brake = u16(f.brake), p.back = u16(f.back), p.third = u16(f.third);
+    return p;
+}
+
+void DemoReplay::pad_bytes(size_t i, u8* out) const {
+    std::fill(out, out + 16, u8(0));
+    if (i >= frames.size()) return;
+    const DemoFrame& f = frames[i];
+    auto h = [&](size_t o, s16 v) { out[o] = u8(u16(v)), out[o + 1] = u8(u16(v) >> 8); };
+    out[0] = f.flags, out[1] = f.kind, out[2] = u8(f.shift);
+    h(4, f.steer), h(6, f.abs_steer), h(8, f.throttle), h(0xA, f.brake), h(0xC, f.back), h(0xE, f.third);
 }
 
 sim::ControlInputs DemoReplay::inputs(size_t i) const {

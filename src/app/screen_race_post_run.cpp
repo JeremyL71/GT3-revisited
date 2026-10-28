@@ -5,6 +5,7 @@
 // (Race screen code map: docs/dev/RACE.md.)
 
 #include "app/screen_race_impl.h"
+#include "sim/exact/race.h"
 
 namespace gt3r::race_screen {
 
@@ -46,6 +47,9 @@ void RaceScreen::exit_as_finish(double overlay_delay) {
     overlay_delay_ = overlay_delay;
     track_->lap_freeze(); // nothing is timed after the finish
     recorder_.assign(Replay(recorder_.replay()));
+    // The race's record too (the replay is its record), and the race object's own EXIT: its recordings closed, the car's
+    // end of run (the end-of-run driver drives on).
+    if (RaceField* f = exact_field()) exact_exit_finish(*f, machine_.has_value());
     if (machine_) rank_finish(top_speed_kmh_, true);
     else rank_finish(track_->best_lap_time(), false);
     LOG_INFO("Race: pause EXIT is the run's finish (best lap %.3f s, top %.1f km/h)", track_->best_lap_time(),
@@ -71,6 +75,7 @@ void RaceScreen::after_run(App& app) {
     last_run_ended_ = finished_;
     const race::RunKind kind = run_kind();
     const menu::flow::GameRequest& rq = launch_.request;
+    solo_run_ghost(); // (before the switches: a recording too long to keep sets no record)
     qm_items_.after_run(kind, finished_, run_session_record_, championship() && rq.champ_last);
     race::RunOutcome o;
     o.finished = finished_ && !tt_failed_;
@@ -98,6 +103,61 @@ void RaceScreen::after_run(App& app) {
         top3_pending_ = p.name_entry; // the Top 3 again once the name is in
         app.push(make_presentation_screen());
     }
+}
+
+// The original's ghosts (presentation §G11): licence tests, time trials and machine tests run
+// the session's best run as their ghost, free runs its best lap (solo race's runs; the free
+// practice before a GT race has none).
+bool RaceScreen::whole_run_ghost() const {
+    const race::RunKind k = run_kind();
+    return k == race::RunKind::Licence || k == race::RunKind::TimeTrial || k == race::RunKind::MachineTest;
+}
+
+bool RaceScreen::lap_ghost() const { return run_kind() == race::RunKind::FreeRun; }
+
+// The run's time the ghost rules compare: the judged licence time, the time trial's (best)
+// lap, the 0-400 m / 0-1000 m time to the goal; none after a FAIL or EXIT, nor in the
+// top-speed test (presentation §G11).
+double RaceScreen::ghost_run_time() const {
+    switch (run_kind()) {
+    case race::RunKind::Licence: return license_.state() == LicenseRun::State::Finished ? license_.time() : -1;
+    case race::RunKind::MachineTest: return machine_ && machine_->timed() && machine_time_ > 0 ? machine_time_ : -1;
+    case race::RunKind::TimeTrial: return tt_failed_ ? -1 : track_->best_lap_time();
+    default: return -1;
+    }
+}
+
+// After a live solo run (presentation §G11): a run that set the session record (at or under
+// the session's best; a licence test with a medal or not) becomes the session's best run, SAVE
+// GHOST's file; a run with a time under the ghost's (or with no ghost yet) gives the ghost the
+// best run: at once with the Ghost option on, else after "Update Ghost?" on the next quick
+// menu. A recording of 10 minutes or more is not kept: no record, no ghost. A free run's lap
+// ghost is its race's own (the free run's lap handlers); here the run that drove the best lap
+// is kept for SAVE GHOST, and a lap that beat the ghost with the Ghost option off (race info
+// + 0x48, left set: the lap is not the ghost yet) asks "Update Ghost?".
+void RaceScreen::solo_run_ghost() {
+    if (replaying_ || demo_ || !preset_.ghost) return;
+    if (lap_ghost()) {
+        if (best_lap_in_run_) best_run_replay_ = finished_recording();
+        best_lap_in_run_ = false;
+        if (const RaceField* f = exact_field())
+            if (const sim::exact::ExactRace* r = exact_race_of(*f); r && r->flow().ghost != 0) ghost_ask_ = true;
+        return;
+    }
+    if (!whole_run_ghost()) return;
+    const bool kept = race::ghost_recording_kept(recorder_.tick());
+    if (!kept) run_session_record_ = false;
+    const double t = ghost_run_time();
+    if (run_session_record_ && t > 0) {
+        best_run_time_ = t;
+        best_run_replay_ = finished_recording();
+        best_run_record_ = best_run_replay_->exact;
+    }
+    const long long ms = t > 0 ? std::llround(t * 1000.0) : -1;
+    const long long ghost_ms = !ghost_record_ ? -1 : std::llround(ghost_time_ * 1000.0);
+    if (!race::replaces_ghost(ms, kept, ghost_ms) || !best_run_record_) return;
+    if (ghost_on_) take_best_run_ghost();
+    else ghost_ask_ = true;
 }
 
 void RaceScreen::start_auto_replay(App& app) {

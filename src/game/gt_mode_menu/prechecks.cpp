@@ -5,6 +5,8 @@
 #include "game/gt_mode_menu/internal.h"
 
 #include "game/gt_setting.h"
+#include "game/language_rules.h"
+#include "vfs/vfs.h"
 
 #include <cstdlib>
 
@@ -103,6 +105,13 @@ std::string intercept(const std::string& page, const MblItem& it) {
         return "00cmn/cd_ride_sure";
     (void)page;
     return {};
+}
+
+bool listed(const std::string& page, const MblItem& it) {
+    if (!starts(page, "cd/")) return true;
+    const MenuState& ms = menu_state();
+    const Language lang = ms.data ? ms.data->language : ms.reader ? language_of(ms.reader) : Language::US;
+    return dealer_item_listed(it.name, lang);
 }
 
 bool enabled(const std::string& page, const MblItem& it) {

@@ -14,6 +14,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +31,10 @@ public:
     virtual void on_event(App&, const SDL_Event&) {}
     // Screens that consume raw input (rebinding) disable menu navigation.
     virtual bool wants_menu_input() const { return true; }
+    // Menu input from any device (InputManager::any_device_pad) instead of player 1's pad alone:
+    // our Settings, so a preset or bindings that leave player 1's controller dead can be undone
+    // with any controller or the keyboard.
+    virtual bool menu_input_any_device() const { return false; }
     // On-screen touch controls for this screen (phones/tablets): menu
     // navigation by default; screens that drive a car return Driving.
     virtual TouchLayout touch_layout() const { return TouchLayout::Menu; }
@@ -41,6 +46,9 @@ public:
     // The startup update dialog (app/updates.h) may open over this screen: the main menu, the
     // first-run screen and the game's title menu.
     virtual bool update_prompts() const { return false; }
+    // A file dropped on the window: true when this screen takes it (the Mods screen takes .zip
+    // archives) and gets it as an SDL_EVENT_DROP_FILE; otherwise it opens as a disc image.
+    virtual bool takes_dropped_file(const std::string&) const { return false; }
 };
 
 class App {
@@ -117,14 +125,33 @@ public:
 #endif
     const std::string& data_dir() const { return data_dir_; }
     std::string mods_dir() const { return data_dir_ + "mods"; }
+    // Scans the mods folder again (after an install, a removal or a visit to the file manager),
+    // or turns a mod on or off and keeps that in the config; the game's next start (title menu,
+    // GT Mode, arcade) has the mods as they are now.
+    void rescan_mods();
+    void set_mod_enabled(const std::string& id, bool enabled);
     // Set by the async file dialog callback; consumed on the main thread.
     void set_dialog_result(std::string path);
     const std::string& last_error() const { return last_error_; }
+    // The game's language code (Vfs::language, disc/region.h): its menu/<code>/ and
+    // race/<code>/ folder ("US", "JP", "BR", "FR", ...).
+    std::string language() const;
+    // Each region keeps its own choice in the config: [gt3menu] lang (NTSC-U), lang_jp, lang_eu.
+    std::string language_key() const;
+    // Whether the region's language was chosen (the config or GT3R_LANG): PAL asks at the
+    // first start until it is.
+    bool language_chosen() const;
+    // Chooses the language (a code the disc has menus for) and keeps it in the config.
+    void set_language(const std::string& code);
+    // The game's start: the opening movie, then the title menu; first the language page on a
+    // PAL disc whose language was not chosen yet.
+    void push_game_start();
+    // The languages the disc has menus for, in kMenuLanguages order.
+    std::vector<std::string> languages() const;
 
 private:
     void apply_screen_changes();
     void save_screenshot(const std::string& path);
-    void push_game_start(); // boot screen: opening movie, then the title menu
     // Sets the renderer's logical presentation and the Ui layout for the frame.
     void layout_ui(bool adaptive);
     // Window area (window coordinates) clear of display cutouts and, on
@@ -132,6 +159,7 @@ private:
     SDL_FRect safe_area_window() const;
     void draw_phone_mask(); // GT3R_PHONE: cutout and rounded corners, for screenshots
     void open_saved_disc(const std::string& saved); // [game] disc, with fallbacks for old relative paths
+    void apply_language(); // the opened disc's language from the config
 
     SDL_Window* window_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;     // owned by gpu_ when it exists
@@ -144,6 +172,14 @@ private:
     bool xr_pointer_on_ = false, xr_pointer_down_ = false;
     float xr_pointer_x_ = 0, xr_pointer_y_ = 0;
 #endif
+    // GT3R_POINTER_SCRIPT: scripted pointer events for tests and screenshots, in UI units and
+    // routed as the VR pointer's are (docs/dev/PLATFORMS.md "Pointer scripts").
+    void pointer_script();
+    std::vector<std::string> pointer_steps_;
+    size_t pointer_step_ = 0;
+    int pointer_wait_ = 0;
+    bool pointer_shown_ = false;
+    float pointer_x_ = 0, pointer_y_ = 0;
     std::unique_ptr<Ui> ui_;
     std::unique_ptr<InputManager> input_;
     std::unique_ptr<AudioEngine> audio_;
@@ -192,10 +228,15 @@ std::unique_ptr<Screen> make_hub_screen();       // home menu under the game
 std::unique_ptr<Screen> make_developer_screen(); // Developer options (tools)
 std::unique_ptr<Screen> make_browser_screen(const std::string& open_path = "");
 std::unique_ptr<Screen> make_jukebox_screen();
-std::unique_ptr<Screen> make_input_screen();
 std::unique_ptr<Screen> make_mods_screen();
 // Settings; `tab` picks the first page shown (SettingsTab order: 0 Display .. 5 Game disc).
-std::unique_ptr<Screen> make_settings_screen(int tab = 0);
+// `to_game`: opened from the game's menus, which it returns to ("Back to game").
+std::unique_ptr<Screen> make_settings_screen(int tab = 0, bool to_game = false);
+constexpr int kSettingsTabControls = 2;
 constexpr int kSettingsTabDisc = 5;
+// Settings -> Touch -> Customize layout: move, resize and hide the on-screen controls. `to_game`:
+// Settings was opened from the game's menus (make_settings_screen's to_game); Triangle then closes
+// this and Settings at once, back to the game (the screen pops itself, then calls it).
+std::unique_ptr<Screen> make_touch_editor_screen(std::function<void(App&)> to_game = {});
 
 } // namespace gt3r

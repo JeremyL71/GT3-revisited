@@ -395,6 +395,67 @@ Gesture::Result Gesture::feed(const SDL_Event& e) {
     return Result::None;
 }
 
+const HitArea* HitList::at(float x, float y) const {
+    for (auto it = areas_.rbegin(); it != areas_.rend(); ++it)
+        if (it->r.contains(x, y)) return &*it;
+    return nullptr;
+}
+
+void PointerInput::event(const SDL_Event& e) {
+    using K = Action::Kind;
+    auto push = [&](Action a) {
+        if (a.kind == K::Hover && !actions_.empty() && actions_.back().kind == K::Hover) actions_.back() = a;
+        else if (a.kind == K::Drag && !actions_.empty() && actions_.back().kind == K::Drag) actions_.back() = a;
+        else actions_.push_back(a);
+    };
+    switch (e.type) {
+    case SDL_EVENT_MOUSE_MOTION: // the mouse, or the VR pointer (not SDL's mouse made from a touch)
+        if (e.motion.which == SDL_TOUCH_MOUSEID) break;
+        hover_known_ = true, hx_ = e.motion.x, hy_ = e.motion.y;
+        if (!e.motion.state && !gesture_.active()) push({K::Hover, e.motion.x, e.motion.y});
+        break;
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE: hover_known_ = false; break;
+    case SDL_EVENT_MOUSE_WHEEL:
+        if (e.wheel.y != 0) {
+            Action a{K::Wheel, e.wheel.mouse_x, e.wheel.mouse_y};
+            a.wheel = e.wheel.y * (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0f : 1.0f);
+            push(a);
+        }
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        if (e.button.button == SDL_BUTTON_RIGHT && e.button.which != SDL_TOUCH_MOUSEID) push({K::Back, e.button.x, e.button.y});
+        break;
+    case SDL_EVENT_FINGER_DOWN:
+        if (e.tfinger.touchID != SDL_MOUSE_TOUCHID) hover_known_ = false;
+        break;
+    default: break;
+    }
+    const PointerEvent p = pointer_event(e);
+    if (p.kind == PointerEvent::Kind::Down && !gesture_.active()) finger_ = p.id != 0;
+    switch (gesture_.feed(e)) {
+    case Gesture::Result::Tap: {
+        Action a{K::Click, gesture_.x(), gesture_.y()};
+        a.finger = finger_;
+        push(a);
+        break;
+    }
+    case Gesture::Result::DragStart:
+    case Gesture::Result::Drag: {
+        Action a{K::Drag, gesture_.x(), gesture_.y(), gesture_.start_x(), gesture_.start_y()};
+        a.finger = finger_;
+        push(a);
+        break;
+    }
+    case Gesture::Result::Up: {
+        Action a{K::DragEnd, gesture_.x(), gesture_.y(), gesture_.start_x(), gesture_.start_y()};
+        a.finger = finger_;
+        push(a);
+        break;
+    }
+    default: break;
+    }
+}
+
 bool pointer_down(const SDL_Event& e, float& x, float& y) {
     if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT && e.button.which != SDL_TOUCH_MOUSEID) {
         x = e.button.x;

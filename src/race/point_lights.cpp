@@ -35,12 +35,20 @@ void CoursePointLights::load(ByteSpan g) {
     }
 }
 
+int first_candidate(int hint, int n) {
+    if (n <= 0) return 0;
+    int start = hint - 4;
+    if (start < 0) start += n;
+    if (start < 0 || start >= n) start = (start % n + n) % n; // hints below 4 - n or above n + 3 (none on the disc)
+    return start;
+}
+
 std::vector<SelectedLamp> CoursePointLights::candidates(const SunParams& env, const render::Vec3& p, int hint) const {
     std::vector<SelectedLamp> out;
     int n = int(lamps_.size());
     if (n == 0) return out;
     int scan = std::min(n, 9);
-    int start = ((hint - 4) % n + n) % n;
+    int start = first_candidate(hint, n);
     for (int k = 0; k < scan; ++k) {
         int idx = (start + k) % n;
         const CourseLamp& l = lamps_[size_t(idx)];

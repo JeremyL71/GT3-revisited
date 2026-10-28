@@ -41,6 +41,7 @@ struct AiPoint {
     float radius() const { return (flags & 1) ? lateral : 0.0f; }
     float heading = 0;  // radians, world frame (converted from the sim frame)
     u32 packed = 0;
+    s32 raw_x = 0, raw_z = 0, raw_radius = 0; // +0x04 / +0x08 / +0x18 as stored (fixed point 1/4096)
 };
 
 struct AiLine {

@@ -130,10 +130,43 @@ uninstall the APK afterwards. `adb shell input keyevent` presses are
 shorter than a frame; both keyboard and touch input latch such presses so
 injected events register.
 
+The user data folder is the app's files dir (private storage). The app's documents
+provider (`GT3DocumentsProvider`, authority `<application id>.documents`) shows it in
+the system Files app and file pickers as GT3 Revisited, so players can copy mods in
+and screenshots out; the Mods screen's **Open folder** opens it there
+(`GT3Activity.openUserFolder`). `GT3R_MOD_ZIP=<archive>` makes the Mods screen install
+that archive as if picked, for testing without the file picker.
+
 Useful checks: `adb emu sensor set acceleration x:y:z` for tilt steering,
 `settings put system user_rotation N` (with `accelerometer_rotation 0`)
 for orientation, `logcat --pid=$(pidof org.gt3revisited.gt3r)` for the
 engine log ("Race perf" lines every 3 s while racing).
+
+### Pointer scripts
+
+`GT3R_POINTER_SCRIPT` feeds a screen scripted pointer events, in UI units (640 × 360),
+routed as the VR controller's pointer is (`App::pointer_script`). It tests mouse and
+touch handling without a person at the machine, and `--shot` shows the pointer's arrow.
+Steps are separated by `;`:
+
+| Step | Event |
+|---|---|
+| `wait:<frames>` | wait that many frames |
+| `move:<x> <y>` | the mouse moves there (hover) |
+| `click:<x> <y>` | moves there, left button down and up |
+| `rclick:<x> <y>` | right button down and up |
+| `drag:<x0> <y0> <x1> <y1>` | press, move in 8 steps, release |
+| `wheel:<steps> <x> <y>` | the wheel (+ = up / away) at the point |
+| `tap:<x> <y>` | a finger's tap (no hover) |
+| `pinch:<x> <y> <from> <to>` | two fingers centred on the point, moving from `from` to `to` units apart in 8 steps |
+
+The log names each step with its frame. Example (the online lobby's car page, then the
+classes, then Class B):
+
+```bash
+GT3R_POINTER_SCRIPT="wait:40;click:100 191;wait:15;rclick:5 5;wait:10;click:90 33;wait:10;click:320 100" \
+GT3R_SHOT_FRAME=120 GT3R_ONLINE="host" ./build/gt3r.app/Contents/MacOS/gt3r disc.iso --screen online --shot out.png
+```
 
 ## CI
 

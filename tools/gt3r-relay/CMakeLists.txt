@@ -10,7 +10,8 @@ add_executable(gt3r-relay
   ${GT3R_SRC}/net/socket.cpp
   ${GT3R_SRC}/net/protocol.cpp
   ${GT3R_SRC}/net/rendezvous.cpp
-  ${GT3R_SRC}/net/relay_server.cpp)
+  ${GT3R_SRC}/net/relay_server.cpp
+  ${GT3R_SRC}/net/geoip.cpp)
 target_include_directories(gt3r-relay PRIVATE ${GT3R_SRC})
 if(WIN32)
   target_link_libraries(gt3r-relay PRIVATE ws2_32)

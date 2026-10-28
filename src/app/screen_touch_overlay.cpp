@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <numbers>
 
 namespace gt3r {
@@ -107,6 +108,7 @@ void draw_controls(Ui& ui, const TouchControls& controls, float ox, float oy) {
     const float a = cfg.opacity, ink = std::min(1.0f, a * 1.7f);
 
     for (Widget w : controls.widgets()) {
+        if (w.hidden) continue;
         w.x += ox, w.y += oy, w.origin_x += ox, w.origin_y += oy, w.knob_x += ox;
         const Color fg = with_alpha(w.active ? kHot : Color{240, 242, 246}, ink);
         switch (w.kind) {
@@ -217,7 +219,67 @@ void draw_controls(Ui& ui, const TouchControls& controls, float ox, float oy) {
     }
 }
 
+// The letterboxed 640x360 UI's window: its corners in UI units, its cutout insets, and the
+// render scale and offset that draw UI units across all of it (letterbox bars included).
+struct WindowSpace {
+    bool logical = false; // a letterboxed logical presentation is set
+    int lw = 0, lh = 0;
+    SDL_RendererLogicalPresentation mode = SDL_LOGICAL_PRESENTATION_DISABLED;
+    float k = 1, ox = 0, oy = 0; // window units per UI unit; UI (0, 0) drawn at (ox, oy)
+    bool screen = false;
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0; // window corners, UI units
+    bool insets = false;
+    float il = 0, it = 0, ir = 0, ib = 0; // cutout / rounded corners, UI units from the edges
+};
+
+WindowSpace window_space(SDL_Renderer* r, const SDL_FRect& safe_window) {
+    WindowSpace w;
+    SDL_FRect lr{};
+    w.logical = SDL_GetRenderLogicalPresentation(r, &w.lw, &w.lh, &w.mode) && w.mode != SDL_LOGICAL_PRESENTATION_DISABLED &&
+                w.lw > 0 && SDL_GetRenderLogicalPresentationRect(r, &lr) && lr.w > 0;
+    if (!w.logical) return w;
+    w.k = lr.w / float(w.lw);
+    w.ox = lr.x / w.k, w.oy = lr.y / w.k;
+    // Window corners in UI units: the same mapping touch events go through.
+    int ww = 0, wh = 0;
+    if (SDL_Window* win = SDL_GetRenderWindow(r); win && SDL_GetWindowSize(win, &ww, &wh) &&
+        SDL_RenderCoordinatesFromWindow(r, 0, 0, &w.x0, &w.y0) &&
+        SDL_RenderCoordinatesFromWindow(r, float(ww), float(wh), &w.x1, &w.y1)) {
+        w.screen = true;
+        // Display cutout / rounded corners, as insets from the window edges.
+        float sx0 = w.x0, sy0 = w.y0, sx1 = w.x1, sy1 = w.y1;
+        const SDL_FRect& sa = safe_window;
+        if (sa.w > 0 && sa.h > 0 && SDL_RenderCoordinatesFromWindow(r, sa.x, sa.y, &sx0, &sy0) &&
+            SDL_RenderCoordinatesFromWindow(r, sa.x + sa.w, sa.y + sa.h, &sx1, &sy1)) {
+            w.insets = true;
+            w.il = sx0 - w.x0, w.it = sy0 - w.y0, w.ir = w.x1 - sx1, w.ib = w.y1 - sy1;
+        }
+    }
+    return w;
+}
+
+void lay_out(TouchControls& c, const WindowSpace& w) {
+    if (w.screen) c.set_screen(w.x0, w.y0, w.x1, w.y1);
+    if (w.insets) c.set_insets(w.il, w.it, w.ir, w.ib);
+}
+
+// Draw in UI units across the whole window: the logical presentation (which clips to the
+// game area) off while `draw` runs.
+template <class F> void with_whole_window(SDL_Renderer* r, const WindowSpace& w, F&& draw) {
+    if (w.logical) {
+        SDL_SetRenderLogicalPresentation(r, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+        SDL_SetRenderScale(r, w.k, w.k);
+    }
+    draw(w.ox, w.oy);
+    if (w.logical) {
+        SDL_SetRenderScale(r, 1, 1);
+        SDL_SetRenderLogicalPresentation(r, w.lw, w.lh, w.mode);
+    }
+}
+
 } // namespace
+
+void draw_touch_controls(Ui& ui, const TouchControls& controls, float dx, float dy) { draw_controls(ui, controls, dx, dy); }
 
 void TouchOverlay::load(const IniDocument& config) {
     controls_.configure(TouchConfig::load(config));
@@ -286,43 +348,19 @@ void TouchOverlay::update(double dt, TouchLayout layout, InputManager& input) {
 
 void TouchOverlay::render(Ui& ui) {
     if (controls_.layout() == TouchLayout::None) return; // our own screens: other layout space, no controls
-    SDL_Renderer* r = ui.renderer();
     // The UI is letterboxed to Ui::kWidth x kHeight. Work out the whole window
     // in UI units so controls can sit in the bars, then draw with the logical
     // presentation (which clips to the game area) switched off.
-    int lw = 0, lh = 0, ww = 0, wh = 0;
-    SDL_RendererLogicalPresentation mode = SDL_LOGICAL_PRESENTATION_DISABLED;
-    SDL_FRect lr{};
-    float k = 1, ox = 0, oy = 0;
-    bool logical = SDL_GetRenderLogicalPresentation(r, &lw, &lh, &mode) && mode != SDL_LOGICAL_PRESENTATION_DISABLED &&
-                   lw > 0 && SDL_GetRenderLogicalPresentationRect(r, &lr) && lr.w > 0;
-    if (logical) {
-        k = lr.w / float(lw);
-        ox = lr.x / k, oy = lr.y / k;
-        // Window corners in UI units: the same mapping touch events go through.
-        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-        if (SDL_Window* win = SDL_GetRenderWindow(r); win && SDL_GetWindowSize(win, &ww, &wh) &&
-            SDL_RenderCoordinatesFromWindow(r, 0, 0, &x0, &y0) &&
-            SDL_RenderCoordinatesFromWindow(r, float(ww), float(wh), &x1, &y1)) {
-            controls_.set_screen(x0, y0, x1, y1);
-            // Display cutout / rounded corners, as insets from the window edges.
-            float sx0 = x0, sy0 = y0, sx1 = x1, sy1 = y1;
-            const SDL_FRect& sa = safe_window_;
-            if (sa.w > 0 && sa.h > 0 && SDL_RenderCoordinatesFromWindow(r, sa.x, sa.y, &sx0, &sy0) &&
-                SDL_RenderCoordinatesFromWindow(r, sa.x + sa.w, sa.y + sa.h, &sx1, &sy1))
-                controls_.set_insets(sx0 - x0, sy0 - y0, x1 - sx1, y1 - sy1);
-        }
-    }
+    const WindowSpace w = window_space(ui.renderer(), safe_window_);
+    lay_out(controls_, w);
     if (!controls_.visible()) return;
-    if (logical) {
-        SDL_SetRenderLogicalPresentation(r, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
-        SDL_SetRenderScale(r, k, k);
-    }
-    draw_controls(ui, controls_, ox, oy);
-    if (logical) {
-        SDL_SetRenderScale(r, 1, 1);
-        SDL_SetRenderLogicalPresentation(r, lw, lh, mode);
-    }
+    with_whole_window(ui.renderer(), w, [&](float ox, float oy) { draw_controls(ui, controls_, ox, oy); });
+}
+
+void TouchOverlay::draw_whole_window(Ui& ui, TouchControls& c, const std::function<void(float, float)>& draw) const {
+    const WindowSpace w = window_space(ui.renderer(), safe_window_);
+    lay_out(c, w);
+    with_whole_window(ui.renderer(), w, draw);
 }
 
 void TouchOverlay::draw_preview(Ui& ui, const UiRect& box, bool controls) const {

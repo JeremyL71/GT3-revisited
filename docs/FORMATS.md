@@ -16,6 +16,14 @@ The disc is ISO9660 + UDF bridge, 2048-byte sectors.
 | `*.IRX`, `IOPRP224.IMG` | IOP modules: pad, memory card, sound (`LIBSD`), USB/i.LINK, plus Polyphony's `PDI*` modules (GT Force wheel and i.LINK multiplayer) |
 | `GT3.VOL` | Asset archive, about 3.9 GB on disc and 6 GB unpacked |
 
+Other games on the engine use the same layout. A dual-layer disc (the Asian
+GT Concept 2002 Tokyo-Geneva, `SCPS_559.02` and `SCPS_559.03`) has a file system
+per layer: the second's primary volume descriptor is the sector where the
+first's volume ends, and the files are spread over both layers. Its assets are
+in `GTC0.VOL` (layer 0: music and movies) and `GTC1.VOL` (layer 1: the rest);
+the engine reads every `*.VOL` with the archive's magic as one set (`GT3.VOL`
+or the one with the largest index first; a path two have is the first's).
+
 ## CORE.GT3 ✅ (`src/disc/core_image.*`)
 
 ```
@@ -32,9 +40,12 @@ Unpacked:
 0x110  u32          image size      (= unpacked size - 0x114)
 0x114  ...          program image
 ```
-The engine **never executes this code**. It only looks up one data table
-in it (the built-in time-trial record names, found by a pattern search),
-and `gt3tool info` prints the header values.
+Each segment is `u32 load address, u32 size`, then its bytes. Gran Turismo 3
+has one; GT Concept's programs have three.
+The engine **never executes this code**. It reads it to tell the release (the
+car database it loads, and the code of the routines whose rules differ between
+releases), to check its built-in tables against the disc's, and to look up the
+time-trial record names; `gt3tool info` prints the header values.
 
 ## GT3.VOL ✅ (`src/disc/volume.*`)
 
@@ -174,7 +185,8 @@ The game save itself is the data file `BASCUS-97102GAMEDATA/BASCUS-97102GAMEDATA
 0x40-byte header {u32 header size 0x40, u32 payload size, u16 minor 1, u16 major 7,
 u32 CRC-32, name "Base"}, then the payload with every byte inverted (XOR 0xFF); the
 CRC is the zlib CRC-32 of the stored (inverted) payload and the file is padded to 64
-bytes. What the payload holds and how GT Mode maps it is in
+bytes. This file alone is the "raw" save PS2 save editors (GT3SaveEditor) read; GT3
+Revisited imports it under any name and exports it as `.raw`. What the payload holds and how GT Mode maps it is in
 [dev/GT_MODE.md](dev/GT_MODE.md#saves) ("PS2 import/export"). Its containers: `.psu` (512-byte directory
 entries: the save folder, ".", "..", then each file entry and its data padded to 1 KB)
 and raw 8 MB card images (`.ps2` / `.mcd`: 512-byte pages with or without a 16-byte

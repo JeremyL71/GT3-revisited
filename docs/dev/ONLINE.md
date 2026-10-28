@@ -8,61 +8,100 @@ online lobby (`src/app/screen_online.cpp`; also `gt3r --screen online`).
 
 ## Model: every player owns their car
 
-- Each player simulates **only their own car** with the full physics, at the
-  usual 60 Hz fixed tick, and sends that car's state after every tick.
-- The other players' cars are opponents in the `RaceField` (no AI). They are
-  **kinematic** cars in `sim::World` (`World::set_kinematic`,
-  `Vehicle::set_remote_pose`). They are never stepped. They are posed before
-  each step, and a car–car contact is solved with both bodies as usual, but
-  only the local car keeps the result. The remote player's machine solves the
-  same contact for its own car, so both sides feel the hit.
-- `race::RemoteCar` predicts a remote car "now". It dead-reckons the newest
-  snapshot along its velocity and spin, capped at 0.25 s. When a new snapshot
-  lands, the jump between the shown car and the new prediction is blended out
-  over about 0.1 s, so cars glide instead of popping. Collisions use the
-  unblended prediction.
+- Each player runs **only their own car**, on the exact core (GT3's own race step,
+  `sim::exact`; docs/dev/RACE.md "Races on the exact core"), at 60 steps a second, and
+  sends that car's state after every step.
+- An online race is a `race::ExactField` with the i.LINK battle's race rules
+  (`Conductor::BattleMP`): start type 1 (four seconds on the grid), the lobby's laps, no
+  tyre wear, no catch-up. Every machine runs **NTSC-U rules at 60 steps a second**,
+  whatever disc it has (`ExactFieldOptions::rules`, set by `RaceScreen::exact_options` for
+  online races; offline races follow their disc's release), so everyone in a race shares
+  one physics.
+- The other players' cars are **posed** cars of that race (`ExactRace::set_posed`,
+  `ExactRace::pose`; docs/dev/RACE.md):
+  - before every step their records take the prediction's motion (`pose_motion`:
+    position, velocity, attitude and rates, body axes, speeds, the road segment, the
+    steering, pedals, gear and engine speed);
+  - their own phases are skipped;
+  - they take part in phase 11 (our slipstream and the AI's view of them) and in the
+    collision step, whose body starts back along the posed motion (the pose is the end
+    of the step); the step's result for them is thrown away;
+  - the race flow, the ranking and the gap matrices run on them as on every car: their
+    laps, place and finish are what this machine sees. The results take the owners'
+    finish times (Finish messages).
+- A car–car contact is solved with both bodies as usual, but only our car keeps the
+  result. The remote player's machine solves the same contact for its own car, so both
+  sides feel the hit.
+- `race::RemoteCar` predicts a remote car "now": a one-car exact race of that car runs
+  on from each state with its owner's newest pad frame ("Feel and fairness" below). When
+  a new state lands, the jump between the shown car and the new prediction is blended out
+  over about 0.1 s, so cars glide instead of popping. Collisions use the unblended
+  prediction.
+- A machine whose disc program the exact core does not know (`ProgramData::load`
+  refuses it) cannot race online: its lobby refuses Ready and Start with the reason.
 
-Why not lockstep or rollback with only inputs exchanged? The physics is
-deterministic only on the same build (float results differ between compilers
-and CPUs: desktop x86, Apple and Android ARM), so a lockstep game would desync
-across platforms. Lockstep also adds input delay equal to the round trip, and
-rollback would have to snapshot and re-simulate every car several ticks per
-frame. Owner authority tolerates different builds and platforms and packet
-loss, and it scales to six cars. The cost is that contacts are approximate
-(each side sees the other car up to one-way latency late) and nothing stops a
-modified client from lying about its car.
+Why owner authority and not lockstep (yet)? Online play was built on a physics that was
+deterministic only on the same build (float results differ between compilers and CPUs), so a
+lockstep game would have desynced across platforms. Owner authority tolerates different builds and
+platforms and packet loss, adds no input delay, and scales to six cars. The cost is that
+contacts are approximate (each side sees the other car up to one-way latency late) and
+nothing stops a modified client from lying about its car.
 
-## State (protocol 3)
+### Later: input-only lockstep
 
-A car's state is 98 bytes on the wire, including six ticks of input history.
-A race datagram carrying it is 114 bytes (126 through the relay, plus 28 bytes
-of IP/UDP header), sent 60 times a second: about 61 kbit/s per stream, 65 kbit/s
-at the busiest second (measured in `net_relay_traffic_per_link`, with pings and
-contacts).
+The exact core changes the first reason. Its step is the same bit for bit on every
+platform (`ee::F` is integer code; `ee_double_platform_hash` and the exact tests pin
+arm64 against x86-64), so machines that start a race from the same setup and feed it the
+same pad frames compute the same race. That would allow, later:
+- **Lockstep:** every machine runs every car from all players' pad frames (each state
+  already carries the newest three); a step runs once every frame for it is in. No
+  prediction, contacts exactly alike everywhere, a few bytes per step; it costs input
+  delay of about half the slowest round trip and a stall when frames are late.
+- **Rollback:** run on with predicted frames and re-run from a copy of the race
+  (`ExactRace` is copyable) when a real frame differs: no input delay, at about 12 µs per
+  car and step re-run (M-series).
+- What it needs: the same rules and program tables on every machine (NTSC-U rules, as
+  now), the same race setup (each car's parameter block from each disc's database: the
+  lobby already compares its digest exactly, "Regional discs" below), and the same
+  exact-core build (a core version in Hello).
+- In GT3's i.LINK battle every console's race starts its random draws from the session's
+  shared seed, a hint that it ran lockstep itself.
+
+Not built.
+
+## State (protocol 4)
+
+A car's state is 113 bytes on the wire with three frames of history when one repeats,
+116 while steering (every frame different), at most 125. A race datagram carrying it is
+about 132 bytes while steering (144 through the relay, plus 28 bytes of IP/UDP header),
+sent 60 times a second: about 69 kbit/s per stream, 70 kbit/s at the busiest second; a host still
+forwarding four other players' states sends up to 0.30 Mbit/s on one channel (measured in
+`net_relay_traffic_per_link`, with pings and contacts; the relay's racing guard is
+0.5 Mbit/s).
 
 | field | encoding |
 |---|---|
-| tick | u32 |
-| position | 3 × 24-bit, mm (±8.4 km) |
-| orientation | "smallest three": 2-bit index + 3 × 10 bits (worst 0.22°) |
-| velocity / angular velocity | 3 × s16 each, cm/s / mrad/s |
-| heading, yaw rate | u16 (2π/65536), s16 mrad/s |
-| rpm, gear, rev limiter, laps, throttle | u16, s8, u8, u8, u8 |
-| wheels | steer s8 (5 mrad), spin speed s16 (0.1 rad/s), suspension s8 (2 mm), slip ratio / angle s8, surface u16, grounded bits |
-| inputs | count + up to 6 × {steer s8, throttle u8, brake u8, flags u8}, newest first |
+| player, tick | u8, u32 (the owner's step; newer replaces older) |
+| race clock | s32, 1/3000 s (negative in the countdown) |
+| flags, laps | u8 (rev limiter; bit 1 a respawn, never set: the game has none), u8 |
+| entry | u8 pedal style (3 bits), steering-wheel type (3), ASM, TCS; u8 control source (2 bits), driver kind (4) |
+| position, velocity | 3 × f32 each, the record's floats bit for bit (physics frame, Z up) |
+| heading, pitch, roll, yaw rate | f32 each, bit for bit |
+| engine speed, steering command, axle speeds | f32, f32, 2 × f32, bit for bit |
+| pitch and roll rates | s16 each, 1/1024 rad/s |
+| wheels | rim speed s16 (1/128 m/s), suspension coordinate s16 (1/65536 m) |
+| gear, clutch state | u8, u8 |
+| pad frames | count + up to 3 frames, newest first: flags u8, kind / shift / back / third bits u8, steer s16, throttle u16, brake u16, back u16 and third u16 when not 0; a frame equal to the one before it is one byte (0xFF) |
 
-Not sent; the receiver rebuilds them (`race::complete_snapshot`) from the car's
-own setup:
-- the race clock (tick / 60 − countdown);
-- the CoG for collisions (position + orientation · cog_offset);
-- wheel contact points (wheel centre from the suspension travel, minus the
-  radius);
-- loads (grounded wheels share the weight);
-- speed;
-- wheel spin angles (integrated from the spin speed).
+A state whose floats include an infinity or NaN (exponent 255) is refused.
 
-The input history feeds the physics-based prediction ("Feel and fairness"
-below). It also means a lost datagram loses no input.
+Not sent; the receiver derives them (`race::complete_snapshot`): the race time, the
+course-frame CoG and velocity, the heading's rotation and the speed (the cheat checks
+read them), the brake lamp. Everything else a remote car needs to be drawn and heard
+(wheels, suspension, smoke, engine) comes from its prediction shadow's own record.
+
+The pad frames are exactly what the owner's car read: the shadow drives on with the
+newest, and a lost datagram loses no frame (what a lockstep game would need).
 
 ## Session (`src/net/`)
 
@@ -79,8 +118,8 @@ below). It also means a lost datagram loses no input.
     ready). The host's Load carries course, laps and grid. Each race screen
     sends Loaded once its scene is built. Go carries the countdown start in
     the host's clock.
-  - **Settings:** course, laps, *mod cars allowed* (default on), *ghost
-    above* a round trip (default 150 ms; 0 = always contact).
+  - **Settings:** course, laps, *ghost above* a round trip (default 150 ms;
+    0 = always contact), and the car rules ("Lobby car rules" below).
   - **Race traffic (mesh).** Each Hello lists the client's LAN endpoints. The
     roster gives every player's endpoints: the address the host sees, then
     the LAN ones. Clients send "punch" datagrams (`"GT3P"` + session token) to
@@ -98,7 +137,9 @@ below). It also means a lost datagram loses no input.
     minimum-round-trip sample of the last 16, taken every 250 ms. Over
     loopback with a 5 s skew: offset error 0.01 ms, start instants 0.01 ms
     apart. The race screen re-reads the start time every frame while the
-    estimate improves.
+    estimate improves. Once racing, a change is eased in (the race clock runs
+    at most 5% fast or slow) rather than jumping: over a long link the
+    estimate moves by a few ms whenever the best sample leaves the window.
 - Peers time out after 8 s of silence. Bye is sent on close.
 - `net::online()` is the session shared by the lobby and the race screen.
 
@@ -110,11 +151,77 @@ Each player's car travels as a `game::OnlineCar` descriptor (`src/game/net_car.*
 - **Disc car:** its database label.
 - **Garage car (GT Mode):** the base car, its 27 fitted part ids, the user
   settings, the engine condition and the wheel (~480 bytes). Every machine
-  rebuilds the exact spec from its own disc (`game::online_car_spec`, the same
-  path as GT Mode's `car_spec`). The lobby lists the GT Mode garage first. A
+  rebuilds the car from its own disc: the race's parameter block from its
+  equipment (`race::exact_online_source`), the spec the lobby's rules read
+  (`game::online_car_spec`, the same path as GT Mode's `car_spec`). The lobby lists the GT Mode garage first. A
   garage car keeps its own paint. Remote cars use their real spec, since
   weight and size count in contact.
 - **Mod car:** its label plus the SHA-256 and size of its package (below).
+- **Arcade car:** a car of the arcade's class lists (database table 35, e.g.
+  `nsx_s_zero_97_290`), with its base car. Every machine builds it as the arcade
+  races it (`race::arcade_car`): the variant's parts with its arcade tyres for the
+  course (stage 10 "racing"; dirt courses stage 12). Road cars' arcade tyres
+  (`arc_normal`) equal their stock `normal` ones; race cars' `arc_racing` grip more
+  than their stock tyres (GT-One: μ 1.70 against 1.59).
+
+### Regional discs
+
+Players on NTSC-U, PAL and NTSC-J discs share lobbies. Each machine builds the other
+players' cars from its own disc, so a car races only where it is the same car.
+
+- **Parameter block digest.** Every descriptor carries the SHA-256 of the car's parameter
+  block P as an online race builds it (`game::online_car_params` / `online_car_digest`:
+  `sim::exact::race_params` of the descriptor's equipment through `exact_online_source` and
+  `exact_equipment`, with NTSC-U's rules at 60 steps a second as every online race, a road
+  course, ASM and TCS on, the descriptor's engine condition). P is what the race reads of the
+  car: mass and extents, engine curves, gearing, tyres, suspension, aids. Names, prices and
+  model ids are not in it, so a car whose records differ only there is the same car.
+- **Compared exactly.** The exact core builds P bit for bit alike on every platform: the
+  digests of 316 cars of the NTSC-U disc fold to the same value on arm64 and x86-64, and so do
+  the PAL and NTSC-J discs' (`net_car_params_disc`), and a synthetic set is pinned
+  (`net_car_params_digest_platform_hash`), with no rounding. The lobby's digest is the race's own: the block a remote car gets in an online
+  race equals it (`net_exact_lobby_digest_is_the_race_params`).
+- **The check** (`game::online_car_here`, tested in `net_car_here_regions`,
+  `net_car_here_disc`). For every other player's car each machine reports one of:
+  - **not on this disc**: the car, a part or its arcade car is not in this database;
+  - **different on this disc**: this machine's digest differs: this disc's data for the car
+    differs where it reaches P (another engine curve, body size, gear set, tyre, suspension);
+  - **no model on this disc**: no `cars/day/<model>` for the body the race would draw;
+  - fine.
+  A mod car not installed here is not refused (download, else a stand-in). Once installed it
+  is checked like the others: its package fixes the definition, but it is built over its
+  donor from this disc's database.
+- **Arcade cars** are found by their arcade label. Their base car may have another label on
+  another disc (`viper_gtsr_oreca_00_597`: `dodge_viper_gtsr_oreca_00` on NTSC-U,
+  `viper_gtsr_oreca_00` on PAL and NTSC-J). A descriptor with a digest builds on this disc's
+  base car, and races when the digests match, drawn as this disc's base car
+  (`game::online_car_base`); one without a digest is refused.
+- **Wire.** The digest trails the descriptor (32 bytes). Older games stop reading before it;
+  an older game's descriptor has none and is not compared.
+
+What the discs build differently (`net_car_params_regions` with `GT3R_COMPARE_DISC`: every
+car, every arcade car, and every car with each of its upgrade parts alone, 9,962 builds):
+- Course physics (road, walls, checkpoints, grid: course slot 28), the AI driver sets and the
+  i.LINK course list are identical on every disc.
+- NTSC-U 1.10 against 1.00, and NTSC-U against PAL: every block alike (PAL's car data
+  differs only in names, prices and model ids, none of which reach P).
+- NTSC-J: 7 cars and arcade cars build another P, and 265 garage builds of them: four engines
+  (the Impreza WRX under 3 labels and the Integra Type R rev lower, 7,500 / 8,000 rpm; the
+  arcade `impreza_wrx_00_281` and `integra_r_98_200` with them) and one collision box
+  (`s2000_e_99` is 1 cm shorter). `celica_ss2_97` differs only in its catalogue power, which is
+  not in P: it races. `s2000_a_99_ext` and `s2000_e_99_ext` are not on it.
+- PAL has no body model for 17 cars: `_996_gt3`, `diablo_gt_00`, `stratos_00`,
+  `stratos_wrc_00`, `lotus_99t`, `mclaren_mp4_5b`, `williams_fw11`, `williams_fw16b`,
+  `sample002`..`sample010`. Its arcade cars `vauxhall_vx220_00_147` and
+  `vauxhall_astra_race_00_461` are not on the other discs.
+
+Cars that race in a mixed lobby:
+
+| discs | cars | arcade cars |
+|---|---|---|
+| NTSC-U + PAL | 227 of 244 | 72 of 72 |
+| NTSC-U + NTSC-J | 237 of 242 | 70 of 72 |
+| all three | 220 of 242 | 70 of 72 |
 
 ## Pickers (`src/app/online_pickers.cpp`)
 
@@ -122,11 +229,36 @@ Cross on the lobby's Car row opens the car page, on the Course row (host) the co
 page; Left / Right on the rows still step through the lists. Both follow GT3's arcade
 pickers with the disc's own art, loaded from the menu sets:
 
+- The car page starts on one of two tile pages, switched with L1 / R1 or their tabs. It
+  opens on the page that lists the lobby's car.
 - Makers: GT Mode's dealers (`cd/cd` -> `cd/cd_<region>` in gt_mode.mbl; each `dealer<n>`
   item links `cd/cd_<region>_<maker>`, its layer holds the maker's `logo<n>`, the region
   page its `flag`), in the dealers' region order; the garage first. Makers without a
   dealer use the tune shop's logo of the same name (ts/ts), else their name. Groups are
   keyed by the maker name without spaces (the database has "CHEVROLET" two ways).
+  Every disc and mod car, as the database builds it.
+- Classes: the arcade's class page (`ar/select_class`): Class C, B, A, S and rally cars
+  with its `class_<x>_logo` art, then the garage (the page's `home_garage`). Every car is
+  on one, each car once (`game::car_class`):
+  - **The class lists' cars** (gcf tag 14), also the ones arcade mode keeps locked (its
+    unlock levels do not apply online); only labels this disc's region lacks are left out
+    (NTSC-U: the two Vauxhalls). They race as arcade cars ("Cars" above). On NTSC-U the
+    lists hold 66 cars: C 11, B 11, A 14, S 20, rally 10. Mod cars with an `[arcade]`
+    class are in theirs (and under their makers).
+  - **Every other car** (178 of the 244) is classed as GT3 classes a garage car in Single
+    Race (docs/behaviour/gt_mode.md §16.1, `data::class_by_weight`): on a road course by
+    its weight per power (the spec's mass less 120 kg over its computed power: below 3.0
+    kg/PS S, 5.0 A, 6.3 B, else C), on a dirt course a rally car. The stock car of a
+    listed arcade car is on the class page as that arcade car only (and under its maker
+    as itself, with its weight's class).
+  - On NTSC-U a road course gives C 41, B 51, A 89 and S 53 cars, and the 10 rally cars; a
+    dirt course 188 rally cars. The weight rule puts 52 of the 56 listed road cars in
+    their own list's class; the misses sit near a boundary (the Silvia Spec R Aero, 4.96
+    kg/PS, is listed in B).
+  - The car page's specs give each car's class ("Class A, 4.6 kg/PS").
+- **Allowed cars only** (the switch at the top right, Square): only the cars the
+  lobby's rules allow, on both pages; tiles left empty are hidden. On by default. The
+  page and the switch are remembered (`[online] car_page`, `car_page_filter`).
 - Car page: the `<car>_mini` strip of `ar/select_car` (250 icons; mod cars in arcade mode
   get theirs from the mod patches), the car turning under `menu/showroom_single.fbi`'s
   lights (render/showroom.h, shared with the GT-mode menus) with the page's reflection
@@ -138,7 +270,33 @@ pickers with the disc's own art, loaded from the menu sets:
 - Lobby: the course still beside the settings, the car's icon and paint chip in their
   rows, a paint chip per player.
 
-Scripted screenshots: `GT3R_ONLINE="host,page=cars|makers|courses,..."` opens a page.
+**Pointers.** Every lobby page takes the mouse, touch and the VR controller's pointer
+(which `App::xr_pointer` sends as mouse events):
+- **Rows** (start page, lobby, rules) focus under a hovering mouse or VR pointer, and a
+  click acts as Cross. A finger has no hover: its first tap focuses, a second acts (as
+  in the game's menus).
+- The **"<" and ">"** around a value are buttons.
+- The **footer's actions** are buttons ("Cross: choose", "Triangle: back").
+- The right button goes back on the car, course and rules pages (not in the lobby:
+  that would leave the session).
+- **Text rows** (code, address, name, relay server) start typing on a click; a click
+  elsewhere finishes the text.
+- A click on the **session code** copies it.
+- The **course picture** opens the course page (host).
+- **Car page:**
+  - Maker and class tiles focus under the pointer and open on a click.
+  - Strip icons move the cursor on the first click and choose on the second (as the
+    arcade pickers).
+  - The wheel and a drag along the strip move along it; the wheel over the paint
+    column changes the paint.
+  - Paint chips and the strip's arrows are buttons.
+- **Course page:** its strip, arrows and wheel work the same way.
+- **The mod car prompt** has Download / No buttons.
+
+Scripted screenshots: `GT3R_ONLINE="host,page=cars|makers|classes|courses|rules,..."`
+opens a page; `class=B`, `category=production|race`, `drive=FR`, `aspiration=na|turbo`,
+`maxps=300`, `stock=1` and `mods=0` set the host's rules. `GT3R_POINTER_SCRIPT` clicks
+through the pages (docs/dev/PLATFORMS.md "Pointer scripts").
 
 ## Mod cars
 
@@ -230,37 +388,47 @@ First results (Apple clang, ASan + UBSan, built-in fuzzer):
 ## Feel and fairness
 
 ### Physics-based prediction
-Each remote car has a **shadow**: a vehicle built from its owner's spec, running
-on our course (walls included). On each state the shadow is synced
-(`Vehicle::sync_to`):
-- **Set from the state:** pose, velocities, wheel speeds, steer and
-  suspension, engine speed, gear.
-- **Kept:** clutch, differentials, turbo and tyre history.
+Each remote car has a **shadow**: a one-car exact race of that car (its equipment, its
+entry flags and grid slot) on our course (`race::exact_shadow`; no laps to finish, no
+tyre effects; with the owner's autopilot, configuration 3, the race's AI drives it too).
+On each state the shadow is synced (`race::sync_motion`, `RemoteCar::receive`):
+- **Set from the state:** position, velocity, attitude and its rates, engine speed,
+  steering command, axle and wheel speeds, suspension, gear and clutch state (then the
+  body axes and hub offsets from the attitude); the pedal style; the driver kind (the AI
+  driving it on after its finish); the start countdown from the owner's clock.
+- **Kept:** the rest of its record (tyre and brake heat, wear, turbo, the driveline's
+  locks, the AI driver's plan, filters).
 
-It then catches up to "now" with the owner's newest input (at most 15 ticks)
-and steps once per tick after that. Corrections are blended over 0.1 s as
-before. `GT3R_NET_PREDICT=dead` switches back to dead reckoning.
+It then catches up to "now" with the owner's newest pad frame (at most 0.25 s) and steps
+once per step after that. Corrections are blended over 0.1 s. `GT3R_NET_PREDICT=dead`
+keeps the synced record moving along its velocity instead (dead reckoning). The step
+never throws; a shadow whose step fails anyway (out of memory) falls back to dead reckoning.
 
-Measured (`net_physics_prediction_beats_dead_reckoning`: a scripted launch,
-hard braking, weave and corner; states through the wire format):
+Measured on Trial Mountain, two machines in one process, states through the wire format
+(`net_exact_prediction_beats_dead_reckoning`: 40 s of a line-following driver with a
+steering weave; `net_exact_duel`: a whole lap):
 
-| latency | dead reckoning rms / max | physics rms / max |
+| latency | dead reckoning rms / max | exact shadow rms / max |
 |---|---|---|
-| 100 ms | 3.7 cm / 5 cm | 1.5 cm / 8 cm |
-| 150 ms | 7.9 cm / 11 cm | 3.2 cm / 18 cm |
+| 17 ms (both cars on the race's AI) | | 0.1 cm / 7 cm |
+| one step ahead, two laps on the race's AI, 18 / 21 contacts | | 0.0 cm / 2 cm |
+| 100 ms | 6.4 cm / 13 cm | 1.9 cm / 7 cm |
+| 150 ms | 12.3 cm / 25 cm | 4.5 cm / 17 cm |
+| 100 ms, a whole lap | | 1.8 cm / 81 cm |
 
-The worst moments are the latency window right after the driver changes input
-(the shadow still applies the old one), the known trade of input-based
-prediction. A physics tick costs 0.66 µs, so 5 remote cars catching up
-16 ticks each is 0.05 ms per frame.
+The worst moments are the latency window right after the driver changes input (the
+shadow still applies the old one), the known trade of input-based prediction. A shadow
+step costs 12.5 µs (M-series), so 5 remote cars catching up 6 steps each is 0.44 ms per
+frame (`net_exact_shadow_cost`).
 
 ### Contacts
-A hit our machine sees between our car and a remote car goes to that car's
-owner (`Contact`: point and the impulse the remote car felt). It travels over
-the direct link, or through the host. The owner applies it with
-`Vehicle::apply_impulse` only when its own machine saw no contact with us
-within 0.2 s and the car is not a ghost to it. Impulses are capped at
-60,000 N·s.
+A hit our machine sees between our car and a remote car (the collision step's car
+responses, `ExactRace::car_contacts`) goes to that car's owner (`Contact`: point and the
+impulse the remote car felt, course frame). It travels over the direct link, or through
+the host. The owner applies it to its car's record (`ExactRace::apply_impulse`: the
+velocity by J / m, the yaw rate by (r × J) / (10 I_z), as the collision step's response
+does) only when its own machine saw no contact with us within 0.2 s and the car is not a
+ghost to it. Impulses are capped at 60,000 N·s.
 
 ### Ghosting
 A remote car is a ghost (drawn at 50 %, no contact) when:
@@ -269,18 +437,43 @@ A remote car is a ghost (drawn at 50 %, no contact) when:
 - it is lapping us or being lapped (race distances more than 0.9 laps apart).
 
 ### Lobby car rules
-- **Car rules:** any car, or stock only (no tuned garage cars).
+The lobby's **Car rules** row sums them up ("Class B, FR, at most 300 PS"); Cross opens
+the rules page, where the host changes them and the others read them. The page counts
+how many of the player's cars are allowed and says why the chosen one is not.
+Each rule is "any" by default (`game::CarRules`, `game::car_meets_rules`; tested in
+`net_car_rules_disc`, `net_car_rules_arcade_classes`):
+- **Mod cars:** allowed (default) or not.
+- **Tuned cars:** allowed, or stock cars only. A garage car counts as tuned when a part
+  or a setting differs from the stock car's, as GT Mode's own test (`GtMode::tuned`);
+  an untuned garage car races in a stock lobby.
+- **Class:** one of the arcade's classes C, B, A, S or rally cars: only the cars of that
+  class, as the car page's classes give them (every car has one: its list's, else by its
+  weight per power, a rally car on dirt). A garage car's class is its weight per power as
+  tuned, as GT3 classes it.
+- **Type:** production cars, or race and rally cars (car +0xF1, as GT3's events tell
+  them apart).
+- **Drivetrain:** FF, FR, 4WD, MR or RR (GT3's events' coding), from the car's
+  drivetrain part.
+- **Aspiration:** NA or turbo (turbo kit record +0x11, as GT3's events read it).
 - **Power limit:** off, or 200–700 PS at the crank, from the car's own spec
   (the R34 V-spec rates 336 PS).
+- **The course:** as the arcade's class page, the listed road classes' cars are refused
+  on dirt courses and the listed rally cars on road courses ("Class S cars are not
+  available on dirt courses"). Every other car races anywhere (on dirt as a rally car).
 - **Who checks:** each player's lobby refuses Ready for a car that breaks
-  them. The host checks every car it can rebuild before the start (a mod car
-  the host lacks cannot be checked there).
+  them. The host checks every car it can rebuild before the start. A mod car the
+  host lacks cannot be checked there; only the mod cars rule applies to it.
+- **Other players' cars** ("Regional discs" above): a player whose machine cannot race
+  another player's car cannot be ready ("Bob's car has no model on this disc"), and drops
+  Ready when such a car appears. The host refuses the start for its own view the same way.
+  The car's name is red in the player list, the reason beside Ready / Start race.
+- **Wire:** the Settings message carries the class, type, drivetrain and aspiration
+  after the power limit (an older host's message without them reads as "any").
 
 ### Cheat warnings
 Every machine runs `race::Plausibility` on every remote car:
 - **Speed:** above its geared top speed × 1.15 + 4 m/s for 0.5 s.
-- **Teleport:** a jump its motion does not explain (more than 6 m). States
-  carry a respawn flag for 0.5 s after a reset.
+- **Teleport:** a jump its motion does not explain (more than 6 m).
 - **Acceleration:** a speed gain over 2.5 g in both quarters of a half
   second (engines ramp; a shove is one step, and contacts with us are
   excluded).
@@ -295,23 +488,36 @@ removes them (Cross twice; they are told "removed by the host"). Flag, don't
 ban.
 
 False positives:
-- `net_plausibility_honest_drive` (the scripted drive, 100 ms late, with
-  physics prediction) raises nothing.
+- The exact duels (`net_exact_duel*`: line drivers, a ram, the race's AI, 0-150 ms
+  late, with the exact shadow) raise nothing.
 - A 2:50 two-instance race on Trial Mountain through the public relay raised
   nothing.
 
 ## Race screen (online mode)
 
-- The tick count comes from the wall clock since the synchronised start, not
+- The step count comes from the wall clock since the synchronised start, not
   the frame accumulator, so a stalled frame catches up instead of leaving the
   car behind everyone's race clock. Snapshot age is then simply local race
-  time minus the snapshot's race time.
+  time minus the snapshot's race time. The blend between the last two ticks
+  comes from that clock as well (`FixedStep::follow`): blended by frame times,
+  above 60 fps every other frame could be drawn half a tick back.
+  A state from ahead of our race clock (our
+  frames stalled and the steps catch up in a burst, or the other machine runs a step
+  early) waits until our race reaches its time, so the car is posed where it was at
+  our race time: posed from the newest state instead, a car 50 ms ahead stood up to
+  1.5 m off and collided where its owner saw no contact (`net_exact_stalled_machine`).
+- The pose is always a step of the shadow's own from the state (a state is synced at
+  the coming step's start, never at its end), so its road segment hint and ground come
+  with it; a sync also moves the hint (`CourseCollision::road_segment`) and the wheels'
+  ground points with the car. With a hint left behind, the race flow counted phantom
+  laps for the remote car (its finish seen mid-lap) and the collision step's segment
+  filter dropped its contacts (`net_exact_duel_one_step_ahead`).
 - Pause opens GT3's race window (CONTINUE / EXIT, "Exit race?") with a note
   that the race goes on. The car keeps running (no input) and the camera keeps
   following it: the race does not stop for anyone. EXIT retires from the race
   (back to the lobby). Select's longer list is Resume, Camera, Gearbox and
-  Retire; restart and replays are not offered. Respawn is disabled (the Select button and `[race] respawn =
-  all`); only a car that falls out of the world is put back on the road.
+  Retire; restart and replays are not offered. There are no respawns, as in GT3: a car
+  stays where it is.
 - Each player's finish time is the owner's (reliable Finish message). A
   finished car turns into a ghost (no contact). So does a car whose round trip
   to us is above the lobby's ghost threshold. It is drawn at 50 % alpha and
@@ -319,7 +525,9 @@ False positives:
   After the results everyone returns to the lobby (the host's return sends
   Lobby, which ends the race for anyone still in it).
 - A car this machine lacks and does not download (or that fails validation) is
-  shown as your own car (a stand-in); physics stay the owner's.
+  shown as your own car (a stand-in); physics stay the owner's. A remote car whose
+  spec this machine refuses is its stock base car; the lobby checks keep both from
+  happening to disc, garage and arcade cars.
 
 ## Server (`tools/gt3r-relay`)
 
@@ -513,12 +721,20 @@ no table may grow without bound.
   sessions. The rate buckets are a fixed array. Codes and nonces come from
   SipHash in counter mode, so earlier ones do not predict later ones.
 - **Logs.** stdout (journald) gets one line when a session is registered,
-  closed or expires (code, and the host's IP on registration), one line per
-  join (code and the joining player's IP, no port), one when a race's slots
+  closed or expires (code, and a tag for the host's IP on registration), one line per
+  join (code and a tag for the joining player's IP), one when a race's slots
   are queued, granted or freed, and a stats line every minute. Version checks
   and refusals for an old version are only counted in that stats line (per
-  platform), never logged one by one. Nothing else is recorded, and nothing goes to disk. Retention is the
-  host system's journald setting.
+  platform), never logged one by one. A tag is a keyed hash of the IP (IPv6: its
+  /64): the same all UTC day, with a new random key each day or restart, so tags
+  cannot be reversed or matched across days. A server run with `--log-ips` logs
+  the IPs (no port) instead; the startup lines say which. With `--geoip` each tag
+  is followed by the player's country (`a1b2c3d4 (BR)`, `??` when unknown), from
+  DB-IP's [IP to Country Lite](https://db-ip.com) (CC BY 4.0), which
+  `tools/gt3r-relay/update-geoip.sh` fetches monthly. Nothing else is recorded, and
+  nothing goes to disk. The systemd unit gives the relay its own journal
+  (`journalctl --namespace=gt3r-relay`), capped at 1 GB
+  (`journald@gt3r-relay.conf`), so it never pushes the system's logs out.
 
 ### Versions and updates
 
@@ -683,6 +899,7 @@ IPv4-only players), e.g. Debian or Ubuntu. Then, from this repository:
 
 ```bash
 tools/gt3r-relay/deploy.sh root@<server IP>   # builds and installs over SSH; run again to update
+tools/gt3r-relay/deploy.sh root@<server IP> --when-idle   # an update that restarts only with no sessions open
 ```
 
 The script copies only the relay's own sources (20 KB, no game code or
@@ -713,7 +930,7 @@ sudo systemctl enable --now gt3r-relay
   limited, the typical race length, version checks per platform, requests
   refused as outdated). At startup and on each reload it logs the versions in
   force. Limits are flags (`gt3r-relay --help`); the systemd unit passes the
-  main ones.
+  main ones. Read the log with `journalctl --namespace=gt3r-relay`.
 - It asks for 4 MB socket buffers (`--buffers-kb`). Linux caps that at
   `net.core.rmem_max` / `wmem_max` (often 208 KB); the startup line shows what
   it got. Raise them for bursts:
@@ -768,8 +985,23 @@ at 100–200 links are the busy desktop, not the relay.
 
 ## Testing
 
-- Unit tests: `net_*` (wire format, loopback sessions with and without 30 %
-  packet loss, rejection, prediction) and `sim_world_kinematic_remote_car`.
+- Unit tests: `net_*` (the wire format bit for bit, loopback sessions with and
+  without 30 % packet loss, rejection, an older protocol told to update:
+  `net_old_protocol_told_to_update`).
+- Disc tests (`GT3R_DISC`; tests/test_net_exact.cpp): two players' machines in one
+  process, each its own `ExactField` with the other car posed from the other's
+  states through the wire format:
+  - `net_exact_posed_car_contact`: a posed car driven into our parked car pushes it,
+    the hit for its owner points against its motion, the posed record keeps the
+    pose, a ghost drives through;
+  - `net_exact_contact_impulse`: the other machine's impulses on our record;
+  - `net_exact_duel`, `net_exact_duel_contact`, `net_exact_duel_ai`,
+    `net_exact_duel_autopilot`: a lap of Trial Mountain 0-150 ms apart (line drivers,
+    a ram at the start, the race's AI from the start, the autopilot's configuration 3
+    with states out of order): both finish, each sees the other's finish where its
+    owner had it, no cheat warning;
+  - `net_exact_stalled_machine`, `net_exact_prediction_beats_dead_reckoning`,
+    `net_exact_shadow_cost` (the figures above).
   The `net_relay_*` tests cover the server: code joins, relay fallback, cookie
   challenges and rollover, spoofed binds, rate limits, join caps, and old
   protocol versions. They also cover link slots:
@@ -802,13 +1034,29 @@ at 100–200 links are the busy desktop, not the relay.
     because loopback UDP is delivered asynchronously on macOS.
   - Waiting for datagrams uses bounded loops that stop as soon as the
     condition holds, not fixed sleeps.
-- Two instances on one machine:
+- Two instances on one machine, directly or through a relay on localhost (for test
+  runs, use two portable copies of the app, `portable.ini` in each one's data folder,
+  with `[audio] music_volume = 0.00` and `sfx_volume = 0.00` in its config.ini;
+  `GT3R_NET_DEBUG=1` logs our car, the posed car and the newest state twice a
+  second; each contact is logged, and a summary at the finish):
 
 ```bash
 GT3R_RACE="auto=1,cam=1" GT3R_ONLINE="host,players=2,course=trialmt,laps=2,car=r34_gtr_v_99" \
   gt3r disc.iso --screen online
 GT3R_RACE="auto=1,cam=1" GT3R_ONLINE="join=127.0.0.1,car=supra_rz_97,name=Two" gt3r disc.iso --screen online
+# through a relay: build/gt3r-relay --port 47751, then
+#   host: GT3R_ONLINE="host,...,server=127.0.0.1:47751,codefile=/tmp/code.txt"
+#   join: GT3R_ONLINE="server=127.0.0.1:47751,codefile=/tmp/code.txt,car=supra_rz_97,name=Two"
 ```
+
+  Measured on an M-series Mac with `auto=1` (the race's AI drives both cars),
+  through the relay, two laps of Trial Mountain: both finished (207.809 s and 210.766 s)
+  and each machine saw the other's finish at its owner's time; about 12,700 states each;
+  the cars touched side by side at 165 km/h for 0.7 s (13 and 18 responses), seen by
+  both machines at the same steps with the same cars' positions to 2 cm and impulses
+  within 4 % (3.18 / 3.22 kN·s the first), so no Contact message had to be applied; no
+  warnings. A one-lap race with no contact finished 107.30 s / 107.46 s, as
+  `net_exact_duel_autopilot` (107.30 s / 107.49 s).
 
 ## Plan
 
@@ -832,6 +1080,9 @@ GT3R_RACE="auto=1,cam=1" GT3R_ONLINE="join=127.0.0.1,car=supra_rz_97,name=Two" g
 4. ~~Feel and fairness: physics-based prediction, contact messages, ghosting at
    the start and for lapped cars, lobby car rules, cheat warnings and removing
    players.~~ (done)
+5. ~~Races on the exact core: posed remote cars, exact prediction shadows,
+   protocol 4.~~ (done)
+6. Later: input-only lockstep or rollback ("Later: input-only lockstep" above).
 
 ## Known issues
 
@@ -839,6 +1090,10 @@ GT3R_RACE="auto=1,cam=1" GT3R_ONLINE="join=127.0.0.1,car=supra_rz_97,name=Two" g
   whine extras are not sent.
 - No online replays yet (they would need the remote snapshots recorded too).
 - No 2P split screen combined with online players.
+- Two game versions whose parameter block builder differs see each other's cars as
+  "different on this disc" (the digest compares builds, not only discs).
+- A remote car is drawn and heard from its prediction shadow's record (its own tyre
+  smoke, wheels and engine as the shadow runs them), not its owner's.
 - Players' IP addresses are visible to the other players (inherent to peer
   links; `GT3R_NET_FORCE_RELAY=1` sends everything through the server instead).
 - The relay is built and run on Linux (Debian, g++) and macOS (clang); the

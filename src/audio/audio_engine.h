@@ -7,10 +7,14 @@
 #include "formats/sound/seq.h"
 
 #include <SDL3/SDL_audio.h>
+#include <SDL3/SDL_events.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace gt3r {
@@ -29,12 +33,32 @@ class Vfs;
 // music volume from its level, and its voices play on the mixer's Music bus,
 // whose gain is the Music volume. The Sound effects volume is the gain of the
 // mixer's Effects bus only.
+// Output device (sound §1.1): both streams play on the chosen playback device, or the system
+// default when none is chosen or the chosen one is not connected.
 class AudioEngine {
 public:
-    AudioEngine();
+    // `device`: the output device's name (config [audio] device); empty for the system default.
+    explicit AudioEngine(const std::string& device = {});
     ~AudioEngine();
 
     bool ok() const { return music_stream_ != nullptr; }
+
+    // The output device by name, empty for the system default (which follows the system's own
+    // choice). Moves both streams at once; the music keeps playing (or stays paused).
+    void set_output_device(const std::string& name);
+    const std::string& output_device() const { return device_name_; }
+    // The physical device in use: the chosen one if connected, else SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK.
+    // A change lands a moment later: devices open and close on a thread of their own (a
+    // CoreAudio device takes up to ~300 ms), so the game never waits for one.
+    SDL_AudioDeviceID output_device_id() const {
+        const SDL_AudioDeviceID d = device_;
+        return d ? d : SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+    }
+    // The connected playback devices' names, in SDL's order, without repeats.
+    static std::vector<std::string> playback_devices();
+    // SDL_EVENT_AUDIO_DEVICE_ADDED / _REMOVED: the sound moves to the chosen device when it
+    // is plugged in and back to the default when it goes.
+    void device_event(const SDL_Event& e);
 
     // Streams an .ads file through the VFS (mods may replace it) at request level `volume`.
     bool play_music(Vfs& vfs, const std::string& path, bool loop, float volume = 1.0f);
@@ -85,6 +109,11 @@ public:
 private:
     bool load_sequences(Vfs& vfs);
     void stop_stream();
+    // Puts both streams on physical device `phys`, else on the default; false if neither opens.
+    bool use_device(SDL_AudioDeviceID phys);
+    // Wakes the switcher thread (started on first use) to put the sound on device_name_.
+    void request_switch();
+    void run_switcher();
 
     static void SDLCALL feed(void* user, SDL_AudioStream* stream, int additional, int total);
     static void SDLCALL feed_voices(void* user, SDL_AudioStream* stream, int additional, int total);
@@ -107,6 +136,16 @@ private:
     bool seq_load_tried_ = false;
     SDL_AudioStream* sfx_stream_ = nullptr;
     float sfx_volume_ = 0.8f;
+    std::string device_name_;
+    std::atomic<SDL_AudioDeviceID> device_{0}; // physical device in use, 0 before the first open
+    // Held while a switch moves the streams, and by the game thread's pause / resume, so a pause
+    // is never made on a device that is about to close.
+    std::mutex device_mutex_;
+    std::thread switcher_;
+    std::mutex switch_mutex_;
+    std::condition_variable switch_cv_;
+    std::string switch_name_;
+    bool switch_requested_ = false, switch_quit_ = false;
 };
 
 } // namespace gt3r

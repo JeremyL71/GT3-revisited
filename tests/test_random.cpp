@@ -3,6 +3,7 @@
 // behaviour around it.
 
 #include "test_framework.h"
+#include "replay_fixtures.h"
 
 #include "base/game_random.h"
 #include "disc/disc.h"
@@ -177,21 +178,15 @@ TEST(random_replay_paint_seed) {
     race::Replay r;
     r.course = "trialmt", r.car = "r34_gtr_v_99";
     r.inputs.resize(3);
+    r.exact = test::race_record_stub();
     r.paint_seed = 0xCAFEBABEu;
     race::Replay p = race::Replay::parse(r.serialize());
     CHECK(p.paint_seed == 0xCAFEBABEu);
-    // A version-5 file has no seed: its race used the boot seed.
-    Bytes b = r.serialize();
-    u32 v5 = 5;
-    std::memcpy(&b[8], &v5, 4);
-    // Drop the seed word (after the start speed): find it by value.
-    for (size_t i = 0; i + 4 <= b.size(); ++i)
-        if (b[i] == 0xBE && b[i + 1] == 0xBA && b[i + 2] == 0xFE && b[i + 3] == 0xCA) {
-            b.erase(b.begin() + long(i), b.begin() + long(i) + 4);
-            break;
-        }
-    race::Replay o = race::Replay::parse(b);
-    CHECK(o.paint_seed == GameRandom::kBootSeed && o.inputs.size() == 3);
+    // Unset: the boot seed (the generator's state at power-on).
+    race::Replay d;
+    d.exact = test::race_record_stub();
+    CHECK(d.paint_seed == GameRandom::kBootSeed);
+    CHECK(race::Replay::parse(d.serialize()).paint_seed == GameRandom::kBootSeed);
 }
 
 TEST(random_gtmode_disc) {

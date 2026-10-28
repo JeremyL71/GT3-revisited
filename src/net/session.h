@@ -54,6 +54,10 @@ struct Settings {
     u16 ghost_ping_ms = 150; // a pair whose round trip is above this does not collide (0 = always collide)
     bool stock_only = false; // no tuned GT Mode garage cars
     u16 max_ps = 0;          // power limit (PS at the crank, the car's own spec; 0 = none)
+    // More car rules (game::CarRules; 0 = any): the arcade class (1 C .. 4 S, 5 rally), the
+    // category (1 production, 2 race and rally), the drivetrain (1 FF, 2 FR, 3 4WD, 4 MR, 5 RR)
+    // and the aspiration (1 NA, 2 turbo).
+    u8 car_class = 0, category = 0, drive = 0, aspiration = 0;
 };
 
 // How this player reaches another one.
@@ -80,6 +84,8 @@ const GameVersion& this_game_version();
 RvPlatform this_platform();
 // Why a direct-IP join was refused for its version (ours, the host's).
 std::string version_mismatch(const GameVersion& ours, const GameVersion& host);
+// Why a game speaking another online protocol (theirs) was refused by this host: who must update.
+std::string protocol_mismatch(u16 theirs);
 
 // The relay server refused us because this game is older than its min_online
 // (docs/dev/ONLINE.md "Versions and updates").

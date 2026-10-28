@@ -35,7 +35,7 @@ void summary(const char* what, const game::GameState& s) {
 } // namespace
 
 GT3TOOL_COMMAND(save_import, "save-import", "<ps2 save> <out.sav>",
-                "convert an original GT3 save (data file, save folder, PCSX2 folder card, .psu, .ps2 card) to a GT3 Revisited save",
+                "convert an original GT3 save (data file / .raw, save folder, PCSX2 folder card, .psu, .ps2 card) to a GT3 Revisited save",
                 2, [](Disc& disc, const Args& a) {
                     auto data = load_gt_data(disc);
                     game::GameState s = game::import_ps2_save_path(a[0], *data);
@@ -45,9 +45,10 @@ GT3TOOL_COMMAND(save_import, "save-import", "<ps2 save> <out.sav>",
                     return 0;
                 });
 
-GT3TOOL_COMMAND(save_export, "save-export", "<save.sav> <out.psu | out.ps2 | out folder>",
-                "write a GT3 Revisited save as an original GT3 memory-card save", 2,
-                [](Disc& disc, const Args& a) {
+GT3TOOL_COMMAND(save_export, "save-export", "<save.sav> <out.psu | out.ps2 | out.raw | out folder>",
+                "write a GT3 Revisited save as an original GT3 memory-card save (.raw: the data file alone, "
+                "for save editors)",
+                2, [](Disc& disc, const Args& a) {
                     auto data = load_gt_data(disc);
                     std::string err;
                     std::optional<game::GameState> s = game::read_save(a[0], &err);

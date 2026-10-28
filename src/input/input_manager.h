@@ -20,20 +20,24 @@ class IniDocument;
 // states, one per player. Configuration lives in the main config file:
 //
 //   [player1]
-//   preset = racing          ; starting point (racing/classic/wheel/keyboard)
-//   device = auto            ; auto, or part of a device name ("DualSense")
-//   keyboard = on
+//   controller = auto        ; auto, part of a device name ("DualSense"), or keyboard (only)
+//   keyboard = on            ; the keyboard also drives the player
 //   phone_vibration = off    ; Android: rumble on the device's own motor (see below)
 //
 //   race = modern            ; race controls layout: modern | gt3 (the original)
 //
-//   [player1.bindings]       ; optional; replaces the preset when present
-//   Cross = pad.south | key.Return
+//   [player1.bindings]       ; optional; the pad's inputs, replacing its layout's
+//   Cross = pad.south
 //
-//   [player1.race]           ; optional; replaces the race layout when present
-//   Cross = pad.righttrigger curve=1.4 | key.W ramp=0.12   ; Cross = accelerate
+//   [player1.race]           ; optional; the pad's race inputs, replacing the race layout's
+//   Cross = pad.righttrigger curve=1.4                     ; Cross = accelerate
 //
-// See docs/INPUT.md for the full binding syntax.
+//   [player1.wheel.bindings] / [player1.wheel.race]        ; the same for a wheel
+//   [player1.keyboard.bindings] / [player1.keyboard.race]  ; the keyboard's, whatever the controller
+//
+// The kind of device in use (DeviceKind) picks the controller's bindings (PlayerBindings). Older
+// configs chose them with `preset` (racing / classic / wheel / keyboard) and `device`; load()
+// reads them once and save() still writes them for older builds. See docs/INPUT.md.
 
 // Phone vibration ([player1] phone_vibration, off by default): player 1's rumble goes to the
 // phone's or tablet's own vibration motor only while the device driving them has no rumble motor
@@ -43,6 +47,31 @@ bool use_phone_vibrator(bool enabled, int player, bool device_rumbles);
 // The DS2 rumble as one motor's strength 0..1: the large motor's level, or the small (on/off)
 // motor's 0.6 when stronger.
 float phone_vibration_strength(const PadRumble& r);
+
+// What a device is to Auto: one SDL identifies as a wheel, a gamepad SDL maps, or any other
+// joystick (flight sticks, but also odd HID devices such as some keyboards, mice and macro pads).
+enum class AutoRank : u8 { Wheel, Gamepad, Other };
+// An "auto" player's device among the ones no other player has, in connection order: the first
+// wheel, otherwise the first gamepad, otherwise the first other joystick. -1 = none.
+int pick_auto_device(const std::vector<AutoRank>& devices);
+// The kind of a player's device: none connected is the keyboard's; a gamepad SDL maps the pad's;
+// a wheel (SDL's, or `named_wheel`: the device the player named was a 0.3 `preset = wheel`'s) the
+// wheel's; any other joystick has no default bindings.
+DeviceKind device_kind(bool connected, bool gamepad, bool wheel, bool named_wheel);
+
+// Which connected devices (in connection order) other players' tagged bindings use (`tags`):
+// Auto never hands those to this player.
+std::vector<bool> reserved_devices(const std::vector<DeviceId>& devices, const std::vector<std::string>& tags);
+
+// Player 1 can drive the menus with what is there: a readable input confirms (Cross) and one moves
+// (Up / Down, or the left stick's Y). `pad`, `joystick`, `keys`: a gamepad, another joystick, a
+// keyboard that drives player 1 is there. When not, the menus read any_device_pad() (menu_pad).
+bool menus_drivable(const Profile& menu, bool pad, bool joystick, bool keys);
+
+// Several pads as one, for menus any device drives (InputManager::any_device_pad): a button is
+// down when it is down on any of them (the strongest pressure), and each axis comes from the pad
+// holding it furthest from rest, so two sticks never cancel out.
+PadState merge_pads(const std::vector<PadState>& pads);
 
 class InputManager {
 public:
@@ -61,6 +90,15 @@ public:
     // The pad a race reads while driving: buttons in GT3's race meaning (race_action_name),
     // driven by the player's race layout. With the "gt3" layout it is pad() itself.
     const PadState& race_pad(int player) const { return players_[player].race_state; }
+    // Player 1's pad merged with every connected gamepad read with the pad layout's buttons and
+    // the keyboard with its default keys, whatever player 1's controller, bindings or keyboard
+    // setting: the menus of our Settings read it (Screen::menu_input_any_device), so controls
+    // that leave player 1 without a working controller can always be changed back.
+    const PadState& any_device_pad() const { return any_pad_; }
+    // What the menus outside races read for player 1 (ours and the game's): their pad, or
+    // any_device_pad() while nothing player 1 has can drive the menus (menus_drivable), so no
+    // controller choice or bindings can leave the game without a way back to Settings.
+    const PadState& menu_pad() const { return menu_rescue_ ? any_pad_ : players_[0].state; }
     // Extra input merged into a player's pad on the next update(): buttons
     // are OR'ed (pressure: the stronger wins), axes are added. Used by the
     // on-screen touch controls; a state with connected=false is ignored.
@@ -83,45 +121,66 @@ public:
     const ForceFeedbackConfig& ffb_config() const { return ffb_.config(); }
     void set_ffb_config(const ForceFeedbackConfig& c) { ffb_.configure(c); }
 
-    const Profile& profile(int player) const { return players_[player].profile; }
-    void apply_preset(int player, std::string_view preset);
-    const std::string& preset(int player) const { return players_[player].preset; }
-    bool is_custom(int player) const { return players_[player].custom_bindings; }
-    // Editing any binding turns the player's profile into a custom one that
-    // is saved to [playerN.bindings].
-    void bind(int player, const PadTarget& target, const InputSource& source, bool replace);
-    void clear_target(int player, const PadTarget& target);
-    // Race controls (see make_race_preset). Editing a race binding makes the race profile a
-    // custom one, saved to [playerN.race]; under "gt3" it starts from the menu bindings.
-    const std::string& race_layout(int player) const { return players_[player].race_layout; }
+    // The kind of device driving the player now; it picks the controller's bindings.
+    DeviceKind kind(int player) const { return players_[player].kind; }
+    // The menu bindings in use: the controller's (for the kind in use) and the keyboard's.
+    const Profile& profile(int player) const { return players_[player].menu; }
+    // One set of them, as in use (PlayerBindings::set); `race`: the race controls'.
+    const Profile& bindings(int player, bool race, BindingSet set) const {
+        return players_[player].bindings.set(players_[player].kind, race, set);
+    }
+    bool is_custom(int player) const;  // custom menu bindings in use
+    void reset_bindings(int player); // the layout chosen; custom bindings kept
+    // Custom bindings kept (in use or not) and chosen again (PlayerBindings::use_custom).
+    bool has_custom(int player, bool race) const;
+    void use_custom(int player, bool race);
+    // Edits (PlayerBindings::bind): the source's own set takes it, the other keeps its bindings.
+    // Saved to [playerN.bindings] (the pad's), [playerN.wheel.bindings], [playerN.keyboard.bindings].
+    bool bind(int player, const PadTarget& target, const InputSource& source, bool replace); // PlayerBindings::bind
+    void clear_target(int player, const PadTarget& target, BindingSet set);
+    // Race controls (see make_race_preset), one layout per player for whichever kind is in use.
+    // Editing a race binding makes that set's race bindings custom ([playerN.race] ...); under
+    // "gt3" it starts from the menu bindings.
+    const std::string& race_layout(int player) const { return players_[player].bindings.race_layout; }
     void set_race_layout(int player, std::string_view layout);
-    bool race_uses_menu_pad(int player) const;
-    bool is_race_custom(int player) const { return players_[player].race_custom; }
+    bool race_uses_menu_pad(int player) const { return players_[player].race_reads_menu; }
+    bool is_race_custom(int player) const;
     const Profile& race_profile(int player) const; // the effective one (gt3: the menu profile)
-    void bind_race(int player, const PadTarget& target, const InputSource& source, bool replace);
-    void clear_race_target(int player, const PadTarget& target);
-    std::string device_name(int player) const;
-    // [playerN] device: "auto" or part of a device name. Reassigns devices.
+    bool bind_race(int player, const PadTarget& target, const InputSource& source, bool replace);
+    void clear_race_target(int player, const PadTarget& target, BindingSet set);
+    std::string device_name(int player) const; // "Keyboard" (or "No device") without one
+    // Races steer with GT3's wheel path: the device Steer (LX) is bound to is a wheel (a tagged
+    // binding's device, otherwise the Controller's kind).
+    bool wheel_steering(int player) const;
+    // [playerN] controller: "auto" (pick_auto_device), part of a device name (any device,
+    // whatever its type), or kKeyboardOnly. Reassigns devices.
+    static constexpr const char* kKeyboardOnly = "keyboard";
     const std::string& device_filter(int player) const { return players_[player].device_filter; }
     void set_device_filter(int player, std::string filter);
-    // [playerN] keyboard: whether the keyboard also drives this player.
+    bool keyboard_only(int player) const { return players_[player].device_filter == kKeyboardOnly; }
+    // [playerN] keyboard: whether the keyboard also drives this player (always with Keyboard only).
     bool keyboard_enabled(int player) const { return players_[player].keyboard; }
     void set_keyboard(int player, bool on) { players_[player].keyboard = on; }
-    // Player 1 with the keyboard off but a profile only the keyboard can drive (the keyboard
-    // preset, or custom bindings with no controller source): the keyboard still drives them, so
-    // the game can't be left with no way to control it.
+    // Player 1 with the keyboard off but bindings only the keyboard can drive (no device in use,
+    // or custom bindings with no controller source): the keyboard still drives them, so the game
+    // can't be left with no way to control it.
     bool keyboard_fallback(int player) const;
-    // The keyboard drives this player: enabled, or the fallback above.
-    bool keyboard_active(int player) const { return players_[player].keyboard || keyboard_fallback(player); }
+    // The keyboard drives this player: enabled, Keyboard only, or the fallback above.
+    bool keyboard_active(int player) const {
+        return players_[player].keyboard || keyboard_only(player) || keyboard_fallback(player);
+    }
     // Names of the connected gamepads, wheels and joysticks.
     std::vector<std::string> device_names() const;
     // Human label for a source on this player's device (e.g. "Cross" on a
-    // PlayStation pad, "A" on Xbox).
+    // PlayStation pad, "A" on Xbox, "Right paddle").
     std::string describe(int player, const InputSource& src) const;
 
-    // Remap support: arms capture; the next deliberate input on any device
-    // is returned once by poll_capture().
-    void begin_capture();
+    // Remap support: arms capture; the next deliberate input on any device is returned once by
+    // poll_capture(). Esc and Android Back cancel it instead (capturing() turns false, nothing
+    // returned). Mouse buttons aren't captured.
+    // `player`: an input from another device than that player's Controller is tagged with it
+    // (InputSource::device); their own Controller's stays untagged.
+    void begin_capture(int player = 0);
     void cancel_capture() { capturing_ = false; }
     bool capturing() const { return capturing_; }
     std::optional<InputSource> poll_capture();
@@ -133,20 +192,21 @@ private:
         SDL_Joystick* joystick = nullptr; // always set
         std::string name;
         bool has_accel = false;
+        bool wheel = false; // SDL identifies it as a wheel (Auto takes it first)
+        std::string serial, path; // for device tags (DeviceId); empty when not reported
     };
     struct Player {
-        Profile profile;
-        std::string preset = "racing";
-        std::string device_filter = "auto";
+        std::string device_filter = "auto"; // [playerN] controller
+        std::string wheel_device; // [playerN] wheel_device: a named device that is a wheel (0.3 preset = wheel)
         bool keyboard = true;
-        bool custom_bindings = false;
         SDL_JoystickID device = 0; // 0 = none
+        DeviceKind kind = DeviceKind::Keyboard; // of `device` (assign_devices)
+        PlayerBindings bindings;
+        Profile menu, race; // in use: both sets for `kind` together (refresh)
+        bool race_reads_menu = false; // "gt3" with nothing custom: the race reads `state`
         PadState state;
-        std::vector<float> ramp_values; // parallel to profile.bindings
-        std::string race_layout = "modern";
-        bool race_custom = false;
-        Profile race_profile; // empty "gt3" profile = the race reads `state`
-        std::vector<float> race_ramps; // parallel to race_profile.bindings
+        std::vector<float> ramp_values; // parallel to the menu profile's bindings
+        std::vector<float> race_ramps;  // parallel to the race profile's bindings
         PadState race_state;
         PadRumble rumble;
         float tilt = 0.0f;
@@ -159,16 +219,31 @@ private:
     void remove_device(SDL_JoystickID id);
     void assign_devices();
     const Device* find_device(SDL_JoystickID id) const;
-    float read_source(const Player& p, const Device* dev, const InputSource& src) const;
+    std::vector<DeviceId> device_ids() const; // the connected devices, for device tags
+    // InputSource::device: the device a tag names; never `controller` (the player's own device),
+    // whose inputs are untagged.
+    const Device* find_tagged(const std::string& tag, SDL_JoystickID controller = 0) const;
+    std::string tag_of(SDL_JoystickID id) const;
+    std::string capture_tag(SDL_JoystickID id) const; // empty for the capturing player's Controller
+    const Device* tagged_steering(const Player& p) const; // a tagged wheel Steer is bound to
+    // The source's value, or nothing when it can't be read: its device, axis, button or hat
+    // isn't connected, or it is a key (or mouse button) and `keyboard` is off.
+    std::optional<float> read_source(const Player& p, const Device* dev, bool keyboard, const InputSource& src) const;
+    void refresh(Player& p); // menu, race and race_reads_menu after a change of kind or bindings
     void evaluate(Player& p, double dt);
-    void evaluate_profile(const Player& p, const Device* dev, const Profile& prof, std::vector<float>& ramps,
-                          PadState& out, double dt) const;
+    // `keyboard`: keys and mouse buttons drive `out` (a player's keyboard_active).
+    void evaluate_profile(const Player& p, const Device* dev, bool keyboard, const Profile& prof,
+                          std::vector<float>& ramps, PadState& out, double dt) const;
+    void evaluate_any_device(double dt); // any_device_pad()
     void update_tilt(Player& p, const Device* dev);
     int brake_trigger(const Player& p) const; // SDL trigger axis bound to the brake, or -1
     void vibrate_phone(float strength);       // 0 stops it
 
     std::vector<Device> devices_;
     std::array<Player, kMaxPlayers> players_;
+    PadState any_pad_; // any_device_pad()
+    bool menu_rescue_ = false; // menu_pad()
+    std::vector<float> any_ramps_; // its keyboard bindings' ramps
     SDL_Sensor* device_accel_ = nullptr; // phone/tablet accelerometer
     ForceFeedback ffb_;
     double time_ = 0;
@@ -182,6 +257,7 @@ private:
     std::vector<bool> key_latch_;
 
     bool capturing_ = false;
+    int capture_player_ = 0;
     std::optional<InputSource> captured_;
     std::vector<std::pair<SDL_JoystickID, std::vector<float>>> capture_baseline_;
 };

@@ -2,6 +2,8 @@
 // GTM1 render-state decoding used by the course renderer, car setup.
 
 #include "test_framework.h"
+#include "replay_fixtures.h"
+#include "course_fixtures.h"
 
 #include "formats/course/course_file.h"
 #include "formats/course/course_model.h"
@@ -23,11 +25,19 @@
 #include "race/license.h"
 #include "race/paint.h"
 #include "race/race_panels.h"
+#include "race/exact_car.h"
+#include "race/exact_field.h"
+#include "race/exact_setup.h"
+#include "disc/core_image.h"
+#include "sim/exact/race.h"
 #include "race/interp.h"
 #include "race/lamp_glows.h"
 #include "race/race_audio.h"
 #include "race/replay.h"
+#include "sim/exact/race_record.h"
+#include "sim/exact/tick.h"
 #include "race/replay_cameras.h"
+#include "race/point_lights.h"
 #include "race/pylons.h"
 #include "race/road_shade.h"
 #include "race/sun_glare.h"
@@ -37,12 +47,11 @@
 #include "menu/flow/game_hooks.h"
 #include "audio/voice_mixer.h"
 #include "formats/course/road.h"
-#include "sim/models.h"
-#include "sim/vehicle.h"
 #include "track/track.h"
 #include "vfs/vfs.h"
 
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <set>
 #include <cstdlib>
@@ -55,6 +64,19 @@ using gt3r::test::test_disc;
 namespace {
 
 bool near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
+
+// The disc's program data (the exact core's), loaded once.
+std::shared_ptr<const sim::exact::ProgramData> program() {
+    static std::shared_ptr<const sim::exact::ProgramData> d;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        if (Disc* disc = test_disc())
+            if (std::optional<Bytes> core = disc->volume().read_program())
+                d = std::make_shared<const sim::exact::ProgramData>(sim::exact::ProgramData::load(CoreImage::decode(*core)));
+    }
+    return d;
+}
 
 PadState pad_with(PadButton b, u8 pressure) {
     PadState p;
@@ -112,23 +134,6 @@ TEST(race_control_reverse) {
     ControlMapper shift;
     shift.update(pad_with(PadButton::L2, 0), dt); // L2 is shift down, never reverse
     CHECK(!shift.reverse());
-    // The sim: a stopped AT car with reverse requested and the brake held backs up.
-    struct Flat : sim::TrackQuery {
-        sim::SurfaceHit probe(float, float, float y_max) const override {
-            sim::SurfaceHit h;
-            h.hit = y_max >= 0;
-            return h;
-        }
-    } flat;
-    std::unique_ptr<sim::Vehicle> v = sim::Vehicle::create(sim::CarSpec::test_car(sim::Drive::FR));
-    v->reset({}, {});
-    v->set_reverse_request(true);
-    sim::ControlInputs r;
-    r.brake = 1.0f;
-    for (int i = 0; i < 180; ++i) v->step(r, flat, dt);
-    CHECK(v->state().gear < 0);
-    sim::Vec3 back = rotate(v->state().orientation, sim::Vec3{0, 0, 1}); // car +Z = back
-    CHECK(v->state().velocity.dot(back) > 1.0f);
 }
 
 // Change view: GT3's two views (in-car with the mirror, chase; in-car first), plus ours: in-car
@@ -267,6 +272,40 @@ TEST(race_fixed_step) {
     CHECK(ticks == 599 || ticks == 600);
 }
 
+// Online races pace ticks by the shared clock: what is drawn (the tick run last, blended
+// back by 1 - alpha) moves on with that clock at every frame rate and wherever its ticks fall
+// between frames. (Blended by the frame times, at 120 fps half the start phases drew every
+// other frame half a tick back: the whole view jittered.)
+TEST(race_fixed_step_follow) {
+    for (double hz : {60.0, 120.0, 144.0, 165.0})
+        for (double phase = 0; phase < 1.0; phase += 0.0625) {
+            FixedStep f(60.0);
+            long long done = 0;
+            double drawn_prev = -1, worst = 0;
+            int ticks = 0;
+            for (int frame = 0; frame < int(hz) * 2; ++frame) {
+                const double clock = (frame / hz) * 60.0 + phase; // ticks due by this frame
+                ticks += f.follow(clock, done, 30);
+                const double drawn = double(done) - 1 + f.alpha();
+                if (drawn_prev >= 0) {
+                    CHECK(drawn >= drawn_prev);
+                    worst = std::max(worst, std::fabs((drawn - drawn_prev) - 60.0 / hz));
+                }
+                drawn_prev = drawn;
+            }
+            CHECK(worst < 1e-4); // evenly spaced: every frame moves 60 / hz ticks on
+            CHECK(ticks == int(std::floor((int(hz) * 2 - 1) / hz * 60.0 + phase)));
+        }
+    // A stall past the cap: the newest state, the rest next frame.
+    FixedStep g(60.0);
+    long long done = 0;
+    CHECK(g.follow(40.5, done, 30) == 30 && done == 30 && g.alpha() == 1.0f);
+    CHECK(g.follow(40.6, done, 30) == 10 && done == 40 && near(g.alpha(), 0.6f, 1e-4f));
+    // The clock set back (a refined start time): nothing runs and the last tick stays drawn.
+    CHECK(g.follow(39.8, done, 30) == 0 && done == 40 && g.alpha() == 0.0f);
+    CHECK(g.follow(40.25, done, 30) == 0 && near(g.alpha(), 0.25f, 1e-4f));
+}
+
 TEST(race_interpolation) {
     sim::Quat a = quat_from_yaw(0), b = quat_from_yaw(1.0f);
     sim::Quat m = slerp(a, b, 0.5f);
@@ -292,31 +331,87 @@ TEST(race_interpolation) {
     CHECK(near(r.engine_rpm, 1500) && near(r.wheels[0].spin_angle, 0.5f) && r.gear == 3);
 }
 
+// Frames at 120 Hz over 60 Hz ticks: the drawn car moves the same distance every frame, and a wheel turns by its speed every
+// frame although its spin angle wraps (the exact core's wheel spin, keeps it within a turn).
+TEST(race_interpolation_120hz) {
+    namespace ex = gt3r::sim::exact;
+    ex::Car c{};
+    c.dt = ex::F(1.0f / 60.0f);
+    c.p.max_lock = ex::F(0.5f);
+    c.p.inv_tire_radius = {ex::F(1.0f / 0.3f), ex::F(1.0f / 0.3f)};
+    for (ex::Wheel& w : c.w) w.rim_speed = ex::F(40.0f); // 133 rad/s: 2.2 rad a tick
+    const sim::VehicleSetup setup;
+    sim::VehicleState prev, state;
+    exact_state(c, setup, state);
+    FixedStep step(60.0);
+    int ticks = 0, wraps = 0, frames = 0, bad_spin = 0, bad_move = 0;
+    float last_spin = 0, last_x = 0;
+    for (int f = 0; f < 600; ++f) {
+        for (int n = step.advance(1.0 / 120.0); n > 0; --n) {
+            prev = state;
+            ex::save_previous(c);
+            ex::wheel_spin(c);
+            exact_state(c, setup, state);
+            state.position.x = 40.0f * float(++ticks) / 60.0f;
+            wraps += state.wheels[0].spin_angle < prev.wheels[0].spin_angle;
+        }
+        const sim::VehicleState r = interpolate(prev, state, step.alpha());
+        if (frames++ > 1) { // (from the first tick on)
+            const float turn = std::remainder(r.wheels[0].spin_angle - last_spin - 133.33333f / 120.0f, 6.2831853f);
+            bad_spin += std::fabs(turn) > 1e-3f;
+            bad_move += !near(r.position.x - last_x, 40.0f / 120.0f, 1e-3f);
+        }
+        last_spin = r.wheels[0].spin_angle, last_x = r.position.x;
+    }
+    CHECK(wraps > 50);
+    CHECK(bad_spin == 0);
+    CHECK(bad_move == 0);
+    // Without the tick's turn (or between states that are not a tick apart) the wheel takes the shorter way round.
+    sim::WheelState a, b;
+    a.spin_angle = 6.2f, b.spin_angle = 0.1f;
+    CHECK(near(spin_change(a, b), 0.1f + 6.2831853f - 6.2f, 1e-4f));
+    b.spin_step = 4.0f, a.spin_angle = 1.0f, b.spin_angle = 5.0f - 6.2831853f; // over half a turn a tick
+    CHECK(near(spin_change(a, b), 4.0f, 1e-4f));
+    b.spin_angle = 1.2f; // not 4 rad on: a blend of two poses
+    CHECK(near(spin_change(a, b), 0.2f, 1e-4f));
+}
+
 TEST(race_rumble) {
     RumbleModel rm;
     sim::VehicleState s;
     s.speed_kmh = 100;
     sim::ControlInputs in;
-    RumbleModel::Events ev;
-    rm.update(s, ev, in, 1.0 / 60.0);
+    sim::VehicleTelemetry t;
+    t.pad_output = true;
+    rm.update(s, &t, in, 1.0 / 60.0);
     CHECK(rm.rumble().large == 0 && !rm.rumble().small);
-    ev.impact = 10;
-    rm.update(s, ev, in, 1.0 / 60.0);
-    CHECK(rm.rumble().large > 200);
-    ev.impact = 0;
-    for (int i = 0; i < 30; ++i) rm.update(s, ev, in, 1.0 / 60.0);
-    CHECK(rm.rumble().large == 0); // impact pulse decays
+    // The step's level goes to the large motor as it is (0..127); the small motor never runs.
+    t.pad_rumble = 100;
+    rm.update(s, &t, in, 1.0 / 60.0);
+    CHECK(rm.rumble().large == 100 && !rm.rumble().small);
+    t.pad_rumble = 127;
+    rm.update(s, &t, in, 1.0 / 60.0);
+    CHECK(rm.rumble().large == 127);
+    // A car the AI drives sends nothing: the motors stop. So does a step without telemetry.
+    t.pad_output = false;
+    rm.update(s, &t, in, 1.0 / 60.0);
+    CHECK(rm.rumble().large == 0);
+    t.pad_output = true;
+    rm.update(s, &t, in, 1.0 / 60.0);
+    CHECK(rm.rumble().large == 127);
+    rm.update(s, nullptr, in, 1.0 / 60.0);
+    CHECK(rm.rumble().large == 0);
     // Wheelspin under throttle drives the right trigger.
     in.throttle = 1;
     for (sim::WheelState& w : s.wheels) w.grounded = true, w.slip_ratio = -0.6f; // wheelspin
-    rm.update(s, ev, in, 1.0 / 60.0);
+    rm.update(s, &t, in, 1.0 / 60.0);
     CHECK(rm.trigger_right() > 0.3f);
     CHECK(rm.trigger_left() == 0);
     // Locked wheels under braking (positive slip) chatter on the left trigger.
     in.throttle = 0, in.brake = 1;
     for (sim::WheelState& w : s.wheels) w.slip_ratio = 0.7f;
     float peak = 0;
-    for (int i = 0; i < 8; ++i) rm.update(s, ev, in, 1.0 / 60.0), peak = std::max(peak, rm.trigger_left());
+    for (int i = 0; i < 8; ++i) rm.update(s, &t, in, 1.0 / 60.0), peak = std::max(peak, rm.trigger_left());
     CHECK(peak > 0.4f && rm.trigger_right() == 0);
     rm.reset();
     CHECK(rm.trigger_right() == 0 && rm.rumble().large == 0);
@@ -395,10 +490,8 @@ TEST(race_car_setup) {
     CHECK(db.load(vfs));
     CarSetup c = car_setup_from_database(db, "r34_gtr_v_99");
     CHECK(c.model == "ni0137");
-    CHECK(c.mass_kg > 1200 && c.mass_kg < 1800);
     CHECK(c.ratios.size() == 6);
     CHECK(c.limit_rpm > 6000 && c.limit_rpm < 10000);
-    CHECK(!c.curve_rpm.empty() && c.curve_rpm.size() == c.curve_torque_nm.size());
     CHECK(c.wheels.wheelbase > 2.5f && c.wheels.wheelbase < 2.8f);
     CHECK(c.sound_id != 0);
 }
@@ -406,30 +499,6 @@ TEST(race_car_setup) {
 // --- replays, ghost, replay cameras, ambience ---------------------------------
 
 namespace {
-
-struct FlatRoad : sim::TrackQuery {
-    sim::SurfaceHit probe(float, float, float y_max) const override {
-        sim::SurfaceHit h;
-        h.hit = y_max >= 0;
-        return h;
-    }
-};
-
-// sim::Vehicle on flat ground behind the race scene's RaceVehicle interface.
-class FlatVehicle : public RaceVehicle {
-public:
-    FlatVehicle() : v_(sim::Vehicle::create(sim::CarSpec::test_car(sim::Drive::FR))) {}
-    const char* backend_name() const override { return "test"; }
-    void reset(const TrackPose& p) override { v_->reset(p.position, p.orientation); }
-    void step(const sim::ControlInputs& in, double dt) override { v_->step(in, road_, dt); }
-    const sim::VehicleState& state() const override { return v_->state(); }
-    const sim::VehicleSetup& setup() const override { return v_->setup(); }
-    float last_impact() const override { return 0; }
-
-private:
-    FlatRoad road_;
-    std::unique_ptr<sim::Vehicle> v_;
-};
 
 sim::ControlInputs test_inputs(int i) {
     sim::ControlInputs in;
@@ -451,7 +520,7 @@ TEST(race_replay_roundtrip) {
     r.paint = 3;
     r.start = {{1, 2, 3}, quat_from_yaw(0.5f)};
     for (int i = 0; i < 500; ++i) r.inputs.push_back(quantize(test_inputs(i)));
-    r.events.push_back({100, ReplayEvent::Respawn, {{4, 5, 6}, quat_from_yaw(-1.0f)}});
+    r.exact = test::race_record_stub();
     r.best_lap = 61.25;
     r.best_lap_begin = 10, r.best_lap_end = 400;
     r.final_position = {7, 8, 9};
@@ -465,8 +534,7 @@ TEST(race_replay_roundtrip) {
     CHECK(q.car2 == "s2000_99" && q.inputs2.size() == 500 && q.inputs2[10].steer == r.inputs2[10].steer);
     CHECK(q.event == "AEAT0001" && q.opponents.size() == 2 && q.opponents[1] == "b_car");
     CHECK(q.course == r.course && q.car == r.car && !q.automatic && q.paint == 3);
-    CHECK(q.ticks() == 500 && q.tick_hz == r.tick_hz);
-    CHECK(q.events.size() == 1 && q.events[0].tick == 100 && q.events[0].pose.position.y == 5);
+    CHECK(q.ticks() == 500 && q.tick_hz == r.tick_hz && q.exact != nullptr);
     CHECK(q.best_lap == 61.25 && q.best_lap_begin == 10 && q.best_lap_end == 400);
     CHECK(q.final_position.z == 9 && q.start.orientation.y == r.start.orientation.y);
     bool same = true;
@@ -492,45 +560,22 @@ TEST(race_replay_roundtrip) {
     CHECK(threw);
 }
 
-// Record a run with a respawn, save/load it, re-simulate: the result must be
-// bit-identical (deterministic simulation), and the ghost of the best lap
-// must match the live states.
-TEST(race_replay_reproduces_run) {
-    FlatVehicle live;
-    ReplayRecorder rec;
-    TrackPose start{{1, 0, 2}, {}};
-    rec.begin("test", "test_car", true, 0, start, sim::kDefaultTickHz);
-    live.reset(start);
-    std::vector<sim::VehicleState> live_states;
-    const double dt = 1.0 / sim::kDefaultTickHz;
-    for (int i = 0; i < 1200; ++i) {
-        if (i == 700) {
-            TrackPose p{{50, 0, -30}, quat_from_yaw(1.0f)};
-            rec.respawn(p);
-            live.reset(p);
-        }
-        if (i >= 200 && i < 600) live_states.push_back(live.state());
-        live.step(rec.record(test_inputs(i)), dt);
-    }
-    rec.lap(6.0, 200, 600);
-    rec.finish(live.state().position);
-    Replay loaded = Replay::parse(rec.replay().serialize());
-    bool exact = false;
-    GhostLap g = ghost_from_replay(loaded, [] { return std::make_unique<FlatVehicle>(); }, &exact);
-    CHECK(exact);
-    CHECK(g.size() == live_states.size());
-    bool same = g.size() == live_states.size();
-    for (size_t i = 0; same && i < g.size(); ++i) {
-        const sim::VehicleState &a = g.frames()[i], &b = live_states[i];
-        same = a.position.x == b.position.x && a.position.y == b.position.y && a.position.z == b.position.z &&
-               a.orientation.w == b.orientation.w && a.engine_rpm == b.engine_rpm && a.gear == b.gear;
-    }
-    CHECK(same);
-    // Ghost playback interpolates between frames.
-    sim::VehicleState s;
-    CHECK(g.state_at(1.0, sim::kDefaultTickHz, s));
-    CHECK(s.position.x == g.frames()[60].position.x);
-    CHECK(!g.state_at(1e6, sim::kDefaultTickHz, s));
+// The original's ghost rules (presentation §G11): a run's (a free-run lap's) recording is kept
+// under 36,000 ticks; the best run replaces the ghost after a run with a time strictly under the
+// ghost's (whole ms), or when there is no ghost yet; a FAIL / EXIT (no time) or a recording not
+// kept never does.
+TEST(race_licence_ghost_rules) {
+    CHECK(ghost_recording_kept(0) && ghost_recording_kept(35999) && !ghost_recording_kept(36000));
+    CHECK(replaces_ghost(35100, true, -1));             // the first finished run
+    CHECK(replaces_ghost(35099, true, 35100));          // faster than the ghost
+    CHECK(!replaces_ghost(35100, true, 35100));         // a tie keeps the ghost
+    CHECK(!replaces_ghost(35101, true, 35100));         // slower
+    CHECK(!replaces_ghost(-1, true, -1));               // no time (FAIL, EXIT)
+    CHECK(!replaces_ghost(35000, false, -1));           // a run of 10 minutes or more
+    // Free runs: a lap becomes the best lap only strictly under the best so far.
+    CHECK(takes_best_lap(90500, true, -1) && takes_best_lap(90499, true, 90500));
+    CHECK(!takes_best_lap(90500, true, 90500) && !takes_best_lap(90600, true, 90500));
+    CHECK(!takes_best_lap(80000, false, 90500) && !takes_best_lap(-1, true, -1));
 }
 
 TEST(race_reverb_ambience) {
@@ -712,20 +757,7 @@ TEST(race_license_course_line_disc) {
 }
 
 TEST(race_tyre_and_collision_sounds) {
-    // Tarmac squeal (the slip intensity, physics §8.3): silent at small slip, louder and higher
-    // (the skid pitch, idling at 0.75) with lateral sliding.
-    using sim::model::skid_pitch;
-    using sim::model::slip_intensity;
-    CHECK(slip_intensity(0, 0.5f, 0, 20, 4000) == 0 && slip_intensity(0, 9.0f, 0, 20, 4000) > 1.0f);
-    CHECK(near(skid_pitch(0, 0.4f, 0, 20), 0.75f) && skid_pitch(0, 9.0f, 0, 20) > 1.0f);
-    CHECK(slip_intensity(0, 0, -0.3f, 20, 4000) > 1.0f); // wheelspin
-    CHECK(slip_intensity(0, 0, 0.3f, 20, 4000) > 0.7f);  // locking
-    // Kerb rumble: nothing below 5 km/h, needs load; its pitch rises 0.5 -> 4.3 from 10 to 200 km/h.
-    CHECK(slip_intensity(1, 0, 0, 1.0f, 5000) == 0 && slip_intensity(1, 0, 0, 20, 5000) > 0.3f &&
-          slip_intensity(1, 0, 0, 20, 0) == 0);
-    CHECK(skid_pitch(1, 0, 0, 2) == 0.5f && near(skid_pitch(1, 0, 0, 60), 4.3f) && skid_pitch(13, 0, 0, 30) > 1.5f);
-    // Wet and loose classes add their offset even at rest (0.5).
-    CHECK(near(skid_pitch(3, 0, 0, 0), 0.5f) && near(skid_pitch(12, 0, 0, 0), 0.5f));
+    // The road roar of a rolling wheel (the slip intensity and skid pitch are the car's own: its record's, physics §8.3, §8.3c).
     CHECK(road_noise(0.25f, 50).vol > 0 && road_noise(0.25f, 50).vol <= 0.3f);
     // Collisions: below 0.2 strength nothing.
     CHECK(wall_strength(5000) == 0 && near(wall_strength(25000), 0.5f) && wall_strength(1e6f) == 1.0f);
@@ -761,119 +793,6 @@ TEST(race_order_and_finish_rules) {
     CHECK(!ranks_ahead(st(2, 6500, 280), st(2, 6000)));
     CHECK(ranks_ahead(st(2, 6000, 270), st(2, 6500, 280)));       // finished: finish time
     CHECK(!ranks_ahead(st(2, 6000), st(2, 6000)));                // ties keep their places
-    // The race's laps (an equality after the crossing), the leader finished, the time limit.
-    CHECK(finishes_at_line(3, 3, false, 100, 0));
-    CHECK(!finishes_at_line(2, 3, false, 100, 0));
-    CHECK(finishes_at_line(2, 3, true, 100, 0));
-    CHECK(!finishes_at_line(5, 0, false, 100, 0));                // no laps (a time-limited race)
-    CHECK(!finishes_at_line(5, 0, false, 7199.9, 7200));
-    CHECK(finishes_at_line(5, 0, false, 7200, 7200));
-}
-
-// The finish rule in a field: two cars moved over the line by the test (no CPU cars). The
-// leader finishes on the race's laps; the other car, a lap down, finishes at its next
-// crossing ("+1 lap"); laps stop counting at the finish. A time limit ends nothing by itself:
-// each car finishes at its first crossing after it.
-TEST(race_field_finish_rules_disc) {
-    Disc* disc = test_disc();
-    if (!disc) SKIP("needs GT3R_DISC");
-    Vfs vfs(&disc->volume());
-    data::CarDatabase db;
-    CHECK(db.load(vfs));
-    Bytes course = disc->volume().read(*disc->volume().find("courses/US/trialmt"));
-    std::unique_ptr<RaceTrack> track = make_track(vfs, course, "trialmt");
-    const track::Track* rt = track->runtime();
-    CHECK(rt != nullptr);
-    if (!rt) return;
-    const float L = rt->length();
-    auto make = [&](double time_limit) {
-        FieldConfig cfg;
-        cfg.player = "r34_gtr_v_99";
-        cfg.second_player = "r34_gtr_v_99";
-        cfg.max_opponents = 0;
-        cfg.countdown = 0;
-        cfg.time_limit = time_limit;
-        std::string err;
-        return RaceField::create(*track, db, cfg, &err);
-    };
-    const double dt = 1.0 / 60;
-    auto pose = [&](float d) {
-        track::Pose p = rt->respawn_pose(std::fmod(d + L, L));
-        return TrackPose{p.position, p.orientation};
-    };
-    // Around the lap in hops of L / 4 (the timers follow), then over the line at speed.
-    auto lap1 = [&](RaceField& f) { // player 1 (placed without the respawn hold)
-        for (int k = 1; k <= 3; ++k) {
-            f.player().place(pose(L * float(k) / 4));
-            f.player().step({}, dt);
-        }
-        f.player().reset_moving(pose(L - 3), 30);
-        for (int i = 0; i < 60; ++i) f.player().step({}, dt);
-    };
-    auto cross2 = [&](RaceField& f) { // player 2: from 2 m before the line, after the respawn hold, under throttle
-        f.reset_second(pose(L - 2));
-        for (int i = 0; i < 125; ++i) f.player().step({}, dt);
-        sim::ControlInputs gas;
-        gas.throttle = 1;
-        for (int i = 0; i < 90; ++i) {
-            f.set_second_inputs(gas);
-            f.player().step({}, dt);
-        }
-        f.set_second_inputs({});
-    };
-    auto lap2 = [&](RaceField& f) {
-        for (int k = 1; k <= 3; ++k) {
-            f.reset_second(pose(L * float(k) / 4 + 5));
-            f.player().step({}, dt);
-        }
-        cross2(f);
-    };
-    // Both cars driven over the start line (a lap timer starts only on a crossing).
-    auto start = [&](RaceField& f) {
-        f.player().reset_moving(pose(-3), 30);
-        for (int i = 0; i < 60; ++i) f.player().step({}, dt);
-        cross2(f);
-    };
-    auto standing = [](const RaceField& f, int car) {
-        for (const RaceField::Standing& s : f.standings())
-            if (s.car == car) return s;
-        return RaceField::Standing{};
-    };
-
-    std::unique_ptr<RaceField> f = make(0);
-    CHECK(f != nullptr && f->has_second());
-    if (!f) return;
-    f->set_laps(2);
-    start(*f);
-    CHECK(f->second_laps().started && standing(*f, -1).laps == 0 && standing(*f, -2).laps == 0);
-    lap1(*f);
-    lap1(*f);
-    CHECK(f->player_finish() >= 0 && standing(*f, -1).laps == 2);
-    CHECK(f->second_finish() < 0 && standing(*f, -2).laps == 0);
-    lap2(*f); // a lap down: finishes at this crossing
-    CHECK(f->second_finish() > f->player_finish());
-    RaceField::Standing s2 = standing(*f, -2);
-    CHECK(s2.finished && s2.laps == 1);
-    CHECK(f->player_position() == 1 && f->second_position() == 2);
-    CHECK(result_time_text(false, true, s2.time, f->player_finish(), 2 - s2.laps) == "+1 lap");
-    lap2(*f);
-    lap1(*f);
-    CHECK(standing(*f, -2).laps == 1 && standing(*f, -1).laps == 2); // frozen at the finish
-
-    // Time limit 20 s, no laps: player 1 crosses before it (no finish) and after it (finish);
-    // player 2 never crosses after it and races on.
-    f = make(20);
-    CHECK(f != nullptr);
-    if (!f) return;
-    f->set_laps(0);
-    start(*f);
-    lap1(*f);
-    CHECK(f->race_time() < 20 && f->player_finish() < 0 && standing(*f, -1).laps == 1);
-    while (f->race_time() < 20.5) f->player().step({}, dt);
-    CHECK(f->player_finish() < 0 && f->second_finish() < 0);
-    lap1(*f);
-    CHECK(f->player_finish() >= 20 && standing(*f, -1).laps == 2);
-    CHECK(f->second_finish() < 0);
 }
 
 // A race field on Trial Mountain: opponents from the event, player last on the
@@ -888,28 +807,28 @@ TEST(race_field_event) {
     std::unique_ptr<RaceTrack> track = make_track(vfs, course, "trialmt");
     CHECK(track->runtime() != nullptr);
     FieldConfig cfg;
-    cfg.player = "r34_gtr_v_99";
     cfg.event = "AEAT0001";
+    cfg.exact.data = program();
+    cfg.exact.course_file = course;
+    cfg.exact.course = "trialmt";
+    cfg.exact.laps = 2;
+    cfg.exact.player.car = {"r34_gtr_v_99"};
     std::string err;
     std::unique_ptr<RaceField> f = RaceField::create(*track, db, cfg, &err);
     CHECK(f != nullptr);
     if (!f) return;
     CHECK(f->opponents() == 5 && f->race_time() < 0);
-    f->set_laps(2);
     RaceVehicle& p = f->player();
-    p.reset(f->player_grid());
     sim::Vec3 start = p.state().position;
+    CHECK((start - f->player_grid().position).length() < 1e-4f);
     sim::ControlInputs gas;
     gas.throttle = 1;
-    for (int i = 0; i < 120; ++i) p.step(gas, 1.0 / 60); // countdown: held
-    CHECK((p.state().position - start).length() < 1.0f);
+    for (int i = 0; i < 540; ++i) p.step(gas, 1.0 / 60); // the start's 10 s hold: held
+    CHECK(f->race_time() < 0 && (p.state().position - start).length() < 1.0f);
     for (int i = 0; i < 600; ++i) p.step(gas, 1.0 / 60);
-    CHECK(f->race_time() > 9);
+    CHECK(f->race_time() > 8.5 && (p.state().position - start).length() > 50.0f);
     std::vector<RaceField::Standing> st = f->standings();
-    CHECK(st.size() == 6);
-    bool sorted = true;
-    for (size_t i = 1; i < st.size(); ++i) sorted = sorted && st[i - 1].distance >= st[i].distance;
-    CHECK(sorted && !st[0].finished);
+    CHECK(st.size() == 6 && !st[0].finished);
 }
 
 TEST(race_lap_logger_and_records) {
@@ -958,6 +877,20 @@ TEST(race_event_start_fields) {
     CHECK(std::fabs(power_to_weight(light) - 1000.0f / (400.0f * 6000 * 0.10471976f / 735.49875f)) < 0.01f);
 }
 
+// A judged licence run as GT3's licence display shows it, from the race flow's result words: a medal with its time; slower
+// than bronze (0 with the failed event) a finished run with no medal and its time (TIME EXPIRED with the time); out of the
+// course (-1) failed with no time (FAIL); a test with no judging times (0, no failed event) finished with its best.
+TEST(race_license_outcome) {
+    LicenseOutcome o = license_outcome(3, 35321, false, -1);
+    CHECK(o.state == LicenseRun::State::Finished && o.medal == 1 && o.time == 35.321);
+    o = license_outcome(0, 41007, true, 40.0);
+    CHECK(o.state == LicenseRun::State::Finished && o.medal == -1 && o.time == 41.007);
+    o = license_outcome(-1, 0x157529FF, true, 40.0);
+    CHECK(o.state == LicenseRun::State::Failed && o.medal == -1 && o.time < 0 && o.failure == "out of the course");
+    o = license_outcome(0, 0, false, 40.5);
+    CHECK(o.state == LicenseRun::State::Finished && o.medal == -1 && o.time == 40.5);
+}
+
 TEST(race_license_medals) {
     Bytes b(0x200, 0);
     auto put = [&](size_t o, int m, int s, int ms) { b[o] = u8(m), b[o + 1] = u8(s), b[o + 2] = u8(ms & 0xFF), b[o + 3] = u8(ms >> 8); };
@@ -979,129 +912,8 @@ TEST(race_license_medals) {
     if (ev) CHECK(license_times(*ev).ms[0] == 35100 && license_times(*ev).ms[1] == 35400 && license_times(*ev).ms[2] == 35800);
 }
 
-TEST(race_license_run_rules) {
-    using St = LicenseRun::State;
-    auto base = [] {
-        LicenseRun::Step s;
-        s.started = true;
-        for (int i = 0; i < 4; ++i) s.grounded[i] = true;
-        return s;
-    };
-    // Kind 2: the goal crossing, interpolated within the step.
-    LicenseRun r;
-    r.begin({2, 1, 100.0f});
-    LicenseRun::Step s = base();
-    s.elapsed = 10.0, s.dt = 0.1, s.progress_prev = 95, s.progress = 99;
-    CHECK(r.step(s) == St::Running);
-    s.elapsed = 10.1, s.progress_prev = 99, s.progress = 103;
-    CHECK(r.step(s) == St::Finished && std::fabs(r.time() - 10.025) < 1e-9);
-    // Kind 1 (the original's stop rule): all four hub ground queries on flag-0x04 triangles,
-    // grounded or not, 3-D body speed <= 1 km/h (equality passes), no line-crossing gate; time
-    // from GO = floor((50 x ticks before this one + trunc(50 |v| / 1 km/h)) / 3) ms.
-    r.begin({1, 1, 1000.0f});
-    s = base();
-    s.started = false; // the line crossing does not matter
-    s.clock_ticks = 1800; // 30 s after GO
-    for (int i = 0; i < 4; ++i) s.surface[i] = 0x0400;
-    s.speed3d_mps = 0.5f;
-    CHECK(r.step(s) == St::Running);
-    s.surface[3] = 0; // three wheels in: keep waiting, never fails
-    s.speed3d_mps = 0.2f;
-    CHECK(r.step(s) == St::Running);
-    s.surface[3] = 0x0400;
-    s.grounded[3] = false; // an airborne wheel over the box still counts
-    s.clock_ticks = 1801, s.speed3d_mps = 0.0f;
-    CHECK(r.step(s) == St::Finished && r.time() == 30.016); // 90050 / 3 = 30016 ms
-    CHECK(LicenseRun::stop_time_ms(1801, 0.0f) == 30016);
-    CHECK(LicenseRun::stop_time_ms(1801, 0.2f) == 30028);              // + trunc(50 x 0.72) = 36 units
-    CHECK(LicenseRun::stop_time_ms(1801, LicenseRun::kStopSpeed) == 30033); // + 50 units: a whole tick
-    r.begin({1, 1, 1000.0f});
-    s.speed3d_mps = LicenseRun::kStopSpeed; // exactly 1 km/h passes
-    CHECK(r.step(s) == St::Finished);
-    r.begin({1, 1, 1000.0f});
-    s.speed3d_mps = 0.2778f; // just above
-    CHECK(r.step(s) == St::Running);
-    // Medals on the B-1 targets (35.100 / 35.400 / 35.800): the sub-tick term can earn one.
-    {
-        LicenseTimes b1;
-        b1.ms = {35100, 35400, 35800};
-        CHECK(license_medal(b1, double(LicenseRun::stop_time_ms(2106, 0.0f)) / 1000.0) == 0);  // 35.100
-        CHECK(license_medal(b1, double(LicenseRun::stop_time_ms(2106, 0.02f)) / 1000.0) == 1); // 105300 + 3 units: 35.101
-        CHECK(license_medal(b1, double(LicenseRun::stop_time_ms(2148, 0.0f)) / 1000.0) == 2);  // 35.800
-        CHECK(license_medal(b1, double(LicenseRun::stop_time_ms(2148, 0.1f)) / 1000.0) == -1); // 35.806
-    }
-    // Failures: four wheels on grass, a hard wall hit, the pit lane; three wheels off is fine.
-    r.begin({3, 1, 0});
-    s = base();
-    for (int i = 0; i < 3; ++i) s.surface[i] = 2;
-    CHECK(r.step(s) == St::Running);
-    s.surface[3] = 3;
-    CHECK(r.step(s) == St::Failed && r.failure() == "course_out");
-    r.begin({3, 1, 0});
-    s = base();
-    s.wall_dv = 10.5f;
-    CHECK(r.step(s) == St::Failed && r.failure() == "wall");
-    r.begin({3, 2, 0});
-    s = base();
-    s.laps_completed = 2, s.laps_time = 61.5;
-    CHECK(r.step(s) == St::Finished && r.time() == 61.5);
-    CHECK(Hud::tire_color(0).g == 252 && Hud::tire_color(127).r == 252 && Hud::tire_color(-64).r == 0);
-}
-
-// Kinds 2 / 3 on the original's clock: from GO for standing tests, from the first line
-// crossing for flying ones; the event interpolated inside its tick as trunc(50 f) / 3000 s.
-TEST(race_license_clock_timing) {
-    using St = LicenseRun::State;
-    auto step = [](LicenseRun& r, long long tick, double d0, double d1) {
-        LicenseRun::Step s;
-        for (int i = 0; i < 4; ++i) s.grounded[i] = true;
-        s.clock_ticks = tick, s.dist_prev = d0, s.dist = d1, s.lap_length = 1000.0f;
-        return r.step(s);
-    };
-    // B-3 (standing section, goal 881.1 m; gold 31.100): the car starts 2 m behind the line.
-    LicenseRun r;
-    LicenseRun::Rules sec{2, 1, 881.1f};
-    r.begin(sec);
-    CHECK(step(r, -1, -2, -2) == St::Running);  // held: no events
-    CHECK(step(r, 0, -2, -1.5) == St::Running); // first racing tick, clock 0
-    CHECK(step(r, 99, -0.5, 0.5) == St::Running && r.lap_counter() == 1); // the line: no restart
-    CHECK(step(r, 1864, 880.0, 882.0) == St::Finished);
-    // 50 x 1864 + trunc(50 x 0.55) = 93227 -> 31075 ms from GO (not from the line).
-    CHECK(r.time() == 31.075);
-    LicenseTimes b3;
-    b3.ms = {31100, 31400, 32500};
-    CHECK(license_medal(b3, r.time()) == 0);
-    // The goal before the first line crossing does not count (lap counter 0).
-    r.begin(sec);
-    CHECK(step(r, 10, -1000, -118) == St::Running);
-    // A-6 (flying section, goal 1097.7 m): the clock origin is the interpolated line crossing.
-    LicenseRun::Rules fly{2, 1, 1097.7f};
-    fly.standing = false;
-    r.begin(fly);
-    CHECK(step(r, 0, -99, -97) == St::Running);
-    CHECK(step(r, 300, -1, 1) == St::Running); // start = floor((15000 + 25) / 3) = 5008 ms
-    CHECK(r.start_ms() == 5008);
-    CHECK(step(r, 1920, 1097.2, 1098.2) == St::Finished); // floor((96000 + 25) / 3) = 32008
-    CHECK(r.time() == 27.0);                               // 32008 - 5008: A-6 gold exactly
-    // A-4 (standing, 3 laps): finishes on the crossing whose old counter is 3, one clock difference.
-    r.begin({3, 3, 0});
-    CHECK(step(r, 0, -0.5, -0.2) == St::Running);
-    CHECK(step(r, 20, -0.1, 0.4) == St::Running && r.lap_counter() == 1);
-    CHECK(step(r, 900, 999.0, 1001.0) == St::Running && r.lap_counter() == 2);
-    CHECK(step(r, 1800, 1999.0, 2001.0) == St::Running && r.lap_counter() == 3);
-    CHECK(step(r, 2630, 2999.5, 3001.5) == St::Finished); // floor((131500 + 12) / 3) = 43837
-    CHECK(r.time() == 43.837);
-    LicenseTimes a4;
-    a4.ms = {43900, 44300, 46200};
-    CHECK(license_medal(a4, r.time()) == 0);
-    // A car placed past the line starts on lap counter 1: one crossing fewer.
-    r.begin({3, 1, 0});
-    CHECK(step(r, 0, 5, 6) == St::Running && r.lap_counter() == 1);
-    CHECK(step(r, 600, 999, 1001) == St::Finished && r.time() == 10.008);
-}
-
 // Licence pylons (GT3's rigid bodies): B-1/B-2's row of 20 cones 1.9 m past the stop box,
-// knocked about by a car's box; any touch fails the licence ("pylon").
+// knocked about by a car's box; any touch is reported (the race's licence judge fails on it).
 TEST(race_pylons_disc) {
     Disc* disc = test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
@@ -1152,20 +964,13 @@ TEST(race_pylons_disc) {
     CHECK(fastest > 15);
     // Struck cones meet a wall: a wall edge 3.7 m past the row whose drivable side
     // (s.z, -s.x) is -z: no body ends up behind it or closer than its radius.
-    struct Wall : sim::WorldQuery {
-        bool wall_contact(const sim::Vec3&, float, sim::Vec3&, float&) const override { return false; }
-        bool wall_segments(const sim::Vec3&, float, std::vector<sim::collide::Segment>& out) const override {
-            sim::collide::Segment sg;
-            sg.a = {-1050, -587.0}, sg.b = {-900, -587.0};
-            out.push_back(sg);
-            return true;
-        }
-    } wall;
+    track::WallLine wall;
+    wall.points = {{{-1050, 0, -587.0f}, 0}, {{-900, 0, -587.0f}, 0}};
     p.reset(flat);
     car.pos = {-972.5f, 0, -590.7f - 0.18f - 2.0f - 0.5f};
     for (int i = 0; i < 90; ++i) {
         car.pos.z += 20.0f / 60;
-        p.step(flat, {car}, 1.0 / 60, &wall);
+        p.step(flat, {car}, 1.0 / 60, std::span<const track::WallLine>(&wall, 1));
         car.pos.z = std::min(car.pos.z, -592.0f); // the car stops before the wall
     }
     float deepest = -1e9f;
@@ -1177,12 +982,6 @@ TEST(race_pylons_disc) {
     render::Vec3 tip = m.transform_point({0, 0.5f, 0});
     CHECK(std::fabs(tip.y) < 0.01f);
     CHECK(!Pylons::shadow_matrix(p.bodies()[0], {1, 0, 0}, m)); // grazing light: none
-    // The licence judge fails on the touch, before anything else.
-    LicenseRun r;
-    r.begin({1, 1, 1000});
-    LicenseRun::Step st;
-    st.clock_ticks = 2000, st.pylon = true;
-    CHECK(r.step(st) == LicenseRun::State::Failed && r.failure() == "pylon");
 }
 
 // GT3's time formatter: dashes for "no time" (negative, or the 359,999,999 ms a FAIL
@@ -1361,18 +1160,6 @@ TEST(race_wet_road_models_disc) {
     CHECK(alpha_only > 0 && other == 0);
 }
 
-TEST(race_course_out_rule) {
-    LicenseRun::Step s;
-    for (int i = 0; i < 4; ++i) s.grounded[i] = true, s.surface[i] = 2; // grass
-    CHECK(course_out(s) && std::string(course_out(s)) == "course_out");
-    s.surface[0] = 1; // a wheel on the kerb: still on course
-    CHECK(course_out(s) == nullptr);
-    s.grounded[0] = false; // airborne wheels do not count as off
-    CHECK(course_out(s) == nullptr);
-    s.wall_dv = 10.5f;
-    CHECK(course_out(s) && std::string(course_out(s)) == "wall");
-}
-
 // Road shade (vertex attributes A/B): the grid lookup agrees with testing every triangle,
 // open road is fully lit and the Trial Mountain bridge / tunnel stretches are shaded.
 TEST(race_road_shade_disc) {
@@ -1400,8 +1187,113 @@ TEST(race_road_shade_disc) {
     CHECK(shaded > 0);
 }
 
+// Point-light courses: road attribute A is a signed lamp index (0xFFFF = -1, the lamp before
+// lamp 0), and the nine candidates start 4 before it, wrapping past either end of the list.
+TEST(race_point_light_index_rule) {
+    CHECK(race::lamp_index(0xFFFF) == -1);
+    CHECK(race::lamp_index(0) == 0 && race::lamp_index(272) == 272);
+    CHECK(race::first_candidate(-1, 273) == 268); // lamps 268..272, 0..3
+    CHECK(race::first_candidate(272, 273) == 268);
+    CHECK(race::first_candidate(0, 273) == 269);
+    CHECK(race::first_candidate(4, 273) == 0);
+    CHECK(race::first_candidate(100, 273) == 96);
+    CHECK(race::first_candidate(-1, 5) == 0);
+    // A ring of 24 lamps (GTRW +0x21 = 1; +0x58 count, +0x5C records {type, axis, pos, kind}).
+    const int n = 24;
+    Bytes b(0x60 + 0x20 * size_t(n), 0);
+    auto put32 = [&](size_t at, u32 v) { for (int i = 0; i < 4; ++i) b[at + size_t(i)] = u8(v >> (8 * i)); };
+    auto putf = [&](size_t at, float f) { u32 v; std::memcpy(&v, &f, 4); put32(at, v); };
+    std::memcpy(b.data(), "GTRW", 4);
+    b[0x21] = 1;
+    put32(0x58, u32(n)), put32(0x5C, 0x60);
+    const float kPi = 3.14159265f, r = 50.0f;
+    for (int i = 0; i < n; ++i) {
+        size_t o = 0x60 + 0x20 * size_t(i);
+        float t = 2 * kPi * float(i) / float(n);
+        putf(o + 8, 1.0f);                                                          // axis (0, 1, 0)
+        putf(o + 0x10, r * std::cos(t)), putf(o + 0x14, 10.0f), putf(o + 0x18, r * std::sin(t));
+        putf(o + 0x1C, 1.0f);                                                       // point lamp
+    }
+    race::CoursePointLights pl;
+    pl.load(b);
+    CHECK(pl.active() && pl.lamps().size() == size_t(n));
+    race::SunParams e;
+    e.lamps[0].c2 = 0.01f; // w = 1 / (1 + 0.01 d^2)
+    // A car on the ring between lamp 23 and lamp 0, over the strip that holds 0xFFFF.
+    float t = -kPi / float(n);
+    render::Vec3 p{r * std::cos(t), 0, r * std::sin(t)};
+    std::vector<race::SelectedLamp> sel = pl.select(e, p, race::lamp_index(0xFFFF));
+    CHECK(sel.size() == 4);
+    std::set<int> got;
+    for (const race::SelectedLamp& l : sel) {
+        got.insert(l.lamp);
+        CHECK(l.w > 0.05f);
+    }
+    CHECK(got == (std::set<int>{22, 23, 0, 1}));
+    // Read as unsigned (65535), the window (lamps 11..19) would lie away from the car.
+    float far = 0;
+    for (const race::SelectedLamp& l : pl.select(e, p, 0xFFFF)) far = std::max(far, l.w);
+    CHECK(far < 0.1f * sel[0].w);
+    std::vector<race::ReflectionDisc> discs = pl.reflection_discs(e, p, race::lamp_index(0xFFFF));
+    CHECK(discs.size() == 6 && discs[0].sqrt_w == std::sqrt(sel[0].w));
+}
+
+// The night routes and circle tests: every road vertex's A names a lamp or is 0xFFFF, which
+// only the strip at the start line holds (between the last lamp and lamp 0); a car there is
+// lit by the lamps around the line about as strongly as just before or after it.
+TEST(race_point_lights_start_line_disc) {
+    Disc* disc = test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    for (const char* name : {"route11", "r_route11", "route5", "route5_dry", "r_route5", "r_route5_dry", "L_circle60_dry1",
+                             "L_circle60_wet1", "L_circle100_dry1", "L_circle100_wet1"}) {
+        Bytes data = disc->volume().read(*disc->volume().find(std::string("courses/US/") + name));
+        course::CourseFile f = course::CourseFile::parse(data);
+        ByteSpan g = f.section(data, course::kSlotRoad);
+        race::CoursePointLights pl;
+        pl.load(g);
+        CHECK(pl.active());
+        int n = int(pl.lamps().size());
+        course::Road road = course::Road::parse(g);
+        int strip = 0, other = 0;
+        for (const course::RoadSegment& s : road.segments)
+            for (u32 w : s.vertex_attrs) {
+                int a = int(w & 0xFFFF);
+                if (a == 0xFFFF) ++strip;
+                else if (a >= n) ++other;
+            }
+        CHECK(strip > 0 && other == 0);
+        if (name[0] == 'L') continue;
+        race::SunParams e = race::SunParams::from_env0(f.section(data, course::kSlotEnv));
+        // Every triangle whose first vertex holds 0xFFFF (the wheel query's lamp index) vs the
+        // triangles over lamps 0 and n - 1, the stretches on either side.
+        double strip_min = 1e9, side_sum = 0;
+        int strip_tris = 0, side_tris = 0;
+        for (const course::RoadSegment& s : road.segments)
+            for (const course::RoadTriangle& t : s.triangles) {
+                const course::Vec3 &a = s.vertices[t.a], &b = s.vertices[t.b], &c = s.vertices[t.c];
+                float x = (a.x + b.x + c.x) / 3, y = (a.y + b.y + c.y) / 3, z = (a.z + b.z + c.z) / 3;
+                race::RoadShade rs = race::road_shade(road, x, z, y + 1.0f);
+                if (!rs.hit || (rs.raw_a != 0xFFFF && rs.raw_a != 0 && rs.raw_a != n - 1)) continue;
+                render::Vec3 p{x, y + 0.5f, z};
+                std::vector<race::SelectedLamp> sel = pl.select(e, p, race::lamp_index(rs.raw_a));
+                double w = 0;
+                for (const race::SelectedLamp& l : sel) w += l.w;
+                if (rs.raw_a != 0xFFFF) {
+                    side_sum += w, ++side_tris;
+                    continue;
+                }
+                ++strip_tris, strip_min = std::min(strip_min, w);
+                CHECK(sel.size() == 4);
+                for (const race::SelectedLamp& l : sel) CHECK(l.lamp >= n - 5 || l.lamp <= 3); // around the line
+                CHECK(!pl.reflection_discs(e, p, race::lamp_index(rs.raw_a)).empty());
+            }
+        CHECK(strip_tris > 0 && side_tris > 0);
+        CHECK(strip_min > 0.5 * side_sum / side_tris);
+    }
+}
+
 // RACING / DRIFT from the arcade car page: the request's tire_mode picks the car's stage-10 /
-// stage-11 tyre records; drift tyres hold their lateral force further out (curve A).
+// stage-11 tyre records.
 TEST(race_arcade_drift_tyres_disc) {
     Disc* disc = test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
@@ -1421,11 +1313,10 @@ TEST(race_arcade_drift_tyres_disc) {
     CHECK(racing && drift);
     if (!racing || !drift) return;
     CHECK(racing->stage == 10 && drift->stage == 11);
-    // Race car: arc_racing mu 1.70 vs arc_d_racing 1.65.
-    CHECK(drift->spec.tire[0].mu < racing->spec.tire[0].mu);
-    // Curve A at 40 degrees: drift keeps more of its peak.
-    float a = 40.0f * 3.14159265f / 180.0f;
-    CHECK(sim::model::lookup(drift->spec.tire[0].slip_a, a) > sim::model::lookup(racing->spec.tire[0].slip_a, a));
+    // The race's equipment: the stage's tyre records (arc_racing / arc_d_racing).
+    std::optional<sim::exact::Equipment> er = exact_equipment(db, {racing->label, std::nullopt, std::nullopt, racing->stage});
+    std::optional<sim::exact::Equipment> ed = exact_equipment(db, {drift->label, std::nullopt, std::nullopt, drift->stage});
+    CHECK(er && ed && er->part[size_t(data::TableId::FrontTire)] != ed->part[size_t(data::TableId::FrontTire)]);
     // Dirt courses force stage 12.
     std::optional<race::ArcadeCar> dirt = race::arcade_car(db, rq.car, 1, "tahitidirt");
     CHECK(dirt && dirt->stage == 12);
@@ -1433,7 +1324,7 @@ TEST(race_arcade_drift_tyres_disc) {
 }
 
 // 2P battle from the arcade 2P car page: player 2's own arcade car with DRIFT tyres (the request's
-// car2 / tire_mode2) runs as the field's second player with that spec.
+// car2 / tire_mode2) runs as the race's second player with them.
 TEST(race_two_player_drift_disc) {
     Disc* disc = test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
@@ -1455,116 +1346,29 @@ TEST(race_two_player_drift_disc) {
     Bytes course = disc->volume().read(*disc->volume().find("courses/US/trialmt"));
     std::unique_ptr<RaceTrack> track = make_track(vfs, course, "trialmt");
     FieldConfig cfg;
-    cfg.player = p1->car;
-    cfg.player_spec = std::make_shared<const sim::CarSpec>(p1->spec);
-    cfg.second_player = p2->car;
-    cfg.second_spec = std::make_shared<const sim::CarSpec>(p2->spec);
     cfg.max_opponents = 0;
+    cfg.exact.data = program();
+    cfg.exact.course_file = course;
+    cfg.exact.course = "trialmt";
+    cfg.exact.kind = sim::exact::Conductor::Battle2P;
+    cfg.exact.laps = 2;
+    cfg.exact.player.car = {p1->label, std::nullopt, std::nullopt, p1->stage};
+    cfg.exact.second.car = {p2->label, std::nullopt, std::nullopt, p2->stage};
     std::string err;
     std::unique_ptr<RaceField> f = RaceField::create(*track, db, cfg, &err);
     CHECK(f != nullptr);
     if (!f) return;
     CHECK(f->has_second());
-    const sim::Vehicle* v2 = f->second_vehicle();
-    CHECK(v2 != nullptr);
-    if (v2) CHECK(std::fabs(v2->spec().tire[0].mu - p2->spec.tire[0].mu) < 1e-6f && p2->spec.tire[0].mu < p1->spec.tire[0].mu);
+    // Player 2's entry: the drift tyres.
+    std::shared_ptr<const sim::exact::RaceRecord> rec = exact_recording(*f);
+    std::optional<sim::exact::Equipment> drift = exact_equipment(db, cfg.exact.second.car);
+    CHECK(rec && rec->entries.size() == 2 && drift);
+    if (rec && drift && rec->entries.size() == 2)
+        CHECK(rec->entries[1].eq.part[size_t(data::TableId::FrontTire)] == drift->part[size_t(data::TableId::FrontTire)] &&
+              rec->entries[1].eq.part[size_t(data::TableId::FrontTire)] != rec->entries[0].eq.part[size_t(data::TableId::FrontTire)]);
 }
 
-// Run-up driver parameter set by course category (ai §9.1): tarmac 0, wet Route 5 1, dirt 2.
-TEST(race_driver_param_set_disc) {
-    Disc* disc = test_disc();
-    if (!disc) SKIP("needs GT3R_DISC");
-    Vfs vfs(&disc->volume());
-    data::CarDatabase db;
-    CHECK(db.load(vfs));
-    CHECK(race::driver_param_set(db, "trialmt") == 0);
-    CHECK(race::driver_param_set(db, "route5") == 1);
-    CHECK(race::driver_param_set(db, "tahitidirt") == 2);
-}
-
-// 2P options: the handicap moves both cars onto the line before the start (the trailing one
-// max(|h|, 20) m back, the other 10 m), and the boost speeds up the trailing car's time step.
-TEST(race_two_player_options_disc) {
-    Disc* disc = test_disc();
-    if (!disc) SKIP("needs GT3R_DISC");
-    Vfs vfs(&disc->volume());
-    data::CarDatabase db;
-    CHECK(db.load(vfs));
-    Bytes course = disc->volume().read(*disc->volume().find("courses/US/trialmt"));
-    std::unique_ptr<RaceTrack> track = make_track(vfs, course, "trialmt");
-    const track::Track* rt = track->runtime();
-    CHECK(rt != nullptr);
-    if (!rt) return;
-    auto make = [&](float handicap, float boost) {
-        FieldConfig cfg;
-        cfg.player = "r34_gtr_v_99";
-        cfg.second_player = "r34_gtr_v_99";
-        cfg.max_opponents = 0;
-        cfg.handicap_m = handicap;
-        cfg.boost_amount = boost, cfg.boost_start = 10, cfg.boost_full = 200;
-        std::string err;
-        return RaceField::create(*track, db, cfg, &err);
-    };
-    auto before_line = [&](const TrackPose& p) { return track->length() - track->distance_of(p.position); };
-    std::unique_ptr<RaceField> f = make(100, 0);
-    CHECK(f != nullptr);
-    if (!f) return;
-    CHECK(std::fabs(before_line(f->player_grid()) - 10.0f) < 3.0f);
-    CHECK(std::fabs(before_line(f->second_grid()) - 100.0f) < 3.0f);
-    f = make(-150, 0);
-    CHECK(f && std::fabs(before_line(f->player_grid()) - 150.0f) < 3.0f && std::fabs(before_line(f->second_grid()) - 10.0f) < 3.0f);
-}
-
-// Determinism: a vehicle placed again after a run must behave exactly like a new one (time-trial
-// replays and restarts reuse the vehicle). Records a run with throttle and steering, then
-// replays the same inputs on the reused vehicle and on a fresh one: identical final states.
-TEST(race_vehicle_reuse_deterministic_disc) {
-    Disc* disc = test_disc();
-    if (!disc) SKIP("needs GT3R_DISC");
-    Vfs vfs(&disc->volume());
-    data::CarDatabase db;
-    CHECK(db.load(vfs));
-    Bytes course = disc->volume().read(*disc->volume().find("courses/US/trialmt"));
-    std::unique_ptr<RaceTrack> track = make_track(vfs, course, "trialmt");
-    CarSetup car = car_setup_from_database(db, "r34_gtr_v_99");
-    TrackPose start = track->grid_pose(0);
-    const double dt = 1.0 / 60.0;
-    std::vector<sim::ControlInputs> inputs;
-    for (int i = 0; i < 900; ++i) {
-        sim::ControlInputs in;
-        in.throttle = i < 600 ? 0.8f : 0.0f;
-        in.brake = i >= 600 ? 0.6f : 0.0f;
-        in.steer = i > 240 ? 0.3f * std::sin(float(i) * 0.02f) : 0.0f;
-        in.controller_kind = 2;
-        inputs.push_back(in);
-    }
-    // Then full throttle into a long turn (off the road, into the wall: contact and surface state).
-    for (int i = 0; i < 1200; ++i) {
-        sim::ControlInputs in;
-        in.throttle = 1;
-        in.steer = i > 120 ? 0.4f : 0.0f;
-        in.controller_kind = 2;
-        inputs.push_back(in);
-    }
-    auto run = [&](RaceVehicle& v) {
-        v.place(start);
-        for (const sim::ControlInputs& in : inputs) v.step(in, dt);
-        return v.state();
-    };
-    std::unique_ptr<RaceVehicle> reused = make_vehicle(car, &db, *track);
-    run(*reused);                                    // the recorded run
-    sim::VehicleState again = run(*reused);          // its replay on the same vehicle
-    std::unique_ptr<RaceVehicle> fresh = make_vehicle(car, &db, *track);
-    sim::VehicleState first = run(*fresh);           // a new vehicle (a saved replay / ghost)
-    CHECK(again.position.x == first.position.x && again.position.y == first.position.y &&
-          again.position.z == first.position.z);
-    CHECK(again.speed_kmh == first.speed_kmh && again.engine_rpm == first.engine_rpm && again.gear == first.gear);
-    if (again.position.x != first.position.x)
-        std::printf("  reuse drift: %.6f %.6f %.6f vs %.6f %.6f %.6f\n", again.position.x, again.position.y, again.position.z,
-                    first.position.x, first.position.y, first.position.z);
-}
-
-// The scripted-driver kind (run-up 1, stop driver 5) survives a replay file round trip.
+// The driver kind (the AI's run-up 1, the stop driver 5) survives a replay file round trip.
 TEST(race_replay_driver_kind) {
     ReplayRecorder rec;
     rec.begin("trialmt", "r34_gtr_v_99", true, 0, {}, 60.0);
@@ -1572,12 +1376,155 @@ TEST(race_replay_driver_kind) {
         rec.record(sim::ControlInputs{});
         rec.set_driver_kind(i < 2 ? 1 : i < 4 ? 0 : 5);
     }
-    Bytes b = rec.replay().serialize();
-    Replay r = Replay::parse(b);
+    Replay recorded = rec.replay();
+    recorded.exact = test::race_record_stub(); // (the race's record: a replay has one)
+    Replay r = Replay::parse(recorded.serialize());
     ReplayPlayer p(&r);
     int kinds[6];
     for (int& k : kinds) p.next_inputs(), k = p.driver_kind();
     CHECK(kinds[0] == 1 && kinds[1] == 1 && kinds[2] == 0 && kinds[3] == 0 && kinds[4] == 5 && kinds[5] == 5);
+}
+
+// The players' reverse requests survive a file round trip (format v10); a file of a version before
+// 11 is refused (ReplayTooOld), not played approximately.
+TEST(race_replay_reverse) {
+    ReplayRecorder rec;
+    rec.begin("trialmt", "r34_gtr_v_99", true, 0, {}, 60.0);
+    rec.set_second_car("s2000_99");
+    const bool rev[6] = {false, true, true, false, true, false};
+    for (int i = 0; i < 6; ++i) {
+        rec.record_second(sim::ControlInputs{});
+        rec.set_second_reverse(!rev[i]);
+        rec.record(sim::ControlInputs{});
+        rec.set_reverse(rev[i]);
+    }
+    Replay recorded = rec.replay();
+    recorded.exact = test::race_record_stub(); // (the race's record: a replay has one)
+    Replay r = Replay::parse(recorded.serialize());
+    bool same = r.reverse.size() == 6 && r.reverse2.size() == 6;
+    for (size_t i = 0; same && i < 6; ++i) same = (r.reverse[i] != 0) == rev[i] && (r.reverse2[i] != 0) == !rev[i];
+    CHECK(same);
+
+    // Versions 1..10: refused with the older-version message; a later version: not a ReplayTooOld.
+    for (u32 v : {1u, 9u, 10u, 12u}) {
+        Bytes b = recorded.serialize();
+        std::memcpy(b.data() + 8, &v, 4);
+        bool too_old = false, refused = false;
+        try {
+            Replay::parse(b);
+        } catch (const ReplayTooOld& e) {
+            too_old = refused = std::string(e.what()) == kReplayTooOld;
+        } catch (const FormatError&) {
+            refused = true;
+        }
+        CHECK(refused && too_old == (v < 11));
+    }
+}
+
+// A race on the exact core in a replay (format v11): its record (setup, race entries, every car's
+// frames, the game's changes, the end hash) survives the file bit for bit; a CPU car's frames cost
+// nothing; a damaged record is refused.
+TEST(race_replay_exact_record) {
+    namespace ex = sim::exact;
+    ex::RaceRecord x;
+    x.program = 0x0123456789ABCDEFull, x.data = 0x1122334455667788ull, x.behaviour = {sim::Program::Pal, 60};
+    x.course = "trialmt";
+    x.course_category = 2;
+    x.kind = ex::Conductor::Battle2P;
+    x.config = 3;
+    x.laps = 5;
+    x.start_type = -1, x.countdown = 3, x.battle_laps = 5, x.battle_wear = 2, x.handicap = -20, x.battle_catchup = 1;
+    x.replay = true, x.unjudged = false, x.effects = true;
+    x.locked = true, x.logger = 1, x.logger_record = 0, x.speed_unit = 1;
+    x.session.lap = 61234, x.session.sector[2] = 20000, x.licence_times = {1, 2, 3}, x.ghost_switch = 1;
+    x.records.resize(2);
+    x.records[1].laps.laps = {60000, 59000}, x.records[1].laps.count = 2, x.records[1].best_lap = 59000;
+    x.records[1].best.sector[0] = 15000, x.records[1].top_speed = ex::F(250.5f);
+    for (size_t k = 0; k < x.rules.size(); ++k) x.rules[k] = u8(k * 7);
+    x.info = 0x100, x.conductor = 0x200, x.course_addr = 0x300;
+    for (int i = 0; i < 3; ++i) {
+        ex::StartEntry e;
+        e.eq.car = 0x1000 + u64(i);
+        for (size_t k = 0; k < e.eq.part.size(); ++k) e.eq.part[k] = k * 31 + u64(i);
+        for (size_t k = 0; k < e.eq.setting.size(); ++k) e.eq.setting[k] = s32(k) - 20 * i;
+        e.human = i < 2 ? 0x500 : 0, e.player = i < 2, e.grid_slot = 5 - i, e.pedal_style = i, e.spec_flag = 1, e.wheel_type = i;
+        e.asm_on = i != 1, e.tcs_on = i != 2;
+        for (size_t k = 0; k < 8; ++k) e.condition[k] = u32(k * 1000 + size_t(i));
+        e.best_lap = 0x157529FF, e.car = 0x4000 + u32(i);
+        x.entries.push_back(e);
+    }
+    x.pads.assign(3, {});
+    for (u32 t = 0; t < 700; ++t) {
+        if (t == 0) x.add_change({0, ex::RaceChange::StartCountdown});
+        if (t == 250) x.add_change({0, ex::RaceChange::PedalStyle, 0, 1});
+        if (t == 250) x.add_change({0, ex::RaceChange::Condition, 1, 77, 0x3F800000, 0x40000000});
+        if (t == 600) x.add_change({0, ex::RaceChange::DriveOn, 0});
+        ex::PadFrame p[3];
+        p[0].flags = 0x1F, p[0].kind = 2, p[0].steer = s16(int(t % 97) * 80 - 3000), p[0].throttle = u16(t < 300 ? 4096 : 0);
+        p[0].shift = s8(t % 50 == 0 ? 1 : 0), p[0].brake = u16(t >= 300 ? t : 0), p[0].third = u16(t > 640 ? 4096 : 0);
+        if (t >= 100) p[1].flags = 0x1F, p[1].kind = 3, p[1].steer = -4096, p[1].back = u16(t % 3 ? 4096 : 0);
+        x.add_frame(p);
+    }
+    x.final_hash = 0xFEEDFACECAFEBEEFull;
+    {
+        ex::PadFrame g[2];
+        g[1].flags = 0x1F, g[1].kind = 2, g[1].steer = -77, g[1].throttle = 4096;
+        x.frames = 401, x.add_nested(g), x.frames = 700; // (an extra step inside frame 400)
+    }
+    CHECK(x.frames == 700 && x.pads[2].empty() && x.pads[1].size() == 700 && x.pads[0].size() == 700);
+    const Bytes xb = x.serialize();
+    const ex::RaceRecord y = ex::RaceRecord::parse(xb);
+    bool same = y.program == x.program && y.data == x.data && y.behaviour == x.behaviour && y.course == x.course && y.course_category == 2 && y.kind == x.kind && y.config == 3 &&
+                y.laps == 5 && y.start_type == -1 && y.countdown == 3 && y.battle_laps == 5 && y.battle_wear == 2 &&
+                y.handicap == -20 && y.battle_catchup == 1 && y.replay && !y.unjudged && y.effects && y.locked && y.logger == 1 &&
+                y.speed_unit == 1 && y.session.lap == 61234 && y.session.sector == x.session.sector && y.records.size() == 2 &&
+                y.records[1].laps.laps == x.records[1].laps.laps && y.records[1].laps.count == 2 && y.records[1].best_lap == 59000 &&
+                y.records[1].best.sector == x.records[1].best.sector && y.records[1].top_speed.bits == x.records[1].top_speed.bits &&
+                y.licence_times == x.licence_times && y.ghost_switch == 1 && y.rules == x.rules && y.info == 0x100 &&
+                y.conductor == 0x200 && y.course_addr == 0x300 && y.frames == 700 && y.final_hash == x.final_hash &&
+                y.changes == x.changes && y.entries.size() == 3 && y.nested.size() == 1 && y.nested[0].frame == 400 &&
+                y.nested[0].pads.size() == 2 && y.nested[0].pads[1].steer == -77 && y.nested[0].pads[1].throttle == 4096;
+    for (size_t i = 0; same && i < 3; ++i) {
+        const ex::StartEntry &a = x.entries[i], &b = y.entries[i];
+        same = a.eq.car == b.eq.car && a.eq.part == b.eq.part && a.eq.setting == b.eq.setting && a.human == b.human &&
+               a.player == b.player && a.grid_slot == b.grid_slot && a.pedal_style == b.pedal_style && a.spec_flag == b.spec_flag &&
+               a.wheel_type == b.wheel_type && a.asm_on == b.asm_on && a.tcs_on == b.tcs_on && a.condition == b.condition &&
+               a.best_lap == b.best_lap && a.car == b.car;
+    }
+    for (int i = 0; same && i < 3; ++i)
+        for (u32 t = 0; same && t < 710; ++t) {
+            const ex::PadFrame a = x.pad(i, t), b = y.pad(i, t);
+            same = a.flags == b.flags && a.kind == b.kind && a.shift == b.shift && a.steer == b.steer && a.throttle == b.throttle &&
+                   a.brake == b.brake && a.back == b.back && a.third == b.third;
+        }
+    CHECK(same);
+    CHECK(xb.size() < 700 * 12); // (changed fields only, under half of 3 x 16 bytes a frame; the CPU car's frames are one run)
+    // In a replay file.
+    Replay r;
+    r.course = "trialmt", r.car = "r34_gtr_v_99";
+    r.inputs.resize(700);
+    r.exact = std::make_shared<const ex::RaceRecord>(x);
+    const Replay q = Replay::parse(r.serialize());
+    CHECK(q.exact && q.exact->serialize() == xb && q.ticks() == 700);
+    r.exact.reset();
+    bool too_old = false; // (a run before every race ran on the exact core: refused)
+    try {
+        Replay::parse(r.serialize());
+    } catch (const ReplayTooOld&) {
+        too_old = true;
+    }
+    CHECK(too_old);
+    // Damaged: refused.
+    int refused = 0;
+    for (size_t cut : {size_t(3), size_t(40), xb.size() / 2, xb.size() - 1}) {
+        Bytes b(xb.begin(), xb.end() - std::ptrdiff_t(cut));
+        try {
+            ex::RaceRecord::parse(b);
+        } catch (const FormatError&) {
+            ++refused;
+        }
+    }
+    CHECK(refused == 4);
 }
 
 // The race result GT mode records (place, prize, trophy mark, best time) is latched when the

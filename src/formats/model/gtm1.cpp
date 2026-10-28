@@ -820,9 +820,12 @@ scene::Model build_model(const Gtm1& g, const Options& opt, const std::string& n
                 // Laguna / Rome road base passes) are ordinary opaque geometry.
                 const bool sheen = opt.road_sheen && kind == 4;
                 const bool dest_add = opt.road_sheen && (sheen || (d.alpha_mode == 0x58 && dp.prim.abe));
-                // Cars: kind-4 specular passes drawn with ALPHA 0x58 add over the body weighted by
-                // the alpha its pass wrote (the per-vertex Written weight).
-                const bool car_glint = opt.weighted_reflection && kind == 4 && d.alpha_mode == 0x58 && dp.prim.abe;
+                // Cars: specular passes drawn with ALPHA 0x58 add over the body weighted by the
+                // alpha its pass wrote (the per-vertex Written weight): the kind-4 glints and the lit
+                // textured overlays lit by their specular term only (Ma = Md = 0: the Calsonic's
+                // headlamp lenses, the Escudo's grilles, the 787B's decks). Not reflection passes.
+                const bool car_glint =
+                    opt.weighted_reflection && !dp.env_normals && d.alpha_mode == 0x58 && dp.prim.abe;
                 // Reflection passes carry a normal in the UV slot; the VU derives the env-map coordinates.
                 bool env = dp.env_normals;
                 if (env && !opt.reflection) continue;

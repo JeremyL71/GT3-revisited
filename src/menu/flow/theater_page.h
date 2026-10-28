@@ -29,6 +29,7 @@ struct TheaterEntry {
     Icon icon = Icon::Replay;
     std::string id;   // replay file path, or the demonstration's event code
     bool deletable = false;
+    bool playable = true; // false: listed only (a replay of an older version: it can be deleted)
     // Info panel texts by field: "course", "car", "time", "laps", "power", "mode", "date",
     // "size", "comment" (the widgets r_pt_<field> / b_pt_<field>).
     std::vector<std::pair<std::string, std::string>> texts;

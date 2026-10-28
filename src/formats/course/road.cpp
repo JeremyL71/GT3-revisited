@@ -24,7 +24,9 @@ void check_table(ByteSpan d, u32 off, u64 count, u32 stride, const char* what) {
 // Lookup grid: u32 cells_off, s16 nx, s16 nz, f32 xs[nx], f32 zs[nz]; at
 // cells_off (nx-1)*(nz-1) u32 offsets, each to groups {u16 n, u16 segment,
 // u16 triangle[n]} ending with n = 0.
-RoadGrid parse_grid(ByteSpan d, u32 off, const std::vector<RoadSegment>& segs) {
+// A lookup grid: breakpoints, then per cell a list of groups {u16 n, u16 segment, u16 id[n]} ending with n = 0.
+// `id_count(segment)` bounds the ids (triangles of the segment, or wall points).
+template <typename IdCount> RoadGrid parse_grid(ByteSpan d, u32 off, u32 nseg, IdCount id_count) {
     RoadGrid g;
     if (!off || off + 8 > d.size()) return g;
     u32 cells_off = rd32(d, off);
@@ -38,21 +40,24 @@ RoadGrid parse_grid(ByteSpan d, u32 off, const std::vector<RoadSegment>& segs) {
     g.cell_begin.reserve(ncell + 1);
     for (u64 c = 0; c < ncell; ++c) {
         g.cell_begin.push_back(u32(g.refs.size()));
+        g.cell_group_begin.push_back(u32(g.groups.size()));
         size_t p = rd32(d, cells_off + 4 * c);
         for (int guard = 0; guard < 4096; ++guard) {
             u32 n = rd16(d, p);
             if (!n) break;
             u16 seg = rd16(d, p + 2);
-            if (seg >= segs.size()) throw FormatError("GTRW: grid segment out of range");
+            if (seg >= nseg) throw FormatError("GTRW: grid segment out of range");
+            g.groups.push_back({seg, u32(g.refs.size()), u32(g.refs.size() + n)});
             for (u32 k = 0; k < n; ++k) {
                 u16 t = rd16(d, p + 4 + 2 * k);
-                if (t >= segs[seg].triangles.size()) throw FormatError("GTRW: grid triangle out of range");
+                if (t >= id_count(seg)) throw FormatError("GTRW: grid reference out of range");
                 g.refs.push_back({seg, t});
             }
             p += 4 + 2 * size_t(n);
         }
     }
     g.cell_begin.push_back(u32(g.refs.size()));
+    g.cell_group_begin.push_back(u32(g.groups.size()));
     return g;
 }
 
@@ -110,6 +115,8 @@ Road Road::parse(ByteSpan d) {
         size_t wend = i + 1 < nseg ? rd32(d, seg_off + (i + 1) * 0x40 + 4) : woff + 16;
         if (woff && woff < wend && wend <= d.size())
             for (size_t p = woff; p + 2 <= wend; p += 2) seg.wall_refs.push_back(rd16(d, p));
+        if (woff && woff <= d.size() && size_t(seg.unknown_a) * 2 <= d.size() - woff)
+            for (u32 k = 0; k < seg.unknown_a; ++k) seg.checkpoint_ids.push_back(rd16(d, woff + 2 * k));
         if (!seg.vertices.empty()) {
             seg.bounds_min = seg.bounds_max = seg.vertices[0];
             for (const Vec3& v : seg.vertices) {
@@ -135,9 +142,46 @@ Road Road::parse(ByteSpan d) {
     r.start_distance = rdf(d, 0x1C);
     r.header_flag = rd16(d, 0x20);
     try {
-        r.grid_index = parse_grid(d, rd32(d, 0x48), r.segments);
+        r.grid_index = parse_grid(d, rd32(d, 0x48), nseg, [&](u16 seg) { return r.segments[seg].triangles.size(); });
     } catch (const FormatError&) {
         r.grid_index = {}; // optional acceleration data; callers fall back to scanning
+    }
+    try {
+        r.wall_grid = parse_grid(d, rd32(d, 0x4C), nseg, [&](u16) { return r.wall_points.size(); });
+    } catch (const FormatError&) {
+        r.wall_grid = {};
+    }
+    // What the program reads as the neighbour list of segment -1 (a car off the road mesh): a count at seg_off - 0x2A,
+    // ids from seg_off - 0x28 (the end of the start grid table or padding), clipped to the block.
+    if (seg_off >= 0x2A) {
+        u32 n = rd16(d, seg_off - 0x2A);
+        for (u32 k = 0; k < n && seg_off - 0x28 + 2 * size_t(k) + 2 <= d.size(); ++k)
+            r.before_segments.push_back(rd16(d, seg_off - 0x28 + 2 * k));
+    }
+
+    // The grid as the race start reads it (eight slots from the table's start, whatever follows the table), and the words
+    // there the course loader makes pointers: the header's table offsets, each segment's vertex, triangle and wall-reference
+    // offsets, and the two lookup grids' cell offsets.
+    r.base = rd32(d, 0x04);
+    {
+        const u64 lo = grid_off, hi = lo + 4 * r.grid_words.size();
+        for (size_t k = 0; k < r.grid_words.size(); ++k)
+            if (lo + 4 * k + 4 <= d.size()) r.grid_words[k] = rd32(d, lo + 4 * k);
+        auto pointer = [&](u64 off) {
+            if (off >= lo && off < hi && (off - lo) % 4 == 0) r.grid_pointers |= 1u << ((off - lo) / 4);
+        };
+        for (u32 o : {0x24u, 0x2Cu, 0x34u, 0x3Cu, 0x44u, 0x48u, 0x4Cu}) pointer(o);
+        if (rd32(d, 0x50) != 0) pointer(0x54);
+        if (rd32(d, 0x58) != 0) pointer(0x5C);
+        for (u32 i = 0; i < nseg; ++i)
+            for (u32 o : {4u, 8u, 0x10u}) pointer(u64(seg_off) + 0x40u * i + o);
+        for (u32 at : {rd32(d, 0x48), rd32(d, 0x4C)}) {
+            if (u64(at) + 8 > d.size()) continue;
+            pointer(at);
+            const s32 nx = s16(rd16(d, at + 4)), nz = s16(rd16(d, at + 6));
+            const u64 cells = rd32(d, at), n = nx > 1 && nz > 1 ? u64(nx - 1) * u64(nz - 1) : 0;
+            for (u64 k = cells < lo ? (lo - cells) / 4 : 0; k < n && cells + 4 * k < hi; ++k) pointer(cells + 4 * k);
+        }
     }
 
     u32 ncp = rd32(d, 0x40), cp_off = rd32(d, 0x44);

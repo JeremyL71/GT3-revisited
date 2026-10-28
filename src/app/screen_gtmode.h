@@ -8,9 +8,6 @@
 namespace gt3r {
 
 class Screen;
-namespace sim {
-struct CarSpec;
-}
 namespace menu::flow {
 struct GameResult;
 }
@@ -35,10 +32,5 @@ std::unique_ptr<Screen> make_presentation_screen();
 // quick menu "Save game" opens it: a new or existing save gets the game with the round `r`
 // recorded; the running game and its save are untouched. Pops itself when the page ends.
 std::unique_ptr<Screen> make_game_save_screen(const menu::flow::GameResult& r);
-
-// The physics spec of the GT-mode ride car with its current parts, settings
-// and condition (nullptr without a session / ride car), e.g. to rebuild the
-// player's car after the settings menu.
-std::shared_ptr<const sim::CarSpec> gt_ride_car_spec();
 
 } // namespace gt3r

@@ -1,0 +1,11 @@
+# Monthly refresh of the relay's country list (gt3r-relay-geoip.service).
+[Unit]
+Description=GT3 Revisited relay server: monthly country list refresh
+
+[Timer]
+OnCalendar=*-*-03 04:00:00
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

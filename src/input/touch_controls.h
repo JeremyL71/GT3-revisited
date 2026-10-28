@@ -2,7 +2,9 @@
 
 #include "input/virtual_pad.h"
 
+#include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace gt3r {
@@ -27,11 +29,38 @@ class IniDocument;
 //   opacity    = 0.5       ; 0..1
 //   size       = 1.0       ; control size multiplier (0.6 .. 1.6)
 //   left_handed = off      ; mirror the layout (pedals on the left)
+//   drive.gas  = right 40 bottom 66 size 1.2 ; a control moved / resized / hidden in the
+//   menu.dpad  = hidden                      ; layout editor (TouchPlacement)
 enum class TouchLayout : u8 { None, Menu, Driving };
 
 // Rectangle in UI units (Ui::kWidth x Ui::kHeight space).
 struct TouchRect {
     float x = 0, y = 0, w = 0, h = 0;
+};
+
+// A control (or group of controls, e.g. the four face buttons) moved, resized or hidden in
+// the layout editor (Settings -> Touch -> Customize layout). Positions are where the group's
+// centre sits in the right-handed layout (left_handed mirrors them), measured from the edges
+// of the area the controls keep to (the screen less its margin, cutouts and rounded corners),
+// so a layout carries over to screens of other shapes:
+//   x: `x` units in from the left or right edge, or from the screen's centre line (+ = right)
+//   y: `y` units in from the top or bottom edge
+// Saved as `[touch] <key> = [left|center|right <x> top|bottom <y>] [size <scale>] [hidden]`.
+struct TouchPlacement {
+    enum class AnchorX : u8 { Default, Left, Centre, Right }; // Default: where the layout puts it
+    enum class AnchorY : u8 { Top, Bottom };
+    AnchorX ax = AnchorX::Default;
+    AnchorY ay = AnchorY::Bottom;
+    float x = 0, y = 0;
+    float scale = 1.0f; // on top of TouchConfig::size
+    bool hidden = false;
+
+    static constexpr float kMinScale = 0.5f, kMaxScale = 2.0f;
+    bool moved() const { return ax != AnchorX::Default; }
+    bool is_default() const { return !moved() && scale == 1.0f && !hidden; }
+    bool operator==(const TouchPlacement&) const = default;
+    static TouchPlacement parse(std::string_view s);
+    std::string to_string() const;
 };
 
 struct TouchConfig {
@@ -48,6 +77,17 @@ struct TouchConfig {
     float opacity = 0.5f;
     float size = 1.0f;
     bool left_handed = false;
+    // Edited controls by key ("drive.gas", TouchControls::Widget::key); the rest keep the
+    // default layout. Never holds a default placement.
+    std::map<std::string, TouchPlacement, std::less<>> placements;
+
+    // The placement of `key` (a default one when the control was never edited).
+    TouchPlacement placement(std::string_view key) const;
+    // Sets (or with a default placement drops) `key`'s placement.
+    void set_placement(std::string_view key, const TouchPlacement& p);
+    // Drops every placement of a layout ("drive." or "menu." keys).
+    void reset_placements(TouchLayout layout);
+    bool customized(TouchLayout layout) const;
 
     static TouchConfig load(const IniDocument& ini);
     void save(IniDocument& ini) const;
@@ -63,6 +103,10 @@ public:
         Kind kind = Kind::Button;
         Shape shape = Shape::Circle;
         float x = 0, y = 0, w = 0, h = 0;
+        // Placement key (TouchConfig::placements): controls sharing one move and resize
+        // together. Empty for the steering zone, which follows the screen.
+        const char* key = "";
+        bool hidden = false; // hidden in the layout editor: not drawn, takes no touches
         PadButton button = PadButton::Cross; // Button / Pedal
         std::string label;                   // short text; empty for face-button symbols
         bool active = false;                 // currently held
@@ -94,6 +138,17 @@ public:
     // Unchanged while the controls are hidden. The steering zone doesn't count.
     TouchRect clear_above(TouchRect r) const;
     TouchLayout layout() const { return layout_; }
+    // The whole screen as set by set_screen (UI units).
+    TouchRect screen() const { return {screen_x0_, screen_y0_, screen_x1_ - screen_x0_, screen_y1_ - screen_y0_}; }
+
+    // Layout editor. Keys are Widget::key; a group's bounds are its widgets' drawn bounds
+    // (hidden ones too, visible or not). The key of the control at (x, y), hidden ones
+    // included and the steering zone left out; empty when none.
+    std::string_view key_at(float x, float y) const;
+    TouchRect group_bounds(std::string_view key) const;
+    // The placement that puts `key`'s centre at (x, y) (UI units as drawn), keeping its size
+    // and kept inside the area the controls stay in.
+    TouchPlacement placement_at(std::string_view key, float x, float y) const;
 
     // Finger input in UI coordinates. `pressure` is 0..1 as reported by the
     // touchscreen. Returns true when the finger landed on a control (the
@@ -128,8 +183,16 @@ private:
         bool released = false; // lifted before any update() saw it: report once, then drop
     };
 
+    // Edges the controls keep to, in the right-handed layout (before mirroring).
+    struct Area {
+        float L, R, T, B;     // the screen
+        float mL, mR, mT, mB; // less the margin / cutout insets
+        float mid;            // the screen's centre line
+    };
+    Area area() const;
     void build_layout();
-    int widget_at(float x, float y) const;
+    void apply_placements(const Area& a);
+    int widget_at(float x, float y, bool hidden = false) const;
     Finger* find(u64 id);
     float pedal_value(const Widget& w, const Finger& f) const;
     int dpad_direction(const Widget& w, float x, float y) const; // -1 none, else PadButton

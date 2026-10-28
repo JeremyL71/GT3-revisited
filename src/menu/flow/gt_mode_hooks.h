@@ -23,8 +23,9 @@
 namespace gt3r::menu::flow {
 
 struct GtModeHooks {
-    // The GT-mode control is opened (once per GameFlow); `read` loads disc files.
-    std::function<void(const FileReader& read)> attach;
+    // The GT-mode control is opened (once per GameFlow); `read` loads disc files, `lang` is
+    // the flow's language folder ("US", "FR", ...).
+    std::function<void(const FileReader& read, const std::string& lang)> attach;
     // Every event of the gt_mode control (item actions, page changes, ...),
     // before the flow's own handling; lines appended to `log` are shown.
     // Returning true for a Finish event (e.g. "go_save_in_home") consumes
@@ -34,6 +35,10 @@ struct GtModeHooks {
     std::function<std::string(const std::string& page, const MblItem& item)> intercept;
     // Enable predicate for items (disabled items refuse confirm).
     std::function<bool(const std::string& page, const MblItem& item)> enabled;
+    // Items a page's list leaves out altogether (MenuController::listed).
+    std::function<bool(const std::string& page, const MblItem& item)> listed;
+    // The item a page opens on (MenuController::initial_item), "" for the flow's rules.
+    std::function<std::string(const std::string& page)> initial_item;
     // Text of a code-filled widget (by its class, e.g. "user_money") or
     // element; nullopt = keep the layout's text. `page` is the top page.
     std::function<std::optional<std::string>(const std::string& page, const Element& e)> widget_text;
@@ -101,7 +106,7 @@ struct GtModeHooks {
     std::function<void(const std::string& page, const std::string& game, const std::string& car_class,
                        std::vector<std::string>& entries)>
         arcade_entries;
-    // GT Mode map (page "map", a MapButtonList): the direction keys move a pointer
+    // GT Mode map (page "map", a map button list): the direction keys move a pointer
     // between the buildings instead of the list order; called every tick with the
     // keys held (the controller does not see the directions on that page).
     std::function<void(MenuController& ctl, MenuKeys held)> map_input;

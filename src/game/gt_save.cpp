@@ -141,7 +141,10 @@ constexpr size_t kHeader = 0x40, kBlock = 0x130, kCarRec = 0x204, kWheelRec = 0x
 constexpr size_t kLicenses = 0x3FC0, kRaceBest = 0x5F8, kCourseBest = 0xB0, kArcade = 0xB40, kAt = 0x1A68,
                  kTimeTrial = 0x8400, kMachine = 0x900, kPrizeFlags = 0xC8, kChamp = 0xF2C, kOptions = 0x888;
 constexpr u32 kEmptyTime = 0x157529FF;
-constexpr u16 kMajor = 7, kMinor = 1;
+// GAMEDATA version 7.x; the minor is the release's (7.0 NTSC-J, 7.1 NTSC-U, 7.2 PAL) and a load
+// checks only the major.
+constexpr u16 kMajor = 7;
+u16 gamedata_minor(Region r) { return r == Region::Japan ? 0 : r == Region::Europe ? 2 : 1; }
 
 // Car setup record part slots (+0x18 + 8 i) -> paramdb table.
 constexpr int kEqSlotTables[26] = {0, 1, 3, 6, 13, 17, 18, 21, 28, 29, 2, 4, 5,
@@ -603,6 +606,12 @@ GameState load_from_text(const std::string& text) {
 
 std::string user_data_dir() {
     std::string dir;
+    // GT3R_DATA_DIR=<dir> (tests, videos): a separate profile, the player's own left alone.
+    if (const char* d = SDL_getenv("GT3R_DATA_DIR"); d && *d) {
+        dir = d;
+        if (dir.back() != '/' && dir.back() != '\\') dir += '/';
+        return dir;
+    }
     const char* base = SDL_GetBasePath();
     if (base && host_path_exists(std::string(base) + "portable.ini")) {
         dir = base;
@@ -614,6 +623,12 @@ std::string user_data_dir() {
 }
 
 bool write_save(const std::string& path, const GameState& s, std::string* error) {
+    // No path (a session whose library went away): nothing written, not even ".tmp" in the
+    // working directory.
+    if (path.empty()) {
+        if (error) *error = "no save file";
+        return false;
+    }
     std::string text = save_to_text(s);
     std::string tmp = path + ".tmp";
     if (!write_host_file(tmp, ByteSpan(reinterpret_cast<const u8*>(text.data()), text.size()))) {
@@ -729,7 +744,7 @@ SettingFile import_ps2_setting(ByteSpan file, const GtData& data) {
 Bytes export_ps2_setting(const SettingFile& f, const GtData& data) {
     Bytes p(0x1D0, 0);
     encode_eq(p, 0, f.car, f.parts, f.settings, f.ref_final, data.db);
-    return close_serialized(std::move(p), 1, 0x827);
+    return close_serialized(std::move(p), 1, data.region == Region::Japan ? 0x826 : 0x827); // NTSC-J: 1.0x826
 }
 
 GameState import_ps2_save(ByteSpan file, const GtData& data) {
@@ -812,7 +827,8 @@ GameState import_ps2_save(ByteSpan file, const GtData& data) {
         if (v >= 0 && v < kNoPosition) s.race_best[data.race_codes[i]] = v;
     }
     o += kRaceBest + kCourseBest;
-    // Arcade Single Race results (difficulty * 34 + course, best place at +0x10)
+    // Arcade Single Race results (difficulty x the SINGLE_RACE list's size + course, best place
+    // at +0x10)
     // and the time-trial best ranks (+0x2A0 of each 0x2A4 record).
     for (size_t i = 0; i < s.arcade.best.size(); ++i) {
         s32 v = s32(rd32(d, o + 0x14 * i + 0x10));
@@ -890,7 +906,8 @@ Bytes export_ps2_save(const GameState& s, const GtData& data) {
     wr32(p, 0x34, u32(nwheels));
     wr32(p, 0xB0, s.trophies);
     wr32(p, 0xBC, s.prize_cars);
-    wr32(p, 0xC8, 1); // region US
+    // The language the game was saved in (NTSC-J never writes it: 0).
+    wr32(p, 0xC8, data.region == Region::Japan ? 0 : u32(data.language));
     wr32(p, 0xCC, s.rng);
     std::memcpy(&p[0x70], s.player_name.data(), std::min(s.player_name.size(), kNameField - 1));
     wr32(p, 0x3C, u32(s.arcade.course_level));
@@ -1010,7 +1027,7 @@ Bytes export_ps2_save(const GameState& s, const GtData& data) {
     Bytes f(total, 0);
     wr32(f, 0, u32(kHeader));
     wr32(f, 4, u32(psize));
-    wr16(f, 8, kMinor);
+    wr16(f, 8, gamedata_minor(data.region));
     wr16(f, 0x0A, kMajor);
     wr32(f, 0x0C, crc32(p));
     std::memcpy(&f[0x10], "Base", 4);
@@ -1065,7 +1082,7 @@ std::vector<Ps2SaveFile> export_ps2_save_files(const GameState& s, std::shared_p
     std::vector<Ps2SaveFile> files;
     files.push_back({"icon0.ico", std::move(*icon)});
     files.push_back({"icon.sys", std::move(y)});
-    files.push_back({kPs2GameDir, export_ps2_save(s, *data)});
+    files.push_back({ps2_game_dir(data->region), export_ps2_save(s, *data)});
     files.push_back({"thumbnail", ps2_thumbnail(s, data)});
     return files;
 }
@@ -1086,31 +1103,45 @@ const ps2::McFile* find_file(const ps2::McDir& d, const std::string& name) {
     return nullptr;
 }
 
-ByteSpan game_file_of(const std::vector<ps2::McDir>& dirs) {
+ByteSpan game_file_of(const std::vector<ps2::McDir>& dirs, const char* name) {
     for (const ps2::McDir& d : dirs)
-        if (d.name == kPs2GameDir)
-            if (const ps2::McFile* f = find_file(d, kPs2GameDir)) return f->data;
-    throw FormatError("no GT3 game save (" + std::string(kPs2GameDir) + ") found");
+        if (d.name == name)
+            if (const ps2::McFile* f = find_file(d, name)) return f->data;
+    throw FormatError("no GT3 game save (" + std::string(name) + ") found");
 }
 
 } // namespace
 
+const char* ps2_game_dir(Region r) {
+    switch (r) {
+    case Region::Japan: return "BISCPS-15009GAMEDATA";
+    case Region::Europe: return "BESCES-50294GAMEDATA";
+    case Region::America: break;
+    }
+    return kPs2GameDir;
+}
+
 GameState import_ps2_save_path(const std::string& path, const GtData& data) {
+    // The disc's release reads its own save only (another release's names other cars and,
+    // in NTSC-J, sums x100).
+    const std::string dir = ps2_game_dir(data.region);
     if (host_is_directory(path)) {
         // The save directory itself, or a folder memory card holding it.
-        for (const std::string& p : {path + "/" + kPs2GameDir, path + "/" + kPs2GameDir + "/" + kPs2GameDir})
+        for (const std::string& p : {path + "/" + dir, path + "/" + dir + "/" + dir})
             if (!host_is_directory(p))
                 if (std::optional<Bytes> b = read_host_file(p)) return import_ps2_save(*b, data);
-        throw FormatError("no GT3 game save (" + std::string(kPs2GameDir) + ") in " + path);
+        throw FormatError("no GT3 game save (" + dir + ") in " + path);
     }
     std::optional<Bytes> b = read_host_file(path);
     if (!b) throw FormatError("cannot read " + path);
-    if (ps2::is_card_image(*b)) return import_ps2_save(game_file_of(ps2::read_card(*b)), data);
+    if (ps2::is_card_image(*b)) return import_ps2_save(game_file_of(ps2::read_card(*b), dir.c_str()), data);
+    // The data file itself, by its header (0x40 bytes, version 7), whatever it is called.
+    if (b->size() >= kHeader && rd32(*b, 0) == kHeader && rd16(*b, 0x0A) == kMajor) return import_ps2_save(*b, data);
     // A .psu: by its extension, or by its first entry (the save directory), for paths
     // without one (Android content:// URIs).
-    const bool psu_entry = b->size() >= 0x400 && std::memcmp(b->data() + 0x40, kPs2GameDir, std::strlen(kPs2GameDir) + 1) == 0;
+    const bool psu_entry = b->size() >= 0x400 && std::memcmp(b->data() + 0x40, dir.c_str(), dir.size() + 1) == 0;
     if (b->size() >= 0x200 && (ends_with_ci(path, ".psu") || psu_entry))
-        return import_ps2_save(game_file_of({ps2::read_psu(*b)}), data);
+        return import_ps2_save(game_file_of({ps2::read_psu(*b)}, dir.c_str()), data);
     return import_ps2_save(*b, data);
 }
 
@@ -1118,7 +1149,7 @@ namespace {
 
 ps2::McDir ps2_save_dir(const GameState& s, std::shared_ptr<const GtData> data, const GtData::Reader& read) {
     ps2::McDir dir;
-    dir.name = kPs2GameDir;
+    dir.name = ps2_game_dir(data->region);
     for (Ps2SaveFile& f : export_ps2_save_files(s, std::move(data), read))
         dir.files.push_back({f.name, std::move(f.data)});
     return dir;
@@ -1126,21 +1157,29 @@ ps2::McDir ps2_save_dir(const GameState& s, std::shared_ptr<const GtData> data, 
 
 } // namespace
 
+Ps2Export ps2_export_format(const std::string& name) {
+    if (ends_with_ci(name, ".ps2") || ends_with_ci(name, ".mcd")) return Ps2Export::Card;
+    if (ends_with_ci(name, ".raw")) return Ps2Export::Raw;
+    return Ps2Export::Psu;
+}
+
 Bytes export_ps2_save_container(const GameState& s, std::shared_ptr<const GtData> data, const GtData::Reader& read,
-                                bool card) {
+                                Ps2Export format) {
+    if (format == Ps2Export::Raw) return export_ps2_save(s, *data);
     ps2::McDir dir = ps2_save_dir(s, std::move(data), read);
-    return card ? ps2::make_card({dir}) : ps2::write_psu(dir);
+    return format == Ps2Export::Card ? ps2::make_card({dir}) : ps2::write_psu(dir);
 }
 
 void export_ps2_save_path(const GameState& s, std::shared_ptr<const GtData> data, const GtData::Reader& read,
                           const std::string& out) {
-    ps2::McDir dir = ps2_save_dir(s, std::move(data), read);
     auto write = [](const std::string& p, ByteSpan b) {
         if (!write_host_file(p, b)) throw FormatError("cannot write " + p);
     };
-    if (ends_with_ci(out, ".psu")) return write(out, ps2::write_psu(dir));
-    if (ends_with_ci(out, ".ps2") || ends_with_ci(out, ".mcd")) return write(out, ps2::make_card({dir}));
-    std::string folder = out + "/" + kPs2GameDir;
+    for (const char* ext : {".psu", ".ps2", ".mcd", ".raw"})
+        if (ends_with_ci(out, ext))
+            return write(out, export_ps2_save_container(s, std::move(data), read, ps2_export_format(out)));
+    ps2::McDir dir = ps2_save_dir(s, std::move(data), read);
+    std::string folder = out + "/" + dir.name;
     SDL_CreateDirectory(folder.c_str());
     for (const ps2::McFile& f : dir.files) write(folder + "/" + f.name, f.data);
 }

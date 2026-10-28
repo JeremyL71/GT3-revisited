@@ -12,10 +12,10 @@
 
 namespace gt3r::race {
 
-std::string replay_dir(const std::string& data_dir) {
+std::string replay_dir(const std::string& data_dir, Region region) {
     std::string d = data_dir;
     if (!d.empty() && d.back() != '/' && d.back() != '\\') d += '/';
-    return d + "replays";
+    return d + (region == Region::America ? "replays" : std::string("replays/") + region_key(region));
 }
 
 std::optional<Replay> read_replay_file(const std::string& path, std::string* error) {
@@ -47,6 +47,13 @@ std::vector<ReplayEntry> list_replay_entries(const std::string& dir) {
             e.header.inputs.clear(), e.header.inputs.shrink_to_fit();
             e.header.inputs2.clear(), e.header.inputs2.shrink_to_fit();
             e.header.driver_kind.clear(), e.header.driver_kind.shrink_to_fit();
+            e.header.reverse.clear(), e.header.reverse.shrink_to_fit();
+            e.header.reverse2.clear(), e.header.reverse2.shrink_to_fit();
+            e.header.exact.reset(); // (the race record: loaded with the replay)
+            out.push_back(std::move(e));
+        } catch (const ReplayTooOld&) {
+            ReplayEntry e;
+            e.path = f.path, e.name = f.name, e.size = b->size(), e.too_old = true;
             out.push_back(std::move(e));
         } catch (const std::exception& ex) {
             LOG_WARN("Replays: %s: %s", f.name.c_str(), ex.what());

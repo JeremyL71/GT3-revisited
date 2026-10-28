@@ -17,6 +17,9 @@
 //
 // Without a handler, the menu screen logs the request and shows it on screen.
 
+#include "sim/car_spec.h"
+
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -26,9 +29,6 @@
 
 namespace gt3r {
 class App;
-}
-namespace gt3r::sim {
-struct CarSpec;
 }
 
 namespace gt3r::menu::flow {
@@ -51,9 +51,9 @@ struct GameRequest {
 
     // GT mode (filled by game/gt_mode_actions.cpp; empty / null elsewhere):
     std::string event;      // event record label (database table 32), e.g. "Gsunday_e_0001", "L0B0001"
-    // The player's garage car with its fitted parts and settings. When set it
-    // replaces `car` (which then only names the base car for models / sounds).
-    std::shared_ptr<const sim::CarSpec> car_spec;
+    // The player's garage car: its fitted parts and settings (the race builds its car from them; `car` names the base car).
+    std::optional<std::array<std::uint64_t, 27>> car_parts;
+    std::optional<sim::CarSettings> car_settings;
     std::string car_model;  // car model id for the garage car ("ni0137"), may be empty
     int car_color = 0;      // paint index of the garage car
     std::string car_wheel;  // fitted aftermarket wheel (wheel/<label>, CarModelOptions::wheel_override), "" = stock
@@ -64,9 +64,10 @@ struct GameRequest {
     // 2 Player Battle: player 2's car, class, paint and choices ("" / -1 = none).
     std::string car2, car2_class;
     int car2_color = 0, transmission2 = -1, tire_mode2 = -1;
-    // Player 2's garage car (arcade garage classes) as car_spec / car_model / car_wheel are
+    // Player 2's garage car (arcade garage classes) as car_parts / car_model / car_wheel are
     // player 1's: its fitted parts and settings, model and bought wheels.
-    std::shared_ptr<const sim::CarSpec> car2_spec;
+    std::optional<std::array<std::uint64_t, 27>> car2_parts;
+    std::optional<sim::CarSettings> car2_settings;
     std::string car2_model, car2_wheel;
     bool racing_gearbox = false; // the garage car has a non-stock transmission (gear part +0x10 != 0): gear whine
     // The engine condition player 1's car starts the run with (physics §10.3), for the modes
@@ -127,7 +128,7 @@ struct GameResult {
     // License tests judged by the race: -2 = not judged (GT mode judges from
     // finished + total_time), -1 = failed / no medal, 0 gold, 1 silver, 2 bronze.
     int license_medal = -2;
-    std::string failure;    // why a test failed ("course_out", "time_over", ...), "" when OK
+    std::string failure;    // why a test failed ("out of the course", "over the times"), "" when OK
     // The race entered runs of this visit into their rankings (licence tests, machine tests,
     // time trials, free runs: it records each run, with its name entry, when it ends, as the
     // original does); the menus never record from a result, they only save it.

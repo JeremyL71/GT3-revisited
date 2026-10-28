@@ -11,8 +11,7 @@ Code: `src/race/` (engine side) and `src/app/screen_race*.cpp` (the screen; see
 
 | File | What |
 |---|---|
-| `race/backend.h/.cpp` | `RaceTrack` / `RaceVehicle` interfaces, adapters over `track::Track` + `sim::TrackWorld` and `sim::Vehicle`, `car_setup_from_database()` |
-| `race/standins.h/.cpp` | Fallbacks used when the real track runtime / vehicle model is not built: GTRW-based track query and walls, kinematic car |
+| `race/backend.h/.cpp` | `RaceTrack` (over `track::Track`) and `RaceVehicle` (the player's car of a race on the exact core) interfaces, `car_setup_from_database()` |
 | `race/controls.h/.cpp` | Pad → `sim::ControlInputs` mapping, rumble model |
 | `race/interp.h/.cpp` | Fixed-tick accumulator, quaternion helpers, `VehicleState` interpolation |
 | `race/camera_rig.h/.cpp` | Chase, far chase, bumper, roof and free-orbit cameras |
@@ -23,11 +22,12 @@ Code: `src/race/` (engine side) and `src/app/screen_race*.cpp` (the screen; see
 | `race/machine_test.h/.cpp` | Machine tests: the test from the event, its timing points and goal (`MachineTest`) |
 | `race/lap_events.h/.cpp` | The event display (the pop-ups' queue and timing), race gaps (`PassingOrder`), time trials' best lap and split times (`BestLapSplits`) |
 | `race/replay.h/.cpp` | Replay format, recorder, player, save/list in `<user data>/replays/` |
+| `sim/exact/race_record.h/.cpp` | A race on the exact core as a replay keeps it (`RaceRecord`: setup, every car's frames, the game's changes, the end hash), `RacePlayback`, `race_hash` |
+| `race/exact_demo.h/.cpp` | The disc's demo runs as race records (`demo_record`: the race GT3's replay playback builds from the save) |
 | `race/replay_library.h/.cpp` | The Replay Theater's files: list with headers, delete, rename, info texts |
 | `race/replay_options.h/.cpp` | REPLAY OPTIONS: replay view mode, target, HUD items, sound; the panel |
-| `race/analyzer.h/.cpp` | The Analyzer (data logger): lap analysis of replays, GRAPH / REPLAY screens |
-| `sim/car_spec_io.h/.cpp` | CarSpec to bytes and back (replays carry their car) |
-| `race/ghost.h` | Best-lap ghost (live, or re-simulated from a saved replay) |
+| `race/analyzer.h/.cpp` | The Analyzer (data logger): the logger's sectors, keys and graph from the race's data logger tables, GRAPH / REPLAY screens |
+| `race/ghost.h` | `GhostLap`: the Analyzer's logger ghost (a recorded lap as poses); race ghosts are cars of the exact race (see "Ghost") |
 | `race/replay_cameras.h/.cpp` | GT3's replay camera script (GTRC) and the replay director |
 | `race/replay_focus.h/.cpp` | The car the replay cameras follow: battles, TOP / AUTO interest scores |
 | `race/procedural_cameras.h/.cpp`, `race/music_markers.h/.cpp` | View mode 1's procedural cameras; the race music's markers its cuts follow |
@@ -35,14 +35,17 @@ Code: `src/race/` (engine side) and `src/app/screen_race*.cpp` (the screen; see
 | `race/race_audio.h/.cpp` | Reverb ambience model, race music, opponents' engine notes |
 | `race/race_playlist.h/.cpp` | The race playlist (the options' music list): next song, list order / shuffle, saved text |
 | `race/race_sfx.h/.cpp`, `race/car_sfx.h/.cpp` | Named se.inf effects; tyre, kerb, road and collision sounds per car |
-| `race/field.h/.cpp` | Player(s) + AI opponents in one `sim::World`; standings |
+| `race/field.h/.cpp` | `RaceField`: the race's cars for the screen (player(s), opponents, standings); `RaceField::create` builds an `ExactField` |
+| `race/exact_field.h/.cpp` | Races on the exact core: `RaceField` over `sim::exact::ExactRace` (see "Races on the exact core") |
+| `race/exact_car.h/.cpp`, `race/exact_setup.h/.cpp` | A record as the screen reads a car (state, setup, telemetry, facts, condition); the program's tables, the course and each car's equipment for the exact core |
 | `race/results.h/.cpp` | Results overlay, time-trial overlay, post-race quick menu (game .pmb pages) |
 | `race/post_run.h/.cpp` | What follows a run per mode (prize / name entry / replay), the quick menu's backdrop, pause EXIT as a finish |
 | `race/paint.h/.cpp` | carcolor.db and the race-start colour draw |
 | `tests/test_race.cpp` | Control mapping, stepping, interpolation, rumble, render-state decoding, car setup |
-| `tests/test_race_field_synthetic.cpp` | `race::Field` without the disc (stadium course, in-memory car database): the stuck-car respawn |
 | `tests/test_race_presentation.cpp` | Presentation rules without the disc: records and RETRY, HUD layouts, replay view modes, quick menus, what follows a run, the title and mark clocks |
 | `tests/test_race_lap_events.cpp` | The pop-ups, split points, machine-test timing and the loading picture without the disc |
+| `tests/test_exact_game.cpp` | Disc: the pad read's frames; whole races through `RaceField` on the exact core equal to `ExactRace` stepped directly (`exact_game_race_lockstep`); a pad-read run equal to its replay's inputs (`exact_game_pad_replay`) |
+| `tests/test_exact_replay.cpp`, `tests/test_exact_demos.cpp` | Disc: races on the exact core through a replay file and back, every step (`exact_replay_round_trip`); the whole-run ghost car (`exact_replay_ghost`); the disc's demos through their race records (`exact_demo_records`) |
 | `tools/gt3tool/cmd_race.cpp` | Diagnostics: `race-texlod`, `race-blend`, `race-sheen`, `race-carprims` |
 
 ## Race screen code map
@@ -60,8 +63,8 @@ them, then the state.
 | `screen_race_impl.h` | Private: `RaceScreen`, `DebugPreset` (GT3R_RACE), `MenuLaunch`, small helpers (`BrakeLamps`, `Perf`, `menu_keys`) |
 | `screen_race.cpp` | Core: constructors (menu / online / `--screen race`), `update` / `render` dispatch, `init` / `begin` and the loading picture (`render_loading`), the menu request handler, `make_*_race_screen`, the screen registration |
 | `screen_race_launch.cpp` | GT3R_RACE parsing (`read_preset`), menu requests → course / car / event / options (`resolve_launch`), online launches (`resolve_online`) |
-| `screen_race_setup.cpp` | Loading and (re)starting a run: `start`, `build_vehicle` (alone or a `RaceField`), `restart` / `reset_run_state`, flying starts, warp, TV cameras, the saved-lap ghost |
-| `screen_race_drive.cpp` | The race loop: `update_drive` (one frame) and `tick` (one physics step), autopilot and scripted inputs, finish detection, respawns, gear hint, dirt, pylons, tyre smoke, force feedback |
+| `screen_race_setup.cpp` | Loading and (re)starting a run: `start`, `build_vehicle` (the run's `RaceField` on the exact core; a race that cannot be set up becomes the error page), `restart` / `reset_run_state`, warp, TV cameras, LOAD GHOST |
+| `screen_race_drive.cpp` | The race loop: `update_drive` (one frame) and `tick` (one race step), the race's AI taking the player's car (autopilot) and scripted inputs, finish detection, gear hint, dirt, pylons, tyre smoke, force feedback |
 | `screen_race_render.cpp` | `render_drive`: 3D views (1P, 2P split, 4:3 frame), draw items, reflections, mirrors, sun / lamps, `hud_data`, the results / licence / time-trial overlays |
 | `screen_race_audio.cpp` | Music cues, course ambience listeners, extra car sound inputs, `silence` |
 | `screen_race_select.cpp` | The standalone selection page: course / car picker and saved-replay list |
@@ -72,7 +75,7 @@ them, then the state.
 | `screen_race_post_run.cpp` | After a run: the exit transition, prize / trophy and name entry, the automatic replay, back to the quick menu, its backdrop (play mode 2), pause EXIT (`run_kind`, `after_run`, `return_to_menu`) |
 | `screen_race_analyzer.cpp` | The Analyzer: the quick menu's data logger and the theater's logger mode |
 | `screen_race_online.cpp` | Online battle glue (field from the grid, events, synchronised start, prediction, ghosting); its state is `RaceScreen::net_` |
-| `screen_race_license.cpp` | Licence tests (the judge every tick, medals) and the disc's demonstration runs (DEMO, preview box) |
+| `screen_race_license.cpp` | Licence tests (the race's judging, medals) and the disc's demonstration runs (DEMO, preview box) |
 | `screen_race_events.cpp` | The pop-ups in the middle of the screen: lap times, split times, gaps, "+N Laps", "Pitting in..." (`lap_events`, `reset_lap_events`) |
 | `screen_race_vr.cpp` | VR builds only: the stereo race (`vr_stereo`, `vr_base`, `render_vr_eyes`); see [VR](VR.md) |
 
@@ -81,19 +84,22 @@ them, then the state.
 ```
 update(dt):
   FixedStep::advance(dt)          -> n ticks of 1/60 s (sim::kDefaultTickHz), at most 8 per frame
-  per tick: prev = state; inputs = ControlMapper(pad) (or auto-drive)
-            vehicle.step(inputs, 1/60)   (sim::Vehicle with track + sim::TrackWorld walls/grip)
-            lap timer, rumble, respawn checks
+                                     (online: FixedStep::follow, by the clock since the synchronised start)
+  per tick: prev = state; inputs = ControlMapper(pad) (the race reads the pad itself)
+            field.step(inputs, 1/60)     (race::ExactField: one step of GT3's race on the exact core)
+            lap timer, rumble
   render_state = interpolate(prev, state, FixedStep::alpha())
+                 (the wheels turn by the tick's own turn, WheelState::spin_step: their spin angles wrap)
   camera, engine audio and rumble use render_state
 render:
   View3D::draw(course items + car items) with frustum culling, draw distance, sorted blending, fog
   HUD over it
 ```
 
-The backends are chosen at compile time (`__has_include` of `track/track.cpp`
-and `sim/vehicle.cpp`) and at run time (falls back to the stand-ins if the
-real ones throw). The HUD's debug line (R3) shows which are active.
+A race that cannot be set up (the disc's program unreadable, a course or car the
+race step cannot run) shows "The race cannot start." with the reason; any button
+(Cross, Circle, Triangle, Start) goes back to the menu. On the standalone
+selection page the reason shows under the lists instead.
 
 ## Controls
 
@@ -107,7 +113,7 @@ real ones throw). The HUD's debug line (R3) shows which are active.
 | R1 | change view (in-car, in-car without the mirror, chase, far chase; see "Cameras") |
 | L1 (held) | look back |
 | Triangle (pressure) | reverse |
-| Select | respawn on the track (bound to the keyboard / touch overlay by default) |
+| Select | no race action (no respawn, as in GT3); in time trials, free runs, machine tests and licence tests the controller's own Select (the menu pad's) shows / hides the ghost |
 | Start | GT3's pause window (see "Pause"); Select there opens our list: Resume, Restart, Watch replay, Save replay, Camera, Gearbox, Exit |
 | R3 | performance overlay |
 | Right stick, L2/R2, mouse | free-orbit camera |
@@ -116,11 +122,16 @@ Stick: 6 % deadzone, response curve `x^1.25` (fine control near the centre).
 Pedals: 8/255 bottom deadzone. Buttons held without a pressure report give
 full travel (keyboards).
 
-Rumble (`InputManager::set_rumble`): wall impacts pulse the large motor
-(delta-v / 8 m/s, 0.25 s), off-road surfaces a low constant level,
-wheelspin a light buzz; kerbs pulse the small motor at a speed-dependent
-rate. Impulse triggers (`set_trigger_rumble`): left = ABS-style chatter when
-a wheel locks under braking, right = wheelspin under throttle.
+Rumble (`race::RumbleModel`, `InputManager::set_rumble`; physics §1.2): as GT3
+drives a DualShock 2. Each race step's vibration level (`VehicleTelemetry::pad_rumble`,
+0-127, set in phase 12 from the front tires' drive and brake forces, the dampers and
+curbs under the front wheels, and a hit's rumble) goes to the large motor as it is, so
+at most about half strength; the small motor never runs. A car the pad does not drive
+(an AI run-up, after the finish; `VehicleTelemetry::pad_output` clear) sends nothing,
+and its motors stop. Replays and demonstrations send nothing, and the Vibration option
+(`vib1`, the quick menu's OPTIONS) turns it off. Impulse triggers (`set_trigger_rumble`,
+ours): left = ABS-style chatter when a grounded wheel locks under braking, right =
+wheelspin under throttle (`race_rumble`).
 
 ## Rendering
 
@@ -140,9 +151,8 @@ a wheel locks under braking, right = wheelspin under throttle.
 - Car placement (as GT3 draws it): the car model's origin (wheelbase
   midpoint, y = 0 = the body's lowest point) sits at the physics body height,
   which at rest is the ride height q (the front ride height in mm x 0.001 m, both axles; physics §4.2) above
-  the ground. Our sim's car frame is on the ground, so the body is drawn at
-  `car * translate(0, q, 0)` (0.13 m when the car has placeholder
-  suspension). Wheel centres are at (±half-track, R + travel, ∓wheelbase/2)
+  the ground. The screen's car frame is on the ground, so the body is drawn at
+  `car * translate(0, q, 0)`. Wheel centres are at (±half-track, R + travel, ∓wheelbase/2)
   in the sim frame (half-track = half the tread less its per-side offset,
   formats/car_model.md "Wheel placement"), travel = `WheelState::suspension -
   VehicleSetup::Wheel::static_suspension` (+ = compressed, the wheel rises
@@ -203,7 +213,10 @@ a wheel locks under braking, right = wheelspin under throttle.
   colours (per draw item) and the light shadow's alpha F; `race/road_shade.*` interpolates them
   from the road mesh (test `race_road_shade_disc`).
 - Point-light courses (route5, route11, circles): `race/point_lights.*` picks each car's up to four
-  lamps; the car is drawn with its own light set (`render::ItemLights`, up to four directional
+  lamps around its lamp index (`RaceScreen::car_lamp_index`: the front-left wheel's road attribute A
+  read as a signed value by `race::lamp_index`, so the 0xFFFF strip at the start line is lamp -1;
+  kept per car while the wheel finds no road; tests `race_point_light_index_rule`,
+  `race_point_lights_start_line_disc`); the car is drawn with its own light set (`render::ItemLights`, up to four directional
   lights) and node 1 casts one shadow per lamp (shear -A78 (r.x, 0, r.z), alpha = lamp shadow
   alpha x w). The lamps' discs in the reflection map (`ReflectionDiscMesh`): GT3 draws them
   over the sky / scenery map before each car: of the same nine candidates sorted by weight, the
@@ -221,16 +234,16 @@ a wheel locks under braking, right = wheelspin under throttle.
   race as in GT3: + S x (8 on tarmac courses, else 1) x 0.001 per second, S = the sum over the wheels
   on loose surfaces (indices 2-6, 12-14) of min(1, slip intensity), capped at 0.8; the result goes
   back to GT mode in `GameResult::car_dirt`.
-- Recommended gear ("> n" after the gear digit): the player's car runs a passive AI driver (line
-  bookkeeping and braking points only); when the car is faster than the coming target speed T (the
-  next point's speed; in an arc's braking zone min(current, next)) the hint is the automatic box's
-  gear for T (`sim::model::gear_for_speed`), blinking in braking zones.
+- Recommended gear ("> n" after the gear digit): the race's AI plan runs for the player's car too
+  (line bookkeeping and braking points only while the pad drives); when the car is faster than the
+  coming target speed T (the next point's speed; in a braking zone min(current, next)) the hint is
+  the automatic box's gear for T, blinking in braking zones (ai §16; `RaceVehicle::gear_hint`).
 - Reverse (GT3's "back" action): Triangle (gt3 layout) / L2 (ours), pressure like the throttle;
-  while at least the throttle it requests reverse gear (`RaceVehicle::set_reverse_request`) and
-  drives it (through the brake in AT, which the sim swaps in reverse; the throttle in MT). Test
-  `race_control_reverse`.
-- Pit auto drive sets `sim::Vehicle::set_driver_kind` (pit-lane state, non-zero; 0 otherwise):
-  the original's scripted driver path (aids off), for the player and the opponents.
+  it is the pad frame's back axis, which the race reads (it sets the gear logic's reverse
+  request); where the screen gives no pad, `RaceVehicle::set_reverse_request` sets the back axis.
+  Test `race_control_reverse`. Replays carry it in the pad frames.
+- Pit lane: the race's own driver kinds 2-4 drive the player's car and the opponents through the
+  pit lane (ai §13); the HUD shows AUTO DRIVE.
 - Pre-race shot (every live run with a standing-start hold: races from t 0.1, standing licence
   tests from t 0.7, machine tests by their hold; not replays, demonstrations or the 2P battle,
   which has no hold): GT3's starting camera plays `cameras/start.cam`
@@ -244,18 +257,19 @@ a wheel locks under braking, right = wheelspin under throttle.
   before the signal (captures of the original: the approach shot from ahead). Its two cuts
   (C 180, 120) and the cut to the player view (C 60) dissolve over 1 s from the last picture
   (`race::start_shot_on` / `start_shot_t` / `start_shot_dissolve`).
-- Rolling / flying run-up (physics §9.4): the regular CPU AI driver (`ai::AiDriver`, builtin set
-  0) drives the player's car on its line with the automatic box until the hand-over (first
-  start-line crossing; rolling: tick 300, counted in ticks), with driver kind 1; kind 5 after the
-  finish (the stop driver); demos and the attract mode stay 0.
+- Rolling / flying run-up (physics §9.4): the race's AI drives the player's car on its line with
+  the automatic box until the hand-over (driver kind 1; the race decides when it hands the car
+  back), also under the test autopilot; after the finish the race's end-of-run drivers take over
+  (ai §1.1); the disc's demonstrations play their recorded pad frames; the attract demo is an
+  all-CPU race (see "Title attract demo").
 - Options (`menu::flow` [options]; the race options of GT3's options block, menus §10), wired:
-  - 2P boost (none / low / high): the trailing player's time step runs 1 + A x (gap - start) /
-    (full - start) faster (A from `full` m or a lap down): low 0.15 / 20 m / 1000 m, high
-    0.20 / 10 m / 200 m (`FieldConfig::boost_*`).
+  - 2P boost (none / low / high): the battle's catch-up (the race's rubber band for the trailing
+    player, ai §9.3): low 0.15 / 20 m / 1000 m, high 0.20 / 10 m / 200 m
+    (`FieldConfig::battle_catchup` 1 / 2).
   - 2P handicap h (metres): both cars on the line before the start, player 2 max(h, 20) m back
-    and player 1 10 m for h > 0, the other way round for h < 0 (`FieldConfig::handicap_m`; we use
-    the centre line for GT3's line 6). Test `race_two_player_options_disc`.
-  - 2P tyre damage: the shipped wear curve for both cars, not on dirt courses.
+    and player 1 10 m for h > 0, the other way round for h < 0 (`FieldConfig::handicap_m`, the
+    race's battle start on GT3's line 6).
+  - 2P tyre damage: the battle's tire wear for both cars, not on dirt courses.
   - ASM / TCS off: the player's car (and player 2's) gets its ASCC flags / TCS gain cleared, in
     arcade single race, free run and 2P only; on keeps the car's own systems.
   - gear_auto: the default AT/MT outside arcade single race and 2P (they use the car page).
@@ -265,7 +279,8 @@ a wheel locks under braking, right = wheelspin under throttle.
   - vibration per player (vib1 / vib2), off in replays.
   - wide mode: the 2P split default (`[race] split = auto`): top / bottom with wide mode off (4:3),
     side by side with it on.
-  - ghost: the time-trial ghost is drawn only when on.
+  - ghost: whether a better run replaces the ghost at once (on) or after "Update Ghost?" (off);
+    it never hides the ghost (see "Ghost").
   Not wired: GT FORCE force feedback and the steering-assist types (wheel input only; platform's
   force-feedback path), the 1P tyre-damage option (no race reader in the original).
 - 2P battle, 4:3 top / bottom halves (matched to captures of the original): ordinal rank top
@@ -283,15 +298,10 @@ a wheel locks under braking, right = wheelspin under throttle.
 - Replay pause (GT3): the frame dimmed, CONTINUE / EXIT / REPLAY OPTIONS on a dark strip
   (buttons 124..236 / 244..356 / 364..508 x 192..216); REPLAY OPTIONS opens GT3's REPLAY OPTIONS
   panel (see "Replay Theater").
-- Replays start the player's car with `place()` like the live standing start (no spawn hold); the
-  2P and field replays now end where the recordings ended.
-- Replay determinism: replays (and restarts) reuse the time-trial vehicle, so
-  `sim::Vehicle::reset` now clears all per-run state (physics fixed the phase-12 ground state,
-  slip gains, smoke, brake heat, ... surviving a reset; test `race_vehicle_reuse_deterministic_disc`).
-  The scripted-driver kind (run-up 1, stop driver 5 after a finish or a course-out) changes the
-  physics, so replays store it per tick (input flag bits 64 / 128; old files read 0) and play it
-  back (test `race_replay_driver_kind`). Time-trial, field, 2P and licence replays end exactly where
-  their recordings ended.
+- Replays rebuild the race from its record and step it with the recorded pad frames (see
+  "Replays"); on the steps the race's AI drove, the recorded frame is read and ignored, as in the
+  game, so the AI drives again from the replayed state. Replays end exactly where their
+  recordings ended.
 - Arcade time trial: "Lap 1/1" with Best / Time (the capture); the run is that one lap (presentation §B7).
 - Tyre smoke puffs up to 3 m that cross the ground line are split along it (GT3): the part above
   is drawn as is, the part below fades to alpha 0 one puff size down.
@@ -368,8 +378,8 @@ a wheel locks under braking, right = wheelspin under throttle.
   `race_two_player_drift_disc`).
 - Buttons: the race reads each player's race pad (`InputManager::race_pad`), whose buttons are
   GT3's defaults: Cross accelerate, Square brake, Circle handbrake, Triangle
-  reverse, R2 / L2 shift, R1 change view, L1 look back (held), Start pause; we put respawn on
-  Select and the performance overlay on R3. The per-player race layout (`[playerN] race = modern
+  reverse, R2 / L2 shift, R1 change view, L1 look back (held), Start pause; we put the
+  performance overlay on R3 (Select has no race action: no respawn, as in GT3). The per-player race layout (`[playerN] race = modern
   | gt3`, custom `[playerN.race]`) maps physical inputs onto them; `gt3` is the menu pad itself.
   docs/INPUT.md "Race controls" (the touch overlay presses race pad buttons).
 - Car shadows (nodes 1 and 6, docs/formats/car_model.md): drawn in the
@@ -460,10 +470,8 @@ and the formula cars' steering arms. `load_car_model` with `CarModelOptions::mor
 draws out of the body and returns them as `gtm1::MorphDraws` (per LOD); `CarVisual` draws them
 from a small model of their own textures, one per drawing of the car (`CarLook::instance`: the
 car and its ghost), rebuilt when `car_callback_values(state, setup)` change. The values come from
-the sim: `WheelState::flap` (`model::flap_step`, run in the tick after the late ground step, its
-kicks drawn from `vu0_random()`, reseeded in `reset_run_state` as the game does at every run
-set-up) and `VehicleState::steer` over `VehicleSetup::steer_lock`; both are interpolated between
-ticks (ghost laps keep them with their states). Online remote cars are not stepped here, so
+the race: `WheelState::flap` (the car record's flap pendulums, physics §8.8) and
+`VehicleState::steer` over `VehicleSetup::steer_lock`; both are interpolated between ticks. Online remote cars are not stepped here, so
 theirs stay still.
 
 ### Course animations
@@ -549,10 +557,10 @@ research (captures of the original, `database/racedetail.db` rows,
   |---|---|
   | race | Best, Last, Lap |
   | endurance | Total, Best, lap-time list (3 lines from 140, sw_16 line height x 0.8 apart, numbered), Lap (216) |
-  | time trial | Best, Time (the run's laps + the current one) |
-  | free run | Record Lap (the session's fastest lap: dashes until a lap is done, kept across retries), Best, list, Lap |
+  | time trial | Best (the visit's best lap), Time (the run's laps + the current one) |
+  | free run | Record Lap (the session's fastest lap: dashes until a lap is done, kept across retries), Best (the visit's best lap: the same), list, Lap |
   | free practice | P.P. (the same, with the player's car picture 99 left of the label), Best, list, Lap |
-  | licence | Best, Time, the three targets (no lap count) |
+  | licence | Best (the visit's best judged time: the only "lap" a licence test posts), Time, the three targets (no lap count) |
   | machine tests | presentation §D4: Best, Time / Record, Best speeds (no lap count) |
   | replay (ITEM time) | the lap count, Lap |
 
@@ -603,13 +611,12 @@ research (captures of the original, `database/racedetail.db` rows,
   `odo#1`, each followed by a space; ASM green (73, 204, 43), TCS (255, 184,
   20), the others red; unlit black 50 %; "acting" blinks (counter + 21 per
   frame, lit while positive as a signed byte). Onboard centred at (435, 430),
-  remote pen (620 - 125, 410). We light ASM when the car has ASCC, TCS when
-  it has TCS (blinking while it cuts), the hand-brake lamp from the input,
-  the oil lamp from the car's live oil counter (worn: 300 km, `model::oil_worn`).
-  The Options menu's ASM / TCS off (`sim::apply_aid_options`) clear the car's
-  ASCC flags and gains / its TCS gain, so each lamp goes out with its aid.
+  remote pen (620 - 125, 410). The ASM and TCS lamps are the car record's own lamp
+  states (`VehicleTelemetry::asm_status` / `tcs_status`), the hand-brake lamp the input,
+  the oil lamp the car's live oil counter (worn: 300 km, `sim::oil_worn`). The Options
+  menu's ASM / TCS off go into the player's race entry, so each lamp goes out with its aid.
 - **Odometers** (font `odo#1`, cyan 98, 192, 192, centred, baseline): "%06d"
-  the car's own odometer as it drives (`sim::Vehicle::engine_condition`, 2 m
+  the car's own odometer as it drives (`RaceVehicle::engine_condition`, 2 m
   units; GT mode: it starts from the garage car's) and "%04d" trip in tenths
   since the start. Onboard (205,
   428) / (205, 370) in the speedometer face, remote (605, 424) / (525, 424).
@@ -704,30 +711,55 @@ Stopped on pause and when leaving the screen.
 
 ## Replays
 
-Every run is recorded: per tick the quantised `ControlInputs` (steer s16,
-pedals u16, flags), plus course, car, gearbox, start pose, respawn events and
-the best lap's tick range. Inputs are quantised before the simulation sees
-them, so playing the file back through a fresh `sim::Vehicle` reproduces the
-run bit for bit (test `race_replay_reproduces_run`; a 230 s Trial Mountain
-run re-simulates to the identical final position). Format: `replay.h`.
+**Format 11: races on the exact core replay from their own record.** A run on the exact core
+(`race::ExactField`) records itself as a `sim::exact::RaceRecord` (`sim/exact/race_record.h`), the
+replay file's block after the battle block: what the race was built from (the race configuration
+block, the race-information words, the race mode, the course by label, every car's `StartEntry` as
+it was: equipment with its parts and settings, pedal style, wheel type, ASM / TCS, condition words,
+grid slot), the fingerprint of the program's tables it ran on, the behaviour it ran with (the rules
+and step rate, `sim::Behaviour`: the disc's release's rules at 60 steps a second, online NTSC-U's), a
+fingerprint of the game data it was built from (`exact_data_fingerprint`: the course file and every
+entry's database records), every car's pad frame of every step (changed fields only; a CPU car's stream
+stays empty; the free run ghost's extra steps' reads apart), the game's own changes to the race between
+steps (`RaceChange`: the start countdown, the pause menu's AT / MT, a seeded engine condition, an AI
+take-over) and `race_hash` after the last step. Version 3 also keeps the solo modes' recorders as the run
+starts (`sim::exact::SoloRecorders`, their record memory stored sparse) and the run's own pad frame recording
+(`RaceRecord::run_recording`: the player's device's block as the race's end closes it, GT3's recorder),
+which a whole-run ghost plays; a version 1 or 2 record's ghost car drives its recorded frames instead. Playback (`ExactFieldOptions::playback`, set by the
+screen through `exact_playback()` wherever it builds an exact field) builds the race from the record,
+makes no grid, car or event decision again, and steps it from the recorded frames and changes; its
+pads and inputs are ignored; at the last frame it logs whether the race's hash is the recording's
+("the race matches the recording"). A replay plays on the physics it was recorded on: a record needs
+the exact core, the program and the game data it was recorded on and its rules (`RaceScreen::can_play`,
+`build_playback`: refused with the reason otherwise, "This replay cannot be played: recorded with ...",
+never played on another program, data or rules). Saved ghosts follow the same rule (a ghost of
+another program's or rules' run is not offered). **Files of versions before 11 are refused** (`ReplayTooOld`,
+"This replay was recorded with an older version and cannot be played."); the Replay Theater lists them
+with "Recorded with an older version", not playable (they can be deleted). Tests: `race_replay_exact_record` (the record through a file, disc-free),
+`exact_replay_round_trip` (disc: a pad-read GT race with a gearbox change and a seeded condition, a
+rally from inputs, a 2P battle with player 2 on the pad, an AI take-over, the autopilot: every step's
+hash and every 300th step's records equal, end matches).
 
-- Format v7 also stores what the theater shows (comment = file name, kind, laps, total
-  time, power, save time) and the run's **car spec** (`sim/car_spec_io.h`: every CarSpec field,
-  floats bit-exact), so a replay saved from GT mode (garage car with parts and settings), arcade
-  (tyre stage, ASM / TCS options), licence or quick race plays back with the same car wherever it
-  is loaded; older files play with the database car. The paint is applied too.
-- Format v8 adds the engine condition the run started with (odometer, running-in / wear, oil;
-  physics §10.3), so a GT-mode car with miles on it replays exactly (playback, ghosts and the
-  Analyzer seed the replayed car with it); older files replay with a fresh engine.
-- Format v9 adds the field's set-up as the run had it: the grid by power-to-weight (GT mode),
-  CPU respawn (`[race] respawn`) and, for a 2P battle (`ReplayBattle`), the Options menu's
-  laps, catch-up boost, handicap and tyre damage and player 2's car (spec with its parts and
-  the Options ASM / TCS, model, wheel, paint). A race replay rebuilds its field with them
-  wherever it is played (`build_vehicle_inner` while replaying; `live_battle` otherwise), so a
-  GT race or a battle in the theater or the Analyzer starts as it did and replays exactly, not
-  with the theater launch's order and today's options. v7 / v8 files take the grid from their
-  kind (`GtRace` were the ones by power-to-weight); the rest is not known before v9 (the
-  playback's own), and re-saving keeps "not known" as it is.
+**Ghosts on the exact core** are GT3's: the ghost is a car of the race. A whole-run ghost (time
+trial, licence test, machine test) is the session's best run's record (or a saved replay's, when it
+can play): `ExactFieldOptions::ghost` adds its car 0 entry after the players, the solo conductors'
+entry set-up flag it a ghost (F +0x3EA), and from the first step it plays that run's recording on the ghost's
+device as GT3's playback does (`SoloRecorders::run_to_ghost`, the ghost taking a whole run: every
+recorded frame but the last, then empty frames; its flying start's run-up by the race's AI as then); ghost cars are not opponents (standings, crossings,
+pit entries). The screen draws it from the race (`exact_ghost`, the draw mode: not while the
+computer drives it). The free run's lap ghost is the free run's ghost car (exact-modes). A replay of a
+run with a ghost has the ghost car's frames in its record. Test `exact_replay_ghost` (the ghost car
+equals the first run's car 0 on every step of that run, the player's car is untouched, the replay of
+the run with its ghost matches).
+
+Around the record the file keeps what the theater and the memory-card pages show (`replay.h`):
+course, car, gearbox, paint, kind, laps, total time, power, save time, the engine condition the run
+started with (physics §10.3), the grid by power-to-weight (GT mode), a 2P battle's Options (laps,
+catch-up boost, handicap, tire damage, player 2's car, wheel and paint), the best lap's tick range,
+and the players' inputs per tick for the HUD (the inputs whose frame the race read). A race replay
+rebuilds its field from the record wherever it is played (`build_vehicle` while replaying;
+`live_battle` otherwise), so a GT race or a battle in the theater or the Analyzer starts as it did.
+
 - **Engine condition across runs** (gt_mode §13): a request that carries the garage car's
   condition (`GameRequest::car_condition`, GT mode's `fill_condition`) seeds every live run
   (`restart`) with `run_condition_`; when a live run ends (a retry, a rebuilt field, a replay
@@ -803,20 +835,31 @@ original's pages: theater, DEMONSTRATION list, Analyzer top, REPLAY OPTIONS):
   mode; it opens like any replay, see "Replay (TV) cameras"), the mark only, Start =
   replay pause, then back. The demonstration's car is the demo's own car record (parts and
   settings: the arcade time trials' dirt tyres, stage 12, differ from the event car's); the
-  flying start's run-up is driven by the AI driver (physics §9.4, also for time trials),
-  the recorded frames ignored until the line. Our physics is not bit-exact, so the open-loop
-  runs drift off the original's line (the fast arcade ones 3-22 s after the line): once two
-  wheels leave the road or the run would fail (course-out, wall), the same AI driver takes over
-  to the end (ours; see "Demo runs").
+  flying start's run-up is driven by the race's AI (physics §9.4, also for time trials),
+  the recorded frames ignored until the line. The run is the race's own replay of the save (see
+  "Demo runs").
 - **Analyzer** (`logger.mbl` page `top`, GameFlow control "logger"): TRACK A / TRACK B panels
   (Car, Power, Course, Time, Date, Mode, File Name) and REPLAY / GRAPH / LOAD A / LOAD B / EXIT;
   LOAD opens the list titled "Load track"; REPLAY / GRAPH need a track (B on another course is
-  left out) and start the race screen in mode `logger`. There both replays are played on the
-  race screen as REPLAY plays them (`screen_race_analyzer.cpp` `sample_replay`: the field, start
-  hold, pit lane, respawns and driver kinds take part; B with its own car and field, then the
-  screen goes back to A's) and their lap (`analyzer_lap`: the best lap, or the whole run without
-  one) is sampled into per-tick traces (`race::LapSampler`): distance from the line, speed,
-  throttle, brake, position. The screen is logger1.pmb page
+  left out) and start the race screen in mode `logger`. A replay on the exact core is played
+  again on its own field with the data logger on (`exact_logger_track`: ExactFieldOptions::logger /
+  logger_record, race info + 0x70 / + 0x74; the logger's tables from `exact_logger_tables`), its car
+  0 binned after every step as GT3's Analyzer pass does (`race::LoggerBinner`: bins of lap /
+  16383, at least 0.5 m, speed, pedals, gear, position, the 1 2 1 smoothing; `logger_track`), the
+  sectors at the course's logger marks (CourseQuery::logger_mark), SECTOR TIME / AVER. SPEED from
+  the logger's table; the bins' frames give REPLAY's seeks and cursor. Two time trial, licence test
+  or machine test replays run as GT3's Analyzer runs them, in one race (`exact_analysis_pass`,
+  ExactFieldOptions::analysis): car 0 plays track A's recording on the player's device, car 1, a ghost
+  car with track B's car, plays track B's on the ghost's (`SoloRecorders::analysis`; only track A's
+  record's changes are made), both binned after every step by their devices' frames, the logger's
+  tables kept. REPLAY plays that race again (track A's replay built as the Analyzer's race with the
+  pass's tables); a seek jumps to the logger entry of the sector the cursor is in
+  (`exact_analysis_jump` -> `ExactRace::logger_jump`, as GT3's REPLAY jump: both cars from
+  the entry's snapshot, their playback sought to its frame, the race simulated on from there;
+  `RacePlayback::seek` and `ReplayPlayer::seek` move the record on without playing the frames
+  between), so no jump replays from the lap's start. Test: `exact_game_analysis` (disc). Free run
+  replays keep a pass each, as above (GT3's free run Analyzer plays its best lap stores). A replay
+  that cannot play on this disc is not offered. The screen is logger1.pmb page
   `replay_logger`: bottom band with per-track status (SPEED, LAP TIME, SECTOR TIME, SECTOR AVER.
   SPEED at the cursor) and the sector bar (`icon_sector<n>`; sectors = the points of the
   course's `logger/<course>` LGM0 map, formats/course.md). GRAPH: speed / accel / brake traces of
@@ -930,23 +973,125 @@ up, spring wobble), Orbit (sweeping 100..760 degrees over x s, ending behind),
 Telephoto (2.5-6.5 m past a bumper, speed shake) and a random GTCI mount 3..n-1
 (`race::car_camera_mounts`, all 20 records). Course shots get the roll as Rz in eye space.
 
+## Races on the exact core
+
+Every race runs on the exact core: `race::ExactField` (`race/exact_field.*`) is the `RaceField`
+(`RaceField::create`), over `sim::exact::ExactRace`, GT3's own race step on its own car records
+(docs/dev/PHYSICS.md, `sim/exact/`): single races in GT mode and arcade, rallies, 2P battles, the solo
+modes (below, "Solo modes") and online races (below). A race the exact core cannot set up (the
+disc's program unreadable, a course or car it refuses) shows the error page with the reason and
+goes back to the menu; there is no other physics. Every race steps 60 times a second
+on every disc (`RaceField::tick_hz`, the one place the screen takes the rate from). The races the
+player drives follow the rules of the disc's release (its program version: NTSC-U, PAL's rule
+branches, NTSC-J's); online races and the game's demos (the attract demo, the quick menu's and the
+theater's demonstrations, the licence preview) follow NTSC-U's on every disc
+(`ExactFieldOptions::rules`: a copy of the program data with that `sim::Behaviour`). The log's
+"Race (exact)" line names the rules, the program and the rate.
+
+- **Set-up** (`race/exact_setup.*`): the program data once per CORE.GT3 (`exact_program_data`: GT3's tables, the disc's
+  program checked; `race_physics` the one place a disc's physics is chosen: GT3's, `own` false for a program that is not a
+  GT3 release, logged and shown under Settings > Game disc; a program that cannot be read cannot race), the course once per course file (`exact_course`, `sim::exact::RaceCourse`), the
+  event record (no event: an empty one, the laps set), the course category, the race mode (single
+  player, or the split-screen battle), the start type and countdown from the event (+0x1F3 / +0x1F2;
+  battles none), the race's laps, and one race entry per car as GT3's race information holds it: car 0
+  player 1 (car 1 player 2), then the opponents. A car's equipment (`exact_equipment`): a GT-mode garage
+  car's parts and settings (`GameRequest::car_parts` / `car_settings`; `make_equipment`), a variant
+  (table 31: its base car with the variant's parts, `stock_equipment`), an arcade car (table 35:
+  `arcade_equipment`, the tyres switched to the car page's stage), a database car with its parts; the
+  screen keeps the launch's source (`launch_source_`). A player's entry: pedal style 0
+  (automatic) or 1 (manual; the pause menu's AT / MT changes it on the record while the pad drives), the
+  steering-wheel type 1 when the player's controller is a wheel (`DeviceKind::Wheel`), ASM / TCS from the Options (arcade single race,
+  free run, 2P battle), the engine condition words and the car's dirt. Grid: the opponents in their order
+  (GT mode: by power-to-weight) on the slots before the players' (the players behind them), never more
+  cars than the course's grid slots (more are left out, logged): GT3's menus never make such a field (every
+  event's cars fit its course; the arcade's dirt races are one against one). The start port itself reads a
+  slot past the course's grid table as the program does (CourseQuery::slot: what follows the table in the
+  road block, the loader's pointer words with the block's address, RaceSetup::road_addr). An electric mod
+  car races with its donor's stock engine, engine parts, drivetrain and gearbox (`exact_equipment`; the log
+  and the mods screen say so) until the exact core has the EV drive. The test autopilot (`GT3R_RACE auto=1`)
+  sets the configuration byte 3: the race's own AI drives the players' cars with their pads decoded.
+- **Inputs**: the race pad (the player's race layout in GT3's type A meanings) through the pad read
+  (`sim::exact::pad_read`, the live path: the analog pad with pressure buttons, pad type 8; the
+  wheel kind the steering-wheel path, the stick's x as its position, Cross / Square as its pedals):
+  `RaceVehicle::set_pad` each step while the pad drives. Where the screen gives no pad (scripts, the
+  autopilot, demos, replays) the step's `ControlInputs` become an all-analog frame
+  (`exact_inputs_frame`). **Analog response** (Settings > Controls, `[race] analog_response`): `linear`
+  (default) keeps the pad read's frame (its kind, flags, buttons, shifts) but sets every analog axis
+  linear in the race pad's: the stick's (or wheel's) x straight to the steering, the d-pad's pressures as
+  GT3 steers with the d-pad, and each pressure to the frame value whose throttle, brake, handbrake or
+  back axis after phase 3's shaping (x + c (1 - x), c = the program's 0.1; a wheel's pedal curves) is the
+  pressure's fraction (`exact_pad_frame`); `original` is the pad read as it is (full throttle at 18 % of a
+  pressure button's range, brake 33 %, handbrake 10 %; the stick curve's dead band over the inner 29 %).
+- **What the screen reads** (`race/exact_car.*`): each car's `VehicleState` from its record (the CoG and
+  body axes in the physics frame, GTRW = (x, z, -y); the speedometer F +0x16D8; wheel contact = the
+  ground under the hub, its raw surface = the triangle's material | flags << 8), `VehicleSetup` from the
+  parameter block, the telemetry the sounds, smoke, dirt, HUD lamps (F +0x521 / +0x520) and force
+  feedback (car +0x16D6 the steering wheel's force) read, the car's facts (mass, extents, gears, drive)
+  and engine condition (`RaceVehicle::telemetry()` / `facts()`).
+  Positions (F +0x4E1), laps and splits (line crossings from the laps, times from F +0x530; sector crossings from the race display's event 12, their time from its event 14),
+  finishes (F +0x4E0, the time F +0x530), player 1's lap clock and best lap (`RaceTrack::set_lap_source`:
+  the HUD, lap list and results), pit entries and the race clock (`-start count / 60` during the
+  countdown, then the clock / 3000) come from the race. The race's own AI drives the run-ups, the pit
+  lane and the end of a run, and the gear hint is the AI driver object's (+0xAC / +0xAD).
+- **Replays**: the race's own record (format 11, "Replays"): the setup with every car's entry and every
+  step's pad frames; the screen's recorded inputs, for a pad-read step the ones whose frame is the one the
+  pad read gave (`exact_frames_of`), are for the replay's HUD only.
+- **Solo modes** (`app/screen_race_solo.cpp`): the time trial, licence test, machine test, free run and
+  GT mode's free run before a race as one race with their conductor (`ExactFieldOptions::kind`, as
+  `run_kind()` tells the runs apart: the licence tests (L...) the licence's, the time attacks (AT...) and
+  other time trials of set laps the time trial's, machine tests the machine test's, a time trial of no set
+  laps the free run's, GT mode's pre-race free run free practice's; no opponents), built by `build_exact_solo` in `build_vehicle_inner`'s solo path and held
+  as `RaceScreen::solo_field_` (field_ stays null: the screen's solo paths; `exact_field()` is the field on
+  the exact core either way). The race information's words: the visit's session best (race info + 0x8AC,
+  carried from run to run), the event's judging times, the speed unit; the start type as the race's start-up
+  sets it (`race::demo_start_type`). The run ends as its conductor decides (`exact_solo_step` after every
+  step): the time trial at its first lap (or its course-out, event 10: failed), the licence test with the
+  race info's result words (2 .. 4 a medal, 0 failed, -1 out of the course; an unjudged test keeps none),
+  the machine test at its split line (the time to it, or the top speed); a time attack's medal from its
+  judging times. The race's clock and start hold feed the screen's (`tt_hold_`, `race_time_`);
+  `MachineTest` only places the pop-ups' split marks. A pylon touch reaches the race as the conductor's hit rule of kind 2
+  (`exact_report_hit`, a `RaceChange::Hit` in the record), every step the player's car touches one; as in
+  GT3, whose frame runs the race step and then the course's rigid bodies (the race's frame update: the race's frame update
+  with the race step first), the touch reaches the car's record before the next step. The free run keeps its recorders for
+  the visit (`sim::exact::SoloRecorders` in the screen's `exact_free_run_`, `ExactFieldOptions::free_run`:
+  the record memory with the lap recording, the best lap's store and the ghost's playback; GT3's free run keeps
+  its race object, and so the best lap and the ghost, from run to run until the player leaves; the record keeps
+  them as the run starts, RaceRecord version 3) and, without
+  a whole-run ghost, drives car 1 as its ghost car (the player's car once more; the start flags it a ghost)
+  from the ghost's playback, the ghost's extra step through the race's nested pads, live and in replays
+  alike. Restarts build a new race (the free run's with the visit's recorders); replays and the disc
+  demonstrations play their record on a solo field. GT mode's free practice starts the player's car in its pit
+  box (the start's mode 6); the pre-race menu offers it only where there is one (QuickMenuItems::visit: not on
+  a dirt course, as GT3's; every course of GT mode's races without a stop line is a dirt course, checked
+  in the start's checks; `start_free_run` refuses a course whose stop line has no box for it, none of GT
+  mode's).
+  Check: `exact_game_solo_modes` (disc).
+- **Online races** (docs/dev/ONLINE.md): the i.LINK
+  battle's conductor (`Conductor::BattleMP`, start type 1), our car stepped, the other players' cars posed
+  from their owners' states (`FieldConfig::remote` with each car's `ExactCarSource` from its online
+  descriptor, `exact_online_source`; `RaceField::set_remote_pose` with the prediction's record,
+  `ExactRace::pose`), their prediction shadows one-car races from the same setup (`exact_shadow`), the
+  hits with them from the collision step's car contacts, the owners' finish times in the standings.
+- **Not yet on it**: the tyre effect
+  emitter's particles (the game's `TyreSmoke` still emits from the wheels' smoke emission).
+- **Checks**: `exact_game_race_lockstep` (disc) runs a whole Sunday Cup, the Tahiti Maze rally and a
+  2P battle (player 2 through the pad read) through `RaceField` and on an `ExactRace` built and stepped
+  directly: every record, the race order, clock and countdown equal after every step.
+  `GT3R_EXACT_DEBUG=1` logs every car's record every 2 s; the step's cost is logged every 600 steps
+  (about 0.10-0.14 ms for 6 cars on an M-series Mac).
+
 ## Races with opponents
 
-`race/field.*`: the player and up to 5 AI opponents (the event's entries,
-`ai::AiDriver` with the event's parameters and rubber band) in one
-`sim::World` (car-to-car contact, slipstream, time scale). The player's
-`RaceVehicle` steps the whole field, so the fixed-tick loop, replays and HUD
-are unchanged; the player starts on the last grid slot. A car finishes at a line
-crossing (`race::finishes_at_line`, presentation §B9): after the
-event's laps, or once the leader has finished (a lapped car, the player included, finishes at
-its next crossing: "+1 lap"), or at its first crossing after a time limit (nothing ends at the
-limit itself); its laps stop counting there. The race order (`race::ranks_ahead`, kept every
-tick, ties keep their places) is the HUD position and the player's place: more laps first,
-then running cars by distance, a running car ahead of a finished one, finished cars by finish
-time. Replays of races store the event
-and opponents (format v2) and re-run the whole field: a 40 s race replay
-reproduces the player's final position exactly. `GT3R_RACE="event=AEAT0001"`
-starts one directly.
+`race/field.*` (`RaceField`), on the exact core: the player and up to 5 opponents (the event's
+entries, driven by the race's AI with the event's parameters and rubber band) in one race (car-to-car
+contact, slipstream). The player's `RaceVehicle` steps the whole race, so the fixed-tick loop,
+replays and HUD are unchanged; the player starts on the last grid slot. A car finishes at a line
+crossing (presentation §B9): after the event's laps, or once the leader has finished (a lapped car,
+the player included, finishes at its next crossing: "+1 lap"), or at its first crossing after a
+time limit (nothing ends at the limit itself); its laps stop counting there. The race order (kept
+every step, ties keep their places) is the HUD position and the player's place: more laps first,
+then running cars by distance, a running car ahead of a finished one, finished cars by finish time.
+`GT3R_RACE="event=AEAT0001"` starts one directly.
 
 ### Starts and event fields
 
@@ -965,12 +1110,10 @@ From the event record (database table 32; `race::event_start`):
 - **Standing** (type 2): all cars held 10 s; `count3..1` and beeps over the
   last 3 s, then START and `count_s`. Type 1 holds 4 s.
 - **Rolling** (type 3 races): every car leaves its grid slot at 80 km/h
-  (`sim::Vehicle::spawn_moving`: gear and rpm matched, no spawn hold), no
-  countdown; the computer drives the player's car for 300 frames (5 s), then
+  (the race's moving start: gear and rpm matched), no countdown; the computer drives the player's car for 300 frames (5 s), then
   START and `count_s` at the hand-over, and the race music starts there (`rolling_runup()`).
-- **Grid** (physics §9): standing starts place every car with
-  `Vehicle::reset` (no spawn hold; that is only for respawns and pit
-  starts), its nose on the slot point (moved back by the front extent).
+- **Grid** (physics §9): standing starts place every car at rest, its nose on the
+  slot point (moved back by the front extent).
   Flying starts sit on the racing line (game line 6) at -distance, heading
   along the line's next 10 m.
 - **Grid order**: player last. Arcade: opponents in draw order. GT mode: ranked by
@@ -988,8 +1131,6 @@ From the event record (database table 32; `race::event_start`):
   start/finish line" 2 s later, then "Press START button to end session", 3 s each, in the
   event display. Live runs only. `GT3R_RACE="tt_event=L0A0006"` runs one; the log says
   "Race: flying start signal at <t> s (count_s)".
-- Replays store the start speed (format v4), so rolling and flying runs
-  re-simulate exactly.
 - Time-limited races, like every race of 10 laps or more, use the endurance HUD layout
   (Total, Best, the lap-time list, Lap; "Lap n" without a total); no time remaining is shown.
 
@@ -999,7 +1140,7 @@ From the race workstream's research (presentation §B, `result1.pmb`,
 `qm_*.pmb`):
 
 - **Start**: `count3..1` images 1 s each with `count_d` beeps, `start` image
-  and `count_s` at the green light (cars held; physics' spawn hold places them).
+  and `count_s` at the green light (cars held by the race's start hold).
 - **Finish**: the `finish` image for 4 s, top edge at y 160. After the finish
   the game drives the player's car (auto drive). 2P: no finish message (the
   half shows AUTO DRIVE, then the results panel; see "2P battle" above).
@@ -1061,7 +1202,7 @@ From the race workstream's research (presentation §B, `result1.pmb`,
   flag 0x100 (all but the championship menus) is EXIT at once (SE `return`;
   `QuickMenu::tick`, test `race_quick_menu_cancel`). Every item works:
   - Retry / Start, Replay (returns to the quick menu at its end), Save
-    replay / ghost, Load ghost (with "Update Ghost?" when one is loaded).
+    replay, Save ghost (the visit's best run), Load ghost (at once; see "Ghost").
   - Demonstration: the computer drives the course from the TV cameras;
     Cross/Start/Circle return; REPLAY is disabled after it (its run replaced the last one in
     the original); the player's run stays the one save uses.
@@ -1089,8 +1230,8 @@ From the race workstream's research (presentation §B, `result1.pmb`,
 ## 2-player battle
 
 Arcade "2 Player Battle" (or `GT3R_RACE="p2=1,car2=<label>"`): both cars in
-one `sim::World` with car contact; player 2 uses pad 2 (R1 camera,
-Select respawn), its own camera, rumble and engine note. Layout as GT3's
+one race with car contact (the exact core's split-screen battle); player 2 uses pad 2 (R1 camera),
+its own camera, rumble and engine note. Layout as GT3's
 16:9 option: side by side, each 3D view letterboxed to (x0, H/6, W/2,
 8H/11); per-half HUD of racemode 8 (426.667x448 units): rank ("1st".."12th" at
 80 %), lap count (pushed right like every lap count: x 310 + 106.667) and
@@ -1105,9 +1246,8 @@ horizontal is the PS2's 4:3 layout, player 1 on top, each half a 640x224
 racemode-7 HUD (text at 70 %); vertical is side by side; auto follows the
 Options' wide mode (top / bottom with it off, side by side with it on).
 
-2P races are recorded: replay format v3 adds player 2's car and inputs (and
-kind-2 respawn events); playback re-runs both cars and the final position
-matches.
+2P races are recorded like every race (the race record keeps both players' pad frames); playback
+re-runs both cars and ends where the race ended.
 
 ## Race sounds
 
@@ -1124,14 +1264,14 @@ table):
   = the view's channel gain x the wheel's slip intensity
   (`VehicleTelemetry::smoke`, unclamped; the kerb formula on kerbs); pitch =
   Doppler x `VehicleTelemetry::skid_pitch` (the second curve set,
-  `model::skid_pitch`); road roar from tyre width and rim speed, silent 6
+  physics §8.3c); road roar from tyre width and rim speed, silent 6
   steps after a wheel leaves the ground. Each voice sits at its wheel seen
   from the camera (`place_voice`: min(1, 32/d), cos/sin pan) and sends the
   stealing priority 255 (1 - min(1, gain)) every step (`LoopEffect`,
   `VoiceMixer::set_priority`), so a loud squeal is never stolen and far,
   quiet loops give way. Opponents use the other-car gains; replays and the
-  TV camera the "other camera" column for every car. Stand-in cars without a
-  simulation estimate the slip words from their state.
+  TV camera the "other camera" column for every car. A car without telemetry
+  (an online remote car's pose) is silent here.
 - Collisions (the followed car only; GT3 reads no other car's hits): the
   strongest hit of the step, wall |j|/50000 -> `clash`, car-car |j|/7500 ->
   `clash2` (both cars of a pair; `clash3`, objects, is not played); clamped to 1,
@@ -1205,10 +1345,42 @@ draw from it.
 
 ## Ghost
 
-The best lap of the session is replayed as a translucent car
-(`DrawItem::alpha` 0.4) in step with the current lap clock. On starting a
-time trial, saved replays of the same course and car (newest 10) are scanned
-and the fastest lap is re-simulated into the initial ghost.
+The original's ghost rules (presentation §G11), drawn as a translucent car (`DrawItem::alpha`
+0.4) in live runs only. The ghost is a car of the exact race (see "Ghosts on the exact core"
+under "Replays"); which runs have one (`RaceScreen::whole_run_ghost`, `lap_ghost`, by
+`run_kind`):
+
+- **Licence tests, time trials, machine tests: the best run.** After the run `solo_run_ghost`
+  keeps the run's race record as the best run (`best_run_record_`, `best_run_time_`,
+  `best_run_replay_`) when it set the session record (`run_session_record_`), and gives the
+  ghost the best run when the run's time (`ghost_run_time`) beats the ghost's or there is none
+  (`race::replaces_ghost`). A recording of 36,000 steps or more keeps nothing (and clears the
+  session record). The next run has the ghost record's car 0 as its ghost car
+  (`ExactFieldOptions::ghost`), drawn from the race (`exact_ghost`; not while the computer
+  drives it).
+- **Free runs: the best lap.** The free run keeps its own recorders for the visit
+  (`exact_free_run_`, `sim::exact::SoloRecorders`: the record memory with the lap recording, the
+  best lap's store and the ghost's playback; the visit takes the field's as each run ends), as
+  GT3's free run promotes a better lap itself; the race's ghost car plays the ghost's store.
+- **The Ghost option** (`ghost_on_`, `SoloRecorders::ghost_option`): on, the ghost is replaced at
+  once (a free run's lap by its lap handlers); off, `ghost_ask_` opens "Update Ghost?"
+  (`ghost_dlg`) on the next quick menu once its root page can take the popup (a free run's: when
+  a lap beat the ghost, race info + 0x48 left set), and YES calls `take_best_run_ghost` (a free
+  run's best lap store becomes the ghost's: `exact_best_lap_to_ghost`).
+- **Select**: the menu pad's Select flips `ghost_shown_` (the visit's).
+  `GT3R_RACE="ghost=0"` turns ghosts off (screenshots).
+- **LOAD GHOST** (`load_saved_ghost`, at once): the newest ten saved replays of the course and
+  car that can play on this disc; a whole-run mode takes the fastest run of the same kind and
+  start (`Replay::start`, `start_speed`) as the next run's ghost record; a free run plays the
+  fastest saved free run headless to its end (`solo_recorders_of`) and takes its best lap's store
+  as the visit's ghost (`SoloRecorders::ghost_from_best`; the live run's too, `exact_ghost_from_best`). **SAVE GHOST** writes `best_run_replay_`.
+- No ghost is loaded when a visit starts, and no "GHOST" time is drawn.
+- Best in these runs is the visit's best (`best_splits_`): `RaceScreen::hud_data`.
+
+Test `exact_replay_ghost` (the ghost car equals the first run's car 0 on every step of that
+run). Not compared with the original on screen: how translucent the ghost is, and the in-car
+view during a standing start, where the ghost stands around the camera (the original draws it
+there too).
 
 ## Audio ambience and music
 
@@ -1261,10 +1433,8 @@ GT3R_RACE="course=trialmt,car=r34_gtr_v_99,cam=0,auto=1,warp=20" \
 |---|---|
 | `course`, `car` | course label / car label or model id; skips the selection |
 | `cam` | 0 chase, 1 far chase, 2 bumper, 3 roof, 4 free orbit (`oyaw`, `opitch`, `odist`), 5 replay (TV) |
-| `auto=1` | auto-drive: steers to the centre line 9 m + 0.12 s·v ahead, speed from the curvature ahead (7 m/s² lateral, 6 m/s² braking), own gear changes, respawns when progress stalls 4 s |
+| `auto=1` | autopilot: the race's own AI drives the player's car (the race's configuration 3: the same driver as the CPU cars, its line, pit stops and gearbox) |
 | `warp=N` | simulate N seconds before the first frame |
-| `at=M`, `atkmh=V` | time trial: start on the racing line M metres past the start line, moving at V km/h (default 150); for screenshots of a given place |
-| `turn=D` | standing start turned D degrees about +Y (e.g. 180: facing back down the straight; lighting comparisons) |
 | `mt=1` | manual gearbox |
 | `pause=1` | open the pause menu |
 | `hud=0`, `perf=1` | hide HUD / show the performance line |
@@ -1273,22 +1443,26 @@ GT3R_RACE="course=trialmt,car=r34_gtr_v_99,cam=0,auto=1,warp=20" \
 | `watch=1`, `rwarp=N` | after `warp`, play the run back (and skip N s into it) |
 | `save=1` | save the run's replay after `warp` |
 | `replay=<file>|last` | watch a saved replay |
-| `ghost=0`, `music=0` | no saved-replay ghost / no race music |
+| `ghost=0`, `music=0` | no ghost / no race music |
 | `event=<label>` | race against the event's field (start type, laps, cars, time limit from the record) |
 | `p2=1`, `car2=<label>`, `split=h\|v` | 2P battle, player 2's car, split layout |
 | `laps=N`, `quick=1`, `qm=<item>` | time trial lap count; open the quick menu after the finish; choose an item |
 | `exit_laps=N` | the live run ends as the pause menu's Exit once it has N laps (screenshots of a free run's record and name entry) |
 | `demo=1` | start the demonstration (licence: the disc's demo run) |
 | `theater=<event>` | the Replay Theater's Demonstration of an event (AT010001 .. AT100001, L0B0001 ...) |
-| `script=thr:1@0;steer:-0.3@4` | scripted player input (steer / thr / brk set at times in seconds) |
-| `pit=1` | auto-drive takes the pit lane at the next entry (pit stop test) |
+| `script=thr:1@0;steer:-0.3@4` | scripted player input (steer / thr / brk set at times in seconds; `rev:1` / `rev:0` the reverse request, as the back input with the automatic's brake driving it: e.g. `brk:0.6@5;rev:1@5`) |
 | `hudmode=<n>`, `ritems=<bits>` | draw the HUD in layout n (`race::HudMode`: 1 endurance, 6 free run, 13 free practice, ...); replays: these ITEM bits (not stored) |
 | `rcam=<n>` | replays: watch from camera mode n (as `cam`; 2 the in-car view) instead of the replay cameras |
 | `rmode=<n>`, `rtarget=<n>` | replays: REPLAY OPTIONS view mode 0..3 and its TARGET 0..2 (not stored); with `watch=1` set before `rwarp` |
 | `tt_event=<label>` | time trial on the event's course with its start (flying starts of licence tests / time attack) |
 | `gpusync=1` | wait for the GPU after the 3D pass so "scene draw" includes GPU time |
 
-`GT3R_RACE_DEBUG=1` logs vehicle telemetry twice a second.
+`GT3R_RACE_DEBUG=1` logs vehicle telemetry twice a second. `GT3R_RACE_TRACE=<file>` writes one
+line per race step with the player's car after it (`L` live / `R` replay, the ticks simulated, the
+driver kind, position and orientation as hex floats, the speed), to compare a run with its replay
+tick by tick: e.g. `tt_event=AT020001,script=thr:1@0,warp=30,save=1,quit=1`, then
+`replay=last,warp=31,quit=1` (licence tests on their own layouts: add `tt_event=` to the replay's
+preset too, which lists the course).
 
 ## Touch controls
 
@@ -1317,8 +1491,10 @@ rank takes the map with it. Desktop check: a portable copy of the app with
 
 ## Licence tests
 
-`race/license.*` (rules), `screen_race_license.cpp` (flow). Facts from the original's
-behaviour (presentation §A):
+The race judges a licence test itself: the exact core's licence conductor (its clock, ends,
+failures and result words, `sim/exact/race_flow.*`); `screen_race_solo.cpp` reads the result
+(`solo_run_ended`), `race/license.*` keeps the run's state, medal times and failure text for the
+screen, `screen_race_license.cpp` the flow. The rules (presentation §A):
 
 - Event fields: +0x19A kind (1 stop test, 2 section, 3 lap(s)), +0x199 laps,
   start type +0x1F3 (1 = standing, 240-frame hold; 3 = flying), gold /
@@ -1343,9 +1519,10 @@ behaviour (presentation §A):
   course's goal distance (GTRW header +0x1C) with the lap counter >= 1, f from the
   progress before / after. Kind 3 on the line crossing whose old lap counter equals the
   laps (+0x199): one clock difference, not a sum of lap times. The HUD time is the same
-  clock - start (tests `race_license_run_rules`, `race_license_clock_timing`).
+  clock - start.
 - **Failures** (immediate): all four wheels on grass / gravel / sand
-  (materials 2, 3, 4, 6), all four on the pit lane (flag 0x01), a wall hit
+  (materials 2, 3, 4, 6) except on a dirt course (course table +0x08 = 2, the
+  rally tests; R-3's run-up starts on a grass patch, public issue 18), all four on the pit lane (flag 0x01) inside the pit span (below), a wall hit
   changing the speed by more than 10 m/s, and **any touch of a pylon**
   (failure "pylon"; no threshold, also on a cone at rest). Wrong way, car contact,
   stopping and time never fail. There is no stop-box overrun rule: B-1 / B-2's row
@@ -1356,6 +1533,18 @@ behaviour (presentation §A):
   `race_hud_time_format`). After a finish the HUD shows the recorded time, frozen.
   Time trial stops the car on a pylon hit too (the same failure bit as a wall hit)
   and its HUD Time then shows the run's best lap, or dashes.
+- **The pit lane** (physics §11) fails only inside the course's **pit span**: four grounded
+  wheels on flag 0x01 while the car's track distance as the step began lies strictly between the
+  pit stop line's (game line 4, file AI line 3) points 1 and n - 2, both sides compared
+  lap-unwrapped as the AI keeps them (the points from the first one in the first half of the lap
+  on have a lap added; the car's distance has one added in the first half). No line 4, or fewer
+  than 6 points on it: the pit lane never fails. On the US disc 28 of the 46 licence courses
+  carry a stop line (12 points; montecarlo 13) and 18 none (the circles, slaloms, test course,
+  rally courses, L_midfield3, L_seattle3). Two quirks follow from the rule: L_akasaka2's (IA-1)
+  stop line starts before half a lap and its point 1 lies past it, so every point has a lap
+  added and no distance is ever inside; L_rome1's (IA-6) span ends at half a lap. A dirt course
+  does not switch the rule off (none of them has a stop line). Time trials share the rule
+  ("Course-out; no respawns").
 - **Pylons** (`race/pylons.*`, docs/formats/course.md "Rigid bodies"): created in every
   race mode on courses that have them and reset on every run / retry; asleep while
   three hull points rest on the ground; awake bodies tumble (torque-free rotation,
@@ -1363,8 +1552,8 @@ behaviour (presentation §A):
   point bouncing with restitution 0.25 (0 under 0.9 m/s) and friction 0.5). Each car's
   box (front / rear extent, half width, 1 m high, sides leaning in 5 %) pushes a body
   out through its nearest face and hits it (restitution 0.01, inertia x 1.5); the car
-  itself feels nothing. A touch by the player's car fails a licence and stops a time
-  trial (test
+  itself feels nothing. A touch by the player's car is reported to the race as a hit (the
+  conductor's rigid-body hit), which fails a licence and stops a time trial (test
   `race_pylons_disc`). Awake bodies then meet the course walls (GTRW wall points; sensor edges
   skipped; edges within 8 m of the motion): the centre against each edge in x/z with the type's
   radius (+0x90): overlapping (foot strictly inside the edge, distance < r) puts the centre r
@@ -1381,9 +1570,12 @@ behaviour (presentation §A):
   shadows join into a dark band along the row.
 - **Medal**: time in ms (rounded) <= target, gold first; slower than bronze =
   no prize. `GameResult::license_medal` (-1 none / failed, 0 gold, 1 silver,
-  2 bronze), `failure` ("course_out", "pit_lane", "wall") and `total_time`.
+  2 bronze), `failure` ("out of the course", "over the times") and `total_time`.
 - **HUD**: Best, the elapsed Time and the three targets with the
-  `mark_1st/2nd/3rd` icons at (615, 140 / 168 / 196); no lap or position.
+  `mark_1st/2nd/3rd` icons at (615, 140 / 168 / 196); no lap or position. Best is the visit's
+  best judged time, medal or not (`best_splits_`, which `rank_finish` feeds), dashes until a
+  run reaches the end, kept across retries; never the lap timer's laps.
+- **Ghost**: the visit's best run (see "Ghost").
 - **Result** (presentation §A4; `LicenseResultOverlay`): the live race keeps
   running behind it (the car under the stop driver, the race camera, the HUD; no FINISH
   message). Frames from the result: wait 6, a black dim 0 -> 1/3 over 30 frames, the medal
@@ -1412,8 +1604,8 @@ behaviour (presentation §A):
   (`LapTimer::crossing_ms`, the lap timer's unwrapped distance); the time to the
   goal is `total_time` for M400 / M1000, MMAX records its top speed. The HUD
   (the original's machine-test layouts): no lap count, the map at the top; M400 /
-  M1000 "Best" (dashes, then the goal time) and "Time" (from GO, then the goal
-  time); MMAX two speed lines instead, "Record" (always dashes: the original
+  M1000 "Best" (the visit's best time to the goal: dashes until the first) and "Time" (from
+  GO, then the goal time); MMAX two speed lines instead, "Record" (always dashes: the original
   never sets it) and "Best" (the highest speed so far, `Hud::speed_text`), and
   no pop-ups or WRONG WAY.
   `GameResult::top_speed_kmh` = the run's best speed until its finish (every
@@ -1432,25 +1624,27 @@ behaviour (presentation §A):
   licence tests, 10 arcade time attacks) are the game's replay saves of the
   demonstration drive: controller input, re-simulated on playback (format in
   `demo_replay.h`; steering +-4096, positive = left; frame 0 = the race's
-  first step, countdown included; the car record says AT/MT). The licence
-  menu's preview box is no movie: the original runs the demo live behind the
-  menu and draws the scene into (32, 58, 280, 210); we do the same (looping,
-  TV cameras, silent), and "Demonstration" runs it full screen. Our physics
-  is not bit-exact with the original, so the open-loop run drifts (e.g. B-3
-  leaves the road after ~30 s); once two wheels are off the road or the run
-  would fail the test (not during a flying start's run-up) the AI driver
-  takes over (`ai::AiDriver`, the run-up's built-in set; before, the debug
-  autopilot, and in the Replay Theater nothing).
+  first step, countdown included; the car record says AT/MT). A demonstration
+  is played as a replay of its race record (`race::demo_record`): the race GT3's
+  replay playback builds from the save (race replay information: the event under the licence or time
+  trial conductor, the header's car record as the race entry as the program loads it: equipment,
+  condition words, grid slot, pedal style, spec flag, wheel type, ASM, TCS; the start type as
+  the race's start-up sets it: the event's +0x1F3, the time trial's start type the moving start 3) and car
+  0's frames as the input device's recorder hands them to the pad read (the recording's
+  T - 1, then empty frames; the stream read on past its block as the game's reader does). The race
+  judges it and drives its end itself, and every demo plays as it does in the game: 7 of them end on
+  the time the save records (A-1, A-2, A-3, A-7, B-1, B-2, IB-4); several within a few ms (A-6, A-8,
+  B-6, R-1, IA-2); the rest, the arcade time attacks among them, leave the course in the game too
+  (course-outs from 3 to 22 s after the line): the saves were recorded on a build whose race differs
+  from the release's (the Japanese disc's data, same files, gives the same results). The licence
+  menu's preview box is no movie: GT3 runs the demo live behind the menu and draws the scene into
+  (32, 58, 280, 210); we do the same (looping, TV cameras, silent), and "Demonstration" runs it full
+  screen. Test `exact_demo_records`.
   `GT3R_RACE="tt_event=L0B0003,demo=1"` starts it, `theater=<event>` as the
-  Replay Theater does. Findings for the arcade time-trial demos (AT01..AT10):
-  their start (event speed 100..220 km/h, -100..-399 m on line 6) matches
-  the licences'; GT3 drives every flying run-up (licence, time trial, free
-  run with a distance) with the CPU AI path until the line (physics §9.1), which we
-  did for licences only, and the theater used the event car (racing tyres on
-  the dirt AT08 / AT09). With both fixed the runs still leave the road
-  (first failure 3-22 s after the line; changing the frame alignment by
-  -16..+4 frames moves it, no offset fixes it): the open-loop drift of our
-  physics at 150-250 km/h, so the takeover applies to them too.
+  Replay Theater does. The arcade time-trial demos (AT01..AT10) start like the
+  licences (event speed 100..220 km/h, -100..-399 m on line 6); GT3 drives every
+  flying run-up (licence, time trial, free run with a distance) with the CPU AI
+  path until the line (physics §9.1).
 
 ## GT-mode flow around a race
 
@@ -1475,12 +1669,15 @@ behaviour (presentation §A):
   with the disc's demonstration in the preview box; menu launches with `GT3R_RACE`
   set skip it unless `qm=` is given): Start, Free run (the
   course alone without laps; Exit in the pause menu returns to this menu),
-  Setting (GT mode's car settings screen; the car is rebuilt from
-  `gt_ride_car_spec()` when it closes), Option, Exit.
+  Setting (GT mode's car settings screen; the race is rebuilt with the ride car's parts and
+  settings when it closes), Option, Exit.
 - Bought wheels (`GameRequest::car_wheel`): the car model is loaded with
   `wheel/<label>` as its wheel.
-- Title attract demo (`attract_demo`): all cars computer-driven from the
-  event (demo events start every car at their +0x198 speed, no countdown),
+- Title attract demo (`attract_demo`): an AI race, as GT3's: the demo event's cars all drawn from
+  its pool (the demo has no player car), run with the race's play kind 2 as the race-flow byte
+  (`ExactFieldOptions::config` 2, what GT3's demo runner passes: every car, slot 0 too, is a CPU
+  car, the event's overrides varied by grid slot, no records); demo events start every car at
+  their +0x198 speed, no countdown,
   TV cameras, no HUD; any button ends it (finished = false), else it ends
   after 1800 steps (30 s, the attract demo's timer) or 5 s after the finish. Its replay
   view is picked per demo (`race::pick_attract_view`, `attract_view_`): mode 0 MANUAL, mode
@@ -1489,60 +1686,37 @@ behaviour (presentation §A):
 ## Pit stops and tyre wear
 
 - **Wear** (physics §8): endurance events carry the wear bytes
-  (+0x1BD..+0x1C3); single-player races on non-dirt courses turn it on for
-  every car (`FieldConfig::wear` -> `Vehicle::set_tire_wear`).
+  (+0x1BD..+0x1C3); the race configuration turns wear on as the game does.
 - **Tyre gauge**: `tire_gage` at (20, 435), each tyre body (alpha codes
   5/10/15/20 in GS units) in the colour of its wear level (-63..127: blue,
   green, yellow, orange, red; black <= -64), outlines dark grey. Shown when
   wear is on.
-- **Pit lane** (`race/pit.*`, physics §8.6, ai §13): markers are the points of AI
-  line 4 (file line 3); entry at its point 1 on the pit surface -> AUTO DRIVE.
-  `race::PitLane` is only the state machine; the car is driven by an
-  `ai::AiDriver` (the player's: the course's set for the car's class) on the
-  line the state asks for: the pit lane line (3) from the entry, held at the
-  set's pit speed + 2 km/h (78 or 80 km/h + 2 on the disc) between stop-line
-  points 2 and N - 3; 25 m before the box (point N - 4 for the player) it drives
-  through (still on line 3, driver kind 4) when the race is over, no tyre is
-  used or at >= 100 km/h, otherwise it takes the stop line (4) at 20 km/h and
-  stops in the box (`Vehicle::begin_pit_stop`: 5 s, tyres at 1 s; held with the
-  brake). It leaves on line 3 0.5 m past the box and hands back at point N - 2,
-  blending back to the main line. The AI's inputs are recorded, so replays re-run
-  the stop. HUD: "AUTO DRIVE" and "<car> Pitting in..." (green, (320, 130), 3 s).
-- **CPU cars** (ai §13): with wear on, a car is armed when the physics
-  sets "tires worn" (a wheel's wear grip below 0.91) and enters at its next
-  pass of stop-line point 0 (not on its last lap); then the same lane, stop
-  (box point N - 4 - n) and exit, driven by its own AI driver, without rubber
-  band. "<car> Pitting in..." for every car. Measured (`ai_cpu_pit_stop_disc`,
-  Trial Mountain): 80.6 km/h at the stop decision, about 19 km/h into the box.
-- `GT3R_RACE="...,pit=1"`: the test autopilot follows the pit lane line from
-  250 m before the entry, so it reaches the entry marker on the pit surface
-  like a player would, and stops.
+- **Pit lane** (physics §8.6, ai §13): the race's own pit lane (the exact core's pit lane state
+  machine and the AI's pit switches, `sim/exact/pit_lane.h`, `tick_pit.cpp`): markers are the
+  points of AI line 4 (file line 3); entry at its point 1 on the pit surface -> AUTO DRIVE; the
+  race's AI drives the car (driver kinds 2-4) through the lane, the stop in the box (new tyres)
+  and back to the main line. HUD: "AUTO DRIVE" and "<car> Pitting in..." (green, (320, 130), 3 s).
+- **CPU cars** (ai §13): with wear on, a car is armed when the race sets "tires worn" and enters
+  at its next pass of the stop line's first point (not on its last lap); then the same lane, stop
+  and exit. "<car> Pitting in..." for every car.
 
-## Course-out and respawns (physics §11)
+## Course-out; no respawns (physics §11)
 
-- The original never respawns or resets a car. **Course-out** is a flag in
-  Time Trial and License only: all four (grounded) wheels on grass / gravel /
-  sand (materials 2, 3, 4, 6), or a wall hit with a speed change above
-  10 m/s (car-car hits never count). The lap is not recorded, FAIL is shown
-  and the car is braked to a stop; then the quick menu (Retry). Arcade time
-  trials and the race screen's own time trial apply it; free runs do not.
-  `race::course_out()` is shared with the licence judge.
-- `[race] respawn = off | cpu | all` (default `cpu`) controls the
-  non-original fail-safe: `cpu` puts a CPU car that is lost or has made no
-  progress for 12 s back on the track (races only; `ai::SafetyRespawn`, the
-  same rule as `ai::AiRace`'s: 12 s from GO, the centre line with the spawn
-  hold, the pits not counted); `all` also respawns the
-  player's car after 8 s off the road; `off` never.
-- **After the run** (ai §1, physics §9.4): the player's car is handed to the AI.
-  After a race, time trial or machine test it drives on along the main line
-  (driver kind 1) at 80 % corner speed and half throttle (CPU finishers get the
-  same slowdown); after a failed licence test or time trial (course-out, wall)
-  it stops with the wheels straight (kind 7); after a stop or section licence
-  test it stops along the main line (kind 6); once still it is parked (kind 8:
-  brake off, clutch request 0 so the clutch opens and stays open, held in place). Replays store kinds 1, 5-7 and 8 per tick. Falling out of the world
-  (NaN or 50 m below the course) always resets the car, and the test
-  autopilot (`auto=1`) keeps its 4 s stuck respawn. The player's manual
-  respawn (Select) and Restart/Retry stay.
+- GT3 never respawns or resets a car, and neither does the game: no player respawn, no CPU
+  respawn, no fail-safe. **Course-out** is the race's own rule in Time Trial and License only
+  (the exact core's race flow): all four (grounded) wheels on grass / gravel / sand (materials 2,
+  3, 4, 6; never on a dirt course, course table +0x08 = 2: arcade time trials 8 and 9, the rally
+  tests), or a wall hit with a speed change above 10 m/s (car-car hits never count), or a pylon
+  touch. The lap is not recorded, FAIL is shown and the car is braked to a stop; then the quick
+  menu (Retry). Four grounded wheels on the pit lane inside the course's pit span fail too (the
+  span as in "Licence tests", "The pit lane"). Free runs have no course-out.
+- **After the run** (ai §1.1, physics §9.4): the race hands the player's car to its AI. After a
+  race, time trial or machine test it drives on along the main line (driver kind 1) at 80 %
+  corner speed and half throttle (CPU finishers get the same slowdown); after a failed licence
+  test or time trial (course-out, wall) it stops with the wheels straight (kind 7); after a stop
+  or section licence test it stops along the main line (kind 6); once still it is parked (kind 8:
+  brake off, clutch request 0 so the clutch opens and stays open, held in place). Replays play the
+  same: the race decides the kinds again. Restart / Retry stay.
 
 ## Original resolution and field of view
 

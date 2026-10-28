@@ -3,8 +3,9 @@
 // Point-light courses (night: Special Stage Route 5 / 11 and the circle tests; GTRW byte +0x21
 // = 1). GTRW +0x58 count, +0x5C offset of 0x20-byte lamp records {u32 type n (Env0 car-light
 // record n gives colours, attenuation and spot), vec3 spot axis, vec3 position, f32 kind (0
-// directional, else point)}. The road vertices' attribute A holds the nearest lamp's index.
-// Each car is lit by up to four lamps chosen from the nine around that index, by weight
+// directional, else point)}. The road vertices' attribute A holds the nearest lamp's index
+// (a signed 16-bit value: 0xFFFF = -1 on the strip at the start line, between the last lamp and
+// lamp 0). Each car is lit by up to four lamps chosen from the nine around that index, by weight
 // w = 1 / (c0 + c1 d + c2 d^2) (x max(r.axis, 0)^exp with a spot cutoff), as directional lights
 // along car -> lamp with the record's colours x w; node 1 casts a shadow away from each.
 
@@ -48,13 +49,22 @@ struct ReflectionDisc {
     float sqrt_w = 0, size = 0;      // sqrt of the lamp weight, record +0x40 (metres)
 };
 
+// The lamp index a road attribute A names: A as a signed 16-bit value (0xFFFF = -1).
+inline int lamp_index(u16 raw_a) { return int(s16(raw_a)); }
+
+// The first of the nine candidates around lamp index `hint` of `n` lamps: hint - 4, plus n when
+// negative (the disc's indices are -1..n - 1); the scan then wraps from n - 1 to 0.
+int first_candidate(int hint, int n);
+
 class CoursePointLights {
 public:
     // `gtrw` = course file slot 28. Inactive (day course) when byte +0x21 is 0.
     void load(ByteSpan gtrw);
     bool active() const { return active_ && !lamps_.empty(); }
     const std::vector<CourseLamp>& lamps() const { return lamps_; }
-    // Up to four lamps for a car at `p` whose front-left wheel is over lamp index `hint`.
+    // Up to four lamps for a car at `p` whose front-left wheel is over lamp index `hint`
+    // (lamp_index of the wheel's road attribute A; a car keeps its last one while the wheel
+    // finds no road).
     std::vector<SelectedLamp> select(const SunParams& env, const render::Vec3& p, int hint) const;
     // The reflection map's discs for a car at `p`: of the same nine candidates sorted by weight,
     // the first six point lamps (kind != 0; weight-0 ones still take a slot, invisible).

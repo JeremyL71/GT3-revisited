@@ -1,4 +1,4 @@
-// Course viewer: course scenery (GTM1) from courses/<REGION>/<name>, with the
+// Course viewer: course scenery (GTM1) from the disc region's course file, with the
 // AI racing line and the road centre line drawn as ribbons on the road.
 
 #include "app/app.h"
@@ -29,13 +29,11 @@ scene::Model load_course_model(App& app, size_t i) {
     Vfs* vfs = app.vfs();
     if (!vfs) throw FormatError("no disc loaded");
     std::string name = kCourses[i];
-    for (const char* region : {"US", "JP", "UK", "EU"}) {
-        std::string path = std::string("courses/") + region + "/" + name;
-        if (auto data = vfs->read(path)) {
-            course::CourseModelOptions opt;
-            opt.ai_lines = true;
-            return course::build_course_model(*data, opt, name);
-        }
+    std::string path = course_file_path(*vfs, name);
+    if (auto data = path.empty() ? std::nullopt : vfs->read(path)) {
+        course::CourseModelOptions opt;
+        opt.ai_lines = true;
+        return course::build_course_model(*data, opt, name);
     }
     throw FormatError("course not found: " + name);
 }

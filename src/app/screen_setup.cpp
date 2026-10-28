@@ -353,8 +353,8 @@ public:
         ui.text(S.x + 12, ty, "Disc", colors::kDim);
         std::string extra = d.serial + "  v" + d.version + "  " + d.video;
         const float ex = S.right() - 12 - Ui::text_width(extra);
-        ui.text(S.x + 12 + 48, ty, Ui::elide(d.description, ex - S.x - 72),
-                d.verified ? colors::kGood : colors::kAccent);
+        ui.text(S.x + 12 + 48, ty, Ui::elide(d.problem.empty() ? d.description : d.problem, ex - S.x - 72),
+                !d.problem.empty() ? colors::kBad : d.verified || d.reported ? colors::kGood : colors::kAccent);
         ui.text(ex, ty, extra, colors::kDim);
         y += line_h + 6;
 

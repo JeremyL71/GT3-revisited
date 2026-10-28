@@ -155,7 +155,9 @@ bool GpuModel::stage(const Upload* uploads, int count) {
         SDL_UploadToGPUBuffer(cp, &src, &dst, true);
     }
     SDL_EndGPUCopyPass(cp);
-    return SDL_SubmitGPUCommandBuffer(cmd);
+    if (!SDL_SubmitGPUCommandBuffer(cmd)) return false;
+    note_gpu_submits(device_, 1); // staging_ is this model's own: no new transfer buffer
+    return true;
 }
 
 bool GpuModel::update_vertices(const std::vector<scene::Vertex>& all) {

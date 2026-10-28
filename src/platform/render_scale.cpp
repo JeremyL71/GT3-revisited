@@ -17,7 +17,12 @@ std::optional<float> parse_render_scale(std::string_view value) {
     char* end = nullptr;
     float v = std::strtof(s.c_str(), &end);
     if (end == s.c_str() || !std::isfinite(v)) return std::nullopt;
-    return std::clamp(v, 0.5f, 1.0f);
+    return std::clamp(v, 0.5f, kMaxRenderScale);
+}
+
+float supersample_limit(float pixel_w, float pixel_h) {
+    if (!(pixel_w > 0) || !(pixel_h > 0)) return 1.0f;
+    return std::clamp(float(kMaxTargetSide) / std::max(pixel_w, pixel_h), 1.0f, kMaxRenderScale);
 }
 
 float auto_render_scale(int pixel_w, int pixel_h, bool mobile) {

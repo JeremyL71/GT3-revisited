@@ -1,8 +1,12 @@
 package org.gt3revisited.gt3r;
 
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
+import android.provider.DocumentsContract;
+import android.provider.OpenableColumns;
 import android.util.Log;
 import android.view.DisplayCutout;
 import android.view.RoundedCorner;
@@ -63,5 +67,46 @@ public class GT3Activity extends SDLActivity {
             }
         }
         return out;
+    }
+
+    /**
+     * Called from native code (src/platform/user_files.cpp): shows the user data folder in the
+     * system Files app through GT3DocumentsProvider, at the folder `relPath` inside it ("" for
+     * the folder itself) on Android 8 and later (the Files app finds it with findDocumentPath),
+     * else at its GT3 Revisited entry. False when no app could open it.
+     */
+    public boolean openUserFolder(String relPath) {
+        String authority = GT3DocumentsProvider.authority(this);
+        String root = GT3DocumentsProvider.ROOT_ID;
+        Intent folder = new Intent(Intent.ACTION_VIEW);
+        folder.setDataAndType(DocumentsContract.buildDocumentUri(authority, relPath.isEmpty() ? root : root + "/" + relPath),
+                              DocumentsContract.Document.MIME_TYPE_DIR);
+        Intent top = new Intent(Intent.ACTION_VIEW);
+        top.setDataAndType(DocumentsContract.buildRootUri(authority, root), DocumentsContract.Root.MIME_TYPE_ITEM);
+        Intent[] tries = Build.VERSION.SDK_INT >= 26 ? new Intent[] {folder, top} : new Intent[] {top};
+        for (Intent i : tries) {
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            try {
+                startActivity(i);
+                return true;
+            } catch (ActivityNotFoundException | SecurityException e) {
+                Log.i("GT3R", "No app opens " + i.getData() + ": " + e);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Called from native code (src/platform/user_files.cpp): the name of a file picked in the
+     * file dialog (a content:// URI, which itself often holds only a document number); null
+     * when its provider does not say.
+     */
+    public String uriDisplayName(String uri) {
+        try (Cursor c = getContentResolver().query(Uri.parse(uri), new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst() && !c.isNull(0)) return c.getString(0);
+        } catch (RuntimeException e) {
+            Log.w("GT3R", "No name for " + uri, e);
+        }
+        return null;
     }
 }

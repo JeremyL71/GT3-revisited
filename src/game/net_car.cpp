@@ -1,16 +1,21 @@
 #include "game/net_car.h"
 
 #include "game/data/car_database.h"
+#include "game/data/weight_class.h"
 #include "game/gt_mode.h"
 #include "game/gt_parts.h"
 #include "game/gt_state.h"
-#include "sim/models.h"
 #include "base/ps2_float.h"
+#include "base/sha256.h"
 #include "net/protocol.h"
+#include "race/arcade_car.h"
+#include "race/exact_car.h"
+#include "race/exact_setup.h"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 
 namespace gt3r::game {
 
@@ -64,7 +69,10 @@ Bytes encode_online_car(const OnlineCar& c) {
     } else if (c.kind == OnlineCar::Kind::Mod) {
         w.str(c.package);
         w.u32_(c.package_size);
+    } else if (c.kind == OnlineCar::Kind::Arcade) {
+        w.str(c.arcade);
     }
+    if (c.digest) w.bytes(*c.digest); // trailing: older games stop reading before it
     return w.data;
 }
 
@@ -74,7 +82,7 @@ std::optional<OnlineCar> decode_online_car(ByteSpan data) {
     if (r.u8_() != kVersion) return std::nullopt;
     OnlineCar c;
     u8 kind = r.u8_();
-    if (kind > u8(OnlineCar::Kind::Mod)) return std::nullopt;
+    if (kind > u8(OnlineCar::Kind::Arcade)) return std::nullopt;
     c.kind = OnlineCar::Kind(kind);
     c.car = r.str();
     c.name = ascii(r.str());
@@ -95,6 +103,14 @@ std::optional<OnlineCar> decode_online_car(ByteSpan data) {
                 return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
             }))
             return std::nullopt;
+    } else if (c.kind == OnlineCar::Kind::Arcade) {
+        c.arcade = r.str();
+        if (c.arcade.empty()) return std::nullopt;
+    }
+    if (r.remaining() >= 32) { // the spec digest (absent from older games' descriptors)
+        ByteSpan d = r.bytes(32);
+        c.digest.emplace();
+        std::copy(d.begin(), d.end(), c.digest->begin());
     }
     if (!r.ok() || c.car.empty()) return std::nullopt;
     return c;
@@ -105,7 +121,7 @@ OnlineCar online_car_from_db(const data::CarDatabase& db, const std::string& lab
     c.car = label;
     c.paint = paint;
     c.kind = db.mod_car(label) ? OnlineCar::Kind::Mod : OnlineCar::Kind::Disc;
-    if (const data::Car* dc = db.car(label)) c.name = ascii(dc->name.empty() ? label : dc->name);
+    if (const data::Car* dc = db.car(label)) c.name = ascii(dc->latin_name.empty() ? label : dc->latin_name);
     return c;
 }
 
@@ -120,7 +136,40 @@ OnlineCar online_car_from_garage(const data::CarDatabase& db, const GarageCar& g
     return c;
 }
 
-std::optional<sim::CarSpec> online_car_spec(const data::CarDatabase& db, const OnlineCar& c, std::string* error) {
+OnlineCar online_car_from_arcade(const data::CarDatabase& db, const std::string& arcade, u8 paint) {
+    for (const data::CarVariant& v : db.arcade_cars())
+        if (v.label == arcade && db.car(v.car)) {
+            OnlineCar c = online_car_from_db(db, v.car, paint);
+            c.kind = OnlineCar::Kind::Arcade;
+            c.arcade = v.label;
+            return c;
+        }
+    return {};
+}
+
+namespace {
+
+// The arcade car `c` names, as this machine builds it for `course`: the arcade car's parts with
+// its racing tyres (the car page's default), as the arcade races it. Its base car is the one
+// the descriptor names, or another label when the owner sent its car's digest (online_car_here
+// compares it: the lobby refuses the car where this disc builds another one).
+std::optional<race::ArcadeCar> arcade_here(const data::CarDatabase& db, const OnlineCar& c, const std::string& course,
+                                           std::string* error) {
+    std::optional<race::ArcadeCar> ac = race::arcade_car(db, c.arcade, 0, course, error);
+    if (!ac || ac->car == c.car || c.digest) return ac;
+    if (error) *error = "arcade car " + c.arcade + " is not a " + c.car;
+    return std::nullopt;
+}
+
+} // namespace
+
+std::optional<sim::CarSpec> online_car_spec(const data::CarDatabase& db, const OnlineCar& c, std::string* error,
+                                            const std::string& course) {
+    if (c.kind == OnlineCar::Kind::Arcade) {
+        std::optional<race::ArcadeCar> ac = arcade_here(db, c, course, error);
+        if (!ac) return std::nullopt;
+        return std::move(ac->spec);
+    }
     if (!db.car(c.car)) {
         if (error) *error = "no car " + c.car + " here";
         return std::nullopt;
@@ -136,6 +185,65 @@ std::optional<sim::CarSpec> online_car_spec(const data::CarDatabase& db, const O
     return s;
 }
 
+std::string online_car_base(const data::CarDatabase& db, const OnlineCar& c) {
+    if (c.kind == OnlineCar::Kind::Arcade)
+        for (const data::CarVariant& v : db.arcade_cars())
+            if ((v.label == c.arcade || v.label == "_" + c.arcade) && db.car(v.car)) return v.car;
+    return db.car(c.car) ? c.car : std::string();
+}
+
+// --- the same car on every machine ---
+
+std::optional<sim::exact::ParamImage> online_car_params(const data::CarDatabase& db, const sim::exact::ProgramData& d,
+                                                        const OnlineCar& c) {
+    namespace ex = sim::exact;
+    if (c.kind == OnlineCar::Kind::Arcade ? !race::arcade_car(db, c.arcade, 0, {}) : !db.car(c.car)) return std::nullopt;
+    sim::EngineCondition cond;
+    const race::ExactCarSource src = race::exact_online_source(db, c, {}, &cond); // (an arcade car: its road tyres)
+    std::optional<ex::Equipment> eq = race::exact_equipment(db, src);
+    if (!eq) return std::nullopt;
+    ex::ProgramData rules = d;
+    rules.set_behaviour({sim::Program::NtscU, 60}); // every online race's (docs/dev/ONLINE.md "Model")
+    ex::ConvertInputs in;
+    in.base = ex::kParams; // P's address in a race's record (the record at 0)
+    in.condition = race::exact_condition_words(cond);
+    try {
+        return ex::race_params(db, rules, *eq, 0, true, true, in);
+    } catch (const std::exception&) { // (records the builder cannot read)
+        return std::nullopt;
+    }
+}
+
+std::optional<std::array<u8, 32>> online_car_digest(const data::CarDatabase& db, const sim::exact::ProgramData& d,
+                                                    const OnlineCar& c) {
+    std::optional<sim::exact::ParamImage> p = online_car_params(db, d, c);
+    if (!p) return std::nullopt;
+    return sha256(ByteSpan(p->data(), p->size()));
+}
+
+CarHere online_car_here(const data::CarDatabase& db, const sim::exact::ProgramData* d, const OnlineCar& c,
+                        const std::function<bool(const std::string& model)>& has_model) {
+    if (c.kind == OnlineCar::Kind::Mod && !db.car(c.car)) return CarHere::ModMissing;
+    std::optional<sim::CarSpec> s = online_car_spec(db, c);
+    if (!s) // an arcade car of this disc on a base car that builds another spec: different
+        return c.kind == OnlineCar::Kind::Arcade && race::arcade_car(db, c.arcade, 0, {}) ? CarHere::Differs : CarHere::Unknown;
+    if (c.digest && d && online_car_digest(db, *d, c) != c.digest) return CarHere::Differs;
+    // The body the race draws (the base car's model).
+    const data::Car* car = db.car(online_car_base(db, c));
+    const std::string model = car ? db.model_of(*car) : std::string();
+    if (model.empty() || !has_model(model)) return CarHere::NoModel;
+    return CarHere::Ok;
+}
+
+const char* car_here_text(CarHere h) {
+    switch (h) {
+    case CarHere::Unknown: return "is not on this disc";
+    case CarHere::Differs: return "is different on this disc";
+    case CarHere::NoModel: return "has no model on this disc";
+    default: return "";
+    }
+}
+
 PowerPeak spec_power_peak(const sim::CarSpec& s, float condition) {
     const sim::EngineSpec& e = s.engine;
     const size_t n = std::min(e.curve_rpm.size(), e.curve_torque.size());
@@ -148,12 +256,23 @@ PowerPeak spec_power_peak(const sim::CarSpec& s, float condition) {
     const int last = std::max(limit, (int(e.curve_rpm[n - 1]) + 50) / 100 * 100);
     // The original's curve axis is in rad/s; look up in the same domain so float ties on a
     // flat power plateau resolve the same way.
+    constexpr float kRpmToRadS = 0.10471976f; // 2*pi/60
     std::vector<float> w(n);
-    for (size_t i = 0; i < n; ++i) w[i] = ps2::mul(e.curve_rpm[i], sim::model::kRpmToRadS);
+    for (size_t i = 0; i < n; ++i) w[i] = ps2::mul(e.curve_rpm[i], kRpmToRadS);
+    // Piecewise-linear lookup on the curve, clamped to its ends.
+    auto lookup = [&](float v) {
+        if (v <= w[0]) return e.curve_torque[0];
+        if (v >= w[n - 1]) return e.curve_torque[n - 1];
+        size_t i = 1;
+        while (i < n - 1 && v > w[i]) ++i;
+        const float span = w[i] - w[i - 1];
+        const float t = span > 0 ? (v - w[i - 1]) / span : 1.0f;
+        return e.curve_torque[i - 1] + (e.curve_torque[i] - e.curve_torque[i - 1]) * t;
+    };
     for (int rpm = first; rpm <= last; rpm += 100) {
         if (rpm > limit) continue;
-        float omega = ps2::mul(float(rpm), sim::model::kRpmToRadS);
-        float t = sim::model::table_lookup(w.data(), e.curve_torque.data(), int(n), omega);
+        float omega = ps2::mul(float(rpm), kRpmToRadS);
+        float t = lookup(omega);
         float kgfm = ps2::mul(t, condition) / 9.8f; // the looked-up torque x the condition factor
         float ps = ps2::mul(kgfm, float(rpm)) / 716.2f; // PS2 multiply (rounds towards zero)
         if (ps > best.ps) {
@@ -166,33 +285,158 @@ PowerPeak spec_power_peak(const sim::CarSpec& s, float condition) {
 
 float spec_power_ps(const sim::CarSpec& s, float condition) { return spec_power_peak(s, condition).ps; }
 
-int display_power(float ps, bool imperial) { return ps2::to_int(imperial ? ps2::mul(ps, std::bit_cast<float>(0x3F7C76F3u)) : ps); }
+int display_power(float ps, const Units& units) {
+    return ps2::to_int(units.power_hp ? ps2::mul(ps, std::bit_cast<float>(0x3F7C76F3u)) : ps);
+}
 
-const char* power_unit(bool imperial) { return imperial ? "HP" : "PS"; }
+const char* power_unit(const Units& units) { return units.power; }
 
 float geared_top_speed(const sim::CarSpec& s) {
     float r = 0;
     for (const sim::AxleSpec& a : s.axle) r = std::max(r, a.tire_radius);
     float ratio = 1e9f;
-    for (size_t g = 1; g <= s.gearbox.ratios.size(); ++g)
-        ratio = std::min(ratio, std::fabs(sim::model::total_ratio(s.gearbox, int(g))));
+    for (float g : s.gearbox.ratios) ratio = std::min(ratio, std::fabs(g * s.gearbox.final_drive));
     float rpm = s.engine.rev_limit_rpm;
     if (!(ratio > 0 && ratio < 1e8f) || r <= 0 || rpm <= 0) return 150.0f; // unknown gearing: a generous bound
     return rpm * 0.10471976f / ratio * r;
 }
 
-bool car_meets_rules(const OnlineCar& c, const sim::CarSpec* spec, bool stock_only, int max_ps, std::string* why) {
-    if (stock_only && c.kind == OnlineCar::Kind::Garage) {
-        if (why) *why = "tuned garage cars are not allowed (stock cars only)";
+// --- arcade classes ---
+
+namespace {
+constexpr const char* kClassTags[kArcadeClasses + 1] = {"", "CLASS_C", "CLASS_B", "CLASS_A", "CLASS_S", "CLASS_DIRT"};
+constexpr const char* kClassNames[kArcadeClasses + 1] = {"", "Class C", "Class B", "Class A", "Class S", "Rally cars"};
+} // namespace
+
+const char* arcade_class_tag(int cls) { return cls >= 1 && cls <= kArcadeClasses ? kClassTags[cls] : ""; }
+const char* arcade_class_name(int cls) { return cls >= 1 && cls <= kArcadeClasses ? kClassNames[cls] : ""; }
+
+int arcade_class_index(const std::string& tag) {
+    for (int i = 1; i <= kArcadeClasses; ++i)
+        if (tag == kClassTags[i]) return i;
+    return 0;
+}
+
+int arcade_class_of(const GtData& gd, const std::string& label) {
+    for (int i = 1; i <= kArcadeClasses; ++i)
+        if (auto it = gd.arcade_classes.find(kClassTags[i]); it != gd.arcade_classes.end())
+            for (const GtData::ArcadeCar& a : it->second)
+                if (a.label == label) return i;
+    return 0;
+}
+
+// --- rules ---
+
+const char* drive_rule_name(int drive) {
+    static const char* const n[] = {"any", "FF", "FR", "4WD", "MR", "RR"};
+    return drive >= 0 && drive <= kDriveRules ? n[drive] : "?";
+}
+
+const char* category_rule_name(int category) {
+    static const char* const n[] = {"any", "production cars", "race and rally cars"};
+    return category >= 0 && category <= kCategoryRules ? n[category] : "?";
+}
+
+const char* aspiration_rule_name(int aspiration) {
+    static const char* const n[] = {"any", "NA", "turbo"};
+    return aspiration >= 0 && aspiration <= kAspirationRules ? n[aspiration] : "?";
+}
+
+std::string car_rules_summary(const CarRules& r) {
+    std::string out;
+    auto add = [&](const std::string& s) { out += (out.empty() ? "" : ", ") + s; };
+    if (r.car_class) add(arcade_class_name(r.car_class));
+    if (r.category) add(r.category == 1 ? "production" : "race and rally");
+    if (r.drive) add(drive_rule_name(r.drive));
+    if (r.aspiration) add(aspiration_rule_name(r.aspiration));
+    if (r.stock_only) add("stock");
+    if (r.max_ps) add("at most " + std::to_string(r.max_ps) + " PS");
+    if (!r.allow_mods) add("no mod cars");
+    return out.empty() ? "any car" : out;
+}
+
+CarFacts online_car_facts(const data::CarDatabase& db, const GtData* gd, const OnlineCar& c) {
+    CarFacts f;
+    const data::Car* car = db.car(online_car_base(db, c));
+    if (c.kind == OnlineCar::Kind::Arcade && gd) f.arcade_class = arcade_class_of(*gd, c.arcade);
+    if (c.kind == OnlineCar::Kind::Mod) // a mod car's own [arcade] class
+        if (const data::ModCar* m = db.mod_car(c.car)) f.arcade_class = arcade_class_index(m->arcade_class);
+    if (!car) return f;
+    f.known = true;
+    f.category = car->bytes.size() > 0xF1 ? car->bytes[0xF1] : 0;
+    // The fitted parts: the car's own, an arcade car's variant parts over them, a garage car's.
+    std::array<u64, 27> parts = car->parts;
+    if (c.kind == OnlineCar::Kind::Garage) parts = c.parts;
+    if (c.kind == OnlineCar::Kind::Arcade)
+        for (const data::CarVariant& v : db.arcade_cars())
+            if (v.label == c.arcade)
+                for (size_t i = 0; i < parts.size(); ++i)
+                    if (v.parts[i]) parts[i] = v.parts[i];
+    if (c.kind == OnlineCar::Kind::Garage) f.tuned = GtMode::tuned(db, c.car, c.parts, c.settings);
+    // Drivetrain and aspiration as GT3's event rules read them (GtMode::check_entry).
+    static const int kRule[5] = {2, 1, 3, 4, 5}; // database drive type FR, FF, AWD, MR, RR -> rule
+    if (auto dt = db.drivetrain(parts[size_t(part_slot(int(data::TableId::Drivetrain)))]); dt && dt->drive_type < 5)
+        f.drive = kRule[dt->drive_type];
+    const ByteSpan* t = db.record(data::TableId::TurbineKit, parts[size_t(part_slot(int(data::TableId::TurbineKit)))]);
+    f.turbo = t && t->size() > 0x11 && (*t)[0x11] != 0;
+    if (std::optional<sim::CarSpec> spec = online_car_spec(db, c)) {
+        f.built = true;
+        f.power_ps = spec_power_ps(*spec);
+        // As Single Race weighs a garage car (arcade_prepare): mass less 120 kg over its power.
+        f.kg_per_ps = std::max(1.0f, spec->mass - 120.0f) / std::max(1.0f, f.power_ps);
+        f.weight_class = data::class_by_weight(f.kg_per_ps).cls;
+    }
+    return f;
+}
+
+int car_class(const CarFacts& f, bool dirt_course) {
+    if (f.arcade_class) return f.arcade_class;
+    if (!f.built) return 0;
+    return dirt_course ? kArcadeClasses : f.weight_class;
+}
+
+std::string car_class_text(const CarFacts& f, bool dirt_course) {
+    const int k = car_class(f, dirt_course);
+    if (!k) return {};
+    if (f.arcade_class) return arcade_class_name(k) + std::string(", class list");
+    if (dirt_course) return arcade_class_name(k) + std::string(", dirt course");
+    char buf[48];
+    std::snprintf(buf, sizeof buf, "%s, %.1f kg/PS", arcade_class_name(k), double(f.kg_per_ps));
+    return buf;
+}
+
+bool car_meets_rules(const OnlineCar& c, const CarFacts& f, const CarRules& r, std::string* why) {
+    auto no = [&](std::string s) {
+        if (why) *why = std::move(s);
         return false;
+    };
+    if (!r.allow_mods && c.kind == OnlineCar::Kind::Mod) return no("mod cars are not allowed");
+    if (!f.known) return true; // a mod car this machine lacks: its owner's lobby checked it
+    // "Class B cars", "rally cars".
+    auto cars_of = [](int cls) { return cls == kArcadeClasses ? std::string("rally cars") : arcade_class_name(cls) + std::string(" cars"); };
+    if (const int k = car_class(f, r.dirt_course); r.car_class && k != r.car_class) {
+        char kg[16];
+        std::snprintf(kg, sizeof kg, "%.1f", double(f.kg_per_ps));
+        std::string what = !k               ? " (its class is unknown here)"
+                           : f.arcade_class ? " (this is one of the " + cars_of(k) + ")"
+                           : r.dirt_course  ? " (on dirt every car without a class list is a rally car)"
+                                            : " (this is a " + std::string(arcade_class_name(k)) + " car: " + kg + " kg/PS)";
+        return no("only " + cars_of(r.car_class) + what);
     }
-    if (max_ps > 0 && spec) {
-        float ps = spec_power_ps(*spec);
-        if (ps > float(max_ps) + 0.5f) {
-            if (why) *why = std::to_string(int(ps + 0.5f)) + " PS is over the " + std::to_string(max_ps) + " PS limit";
-            return false;
-        }
-    }
+    // The arcade class page: the listed road classes only on road courses, the rally class only
+    // on dirt. Every other car races anywhere (as GT3's garage cars: on dirt in the rally race).
+    if (f.arcade_class == kArcadeClasses && !r.dirt_course) return no("rally cars are not available on road courses");
+    if (f.arcade_class && f.arcade_class < kArcadeClasses && r.dirt_course)
+        return no(cars_of(f.arcade_class) + " are not available on dirt courses");
+    if (r.category == 1 && f.category != 0) return no("production cars only");
+    if (r.category == 2 && f.category == 0) return no("race and rally cars only");
+    if (r.drive && f.drive != r.drive)
+        return no(std::string(drive_rule_name(r.drive)) + " cars only (this is " + drive_rule_name(f.drive) + ")");
+    if (r.aspiration && f.turbo != (r.aspiration == 2))
+        return no(std::string(aspiration_rule_name(r.aspiration)) + " cars only");
+    if (r.stock_only && f.tuned) return no("tuned garage cars are not allowed (stock cars only)");
+    if (r.max_ps > 0 && f.built && f.power_ps > float(r.max_ps) + 0.5f)
+        return no(std::to_string(int(f.power_ps + 0.5f)) + " PS is over the " + std::to_string(r.max_ps) + " PS limit");
     return true;
 }
 

@@ -5,6 +5,8 @@
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_rect.h>
 
+#include <functional>
+
 namespace gt3r {
 
 class IniDocument;
@@ -43,6 +45,11 @@ public:
     std::vector<TouchRect> control_bounds() const { return controls_.control_bounds(); }
     // A screen's own button moved up clear of the visible controls (TouchControls::clear_above).
     TouchRect clear_above(TouchRect r) const { return controls_.clear_above(r); }
+    // The layout editor: lays `c` out on the window's edges and cutouts as render() does the
+    // overlay, then calls draw(dx, dy) with the renderer drawing in UI units across the
+    // whole window, letterbox bars included: UI point (x, y) is drawn at (x + dx, y + dy).
+    // Needs a letterboxed screen (Screen::adaptive_ui() false).
+    void draw_whole_window(Ui& ui, TouchControls& c, const std::function<void(float dx, float dy)>& draw) const;
 
     TouchControls& controls() { return controls_; }
 
@@ -51,5 +58,8 @@ private:
     SDL_FRect safe_window_{0, 0, 0, 0};
     bool swallow_mouse_ = false;
 };
+
+// The controls of `c` as the overlay draws them, shifted by (dx, dy) UI units; hidden ones left out.
+void draw_touch_controls(Ui& ui, const TouchControls& c, float dx, float dy);
 
 } // namespace gt3r

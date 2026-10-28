@@ -11,6 +11,7 @@
 // a separate GPU command buffer; the result is drawn as an SDL_Texture, so
 // UI drawn afterwards appears on top.
 
+#include "platform/render_scale.h"
 #include "render/camera.h"
 #include "render/gpu_context.h"
 #include "render/gpu_model.h"
@@ -255,6 +256,8 @@ private:
     void write_capture();
     bool ensure_target(SDL_Renderer* renderer, int w, int h);
     void release_target();
+    SDL_Texture* wrap(SDL_Renderer* renderer, SDL_GPUTexture* texture, int w, int h);
+    bool ensure_half(SDL_Renderer* renderer);
     bool ensure_cube(int size);
     void release_cube();
     SDL_GPUTexture* placeholder_cube();
@@ -266,8 +269,8 @@ private:
     bool ensure_post(SDL_GPUTexture** t);
     void encode_post(SDL_GPUCommandBuffer* cmd, SDL_GPURenderPass* pass, SDL_GPUTexture* picture, int picture_w,
                      int picture_h, float alpha, const DrawOptions::PostGrade* grade);
-    // Copies the w x h corner (a picture) of `from` to `to`.
-    void copy_picture(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* from, SDL_GPUTexture* to, int w, int h);
+    // Copies the w x h corner (a picture) of `from` to `to` (cycling `to`: see draw).
+    void copy_picture(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* from, SDL_GPUTexture* to, int w, int h, bool cycle);
 
     GpuContext& ctx_;
     // The targets are width_ x height_, sized for the largest 3D scale (GpuContext::render_ceiling);
@@ -280,6 +283,13 @@ private:
     SDL_GPUTexture* msaa_ = nullptr;    // multisampled colour (when MSAA is on)
     SDL_GPUTexture* depth_ = nullptr;
     SDL_Texture* wrapper_ = nullptr;    // color_ as an SDL_Renderer texture
+    // Supersampling past 2x: the picture halved (half_, as half_wrapper_ for the 2D renderer).
+    SDL_GPUTexture* half_ = nullptr;
+    SDL_Texture* half_wrapper_ = nullptr;
+    int half_w_ = 0, half_h_ = 0;
+    // Supersampled targets that failed (GPU memory) lower this view's most: 75% of the failed
+    // size each time, down to native.
+    float scale_cap_ = platform::kMaxRenderScale;
     // The post-process passes: the scene before them, the last picture shown, the frozen one;
     // a quad over the target.
     SDL_GPUTexture *scene_ = nullptr, *last_ = nullptr, *snap_ = nullptr;

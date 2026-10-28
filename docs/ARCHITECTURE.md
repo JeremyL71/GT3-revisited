@@ -44,7 +44,9 @@ tests all link it.
 ## Threading
 
 The main thread runs input, game logic and rendering. SDL's audio thread
-pulls decoded music through `AudioEngine::feed`; movie playback decodes video
+pulls decoded music through `AudioEngine::feed` and renders the voice mixer
+block by block from a copy of its voices, so the main thread's voice calls
+never wait for a block (their changes apply after it); movie playback decodes video
 on its own worker thread. `File::read_at` is
 mutex-protected, so the disc can be read from both threads. On phones and
 tablets a background thread creates the 3D pipelines at start-up
@@ -66,9 +68,8 @@ thread, and the update check runs on a detached one.
 | `render/`, `scene/` | SDL_GPU device, shaders, model upload, showroom ([dev/RENDERING.md](dev/RENDERING.md)) |
 | `xr/` | VR headsets: the OpenXR session, head tracking and Touch controllers (Quest builds, `GT3R_XR`; [dev/VR.md](dev/VR.md)) |
 | `text/` | the game's fonts |
-| `sim/` | fixed-tick vehicle physics, car specs, collisions ([dev/PHYSICS.md](dev/PHYSICS.md)) |
+| `sim/` | the race step (`sim/exact/`: vehicle physics, AI drivers, the race), collisions, the menus' car specs ([dev/PHYSICS.md](dev/PHYSICS.md), [dev/AI.md](dev/AI.md)) |
 | `track/` | course runtime: road surface, walls, lap timing ([dev/TRACK.md](dev/TRACK.md)) |
-| `ai/` | AI drivers ([dev/AI.md](dev/AI.md)) |
 | `race/` | the race screen's engine side: field, HUD, cameras, replays, effects, sounds ([dev/RACE.md](dev/RACE.md)) |
 | `menu/` | the game's menu system (pages, items, transitions) and game flow |
 | `game/` | GT Mode rules and state, saves, replay theater, mod cars ([dev/GT_MODE.md](dev/GT_MODE.md)) |

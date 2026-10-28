@@ -1,9 +1,11 @@
 #pragma once
 
-// The saved replays as the Replay Theater lists them: native files in one folder,
-// <user data>/replays/, where every save from a race lands (time trial, arcade, licence,
-// GT mode, quick race, 2P). No slots and no capacity: as many as the disk holds.
+// The saved replays as the Replay Theater lists them: native files in one folder per region,
+// <user data>/replays/ (NTSC-U; replays/jp/, replays/eu/ for the others, whose cars and AI
+// lines differ), where every save from a race lands (time trial, arcade, licence, GT mode,
+// quick race, 2P). No slots and no capacity: as many as the disk holds.
 
+#include "disc/region.h"
 #include "race/replay.h"
 
 #include <string>
@@ -11,16 +13,18 @@
 
 namespace gt3r::race {
 
-std::string replay_dir(const std::string& data_dir); // <data_dir>/replays
+// <data_dir>/replays, or <data_dir>/replays/<region key> outside NTSC-U.
+std::string replay_dir(const std::string& data_dir, Region region = Region::America);
 
 struct ReplayEntry {
     std::string path, name; // full path / file name
     u64 size = 0;           // bytes
     u32 ticks = 0;
     Replay header;          // everything but the inputs (header.inputs / inputs2 are empty)
+    bool too_old = false;   // a file of a version before 11: listed (it can be deleted), not played (header empty)
 };
 
-// The folder's replays, newest first (unreadable files are skipped).
+// The folder's replays, newest first (unreadable files are skipped; those of older versions are listed as too_old).
 std::vector<ReplayEntry> list_replay_entries(const std::string& dir);
 // Reads a whole replay; nullopt (and *error) when it cannot be read.
 std::optional<Replay> read_replay_file(const std::string& path, std::string* error = nullptr);

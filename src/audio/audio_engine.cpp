@@ -9,7 +9,47 @@
 
 namespace gt3r {
 
-AudioEngine::AudioEngine() {
+namespace {
+
+// The music stream's input format is set per track; the voices are the mixer's own.
+// Output adapts to the device.
+constexpr SDL_AudioSpec kMusicSpec{SDL_AUDIO_S16, 2, 44100};
+constexpr SDL_AudioSpec kVoiceSpec{SDL_AUDIO_S16, 2, int(VoiceMixer::kRate)};
+
+// The connected playback device called `name`, or the default.
+SDL_AudioDeviceID find_playback_device(const std::string& name) {
+    SDL_AudioDeviceID found = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+    if (name.empty()) return found;
+    int n = 0;
+    SDL_AudioDeviceID* ids = SDL_GetAudioPlaybackDevices(&n);
+    for (int i = 0; i < n && found == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK; ++i)
+        if (const char* d = SDL_GetAudioDeviceName(ids[i]); d && name == d) found = ids[i];
+    SDL_free(ids);
+    return found;
+}
+
+// Opens a device for each stream on physical device `phys`; false (none left open) if either fails.
+bool open_pair(SDL_AudioDeviceID phys, SDL_AudioDeviceID& music, SDL_AudioDeviceID& voices) {
+    music = SDL_OpenAudioDevice(phys, &kMusicSpec);
+    voices = music ? SDL_OpenAudioDevice(phys, &kVoiceSpec) : 0;
+    if (voices) return true;
+    if (music) SDL_CloseAudioDevice(music);
+    return false;
+}
+
+// Moves `stream` onto the opened device `to`; returns the device it was on, still open. A paused
+// device (the race pause) leaves the new one paused.
+SDL_AudioDeviceID move_stream(SDL_AudioStream* stream, SDL_AudioDeviceID to) {
+    const SDL_AudioDeviceID from = SDL_GetAudioStreamDevice(stream);
+    if (from && SDL_AudioDevicePaused(from)) SDL_PauseAudioDevice(to);
+    SDL_UnbindAudioStream(stream);
+    if (!SDL_BindAudioStream(to, stream)) LOG_ERROR("Cannot move an audio stream: %s", SDL_GetError());
+    return from;
+}
+
+} // namespace
+
+AudioEngine::AudioEngine(const std::string& device) : device_name_(device) {
     // The game's sound init: effect mode 4 on both cores, EVOL 0x0FFF.
     voices_.set_reverb(SpuReverb::StudioC, 0x0FFF, 0x0FFF);
     voices_.set_bus_gain(VoiceBus::Music, music_volume_);
@@ -17,29 +57,107 @@ AudioEngine::AudioEngine() {
     // The sequencer runs inside the mixer at the game's 60 Hz, sample-exact.
     voices_.set_tick_hook([this] { sequencer_.update(voices_); }, sequencer_.samples_per_update());
 
-    // The stream's input format is set per track; output adapts to the device.
-    SDL_AudioSpec spec{SDL_AUDIO_S16, 2, 44100};
-    music_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, &AudioEngine::feed, this);
-    if (!music_stream_) {
+    // Each stream has a device of its own (opened on the same physical device), so the race
+    // pause can pause the music alone.
+    music_stream_ = SDL_CreateAudioStream(&kMusicSpec, &kMusicSpec);
+    sfx_stream_ = SDL_CreateAudioStream(&kVoiceSpec, &kVoiceSpec);
+    if (!music_stream_ || !sfx_stream_ || !SDL_SetAudioStreamGetCallback(music_stream_, &AudioEngine::feed, this) ||
+        !SDL_SetAudioStreamGetCallback(sfx_stream_, &AudioEngine::feed_voices, this) ||
+        !use_device(find_playback_device(device_name_))) {
         LOG_ERROR("Audio unavailable: %s", SDL_GetError());
+        if (sfx_stream_) SDL_DestroyAudioStream(sfx_stream_);
+        if (music_stream_) SDL_DestroyAudioStream(music_stream_);
+        music_stream_ = sfx_stream_ = nullptr;
         return;
     }
     SDL_SetAudioStreamGain(music_stream_, stream_output_gain(stream_level_, music_volume_));
-    SDL_ResumeAudioStreamDevice(music_stream_);
-
-    SDL_AudioSpec vspec{SDL_AUDIO_S16, 2, int(VoiceMixer::kRate)};
-    sfx_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &vspec, &AudioEngine::feed_voices, this);
-    if (!sfx_stream_) {
-        LOG_ERROR("Voice mixer unavailable: %s", SDL_GetError());
-        return;
-    }
-    SDL_ResumeAudioStreamDevice(sfx_stream_); // unity gain: the volumes are the mixer's bus gains
+    // The voices play at unity gain: the volumes are the mixer's bus gains.
 }
 
 AudioEngine::~AudioEngine() {
-    if (sfx_stream_) SDL_DestroyAudioStream(sfx_stream_);
-    if (music_stream_) SDL_DestroyAudioStream(music_stream_);
+    {
+        std::lock_guard lock(switch_mutex_);
+        switch_quit_ = true;
+    }
+    switch_cv_.notify_one();
+    if (switcher_.joinable()) switcher_.join();
+    for (SDL_AudioStream* s : {sfx_stream_, music_stream_}) {
+        if (!s) continue;
+        const SDL_AudioDeviceID dev = SDL_GetAudioStreamDevice(s);
+        SDL_DestroyAudioStream(s);
+        if (dev) SDL_CloseAudioDevice(dev);
+    }
     voices_.set_tick_hook({}, 0);
+}
+
+bool AudioEngine::use_device(SDL_AudioDeviceID phys) {
+    // Both devices open before either stream moves, so a failure leaves the sound where it was.
+    SDL_AudioDeviceID music = 0, voices = 0;
+    if (!open_pair(phys, music, voices)) {
+        LOG_WARN("Cannot open audio device: %s", SDL_GetError());
+        if (phys == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) return false;
+        phys = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+        if (phys == device_) return true; // already there
+        if (!open_pair(phys, music, voices)) return false;
+    }
+    SDL_AudioDeviceID old_music = 0, old_voices = 0;
+    {
+        std::lock_guard lock(device_mutex_);
+        old_music = move_stream(music_stream_, music);
+        old_voices = move_stream(sfx_stream_, voices);
+        device_ = phys;
+    }
+    if (old_music) SDL_CloseAudioDevice(old_music);
+    if (old_voices) SDL_CloseAudioDevice(old_voices);
+    const char* name = SDL_GetAudioDeviceName(phys);
+    LOG_INFO("Audio output: %s%s", phys == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK ? "system default, " : "",
+             name ? name : "?");
+    return true;
+}
+
+void AudioEngine::set_output_device(const std::string& name) {
+    device_name_ = name;
+    request_switch();
+}
+
+void AudioEngine::device_event(const SDL_Event& e) {
+    if (device_name_.empty() || e.adevice.recording) return; // the default follows the system by itself
+    request_switch();
+}
+
+void AudioEngine::request_switch() {
+    if (!music_stream_) return;
+    std::lock_guard lock(switch_mutex_);
+    switch_name_ = device_name_;
+    switch_requested_ = true;
+    if (!switcher_.joinable()) switcher_ = std::thread([this] { run_switcher(); });
+    switch_cv_.notify_one();
+}
+
+void AudioEngine::run_switcher() {
+    std::unique_lock lock(switch_mutex_);
+    for (;;) {
+        switch_cv_.wait(lock, [this] { return switch_requested_ || switch_quit_; });
+        if (switch_quit_) return;
+        switch_requested_ = false; // requests made meanwhile collapse into the latest
+        const std::string name = switch_name_;
+        lock.unlock();
+        // A reconnected device has a new id; a lost one is no longer listed.
+        const SDL_AudioDeviceID want = find_playback_device(name);
+        if (want != device_) use_device(want);
+        lock.lock();
+    }
+}
+
+std::vector<std::string> AudioEngine::playback_devices() {
+    std::vector<std::string> names;
+    int n = 0;
+    SDL_AudioDeviceID* ids = SDL_GetAudioPlaybackDevices(&n);
+    for (int i = 0; i < n; ++i)
+        if (const char* d = SDL_GetAudioDeviceName(ids[i]); d && *d && std::find(names.begin(), names.end(), d) == names.end())
+            names.emplace_back(d);
+    SDL_free(ids);
+    return names;
 }
 
 bool AudioEngine::load_sequences(Vfs& vfs) {
@@ -170,7 +288,10 @@ bool AudioEngine::play_music(Vfs& vfs, const std::string& path, bool loop, float
     // A new piece always plays: a pause (the race pause) ends with the piece it paused.
     // Without this, leaving a race from its pause menu left the device paused and the
     // next race's music silent until the next pause / resume.
-    SDL_ResumeAudioStreamDevice(music_stream_);
+    {
+        std::lock_guard dl(device_mutex_);
+        SDL_ResumeAudioStreamDevice(music_stream_);
+    }
     LOG_INFO("Playing %s (%u Hz, %u ch, %.0f s)", path.c_str(), h.sample_rate, h.channels, music_length_);
     return true;
 }
@@ -186,6 +307,7 @@ void AudioEngine::stop_stream() {
     }
     if (music_stream_) {
         SDL_UnlockAudioStream(music_stream_);
+        std::lock_guard dl(device_mutex_);
         SDL_ResumeAudioStreamDevice(music_stream_); // a stop also ends a pause
     }
 }
@@ -196,10 +318,12 @@ void AudioEngine::stop_music() {
 }
 
 void AudioEngine::pause_music() {
+    std::lock_guard dl(device_mutex_);
     if (music_stream_) SDL_PauseAudioStreamDevice(music_stream_);
 }
 
 void AudioEngine::resume_music() {
+    std::lock_guard dl(device_mutex_);
     if (music_stream_) SDL_ResumeAudioStreamDevice(music_stream_);
 }
 

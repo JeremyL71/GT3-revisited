@@ -56,13 +56,14 @@ constexpr int kLicFadeIn = 120, kLicFadeEnd = 180, kTrophyFadeIn = 180, kTrophyF
 constexpr int kLicMess0End = 240, kLicMess1 = 360, kLicOk = 420;
 // Trophy (gt_mode §18): mess0 for 180 frames, 90 more, then get_mess;
 // after 60 frames it waits for the prize counter (its count starts 360 frames after the page
-// opened); 15 frames after the count, mess1 and OK.
+// opened: the counter's constructor, PrizeCountUp::delay); 15 frames after the count,
+// mess1 and OK.
 constexpr int kTrophyMess0End = 180, kTrophyMoney = 270, kTrophyCountDelay = 360, kTrophyOkAfter = 15;
 // Race prizes (presentation §F): the arcade cup accepts OK after 180 frames; the GT-mode cup and
 // the consolation prize once the prize-money counter (presentations.cpp) has finished.
 constexpr int kMiniFadeFrames = 30, kArcadeMiniOk = 180;
 
-// GT Mode map pointer (MapButtonList, spec menus): a direction picks the building that
+// GT Mode map pointer (map button list, spec menus): a direction picks the building that
 // maximises cos^2 / distance among those within 90 degrees of it; the pointer eases
 // there (30 % per frame) and the building takes the focus within 12 px.
 struct MapPointer {
@@ -73,10 +74,17 @@ struct MapPointer {
     menu::flow::MenuKeys prev = 0;
 };
 
-// The wheel shop's tile row held still under a hovering pointer that moved the cursor (WheelRow).
+// A code-drawn list held still under a hovering pointer that moved its cursor (the wheel shop's
+// tile row, WheelRow; the vertical lists, ListRows).
 struct WheelPin {
     std::string page;
     int focus = -1;
+    float off = 0;
+};
+// A code-drawn list's offset on a page, easing towards the focused button's (as GT3's
+// button list: 30 % a frame); for another page none yet (the list is placed at once).
+struct ShopRow {
+    std::string page;
     float off = 0;
 };
 
@@ -110,6 +118,7 @@ struct MenuState {
     // and the running session.
     std::shared_ptr<GtData> data;
     GtData::Reader reader;
+    std::string lang = "US"; // the menus' language folder (the name entry's characters)
     std::unique_ptr<GtModeSession> session;
     // Races (races.cpp): the last request (the next championship round repeats it), the free
     // run's course, whether the last result was a championship round with more to come, and
@@ -133,6 +142,9 @@ struct MenuState {
     // Code-drawn lists (lists.cpp).
     MapPointer map;
     WheelPin wheel_pin;
+    ShopRow shop_row;
+    ShopRow list_off; // the vertical list's (ListRows)
+    WheelPin list_pin;
     // The menu controller's frame at the last on_tick (actions run after it, on the same frame),
     // the oil gauge's animation and the car wash.
     u32 frame = 0;
@@ -155,8 +167,8 @@ inline bool starts(const std::string& s, const char* p) { return s.rfind(p, 0) =
 
 // --- common.cpp: helpers the files share.
 std::string cr(s64 v); // log lines
-// Menu money texts (as the reference screens): "Cr. 14,660" on the dealer pages, the plain
-// number next to a Cr. icon elsewhere.
+// Menu money texts: the game's "Cr. %s" ("Cr. 14,660", credits_text) on the dealer pages,
+// the plain number next to a Cr. icon elsewhere.
 std::string cr_pre(s64 v);
 std::string cr_num(s64 v);
 std::string car_name(const GtMode& gt, const std::string& label);
@@ -190,6 +202,9 @@ bool start_session(const GtData::Reader& read, std::string* data_error, bool* lo
 // --- prechecks.cpp: popups instead of an item, enable rules.
 std::string intercept(const std::string& page, const MblItem& it);
 bool enabled(const std::string& page, const MblItem& it);
+// Items a page's list leaves out: the dealer region pages' Opel or Vauxhall button by the game's
+// language (docs/dev/GT_MODE.md "Language", dealer_item_listed).
+bool listed(const std::string& page, const MblItem& it);
 
 // --- actions.cpp: the GT-mode control's actions.
 bool on_event(const MenuEvent& e, std::vector<std::string>& log);
@@ -263,29 +278,88 @@ void oil_gauge_draws(const MenuController& ctl, std::vector<menu::ElementDraw>& 
 
 // --- lists.cpp: code-driven lists (garage, permitted cars, wheel shop tiles, map pointer) and
 // the per-frame input.
-// Code-drawn list geometry (the garage, the permitted cars; shared by drawing and touch):
-// rows of the page's item template in its window widget, the cursor row centred while the
-// list scrolls.
-struct GarageRows {
-    const Element* tmpl = nullptr;
-    const Element* win = nullptr;
-    float row = 0;
-    int rows = 0, first = 0, n = 0;
-    float y(int i) const { return win->y + win->h - float(i - first + 1) * row; }
+// The code-drawn vertical lists (shared by drawing and touch): the garage and trade lists, Cars
+// Permitted and the records, each GT3's vertical button list (menu::flow::column_layout): the
+// page's item template once per entry, kRowGap = 4 apart from the top of the list's window
+// widget (so 28 units apart for the garage's 24-unit rows, 24 for Cars Permitted's 20, 60 for
+// the records' 56); while the list is longer than the window the cursor row is centred and the
+// ends are held at the window's edges. The offset eases towards the cursor row's
+// (MenuState::list_off, 30 % a frame; placed at once when the page opens) and the rows are
+// clipped to the window. While a hovering pointer moves the cursor the list holds still
+// (MenuState::list_pin), so the row stays under it; a cursor key releases it.
+struct ListRows {
+    const Element* tmpl = nullptr;   // the page's item (its alt: the cursor row's look)
+    const Element* win = nullptr;    // the window widget
+    int n = 0, cursor = 0;
+    std::vector<float> y;            // each row's top in the list, downwards from its top
+    float total = 0;                 // the list's height
+    float target = 0, off = 0;       // the list's top from the window's top (downwards): wanted, shown
+    // Row i in layout coordinates (y up), at the window's left edge.
+    SDL_FRect box(int i) const {
+        return {win->x, win->y + win->h - off - y[size_t(i)] - tmpl->h, tmpl->w, tmpl->h};
+    }
+    // Whether any of row i is inside the window.
+    bool shown(int i) const {
+        const SDL_FRect b = box(i);
+        return b.y < win->y + win->h && b.y + b.h > win->y;
+    }
+    SDL_FRect clip() const { return {win->x, win->y, win->w, win->h}; }
 };
+bool garage_rows(const MenuController& ctl, GtModeSession& s, ListRows& g);
 // The race information's Cars Permitted popup.
-bool regulated_rows(const MenuController& ctl, GtModeSession& s, int n, GarageRows& g);
+bool regulated_rows(const MenuController& ctl, GtModeSession& s, int n, ListRows& g);
+// The records page's places (`n`: 12, a licence test's 6).
+bool records_rows(const MenuController& ctl, GtModeSession& s, int n, ListRows& g);
+// The places of the records page's table.
+int records_places(const GtModeSession& s);
+// A vertical list's scroll bar (the page's "scroll_bar" widget, GT3's ScrollBar): nothing, track
+// included, while the list is no longer than the bar; else the track and the hidden "pinch"
+// over the visible share of the list at its offset: top = bar top - offset x bar h / list h,
+// window h x bar h / list h high (top-down).
+void list_scroll_bar(const ListRows& g, const menu::flow::MenuSet::PageRef& ref, std::vector<menu::ElementDraw>& out);
 // The wheel shop's tiles on a brand page: the brand's wheels in a row in the "menu_wheel_shop"
-// window (WheelShopButton: 52 x 52 tiles 56.5 units apart, centred while they fit, else the
-// focused one centred within the ends). While a hovering pointer moves the cursor the row holds
+// window (GT3's wheel shop button list: a horizontal button row, menu::flow::row_layout, of the
+// page's 52 x 52 items kRowGap = 4 apart, so 56 units from tile to tile; its offset eases
+// towards the focused tile's, ShopRow). While a hovering pointer moves the cursor the row holds
 // still (WheelPin), so the tile stays under it; a cursor key releases it.
 struct WheelRow {
     const Element* win = nullptr;
     int n = 0;
-    float tile = 52, step = 56.5f, off = 0;
+    float tile = 52, step = 56, off = 0, target = 0;
     SDL_FRect box(int i) const { return {win->x + off + float(i) * step, win->y + (win->h - tile) * 0.5f, tile, tile}; }
 };
 bool wheel_row(const MenuController& ctl, WheelRow& r);
+// The garage's wheel list (hm/hm_wheel, GT3's WheelButtonList, gt_mode §7): one button per
+// entry of the wheel inventory, the stock-wheel placeholder first and then the bought wheels in
+// the order they were bought, as a horizontal button row (menu::flow::row_layout) centred in the
+// "menu_wheel" window and scrolling with the cursor (GtModeSession::wheel_cursor /
+// wheel_row_off). Each button is the page's "wheel" item (its 60 x 60 frame, the focused one in
+// the item's focus look) with the entry's 52 x 52 tile in the middle: the page's hidden
+// "default_wheel" for the placeholder, the hidden image named after the wheel otherwise; the
+// hidden "mark" frame is drawn over the entry the car wears. While a hovering pointer moves the
+// cursor the row holds still (WheelPin), as the wheel shop's.
+struct WheelList {
+    const Element* win = nullptr;    // "menu_wheel"
+    const Element* button = nullptr; // the page's "wheel" item
+    int n = 0;                       // entries: the placeholder + the bought wheels
+    std::vector<float> x;            // each button's left edge in the row
+    float off = 0, total = 0;        // the row's offset in the window (as it eases), its width
+    float target = 0;                // the offset it eases towards (the cursor's button's)
+    SDL_FRect box(int i) const {
+        return {win->x + off + x[size_t(i)], win->y + (win->h - button->h) * 0.5f, button->w, button->h};
+    }
+};
+bool wheel_list(const MenuController& ctl, const GtModeSession& s, WheelList& r);
+// The item a page opens on (GtModeHooks::initial_item): a wheel shop brand page on the wheel the
+// ride car wears, when the page sells it (wheel shop button list).
+std::string initial_item(const std::string& page);
+// The list's entry `i`: "" (the stock wheel) for the placeholder, else the bought wheel.
+std::string wheel_list_entry(const GameState& st, int i);
+// The entry a car wears: 0 on its own wheels, k for GameState::wheels[k - 1], -1 for a wheel the
+// inventory does not hold (no button is marked, gt_mode §7).
+int worn_wheel_entry(const GameState& st, const GarageCar& c);
+// The garage car the wheel page is for (the one chosen in the garage), or nullptr.
+const GarageCar* wheel_page_car(const GtModeSession& s);
 void map_input(MenuController& ctl, menu::flow::MenuKeys held);
 std::string on_frame(MenuController& ctl);
 std::string on_tick(MenuController& ctl);

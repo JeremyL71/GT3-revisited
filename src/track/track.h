@@ -4,7 +4,7 @@
 // need to know about a course at run time, built from the decoded GTRW road
 // data (src/formats/course/road.h) and AI lines.
 //
-//   auto track = track::Track::load(vfs, "trialmt");          // courses/US/trialmt
+//   auto track = track::Track::load(vfs, "trialmt");          // courses/US/trialmt (NTSC-U)
 //   sim::SurfaceHit h = track->probe(x, z, wheel_y + 1.0f);  // sim::TrackQuery
 //   track::Pose p = track->grid_pose(0);                     // start slot 0
 //   track::LapTimer timer(*track);  timer.update(car_pos, race_time);
@@ -115,7 +115,7 @@ class Track : public sim::TrackQuery {
 public:
     // Loads courses/<region>/<label> through the VFS. Throws FormatError when
     // the file is missing or malformed.
-    static std::unique_ptr<Track> load(const Vfs& vfs, std::string_view label, std::string_view region = "US");
+    static std::unique_ptr<Track> load(const Vfs& vfs, std::string_view label);
     // From an already read (decompressed) course file.
     static std::unique_ptr<Track> from_course_file(ByteSpan data, std::string label = {});
     // From a decoded road (and optional AI lines); used by tests.
@@ -172,8 +172,8 @@ public:
     sim::Vec3 point_at(float s, float lateral = 0) const;
     sim::Vec3 direction_at(float s) const;
     // A pose on the centre line (lateral 0) at track distance s, facing along
-    // the lap; used to respawn a car that left the track.
-    Pose respawn_pose(float s) const;
+    // the lap (the grid's fallback; the track survey's checks).
+    Pose centre_pose(float s) const;
 
     // AI line `index` (0 = racing line; < 0 = the first non-empty line of
     // 0, 1, 2, 5, 6, since some courses leave line 0 empty) as a dense polyline about `step`
@@ -245,7 +245,7 @@ public:
     const std::vector<float>& checkpoints() const { return checkpoints_; }
     // Resets to "before the start line".
     void reset(double time = 0);
-    // Re-locates the car (after a respawn) without counting progress.
+    // Re-locates the car without counting progress.
     void teleport(const sim::Vec3& position);
     // Where lap 1 is timed from: the first line crossing (the default: time trials, free runs,
     // flying licence tests), or GO, clock 0 (races, standing licence tests: the start-line

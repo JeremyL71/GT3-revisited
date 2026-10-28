@@ -239,8 +239,9 @@ struct Track::Impl {
 
 Track::~Track() = default;
 
-std::unique_ptr<Track> Track::load(const Vfs& vfs, std::string_view label, std::string_view region) {
-    std::string path = "courses/" + std::string(region) + "/" + std::string(label);
+std::unique_ptr<Track> Track::load(const Vfs& vfs, std::string_view label) {
+    std::string path = course_file_path(vfs, label);
+    if (path.empty()) path = vfs.region().course_path(label, vfs.language());
     std::optional<Bytes> data = vfs.read(path);
     if (!data) throw FormatError("track: missing course file " + path);
     return from_course_file(*data, std::string(label));
@@ -542,7 +543,7 @@ sim::SurfaceHit Track::probe_or_ground(float x, float z, float y_max) const {
 
 Pose Track::grid_pose(int slot) const {
     Pose p;
-    if (grid_.empty()) return respawn_pose(0);
+    if (grid_.empty()) return centre_pose(0);
     slot = std::clamp(slot, 0, int(grid_.size()) - 1);
     const course::GridSlot& g = grid_[size_t(slot)];
     sim::SurfaceHit h = probe(g.pos.x, g.pos.z, g.pos.y + 50.0f);
@@ -556,7 +557,7 @@ Pose Track::grid_pose(int slot) const {
     return p;
 }
 
-Pose Track::respawn_pose(float s) const {
+Pose Track::centre_pose(float s) const {
     Pose p;
     sim::Vec3 c = point_at(s, 0);
     sim::Vec3 f = direction_at(s);

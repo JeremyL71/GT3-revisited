@@ -1,5 +1,6 @@
 #include "game/gt_mode.h"
-#include "sim/models.h"
+#include "game/language_rules.h"
+#include "sim/engine_condition.h"
 
 #include "formats/bgm_index.h"
 #include "menu/flow/menu_set.h"
@@ -10,6 +11,8 @@
 #include "disc/core_image.h"
 #include "vfs/vfs.h"
 #include "formats/menu/pmb.h"
+#include "formats/text/mltx.h"
+#include "menu/menu_scene.h"
 
 #include <algorithm>
 #include <cctype>
@@ -30,6 +33,9 @@ bool ends(const std::string& s, const char* p) {
     return s.size() >= v.size() && s.compare(s.size() - v.size(), v.size(), v) == 0;
 }
 
+// Championship points per finishing place: program constant, the signed bytes read by
+// place (after them the program's data holds zeros, so places 7 and 8 score none).
+// The same table.
 constexpr int kChampPoints[6] = {10, 6, 4, 3, 2, 1};
 
 // Event record (table 32) offsets (docs/formats/database.md).
@@ -118,13 +124,38 @@ const char* check_name(Check c) {
 }
 
 std::string format_credits(s64 v) {
-    std::string d = std::to_string(v < 0 ? -v : v), out;
+    // "%ld", then from the
+    // right a ',' (immediate 0x2C) after every third character that has more before it. A
+    // minus sign counts as a character (-100 -> "-,100"; the game never shows negative money).
+    const std::string d = std::to_string(v);
+    std::string out;
     for (size_t i = 0; i < d.size(); ++i) {
         if (i && (d.size() - i) % 3 == 0) out.push_back(',');
         out.push_back(d[i]);
     }
-    return v < 0 ? "-" + out : out;
+    return out;
 }
+
+namespace {
+// A program format string with its "%s" fields filled in order.
+std::string fill(std::string_view format, std::initializer_list<std::string_view> fields) {
+    std::string out;
+    auto f = fields.begin();
+    for (size_t i = 0; i < format.size(); ++i) {
+        if (format.compare(i, 2, "%s") == 0 && f != fields.end()) {
+            out += *f++;
+            ++i;
+        } else {
+            out.push_back(format[i]);
+        }
+    }
+    return out;
+}
+} // namespace
+
+// Program constants, the same strings in the PAL and NTSC-J programs.
+std::string credits_text(s64 v) { return fill("Cr. %s", {format_credits(v)}); }
+std::string prize_remain_text(std::string_view prefix, s64 v) { return fill("%s Cr. %s", {prefix, format_credits(v)}); }
 
 std::string format_time_ms(u32 ms) {
     char b[32];
@@ -148,7 +179,7 @@ u32 record_stamp_now() {
     return s > 0 && s < s64(0xFFFFFFFF) ? u32(s) : 1;
 }
 
-std::string record_date_text(u32 stamp) {
+std::string record_date_text(u32 stamp, Language lang) {
     if (stamp == 0) return "--/--/--";
     // The original's conversion: four-year cycles of 1461 days, each starting with a leap
     // year, then the month by the days before it; it picks the leap year's month table only
@@ -165,7 +196,8 @@ std::string record_date_text(u32 stamp) {
     int mi = 0;
     while (mi < 11 && doy >= month[mi + 1]) ++mi;
     char b[32];
-    std::snprintf(b, sizeof b, "%02d/%02d/%02u", doy - month[mi] + 1, mi + 1, year % 100);
+    if (lang == Language::JP) std::snprintf(b, sizeof b, "%02u/%02d/%02d", year % 100, mi + 1, doy - month[mi] + 1);
+    else std::snprintf(b, sizeof b, "%02d/%02d/%02u", doy - month[mi] + 1, mi + 1, year % 100);
     return b;
 }
 
@@ -188,14 +220,8 @@ namespace {
 // per time trial (30) consecutive pointers to short "X.Name" strings in the program's
 // data. Found by a pattern search over the program (the same table on 1.00 and
 // 1.10); an unexpected program gives none.
-std::vector<std::string> find_builtin_names(ByteSpan core_gt3) {
+std::vector<std::string> find_builtin_names(const CoreImage& img) {
     std::vector<std::string> out;
-    CoreImage img;
-    try {
-        img = CoreImage::decode(core_gt3);
-    } catch (const std::exception&) {
-        return out;
-    }
     const Bytes& p = img.program;
     const u32 base = img.load_address, end = base + u32(p.size());
     auto name_at = [&](u32 addr, std::string& s) {
@@ -226,12 +252,75 @@ std::vector<std::string> find_builtin_names(ByteSpan core_gt3) {
     return out;
 }
 
+// The built-in default text of a realtime text slot (text/realtime.dat key "<group>_<name>",
+// used when the language's value is empty). The program registers each group with its name,
+// an array of slot names, an array of the slots' texts (initially the defaults) and the slot
+// count, all set up just before the call: the name's address built from its two halves, the
+// arrays' addresses as offsets from the global pointer, the count a small constant
+// (PRIZE_RT_MSG: names, texts, one slot).
+// The global pointer is the value the start-up code
+// builds and hands the thread setup.
+// "" when the program has no such slot.
+std::string find_realtime_default(const CoreImage& img, std::string_view group, std::string_view name) {
+    const Bytes& p = img.program;
+    const u32 base = img.load_address, end = base + u32(p.size());
+    auto word = [&](u32 a) { return a >= base && a + 4 <= end && !(a & 3) ? rd32(p, a - base) : 0u; };
+    auto string_at = [&](u32 a) {
+        std::string s;
+        for (; a >= base && a < end && p[a - base] && s.size() < 256; ++a) s.push_back(char(p[a - base]));
+        return s;
+    };
+    constexpr u32 kZero = 0, kA0 = 4, kA1 = 5, kA2 = 6, kA3 = 7, kT0 = 8, kGp = 28;
+    auto is_lui = [](u32 op, u32 rt) { return op >> 26 == 0x0F && (op >> 16 & 31) == rt; };
+    auto is_addiu = [](u32 op, u32 rs, u32 rt) { return op >> 26 == 0x09 && (op >> 21 & 31) == rs && (op >> 16 & 31) == rt; };
+    auto imm = [](u32 op) { return u32(s32(s16(op & 0xFFFF))); };
+    // The global pointer: the value the start-up code builds and then moves into it.
+    u32 gp = 0, a0_hi = 0, a0 = 0;
+    for (u32 a = img.entry_point; a < img.entry_point + 4 * 64 && !gp; a += 4) {
+        const u32 op = word(a);
+        if (is_lui(op, kA0)) a0_hi = op << 16, a0 = a0_hi;
+        else if (is_addiu(op, kA0, kA0)) a0 = a0_hi + imm(op);
+        else if (op == (kA0 << 21 | kZero << 16 | kGp << 11 | 0x2D)) gp = a0;
+    }
+    if (!gp) return {};
+    for (u32 a = base; a + 4 <= end; a += 4) {
+        const u32 lui = word(a);
+        if (!is_lui(lui, kA1)) continue;
+        u32 group_at = 0, names = 0, texts = 0, count = 0;
+        for (u32 k = 1; k <= 8; ++k) {
+            const u32 op = word(a + 4 * k);
+            if (is_addiu(op, kA1, kA1)) group_at = (lui << 16) + imm(op);
+            else if (is_addiu(op, kGp, kA2)) names = gp + imm(op);
+            else if (is_addiu(op, kGp, kA3)) texts = gp + imm(op);
+            else if (is_addiu(op, kZero, kT0)) count = imm(op);
+        }
+        if (!group_at || !names || !texts || !count || count > 256 || string_at(group_at) != group) continue;
+        for (u32 i = 0; i < count; ++i)
+            if (string_at(word(names + 4 * i)) == name) return string_at(word(texts + 4 * i));
+    }
+    return {};
+}
+
 } // namespace
+
+const std::map<std::string, std::string>& GtData::name_entry_chars(const std::string& lang) const {
+    static const std::map<std::string, std::string> kNone;
+    for (const std::string& l : {lang, name_language_, std::string("US")})
+        if (auto it = name_chars.find(l); it != name_chars.end() && !it->second.empty()) return it->second;
+    return kNone;
+}
 
 bool GtData::load(const Reader& read) {
     try {
-        if (!db.load(read)) {
-            error_ = "database: " + db.error();
+        // The disc's regional data set and the game's language (disc/region.h): the database
+        // and game config; the units, money and names.
+        const RegionData rd = region_data(read);
+        region = rd.region;
+        language = language_of(read);
+        units = language_units(language);
+        money_scale = gt3r::money_scale(language);
+        if (!db.load(read, std::string(rd.db_suffix()))) {
+            error_ = db.player_error();
             return false;
         }
         auto need = [&](const std::string& p) {
@@ -239,44 +328,84 @@ bool GtData::load(const Reader& read) {
             if (!b) throw FormatError(p + " not found");
             return std::move(*b);
         };
-        // The regional set's game config (PAL: product_eu.gcf); product.gcf otherwise.
-        region = db.region();
-        imperial = region == 1;
-        std::optional<Bytes> regional;
-        if (region == 2) regional = read("gameconf/product_eu.gcf");
-        gcf = Gcf::parse(regional ? std::move(*regional) : need("gameconf/product.gcf"));
+        gcf = Gcf::parse(need(rd.gcf_path()));
+        // The game's sums, by name (gcf tag 10; x100 in Japanese). The program reads
+        // a missing one through a null pointer, so a game config without them is refused.
+        auto sum = [&](const char* name) {
+            std::optional<u32> v = gcf.value(name);
+            if (!v) throw FormatError(std::string(rd.gcf_path()) + ": no '" + name + "' value (tag 10)");
+            return money(*v);
+        };
+        initial_credits_ = sum("initial");
+        car_wash_price_ = sum("car_wash");
+        oil_change_price_ = sum("oil_change");
+        wheel_price_ = sum("wheel");
         if (auto c = read("database/carcolor.db")) {
             colors_.parse(*c);
-            // Colour names: the definitions {u32 id, u32 name, u32 name (alternate), u32 rgb}
-            // index carcolor.sdb (gt_mode §7).
+            // Colour names: the definitions {u32 id, u32 name, u32 second name, u32 rgb} index
+            // carcolor.sdb; the language picks the name (docs/dev/GT_MODE.md "Language", color_name_field).
+            color_names_.clear();
             if (auto sdb = read("database/carcolor.sdb")) {
                 db::StringTable names = db::StringTable::parse(*sdb);
                 ByteSpan d(*c);
                 u32 defs = rd32(d, 0x10), n = rd32(d, defs);
+                auto name_at = [&](size_t o) {
+                    std::string nm = names.at(rd32(d, o));
+                    while (!nm.empty() && nm.back() == '\0') nm.pop_back();
+                    return nm;
+                };
                 for (u32 i = 0; i < n && defs + 4 + 16 * (i + 1) <= d.size(); ++i) {
                     size_t o = defs + 4 + 16 * size_t(i);
-                    std::string nm = names.at(rd32(d, o + 4));
-                    while (!nm.empty() && nm.back() == '\0') nm.pop_back();
-                    color_names_[rd32(d, o)] = nm;
+                    color_names_[rd32(d, o)] = {name_at(o + color_name_field(language)), name_at(o + 4)};
                 }
             }
         }
+        // From the program (CORE.GT3): its built-in record names and realtime-text defaults.
         builtin_names.clear();
-        if (auto core = read(Vfs::kProgramFile)) builtin_names = find_builtin_names(*core);
+        std::string prize_default;
+        if (auto core = read(Vfs::kProgramFile)) {
+            try {
+                const CoreImage img = CoreImage::decode(*core);
+                builtin_names = find_builtin_names(img);
+                prize_default = find_realtime_default(img, "PRIZE_RT_MSG", "BONUS_PREFIX");
+                if (prize_default.empty()) LOG_WARN("gt mode: the program's PRIZE_RT_MSG_BONUS_PREFIX was not found");
+            } catch (const std::exception& e) {
+                LOG_WARN("gt mode: %s: %s", Vfs::kProgramFile, e.what());
+            }
+        }
+        // The prize pages' "%s" before "Cr.": the language's realtime text, else the default.
+        prize_prefix = prize_default;
+        if (auto rt = read("text/realtime.dat")) {
+            try {
+                const text::StringTable t = text::StringTable::parse(*rt);
+                const int k = t.find("PRIZE_RT_MSG_BONUS_PREFIX");
+                if (k >= 0 && int(language) < t.language_count() && !t.raw(size_t(k), language).empty())
+                    prize_prefix = t.raw(size_t(k), language);
+            } catch (const std::exception& e) {
+                LOG_WARN("gt mode: text/realtime.dat: %s", e.what());
+            }
+        }
         // The race songs of bgm/ads.inf in index order (the options' music list, gt_mode §12.2).
         race_songs.clear();
         if (auto ads = read("bgm/ads.inf"))
             for (const BgmTrack& t : parse_bgm_index(*ads))
                 if (t.name.rfind("race_", 0) == 0) race_songs.push_back(t.file);
         Bytes mbl = need("menu/gt_mode.mbl");
-        // Name entry characters: the text of each item of the name entry page.
+        // Name entry characters: the text of each item of each language's name entry page.
         name_chars.clear();
-        if (auto pmb = read("menu/US/name_entry1.pmb")) {
-            menu::PmbFile f = menu::PmbFile::parse(*pmb);
-            for (const menu::Page& p : f.pages)
-                for (const menu::Element& el : p.items)
-                    if (el.text) name_chars[el.name] = el.text->text;
-        }
+        name_language_ = text::language_code(rd.default_language());
+        for (int i = 0; menu::kMenuLanguages[i]; ++i)
+            if (auto pmb = read(std::string("menu/") + menu::kMenuLanguages[i] + "/name_entry1.pmb")) {
+                try { // some discs carry unfinished pages for languages their program never uses
+                    menu::PmbFile f = menu::PmbFile::parse(*pmb);
+                    std::map<std::string, std::string>& chars = name_chars[menu::kMenuLanguages[i]];
+                    for (const menu::Page& p : f.pages)
+                        for (const menu::Element& el : p.items)
+                            if (el.text) chars[el.name] = el.text->text;
+                } catch (const std::exception& e) {
+                    LOG_INFO("gt mode: menu/%s/name_entry1.pmb: %s", menu::kMenuLanguages[i], e.what());
+                }
+            }
         {
             // The same flow the menus see (mod cars and makers at the dealers).
             menu::MblFile flow = menu::MblFile::parse(mbl);
@@ -361,15 +490,18 @@ bool GtData::load(const Reader& read) {
     return true;
 }
 
-u32 GtData::starting_credits() const { return gcf.value("initial").value_or(18000); }
-u32 GtData::car_wash_price() const { return gcf.value("car_wash").value_or(50); }
-u32 GtData::oil_change_price() const { return gcf.value("oil_change").value_or(250); }
-u32 GtData::wheel_price() const { return gcf.value("wheel").value_or(500); }
-
 const PrizeSet* GtData::prize_set(const std::string& name) const {
     for (const PrizeSet& p : prizes)
         if (p.name == name) return &p;
     return nullptr;
+}
+
+PrizeCar GtData::prize_candidate(const PrizeCar& pc) const {
+    PrizeCar c = pc;
+    bool swapped = false;
+    c.car = prize_car_label(pc.car, language, &swapped);
+    if (swapped) c.color_id = -1;
+    return c;
 }
 
 std::string GtData::model(const std::string& car) const {
@@ -428,7 +560,13 @@ u32 GtData::color_rgb(u32 id) const {
 std::string GtData::color_name(u32 id) const {
     if (const auto* p = mod_paint(db, id)) return p->first;
     auto it = color_names_.find(id);
-    return it == color_names_.end() ? std::string() : it->second;
+    return it == color_names_.end() ? std::string() : it->second.first;
+}
+
+std::string GtData::color_name_latin(u32 id) const {
+    if (const auto* p = mod_paint(db, id)) return p->first;
+    auto it = color_names_.find(id);
+    return it == color_names_.end() ? std::string() : it->second.second;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,8 +631,9 @@ int pick_trophy_index(float completion, u32& rng) {
 }
 
 s64 GtMode::car_price(const std::string& car) const {
+    // The car record's u32 +0xEC, x100 in Japanese.
     const data::Car* c = db().car(car);
-    return c ? s64(c->price) : 0;
+    return c ? s64(data_->money(c->price)) : 0;
 }
 
 u8 GtMode::car_flags(const std::string& car) const {
@@ -507,7 +646,13 @@ u8 GtMode::car_category(const std::string& car) const {
     return c && c->bytes.size() > 0xF1 ? c->bytes[0xF1] : 0;
 }
 
-s64 GtMode::sell_price(const GarageCar& c) const { return car_price(c.car) / 4; }
+s64 GtMode::sell_price(const GarageCar& c) const {
+    // Program constant: the catalogue price (scaled) / 4, a signed 32-bit division (sra 2 after
+    // the round-toward-zero +3): the sale, the garage car page's price
+    // and the garage list's price column (garage button). The same in the
+    // PAL and NTSC-J programs.
+    return s64(s32(car_price(c.car)) / 4);
+}
 
 void GtMode::set_stock_ownership(GarageCar& g) const {
     g.owned.reset();
@@ -674,7 +819,9 @@ std::string GtMode::sort_value(const GarageCar& c, int key) const {
         return car ? car->maker : std::string();
     }
     case 3: return data_->color_name(data_->color_id(c.car, c.color));
-    case 4: return format_credits(car_price(c.car)) + " Cr.";
+    // The price column (garage button): what the car sells for, digits only; "-" for
+    // a car that cannot be sold (flag bit 1).
+    case 4: return car_flags(c.car) & 2 ? std::string("-") : format_credits(sell_price(c));
     case 5: std::snprintf(b, sizeof b, "%.1f km", c.cond.odometer_m / 1000.0); return b;
     case 6: return power_text(power_ps(c), " ");
     case 7: {
@@ -701,7 +848,9 @@ std::string GtMode::model_of(const GarageCar& c) const {
 std::optional<PartOffer> GtMode::part_offer(int goods) const {
     const GarageCar* c = state_.ride_car();
     if (!c) return std::nullopt;
-    return find_part(db(), c->car, goods);
+    std::optional<PartOffer> o = find_part(db(), c->car, goods);
+    if (o) o->price = part_price(o->price);
+    return o;
 }
 
 bool GtMode::owns(int goods) const {
@@ -793,7 +942,7 @@ PowerPeak GtMode::power_peak(const GarageCar& c) const {
 float GtMode::power_ps(const GarageCar& c) const { return power_peak(c).ps; }
 
 std::string GtMode::power_text(float ps, const char* sep) const {
-    return std::to_string(display_power(ps, data_->imperial)) + sep + power_unit(data_->imperial);
+    return std::to_string(display_power(ps, data_->units)) + sep + power_unit(data_->units);
 }
 
 float GtMode::ride_power_ps() const {
@@ -821,7 +970,9 @@ Check GtMode::can_buy_wheel(const std::string& wheel) const {
 }
 
 bool GtMode::buy_wheel(const std::string& wheel) {
-    if (can_buy_wheel(wheel) != Check::Ok || int(state_.wheels.size()) >= kMaxWheels) return false;
+    // The inventory's slots hold the stock-wheel placeholder too; with none free the original
+    // adds nothing and charges nothing, as here.
+    if (can_buy_wheel(wheel) != Check::Ok || int(state_.wheels.size()) + 1 >= kMaxWheels) return false;
     state_.credits -= data_->wheel_price();
     state_.wheels.push_back(wheel);
     return true;
@@ -834,6 +985,21 @@ bool GtMode::fit_wheel(int index, const std::string& wheel) {
     if (!wheel.empty() && std::find(state_.wheels.begin(), state_.wheels.end(), wheel) == state_.wheels.end())
         return false;
     c.wheel = wheel;
+    return true;
+}
+
+bool GtMode::fit_shop_wheel(const std::string& wheel) {
+    // The shop's fit action (the same code): the ride
+    // car's wheel becomes the id of the focused wheel's name, the wheel the purchase was asked
+    // for (set_focus_wheel_code; the purchase hands the same name to the slot search).
+    // It checks neither the inventory nor the car's no-wheel-change flag (the shop does not open
+    // for such a car) and charges nothing. After a purchase refused for want of a free slot the
+    // car so wears a wheel the inventory does not hold: the garage's wheel list then
+    // marks none of its buttons as the car's, and the car keeps the wheel until it is changed
+    // (the PS2 save stores the car's wheel by id, the inventory's wheels by name).
+    GarageCar* c = state_.ride_car();
+    if (!c) return false;
+    c->wheel = wheel;
     return true;
 }
 
@@ -864,7 +1030,7 @@ bool GtMode::change_oil() {
 float GtMode::engine_factor(const CarCondition& c) {
     // Break-in / wear and oil (physics §10.3; verified there): 97 % new
     // (E <= -300 km), 100 % from 0 to 500 km, 98 % from 600 km; oil +5 % fading out.
-    return sim::model::engine_condition_factor(c.engine_wear_m, c.oil_m);
+    return sim::engine_condition_factor(c.engine_wear_m, c.oil_m);
 }
 
 float GtMode::oil_age(float oil_m) {
@@ -880,14 +1046,14 @@ bool GtMode::carries_engine_condition(const std::string& mode) {
 }
 
 sim::EngineCondition GtMode::run_condition(const CarCondition& c) {
-    const double units = std::clamp(c.odometer_m / 2, 0.0, double(sim::model::kOdometerMax));
+    const double units = std::clamp(c.odometer_m / 2, 0.0, double(sim::kOdometerMax));
     return {u32(units), c.engine_wear_m, c.oil_m};
 }
 
 sim::EngineCondition GtMode::driven(sim::EngineCondition c, float metres) {
     if (metres <= 0) return c;
-    sim::model::odometer_step(c.odometer, metres);
-    sim::model::engine_condition_step(c.wear_m, c.oil_m, metres);
+    sim::odometer_step(c.odometer, metres);
+    sim::engine_condition_step(c.wear_m, c.oil_m, metres);
     return c;
 }
 
@@ -1011,8 +1177,13 @@ std::optional<EventRules> GtMode::rules(const std::string& code) const {
     x.required_license = r[kEvLicense];
     x.cars = r[kEvCars];
     x.laps = r[kEvLaps];
-    for (int p = 0; p < 6; ++p) x.prize[size_t(p)] = u32(rd16(r, kEvPrize + 2 * size_t(p))) * 100;
-    x.champ_bonus = u32(rd16(r, kEvBonus)) * 100;
+    // Program constant: the prizes and the bonus are stored in hundreds of credits; the readers
+    // multiply by 100 (immediate 0x64: race prizes, the championship bonus),
+    // then x100 again in
+    // Japanese.
+    constexpr u32 kHundreds = 100;
+    for (int p = 0; p < 6; ++p) x.prize[size_t(p)] = data_->money(u32(rd16(r, kEvPrize + 2 * size_t(p))) * kHundreds);
+    x.champ_bonus = data_->money(u32(rd16(r, kEvBonus)) * kHundreds);
     x.league = r[kEvLeague];
     x.car_class = r[kEvClass];
     x.aspiration = r[kEvAspiration];
@@ -1028,12 +1199,15 @@ std::optional<EventRules> GtMode::rules(const std::string& code) const {
     return x;
 }
 
-bool GtMode::tuned(const GarageCar& c) const {
-    const data::Car* car = db().car(c.car);
+bool GtMode::tuned(const GarageCar& c) const { return tuned(db(), c.car, c.parts, c.settings); }
+
+bool GtMode::tuned(const data::CarDatabase& db, const std::string& label, const std::array<u64, 27>& parts,
+                   const sim::CarSettings& settings) {
+    const data::Car* car = db.car(label);
     if (!car) return false;
-    for (size_t i = 0; i + 1 < c.parts.size(); ++i)
-        if (c.parts[i] != car->parts[i]) return true;
-    return !same_settings(c.settings, sim::stock_settings(db(), c.car, car->parts));
+    for (size_t i = 0; i + 1 < parts.size(); ++i)
+        if (parts[i] != car->parts[i]) return true;
+    return !same_settings(settings, sim::stock_settings(db, label, car->parts));
 }
 
 EntryResult GtMode::check_entry(const std::string& code, const GarageCar& c) const {
@@ -1151,7 +1325,7 @@ Award GtMode::record_round(int place, const std::vector<int>& order) {
         int& best = state_.race_best.try_emplace(code, kNoPosition).first->second;
         best = std::min(best, place);
     }
-    // Points: 10, 6, 4, 3, 2, 1.
+    // Points by place (kChampPoints).
     const int n = int(ch.points.size());
     std::vector<int> finish = order;
     if (finish.empty()) {
@@ -1202,17 +1376,22 @@ bool GtMode::league_complete(const std::string& tier) const {
 }
 
 float GtMode::completion() const {
-    // GT races won + arcade Clear Status count (max 102) + time trials cleared
-    // + license tests passed, over 364 + 102 + 10 + 48 (gt_mode §4).
+    // gt_mode §4: four (done, total) pairs. GT Mode: the gcf tag-4 result slots won
+    // over their count; arcade: the Clear Status count over the courses
+    // of the gcf SINGLE_RACE list over a fixed 102; time trials beaten
+    // over 10; licence tests with a medal over 48.
+    // All done = 1, else the ratio, at most 0.99. Program constants: the three
+    // fixed totals and the cap; the same in the PAL and NTSC-J programs.
+    constexpr int kArcadeTotal = 102;
+    constexpr float kCap = 0.99f;
     int won = 0, tests = 0;
     for (const std::string& c : data_->race_codes) won += state_.best_position(c) == 0;
     for (const LicenseTestRecord& t : state_.license_tests) tests += t.medal != Medal::None;
     won += arcade_completion();
     for (int r : state_.arcade.at_best_rank) won += r == 0;
-    int total = int(data_->race_codes.size()) + 3 * kArcadeCourses + kTimeTrials + kLicenseCount * kTestsPerLicense;
-    if (total == 0) return 0;
+    const int total = int(data_->race_codes.size()) + kArcadeTotal + kTimeTrials + kLicenseCount * kTestsPerLicense;
     if (won + tests == total) return 1;
-    return std::min(0.99f, float(won + tests) / float(total));
+    return std::min(kCap, float(won + tests) / float(total));
 }
 
 std::string GtMode::completion_text() const {
@@ -1265,6 +1444,7 @@ std::vector<int> GtMode::award_prizes(const std::string& code) {
         else if (n == "gtmode_enduro_complete") eligible = league_complete("end");
         // The whole game: checked with a GT-mode code (not arcade), every GT-mode result won.
         else if (n == "gtmode_complete") eligible = gt_mode_code(code) && all_races_won();
+        // Completion at or over a program constant: 0.5, 0.75, 1.0
         else if (n == "achieve_half") eligible = completion() >= 0.5f;
         else if (n == "achieve_3_quoter") eligible = completion() >= 0.75f;
         else if (n == "achieve_complete") eligible = completion() >= 1.0f;
@@ -1277,11 +1457,14 @@ std::vector<int> GtMode::award_prizes(const std::string& code) {
             ++prizes_refused_;
             continue;
         }
-        // car_get (gt_mode §20.3): per set every candidate gets its paint, then the weighted pick.
-        std::vector<int> paint(set.cars.size());
-        for (size_t i = 0; i < set.cars.size(); ++i) paint[i] = prize_paint(set.cars[i]);
-        const PrizeCar& pc = set.cars[size_t(pick_prize(set))];
-        int idx = add_prize_car_paint(pc.car, paint[size_t(&pc - set.cars.data())], n);
+        // car_get (gt_mode §20.3): per set every candidate, its label in the game's language
+        // (docs/dev/GT_MODE.md "Language"), gets its paint, then the weighted pick.
+        std::vector<PrizeCar> cands;
+        for (const PrizeCar& c : set.cars) cands.push_back(data_->prize_candidate(c));
+        std::vector<int> paint(cands.size());
+        for (size_t i = 0; i < cands.size(); ++i) paint[i] = prize_paint(cands[i]);
+        const size_t pick = size_t(pick_prize(set));
+        int idx = add_prize_car_paint(cands[pick].car, paint[pick], n);
         if (idx < 0) continue;
         state_.prizes_given.insert(n);
         // Earlier indices shift by one with each insertion at the head.
@@ -1350,11 +1533,17 @@ int GtMode::arcade_difficulty(const std::string& code) {
     }
 }
 
+int GtMode::arcade_course_count() const {
+    auto it = data_->arcade_courses.find("SINGLE_RACE");
+    if (it == data_->arcade_courses.end()) return 0;
+    return std::min(int(it->second.size()), kArcadeResultSlots / kArcadeDifficulties);
+}
+
 int GtMode::arcade_course_index(const std::string& course) const {
     auto it = data_->arcade_courses.find("SINGLE_RACE");
     if (it == data_->arcade_courses.end()) return -1;
-    for (size_t i = 0; i < it->second.size() && i < size_t(kArcadeCourses); ++i)
-        if (it->second[i].course == course) return int(i);
+    for (int i = 0; i < arcade_course_count(); ++i)
+        if (it->second[size_t(i)].course == course) return i;
     return -1;
 }
 
@@ -1383,29 +1572,15 @@ bool GtMode::arcade_car_level_open(int level) const {
 
 // The arcade car filter's region test (gt_mode §16): the base car is the arcade-car (35)
 // or car-variant (31) record's +8, else the label itself; a car missing from the car table
-// (30) is hidden (NTSC-U: the Vauxhall twins of the Opels), otherwise its region byte +0xF7
-// decides: 0 everywhere, 1 only in EU, 2 not in EU, 3 only in US, 4 not in US, 5 not in US /
-// JP, 6 only in US / JP, 7 only in JP, 8 not in JP.
+// (30) is hidden, otherwise its region byte +0xF7 against the game's language decides
+// (car_region_offered).
 bool GtMode::arcade_car_region_hidden(const std::string& label) const {
     u64 base = db::id_hash(label);
     if (const ByteSpan* r = db().record(data::TableId::ArcadeCar, label); r && r->size() >= 16) base = rd64(*r, 8);
     else if (const ByteSpan* v = db().record(data::TableId::CarVariant, label); v && v->size() >= 16) base = rd64(*v, 8);
     const ByteSpan* car = db().record(data::TableId::Car, base);
     if (!car || car->size() <= 0xF7) return true;
-    const int reg = data_->region;
-    const bool jp = reg == 0, us = reg == 1, eu = reg == 2, other = !us && !jp;
-    switch ((*car)[0xF7]) {
-    case 0: return false;
-    case 1: return !eu;
-    case 2: return eu;
-    case 3: return !us;
-    case 4: return us;
-    case 5: return !other;
-    case 6: return other;
-    case 7: return !jp;
-    case 8: return jp;
-    default: return false;
-    }
+    return !data::car_region_offered((*car)[0xF7], data_->language);
 }
 
 std::vector<const GtData::ArcadeCar*> GtMode::arcade_cars(const std::string& car_class) const {
@@ -1431,10 +1606,15 @@ std::vector<std::string> GtMode::arcade_courses(const std::string& list) const {
     return out;
 }
 
+int GtMode::arcade_best(int d, int course) const {
+    const int n = arcade_course_count();
+    if (d < 0 || d >= kArcadeDifficulties || course < 0 || course >= n) return kArcadeNoPosition;
+    return state_.arcade.best[size_t(d * n + course)];
+}
+
 bool GtMode::arcade_won_at_least(int course, int d) const {
-    if (course < 0 || course >= kArcadeCourses) return false;
     for (int k = std::max(d, 0); k <= 2; ++k)
-        if (state_.arcade.best[size_t(k * kArcadeCourses + course)] == 0) return true;
+        if (arcade_best(k, course) == 0) return true;
     return false;
 }
 
@@ -1442,24 +1622,26 @@ bool GtMode::arcade_group_won(int g, int d) const {
     auto it = data_->arcade_courses.find("SINGLE_RACE");
     if (it == data_->arcade_courses.end()) return false;
     bool any = false;
-    for (size_t i = 0; i < it->second.size() && i < size_t(kArcadeCourses); ++i) {
-        if (it->second[i].level != g) continue;
+    for (int i = 0; i < arcade_course_count(); ++i) {
+        if (it->second[size_t(i)].level != g) continue;
         any = true;
-        if (!arcade_won_at_least(int(i), d)) return false;
+        if (!arcade_won_at_least(i, d)) return false;
     }
     return any;
 }
 
 bool GtMode::arcade_all_won_at(int d) const {
-    if (d < 0 || d >= kArcadeDifficulties) return false;
-    for (int i = 0; i < kArcadeCourses; ++i)
-        if (state_.arcade.best[size_t(d * kArcadeCourses + i)] != 0) return false;
+    if (d < 0 || d >= kArcadeDifficulties || arcade_course_count() == 0) return false;
+    for (int i = 0; i < arcade_course_count(); ++i)
+        if (arcade_best(d, i) != 0) return false;
     return true;
 }
 
 int GtMode::arcade_completion() const {
+    // Per course of the SINGLE_RACE list, won at Easy, Normal or Hard; at Normal or
+    // Hard; at Hard.
     int n = 0;
-    for (int i = 0; i < kArcadeCourses; ++i)
+    for (int i = 0; i < arcade_course_count(); ++i)
         for (int d = 0; d <= 2; ++d) n += arcade_won_at_least(i, d) ? 1 : 0;
     return n;
 }
@@ -1484,12 +1666,13 @@ void GtMode::arcade_unlock_pass(ArcadeOutcome& out) {
     for (const GtData::ArcadeCourse& c : it->second) max_level = std::max(max_level, c.level);
     // Course groups: the next group opens when every course of the current
     // one has been won at Easy, Normal or Hard (several may open at once).
+    const int courses = arcade_course_count();
     auto group_won_any = [&](int g) {
         bool any = false;
-        for (size_t i = 0; i < it->second.size() && i < size_t(kArcadeCourses); ++i) {
-            if (it->second[i].level != g) continue;
+        for (int i = 0; i < courses; ++i) {
+            if (it->second[size_t(i)].level != g) continue;
             any = true;
-            if (!arcade_won_at_least(int(i), 0)) return false;
+            if (!arcade_won_at_least(i, 0)) return false;
         }
         return any;
     };
@@ -1501,10 +1684,10 @@ void GtMode::arcade_unlock_pass(ArcadeOutcome& out) {
     // Hard -> flags g+1 and g+7. Flags are never cleared.
     auto group_all_at = [&](int g, int d) {
         bool any = false;
-        for (size_t i = 0; i < it->second.size() && i < size_t(kArcadeCourses); ++i) {
-            if (it->second[i].level != g) continue;
+        for (int i = 0; i < courses; ++i) {
+            if (it->second[size_t(i)].level != g) continue;
             any = true;
-            if (a.best[size_t(d * kArcadeCourses) + i] != 0) return false;
+            if (arcade_best(d, i) != 0) return false;
         }
         return any;
     };
@@ -1532,7 +1715,7 @@ GtMode::ArcadeOutcome GtMode::arcade_single_race(const std::string& code, const 
         ++state_.trophies;
         a.awards |= 0x1000u << d;
     }
-    int& best = a.best[size_t(d * kArcadeCourses + i)];
+    int& best = a.best[size_t(d * arcade_course_count() + i)]; // difficulty x list size + course
     if (place < best) {
         best = place;
         out.improved = true;

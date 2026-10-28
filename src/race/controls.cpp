@@ -71,20 +71,15 @@ sim::ControlInputs ControlMapper::update(const PadState& pad, double dt) {
 void RumbleModel::reset() {
     rumble_ = {};
     trig_l_ = trig_r_ = 0;
-    impact_timer_ = impact_level_ = 0;
 }
 
-void RumbleModel::update(const sim::VehicleState& s, const Events& ev, const sim::ControlInputs& in, double dt) {
+void RumbleModel::update(const sim::VehicleState& s, const sim::VehicleTelemetry* t, const sim::ControlInputs& in, double dt) {
     clock_ += dt;
-    float speed = s.speed_kmh / 3.6f;
-    if (ev.impact > 1.5f) {
-        impact_level_ = std::max(impact_level_, std::min(1.0f, ev.impact / 8.0f));
-        impact_timer_ = 0.25f;
-    }
-    impact_timer_ = std::max(0.0f, impact_timer_ - float(dt));
-    if (impact_timer_ == 0) impact_level_ = 0;
+    // The pad's actuators are cleared after every send, so a step that sends nothing stops both motors.
+    rumble_ = {};
+    if (t && t->pad_output && t->pad_rumble > 0) rumble_.large = u8(std::min(t->pad_rumble, 127));
 
-    // Wheel slip (sim convention: slip_ratio > 0 braking / locking, < 0 wheelspin).
+    // Ours, the triggers. Wheel slip (sim convention: slip_ratio > 0 braking / locking, < 0 wheelspin).
     float spin = 0, lock = 0;
     for (const sim::WheelState& w : s.wheels) {
         if (!w.grounded) continue;
@@ -93,14 +88,6 @@ void RumbleModel::update(const sim::VehicleState& s, const Events& ev, const sim
     }
     float spin_amt = std::clamp((spin - 0.15f) / 0.5f, 0.0f, 1.0f) * std::min(1.0f, in.throttle * 2);
     float lock_amt = std::clamp((lock - 0.2f) / 0.5f, 0.0f, 1.0f) * std::min(1.0f, in.brake * 2);
-
-    float large = impact_level_;
-    if (ev.offroad && speed > 3) large = std::max(large, 0.18f + std::min(0.2f, speed / 150.0f));
-    large = std::max(large, 0.25f * spin_amt);
-    // Kerbs: the small (on/off) motor, pulsed at a rate that follows the speed.
-    bool kerb_pulse = ev.kerb && speed > 2 && std::fmod(clock_ * (4.0 + speed * 0.4), 1.0) < 0.5;
-    rumble_.small = kerb_pulse;
-    rumble_.large = u8(std::clamp(large, 0.0f, 1.0f) * 255.0f);
     // Impulse triggers: ABS chatter on the brake trigger, wheelspin buzz on the throttle trigger.
     trig_l_ = lock_amt > 0 ? (std::fmod(clock_ * 15.0, 1.0) < 0.5 ? 0.6f * lock_amt + 0.2f : 0.0f) : 0.0f;
     trig_r_ = 0.5f * spin_amt;

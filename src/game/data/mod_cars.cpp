@@ -1,4 +1,5 @@
 #include "game/data/mod_cars.h"
+#include "game/data/weight_class.h"
 
 #include "base/config.h"
 #include "base/log.h"
@@ -120,6 +121,48 @@ std::optional<TableId> table_by_name(std::string_view n) {
 // Engine-only upgrade tables: an electric car gets none of these.
 bool engine_part_table(int t) {
     return t == 7 || t == 8 || t == 9 || t == 10 || t == 11 || t == 12 || t == 14 || t == 15 || t == 16 || t == 19 || t == 20;
+}
+
+// An arcade record's tuning settings (table 35, +0xE8..) set to the car's stock settings: each one from the car's own part
+// record and clamped to that record's range, as the race builds a car's stock equipment (stock_equipment in
+// sim/exact/spec_build.cpp), at the offsets arcade_equipment reads them from. The disc's arcade cars mostly hold exactly
+// these; a copy of the donor's would replace the mod car's final drive, output factor and suspension with the donor's.
+// `part(slot)` is the car's part record for a kCarPartTables slot (empty when it has none). The output word (+0x10A) is 0:
+// the engine record's own factor, as in a garage car's equipment.
+template <class Part>
+void stock_arcade_settings(Bytes& a, Part&& part) {
+    auto clamp = [](int v, int lo, int hi) { return std::min(std::max(v, lo), hi); }; // max with lo, then min with hi
+    auto b = [](ByteSpan r, size_t o) -> int { return o < r.size() ? r[o] : 0; };
+    auto h = [&](ByteSpan r, size_t o) { return b(r, o) | b(r, o + 1) << 8; };
+    auto set = [&](size_t o, int v) { put8(a, o, u8(v)); };
+    auto set16 = [&](size_t o, int v) { put16(a, o, u16(v)); };
+    const ByteSpan ls = part(17), ge = part(18), su = part(19), rm = part(5), as = part(24), tc = part(25);
+    // LSD: the front's initial, accel and decel, then the rear's.
+    const size_t lsd[6][3] = {{0x12, 0x13, 0x14}, {0x15, 0x16, 0x17}, {0x18, 0x19, 0x1A},
+                              {0x1C, 0x1D, 0x1E}, {0x1F, 0x20, 0x21}, {0x22, 0x23, 0x24}};
+    for (size_t i = 0; i < 6; ++i) set(0xE8 + i, ls.empty() ? 0 : clamp(b(ls, lsd[i][0]), b(ls, lsd[i][1]), b(ls, lsd[i][2])));
+    set(0xEE, ge.empty() ? 0 : clamp(b(ge, 0x29), b(ge, 0x2A), b(ge, 0x2B)));
+    set16(0x10C, ge.empty() ? 0 : clamp(h(ge, 0x22), h(ge, 0x26), h(ge, 0x24)));
+    set(0xF8, rm.empty() ? 0 : clamp(b(rm, 0x13), b(rm, 0x11), b(rm, 0x12)));
+    set(0xF9, rm.empty() ? 0 : clamp(b(rm, 0x3C), b(rm, 0x3A), b(rm, 0x3B)));
+    if (!su.empty()) {
+        const int f1 = b(su, 0x2B), f2 = b(su, 0x32), r1 = b(su, 0x39), r2 = b(su, 0x40);
+        const std::pair<size_t, int> damper[8] = {{0x2E, f1}, {0x31, f1}, {0x35, f2}, {0x38, f2},
+                                                  {0x3C, r1}, {0x3F, r1}, {0x43, r2}, {0x46, r2}};
+        for (size_t i = 0; i < 8; ++i) set(0xF0 + i, clamp(b(su, damper[i].first), 1, damper[i].second));
+        set(0xFA, clamp(b(su, 0x13), b(su, 0x11), b(su, 0x12))), set(0xFB, clamp(b(su, 0x16), b(su, 0x14), b(su, 0x15)));
+        set(0xFC, b(su, 0x19)), set(0xFD, b(su, 0x1C));
+        set(0xFE, clamp(b(su, 0x4A), 1, b(su, 0x47))), set(0xFF, clamp(b(su, 0x4E), 1, b(su, 0x4B)));
+        set16(0x100, clamp(h(su, 0x54), h(su, 0x50), h(su, 0x52))), set16(0x102, clamp(h(su, 0x5A), h(su, 0x56), h(su, 0x58)));
+        set16(0x104, clamp(b(su, 0x23), b(su, 0x21), b(su, 0x22))), set16(0x106, clamp(b(su, 0x26), b(su, 0x24), b(su, 0x25)));
+    } else {
+        for (size_t o = 0xF0; o < 0x100; ++o)
+            if (o != 0xF8 && o != 0xF9) set(o, 0);
+        for (size_t o : {0x100, 0x102, 0x104, 0x106}) set16(o, 0);
+    }
+    set(0x108, tc.empty() ? 0 : clamp(b(tc, 0x11), 1, b(tc, 0x12)));
+    set(0x109, as.empty() ? 0 : clamp(b(as, 0x12), 1, b(as, 0x11)));
+    set16(0x10A, 0);
 }
 
 } // namespace
@@ -576,7 +619,6 @@ bool add_mod_car(CarDatabase& db, const ModCarDef& def, std::string* error) {
         }
         put8(*en, 0x57, u8(n));
         put8(*en, 0x42, 100);
-        if (def.output_pct) put8(*en, 0x42, *def.output_pct);
         float limit = def.max_rpm.value_or(float(last) * 100.0f);
         u8 lim = clamp8(limit / 100.0f);
         put8(*en, 0x45, lim);
@@ -586,7 +628,15 @@ bool add_mod_car(CarDatabase& db, const ModCarDef& def, std::string* error) {
         auto rpm_text = [](float r) { return std::to_string(int(std::lround(r / 100.0f)) * 100) + "rpm"; };
         put16(*en, 0x3C, db.add_unistring(rpm_text(peak_kw_rpm)));
         put16(*en, 0x40, db.add_unistring(def.electric ? "0rpm" : rpm_text(peak_nm_rpm)));
+    } else if (def.max_rpm) { // the donor's curve with this rev limit
+        u8 lim = clamp8(*def.max_rpm / 100.0f);
+        put8(*en, 0x45, lim);
+        put8(*en, 0x46, u8(std::max(0, int(lim) - 5)));
     }
+    if (def.output_pct) put8(*en, 0x42, *def.output_pct); // also on the donor's curve
+    const int output_pct = (*en)[0x42];
+    if (peak_kw <= 0)
+        if (auto e = db.engine(donor->parts[6])) peak_kw = e->curve_peak_ps() / 1.35962f; // the donor's curve, for the arcade class
     if (def.electric) {
         put8(*en, 0x44, 0); // no idle
         put16(*en, 0x16, 0); // no sampled engine sound: the race synthesises the motor
@@ -637,6 +687,17 @@ bool add_mod_car(CarDatabase& db, const ModCarDef& def, std::string* error) {
         if (!gears.empty() && fin > 0) overall_ratio = gears[0] * fin;
         if (fin > 0) {
             s16 f = clamps16(fin * 1000);
+            // The shop's gearboxes (the donor's, cloned) share the stock final drive, as every gearbox on the disc does:
+            // this car's, with an adjustable box's range widened to hold it. Their ratios are generated for the car.
+            const s16 d_fin = s16(get16(*ge, 0x22));
+            for (Rec& r : recs) {
+                if (r.table != TableId::Gear || &r.bytes == ge || r.bytes.size() < 0x28) continue;
+                for (size_t o : {0x24, 0x26})
+                    if (s16(get16(r.bytes, o)) == d_fin) put16(r.bytes, o, u16(f));
+                put16(r.bytes, 0x22, u16(f));
+                if (s16(get16(r.bytes, 0x24)) < f) put16(r.bytes, 0x24, u16(f));
+                if (s16(get16(r.bytes, 0x26)) > f) put16(r.bytes, 0x26, u16(f));
+            }
             put16(*ge, 0x22, u16(f));
             put16(*ge, 0x24, u16(f));
             put16(*ge, 0x26, u16(f));
@@ -681,15 +742,21 @@ bool add_mod_car(CarDatabase& db, const ModCarDef& def, std::string* error) {
     put16(car, 0xE6, name);
     put16(car, 0xE8, db.add_string(def.label));
     put16(car, 0xEA, def.year.value_or(donor->year));
+    // The price as the disc stores its own cars' (docs/MODDING.md): credits in the US and
+    // European languages, shown and charged x100 in Japanese like every price (GtMode::car_price).
     put32(car, 0xEC, def.price.value_or(donor->price));
     put8(car, 0xF0, 0);
     if (def.category) put8(car, 0xF1, *def.category);
-    for (size_t o = 0xF4; o < 0x104; o += 2) put16(car, o, name);
+    // The same names in every language (car_name_fields), and offered in every language
+    // (region byte +0xF7 = 0).
+    for (size_t o : {0xF2, 0xF4, 0x100, 0x102}) put16(car, o, name);
+    put8(car, 0xF7, 0);
     put16(car, 0x104, db.add_unistring(maker));
     db.add_label(def.label);
 
-    // Arcade car (table 35): the car with its own parts, as the arcade pickers and races
-    // look cars up there (the tyres switch to its ft_/rt_ stage 10-12 records).
+    // Arcade car (table 35): the car with its own parts and stock settings, as the arcade
+    // pickers and races look cars up there (the tyres switch to its ft_/rt_ stage 10-12
+    // records), so it races the same as from its own parts in GT Mode.
     {
         const db::Table& at = db.table(TableId::ArcadeCar);
         ByteSpan tmpl = at.records.empty() ? ByteSpan{} : at.records[0];
@@ -703,6 +770,11 @@ bool add_mod_car(CarDatabase& db, const ModCarDef& def, std::string* error) {
             put64(a, 0, car_code);
             put64(a, 8, car_code);
             for (size_t i = 0; i < parts.size(); ++i) put64(a, 0x10 + i * 8, parts[i]);
+            stock_arcade_settings(a, [&](int slot) -> ByteSpan {
+                if (const Bytes* b = stock_rec(slot)) return *b;
+                const ByteSpan* r = parts[size_t(slot)] ? db.record(TableId(kCarPartTables[size_t(slot)]), parts[size_t(slot)]) : nullptr;
+                return r ? *r : ByteSpan{};
+            });
             arcade_rec = std::move(a);
         }
     }
@@ -720,26 +792,15 @@ bool add_mod_car(CarDatabase& db, const ModCarDef& def, std::string* error) {
     m.for_sale = def.for_sale;
     m.description = def.description;
     {
-        // Arcade class by weight / power, the game's garage-car table (gt_mode_menu/arcade.cpp
-        // arcade_prepare): < 2.1 S, < 3.0 S+1, < 3.5 A, < 5.0 A+1, < 5.8 B, < 6.3 B+1, < 9.0 C,
-        // else C+1. Power: the curve's peak with the hidden output factor.
-        float ps = peak_kw * 1.35962f * (def.output_pct ? *def.output_pct : 100) / 100.0f;
-        if (ps <= 0 && def.power_kw) ps = *def.power_kw * 1.35962f;
-        float ratio = float(weight) / std::max(ps, 1.0f);
-        static const struct {
-            float below;
-            const char* cls;
-            int variant;
-        } kTable[] = {{2.1f, "s", 0}, {3.0f, "s", 1}, {3.5f, "a", 0}, {5.0f, "a", 1},
-                      {5.8f, "b", 0}, {6.3f, "b", 1}, {9.0f, "c", 0}, {1e9f, "c", 1}};
+        // Arcade class by weight / power, the game's garage-car table (weight_class.h).
+        // Power: the curve's peak with the hidden output factor.
+        float ps = peak_kw * 1.35962f * float(output_pct) / 100.0f;
+        const WeightClass w = class_by_weight(float(weight) / std::max(ps, 1.0f));
+        const std::string by_weight(1, "?cbas"[w.cls]);
         std::string cls = def.arcade_class;
         int variant = def.arcade_variant;
-        for (const auto& t : kTable)
-            if (ratio < t.below) {
-                if (cls == "auto") cls = t.cls;
-                if (variant < 0) variant = t.cls == cls ? t.variant : 0;
-                break;
-            }
+        if (cls == "auto") cls = by_weight;
+        if (variant < 0) variant = by_weight == cls ? w.next : 0;
         if (cls != "none" && cls != "auto") m.arcade_class = "CLASS_" + to_upper_ascii(cls);
         m.arcade_variant = std::max(variant, 0);
         m.arcade_level = def.arcade_level;

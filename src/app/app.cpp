@@ -4,8 +4,12 @@
 #include "app/updates.h"
 
 #include "base/log.h"
+#include "disc/region.h"
 #include "gt3r_version.h"
 #include "formats/png_writer.h"
+#include "game/gt_mode_menu.h"
+#include "game/gt_save.h"
+#include "menu/menu_scene.h"
 #include "platform/recent_discs.h"
 #include "platform/render_scale.h"
 #include "platform/mac_layer.h"
@@ -59,18 +63,15 @@ bool App::init(int argc, char** argv) {
     }
 
     // Portable mode: a portable.ini next to the executable keeps all user
-    // data beside it (handy for USB sticks); otherwise use the OS location.
-    const char* base = SDL_GetBasePath();
-    if (base && host_path_exists(std::string(base) + "portable.ini")) {
-        data_dir_ = base;
-    } else if (char* pref = SDL_GetPrefPath("GT3Revisited", "GT3Revisited")) {
-        data_dir_ = pref;
-        SDL_free(pref);
-    }
+    // data beside it (handy for USB sticks); otherwise use the OS location
+    // (GT3R_DATA_DIR overrides both; game::user_data_dir, shared with the saves).
+    data_dir_ = game::user_data_dir();
+    SDL_CreateDirectory(data_dir_.c_str());
     SDL_CreateDirectory(mods_dir().c_str());
     config_path_ = data_dir_ + "config.ini";
     if (auto cfg = IniDocument::load(config_path_)) config_ = std::move(*cfg);
     LOG_INFO("User data: %s", data_dir_.c_str());
+    set_speed_unit(parse_speed_unit(config_.get("race", "units").value_or(""))); // menus and races
 
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight"); // mobile: racing is landscape
     // macOS: the menu bar (and the title bar's green button) appears at the top of the screen in
@@ -108,9 +109,10 @@ bool App::init(int argc, char** argv) {
     bool use_gpu = config_.get("video", "gpu").value_or("1") != "0";
     gpu_opts.msaa = platform::default_msaa(platform::is_mobile());
     if (auto v = config_.get("video", "msaa")) gpu_opts.msaa = std::atoi(v->c_str());
+    if (auto v = config_.get("video", "anisotropy")) gpu_opts.anisotropy = std::atoi(v->c_str());
     if (auto v = config_.get("video", "vsync")) gpu_opts.vsync = *v != "0";
     if (auto v = config_.get("video", "gpu_debug")) gpu_opts.debug = *v == "1";
-    // [video] render_scale = auto | 0.5..1.0 (auto: native on desktop, capped on mobile)
+    // [video] render_scale = auto | 0.5..4.0 (auto: native on desktop, capped on mobile)
     std::optional<float> render_scale = platform::parse_render_scale(config_.get("video", "render_scale").value_or("auto"));
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -170,7 +172,7 @@ bool App::init(int argc, char** argv) {
     input_ = std::make_unique<InputManager>();
     input_->load(config_);
     touch_.load(config_);
-    audio_ = std::make_unique<AudioEngine>();
+    audio_ = std::make_unique<AudioEngine>(config_.get("audio", "device").value_or(""));
     if (auto vol = config_.get("audio", "music_volume")) audio_->set_music_volume(std::strtof(vol->c_str(), nullptr));
     if (auto vol = config_.get("audio", "sfx_volume")) audio_->set_sfx_volume(std::strtof(vol->c_str(), nullptr));
     if (auto v = config_.get("audio", "surround_cue")) audio_->voices().set_surround_cue(*v == "on");
@@ -225,8 +227,9 @@ bool App::init(int argc, char** argv) {
 }
 
 void App::push_game_start() {
+    const bool ask = vfs_ && vfs_->region().languages().size() > 1 && !language_chosen();
     for (const ScreenEntry& entry : screen_registry())
-        if (std::string_view(entry.id) == "boot") {
+        if (std::string_view(entry.id) == (ask ? "language" : "boot")) {
             push(entry.factory());
             return;
         }
@@ -248,6 +251,66 @@ void App::open_saved_disc(const std::string& saved) {
     LOG_WARN("Remembered disc image not available: %s", saved.c_str());
 }
 
+std::vector<std::string> App::languages() const {
+    std::vector<std::string> out;
+    if (!vfs_) return out;
+    for (int i = 0; menu::kMenuLanguages[i]; ++i)
+        if (vfs_->exists(std::string("menu/") + menu::kMenuLanguages[i] + "/gt_mode3.pmb"))
+            out.push_back(menu::kMenuLanguages[i]);
+    return out;
+}
+
+std::string App::language_key() const {
+    const Region r = vfs_ ? vfs_->region().region : Region::America;
+    return r == Region::America ? "lang" : std::string("lang_") + region_key(r);
+}
+
+std::string App::language() const { return text::language_code(vfs_ ? vfs_->language() : Language::US); }
+
+bool App::language_chosen() const {
+    if (const char* env = std::getenv("GT3R_LANG"); env && *env) return true;
+    return config_.get("gt3menu", language_key()).has_value();
+}
+
+// The disc's language: GT3R_LANG, else the region's choice in the config, when the disc has
+// that language's menus; else the region's own, else the first language the disc has.
+void App::apply_language() {
+    if (!vfs_) return;
+    std::string want;
+    if (const char* env = std::getenv("GT3R_LANG"); env && *env) want = env;
+    else want = config_.get("gt3menu", language_key()).value_or("");
+    const std::vector<std::string> have = languages();
+    auto has = [&](const std::string& l) { return std::find(have.begin(), have.end(), l) != have.end(); };
+    std::string code = text::language_code(vfs_->region().default_language());
+    if (!want.empty() && has(want)) code = want;
+    else if (!has(code) && !have.empty()) code = have.front();
+    vfs_->set_language(text::language_from_code(code).value_or(vfs_->region().default_language()));
+}
+
+void App::set_language(const std::string& code) {
+    std::optional<Language> l = text::language_from_code(code);
+    if (!vfs_ || !l) return;
+    config_.set("gt3menu", language_key(), code);
+    save_config();
+    if (vfs_->language() == *l) return;
+    vfs_->set_language(*l);
+    game::close_gt_mode(); // its data follows the language (units, money, names)
+}
+
+void App::rescan_mods() {
+    if (!vfs_) return;
+    vfs_->scan_mods(mods_dir(), &config_);
+    game::reload_gt_mode_data(); // loaded at the first title menu, with the mods of then
+}
+
+void App::set_mod_enabled(const std::string& id, bool enabled) {
+    config_.set("mods", id, enabled ? "on" : "off");
+    save_config();
+    if (!vfs_) return;
+    vfs_->set_mod_enabled(id, enabled);
+    game::reload_gt_mode_data();
+}
+
 std::string App::open_disc(const std::string& path) {
     const std::string full = absolute_disc_path(path);
     try {
@@ -256,6 +319,7 @@ std::string App::open_disc(const std::string& path) {
         disc_ = std::move(disc);
         vfs_ = std::make_unique<Vfs>(&disc_->volume());
         vfs_->scan_mods(mods_dir(), &config_);
+        apply_language();
         config_.set("game", "disc", full);
         platform::save_recent_discs(config_, platform::push_recent_disc(recent_discs(), full));
         save_config();
@@ -391,6 +455,7 @@ void App::reset_dynamic_scale() {
 
 void App::close_disc() {
     if (audio_) audio_->stop_music();
+    game::close_gt_mode(); // its data, reader and save library belong to this disc
     vfs_.reset();
     disc_.reset();
 }
@@ -413,6 +478,8 @@ void App::save_config() {
     config_.set("audio", "music_volume", vol);
     std::snprintf(vol, sizeof(vol), "%.2f", audio_ ? audio_->sfx_volume() : 0.8f);
     config_.set("audio", "sfx_volume", vol);
+    if (audio_ && !audio_->output_device().empty()) config_.set("audio", "device", audio_->output_device());
+    else if (audio_) config_.remove("audio", "device");
     if (!config_.save(config_path_)) LOG_WARN("Could not save %s", config_path_.c_str());
 }
 
@@ -490,9 +557,11 @@ SDL_AppResult App::iterate() {
         xr_pointer();
     }
 #endif
+    pointer_script();
     touch_.update(dt, touch_layout, *input_);
     input_->update(dt);
-    if (modal || (top && top->wants_menu_input())) menu_.update(input_->pad(0), dt);
+    if (modal || (top && top->wants_menu_input()))
+        menu_.update(!modal && top->menu_input_any_device() ? input_->any_device_pad() : input_->menu_pad(), dt);
     else menu_.update(PadState{}, dt);
 
     Uint64 h_u0 = SDL_GetTicksNS();
@@ -523,6 +592,15 @@ SDL_AppResult App::iterate() {
     touch_.set_safe_area(safe_area_window());
     touch_.render(*ui_);
     if (phone_sim_) draw_phone_mask();
+    if (pointer_shown_) { // a scripted pointer's arrow (screenshots)
+        const float x = pointer_x_, y = pointer_y_;
+        const SDL_FPoint tip[4] = {{x, y}, {x, y + 11}, {x + 7.5f, y + 7.5f}, {x, y}};
+        SDL_Vertex v[3];
+        for (int i = 0; i < 3; ++i) v[i] = {tip[i], {1, 1, 1, 1}, {0, 0}};
+        SDL_RenderGeometry(renderer_, nullptr, v, 3, nullptr, 0);
+        SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
+        SDL_RenderLines(renderer_, tip, 4);
+    }
 #if GT3R_XR
     if (xr_ && xr_pointer_on_) { // the pointer's dot on the virtual screen
         SDL_SetRenderDrawColor(renderer_, 255, 255, 255, 230);
@@ -561,6 +639,7 @@ SDL_AppResult App::iterate() {
     }
     const Uint64 present_start = SDL_GetTicksNS();
     SDL_RenderPresent(renderer_);
+    if (gpu_) gpu_->frame_presented();
     const double present_ms = double(SDL_GetTicksNS() - present_start) / 1e6;
     // A lost GPU (Vulkan's VK_ERROR_DEVICE_LOST, which SDL only reports in its error text) never
     // comes back, and the frames that never finish grow the memory by hundreds of MB a second
@@ -572,6 +651,7 @@ SDL_AppResult App::iterate() {
                                  window_);
         return SDL_APP_FAILURE;
     }
+    if (gpu_) gpu_->warm_step(); // Mali Bifrost: the warm-up, one pipeline per frame (after present_ms)
     if (dyn_on_) {
         float s = dyn_.frame(frame_s * 1000.0, present_ms);
         if (const double c = dyn_cycle_s(); c > 0) { // testing: down to 50% and back up every c seconds
@@ -609,7 +689,9 @@ SDL_AppResult App::event(const SDL_Event& e) {
     // Android may end a backgrounded app without a quit.
     if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND || e.type == SDL_EVENT_TERMINATING) remember_race_scale();
     input_->handle_event(e);
-    if (e.type == SDL_EVENT_DROP_FILE && e.drop.data) set_dialog_result(e.drop.data);
+    if (audio_ && (e.type == SDL_EVENT_AUDIO_DEVICE_ADDED || e.type == SDL_EVENT_AUDIO_DEVICE_REMOVED)) audio_->device_event(e);
+    if (e.type == SDL_EVENT_DROP_FILE && e.drop.data && (screens_.empty() || !screens_.back()->takes_dropped_file(e.drop.data)))
+        set_dialog_result(e.drop.data);
     if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F12 && !e.key.repeat) screenshot_requested_ = true;
     if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_F11 && !e.key.repeat) set_fullscreen(!fullscreen());
     // Fullscreen entered or left another way (macOS green button, window manager).
@@ -788,6 +870,97 @@ void App::save_screenshot(const std::string& path) {
         if (write_host_file(eyes, encode_png(u32(w) * 2, u32(h), both))) LOG_INFO("Eyes saved: %s", eyes.c_str());
     }
 #endif
+}
+
+// GT3R_POINTER_SCRIPT="wait:60;move:320 200;click:320 200;wheel:-1 320 272;drag:300 280 200 280;tap:100 100;rclick:5 5"
+// Steps run in order, `wait:<frames>` between them; coordinates are UI units. move / click /
+// drag / wheel / rclick are the mouse (as the VR pointer sends them), tap a finger, and
+// pinch:<x> <y> <from> <to> two fingers centred on (x, y) moving from `from` to `to` units apart.
+void App::pointer_script() {
+    static const bool parsed = [this] {
+        if (const char* env = SDL_getenv("GT3R_POINTER_SCRIPT"))
+            for (std::string_view step : split(env, ';'))
+                if (!trim(step).empty()) pointer_steps_.emplace_back(trim(step));
+        return true;
+    }();
+    (void)parsed;
+    auto dispatch = [this](const SDL_Event& e) {
+        if (updates().dialog_open()) updates().dialog_event(*this, e);
+        else if (!screens_.empty()) screens_.back()->on_event(*this, e);
+    };
+    auto motion = [&](float x, float y, bool held) {
+        SDL_Event e{};
+        e.type = SDL_EVENT_MOUSE_MOTION;
+        e.motion.x = x, e.motion.y = y;
+        e.motion.xrel = x - pointer_x_, e.motion.yrel = y - pointer_y_;
+        e.motion.state = held ? SDL_BUTTON_LMASK : 0;
+        dispatch(e);
+        pointer_x_ = x, pointer_y_ = y, pointer_shown_ = true;
+    };
+    auto button = [&](float x, float y, bool down, Uint8 which = SDL_BUTTON_LEFT) {
+        SDL_Event e{};
+        e.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+        e.button.button = which;
+        e.button.down = down;
+        e.button.clicks = 1;
+        e.button.x = x, e.button.y = y;
+        dispatch(e);
+    };
+    while (pointer_step_ < pointer_steps_.size()) {
+        if (pointer_wait_ > 0) {
+            --pointer_wait_;
+            return;
+        }
+        const std::string& step = pointer_steps_[pointer_step_++];
+        if (step.rfind("wait:", 0) != 0) LOG_INFO("Pointer script (frame %d): %s", frame_, step.c_str());
+        size_t colon = step.find(':');
+        std::string verb = step.substr(0, colon);
+        float a[4] = {};
+        if (colon != std::string::npos)
+            std::sscanf(step.c_str() + colon + 1, "%f %f %f %f", &a[0], &a[1], &a[2], &a[3]);
+        if (verb == "wait") pointer_wait_ = std::max(0, int(a[0]));
+        else if (verb == "move") motion(a[0], a[1], false);
+        else if (verb == "click") motion(a[0], a[1], false), button(a[0], a[1], true), button(a[0], a[1], false);
+        else if (verb == "rclick") button(a[0], a[1], true, SDL_BUTTON_RIGHT), button(a[0], a[1], false, SDL_BUTTON_RIGHT);
+        else if (verb == "drag") {
+            motion(a[0], a[1], false);
+            button(a[0], a[1], true);
+            for (int i = 1; i <= 8; ++i) motion(a[0] + (a[2] - a[0]) * float(i) / 8, a[1] + (a[3] - a[1]) * float(i) / 8, true);
+            button(a[2], a[3], false);
+        } else if (verb == "wheel") {
+            SDL_Event e{};
+            e.type = SDL_EVENT_MOUSE_WHEEL;
+            e.wheel.y = a[0];
+            e.wheel.mouse_x = a[1], e.wheel.mouse_y = a[2];
+            dispatch(e);
+        } else if (verb == "tap") {
+            SDL_Event e{};
+            e.type = SDL_EVENT_FINGER_DOWN;
+            e.tfinger.touchID = 1, e.tfinger.fingerID = 1;
+            e.tfinger.x = a[0], e.tfinger.y = a[1];
+            dispatch(e);
+            e.type = SDL_EVENT_FINGER_UP;
+            dispatch(e);
+            pointer_shown_ = false;
+        } else if (verb == "pinch") {
+            auto finger = [&](Uint32 type, SDL_FingerID id, float spread) {
+                SDL_Event e{};
+                e.type = type;
+                e.tfinger.touchID = 1, e.tfinger.fingerID = id;
+                e.tfinger.x = a[0] + (id == 1 ? -spread : spread) / 2, e.tfinger.y = a[1];
+                dispatch(e);
+            };
+            finger(SDL_EVENT_FINGER_DOWN, 1, a[2]);
+            finger(SDL_EVENT_FINGER_DOWN, 2, a[2]);
+            for (int i = 1; i <= 8; ++i)
+                for (SDL_FingerID id : {1, 2}) finger(SDL_EVENT_FINGER_MOTION, id, a[2] + (a[3] - a[2]) * float(i) / 8);
+            finger(SDL_EVENT_FINGER_UP, 1, a[3]);
+            finger(SDL_EVENT_FINGER_UP, 2, a[3]);
+            pointer_shown_ = false;
+        } else {
+            LOG_WARN("GT3R_POINTER_SCRIPT: unknown step '%s'", step.c_str());
+        }
+    }
 }
 
 #if GT3R_XR

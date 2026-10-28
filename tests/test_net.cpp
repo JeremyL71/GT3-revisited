@@ -6,20 +6,21 @@
 #include "net/protocol.h"
 #include "base/file.h"
 #include "base/sha256.h"
+#include "disc/volume.h"
 #include "formats/png_writer.h"
 #include "game/data/car_database.h"
 #include "game/mod_package.h"
 #include "game/gt_mode.h"
 #include "game/gt_state.h"
 #include "game/net_car.h"
+#include "net/geoip.h"
 #include "net/relay_server.h"
 #include "vfs/vfs.h"
 #include "net/session.h"
 #include "net/update_check.h"
+#include "race/exact_setup.h"
 #include "race/net_race.h"
 #include "race/interp.h"
-#include "sim/vehicle.h"
-#include "sim/world.h"
 
 #include <atomic>
 #include <chrono>
@@ -107,60 +108,77 @@ bool has(const std::vector<net::Event>& ev, net::Event::Kind k) {
 
 } // namespace
 
+namespace {
+u32 fbits(float v) {
+    u32 b;
+    std::memcpy(&b, &v, 4);
+    return b;
+}
+} // namespace
+
 TEST(net_wire_roundtrip) {
+    // An exact car state: the record's floats bit for bit, the fixed-unit fields, the entry and the pad frames.
     net::CarSnapshot s;
     s.player = 3;
     s.tick = 12345;
-    s.state.position = {-812.3456f, 21.25f, 640.0019f};
-    s.state.orientation = race::normalize(sim::Quat{0.9f, 0.05f, 0.4f, -0.02f});
-    s.state.velocity = {55.55f, -1.2f, -20.04f};
-    s.state.angular_velocity = {0.1f, -0.75f, 0.02f};
-    s.state.engine_rpm = 7123;
-    s.state.gear = -1;
-    s.state.throttle = 0.5f;
-    s.state.rev_limiter = true;
-    s.state.wheels[0].steer_angle = 0.31f;
-    s.state.wheels[2].angular_velocity = 180.33f;
-    s.state.wheels[3].suspension = -0.071f;
-    s.state.wheels[1].slip_ratio = -0.33f;
-    s.state.wheels[1].slip_angle = 0.2f;
-    s.state.wheels[3].grounded = true;
-    s.state.wheels[1].surface = 0x1A0C;
-    s.heading = -1.25f, s.yaw_rate = -0.5f;
+    s.clock = -2950; // in the countdown
+    net::CarMotion& m = s.motion;
+    m.pos = {fbits(-812.3456f), fbits(640.0019f), fbits(21.25f)};
+    m.vel = {fbits(55.55f), fbits(-20.04f), fbits(-1.2f)};
+    m.heading = fbits(-1.25f), m.pitch = fbits(0.01f), m.roll = 0x80000000u, m.yaw_rate = fbits(-0.5f);
+    m.omega = fbits(745.6f), m.steer_cmd = fbits(0.11f), m.axle_speed = {fbits(180.3f), fbits(181.0f)};
+    m.pitch_rate = -321, m.roll_rate = 77;
+    m.rim_speed = {7000, 7001, -12, 32767};
+    m.susp = {-6000, -6100, 200, -32768};
+    m.gear = 3, m.clutch = 2;
+    s.entry = {1, 1, false, true, 1, 1};
     s.laps = 2;
-    sim::ControlInputs in;
-    in.steer = -0.5f, in.throttle = 1, in.brake = 0.25f, in.handbrake = true, in.automatic = true;
-    s.inputs[0] = net::pack_input(in);
-    s.inputs[1] = net::pack_input({}, true);
-    s.input_count = 2;
+    s.rev_limiter = true;
+    s.inputs[0] = {0x1F, 2, 1, -4096, 4096, 120, 0, 0};
+    s.inputs[1] = s.inputs[0];                          // repeated: one byte
+    s.inputs[2] = {0x1B, 4, -1, 2048, 0, 4096, 4096, 4096}; // the back and third axes too
+    s.input_count = 3;
     net::Writer w;
     net::write_snapshot(w, s);
-    std::printf("  state: %zu bytes with %d inputs of history\n", w.data.size() + 4 * (net::kInputHistory - 2),
-                net::kInputHistory);
-    CHECK(w.data.size() + 4 * (net::kInputHistory - 2) <= 100); // the whole state with full input history
+    std::printf("  state: %zu bytes with %d frames of history (one repeated)\n", w.data.size(), net::kInputHistory);
+    CHECK(w.data.size() <= 125);
     net::Reader r(w.data);
     net::CarSnapshot t;
     CHECK(net::read_snapshot(r, t));
     CHECK(r.at_end());
-    auto near = [](float a, float b, float tol) { return std::fabs(a - b) <= tol; };
-    CHECK(t.player == 3 && t.tick == 12345);
-    CHECK(near(t.state.position.x, s.state.position.x, 0.0006f) && near(t.state.position.z, s.state.position.z, 0.0006f));
-    CHECK(near(t.state.velocity.x, 55.55f, 0.006f) && near(t.state.angular_velocity.y, -0.75f, 0.0006f));
-    CHECK(t.state.engine_rpm == 7123 && t.state.gear == -1 && t.state.rev_limiter && near(t.state.throttle, 0.5f, 0.003f));
-    CHECK(near(t.state.wheels[0].steer_angle, 0.31f, 0.003f) && near(t.state.wheels[2].angular_velocity, 180.33f, 0.06f));
-    CHECK(near(t.state.wheels[3].suspension, -0.071f, 0.0011f) && near(t.state.wheels[1].slip_ratio, -0.33f, 0.006f));
-    CHECK(near(t.state.wheels[1].slip_angle, 0.2f, 0.003f) && t.state.wheels[1].surface == 0x1A0C);
-    CHECK(t.state.wheels[3].grounded && !t.state.wheels[0].grounded);
-    float dh = std::remainder(t.heading - s.heading, 6.2831853f);
-    CHECK(std::fabs(dh) < 1e-4f && near(t.yaw_rate, -0.5f, 0.0006f) && t.laps == 2);
-    CHECK(t.input_count == 2 && t.inputs[0] == s.inputs[0] && t.inputs[1] == s.inputs[1]);
-    sim::ControlInputs back = net::unpack_input(t.inputs[0]);
-    CHECK(near(back.steer, -0.5f, 0.005f) && back.throttle == 1 && near(back.brake, 0.25f, 0.003f) && back.handbrake &&
-          back.automatic);
-    CHECK((t.inputs[1].flags & 16) && near(t.brake, 0.25f, 0.003f));
+    CHECK(t.player == 3 && t.tick == 12345 && t.clock == -2950);
+    CHECK(t.motion == s.motion && t.entry == s.entry);
+    CHECK(t.laps == 2 && t.rev_limiter && !t.respawned);
+    CHECK(t.input_count == 3 && t.inputs[0] == s.inputs[0] && t.inputs[1] == s.inputs[1] && t.inputs[2] == s.inputs[2]);
+    // Read back and written again (the host relays states this way): the same bytes.
+    net::Writer w2;
+    net::write_snapshot(w2, t);
+    CHECK(w2.data == w.data);
+    // Typical analog driving: three different frames without the back or third axis.
+    net::CarSnapshot d = s;
+    d.inputs[1].steer = -4000, d.inputs[2] = d.inputs[0], d.inputs[2].steer = -3900;
+    net::Writer wd;
+    net::write_snapshot(wd, d);
+    std::printf("  state while steering: %zu bytes\n", wd.data.size());
+    CHECK(wd.data.size() <= 118);
     // Truncated input fails cleanly.
     net::Reader cut(ByteSpan(w.data.data(), w.data.size() - 3));
     CHECK(!net::read_snapshot(cut, t));
+    // A float a peer sends as infinity or NaN is refused (the exact core would carry it; the host's floats would not).
+    net::CarSnapshot bad = s;
+    bad.motion.vel[1] = 0x7FC00000u;
+    net::Writer wb;
+    net::write_snapshot(wb, bad);
+    net::Reader rb(wb.data);
+    CHECK(!net::read_snapshot(rb, t));
+    // A repeat marker without a frame before it is malformed.
+    net::CarSnapshot one = s;
+    one.input_count = 1;
+    net::Writer w1;
+    net::write_snapshot(w1, one);
+    w1.data[w1.data.size() - 8] = 0xFF; // the first frame's flags byte
+    net::Reader r1(ByteSpan(w1.data.data(), w1.data.size() - 7));
+    CHECK(!net::read_snapshot(r1, t));
     // A NaN from a peer never reaches us.
     net::Writer n;
     n.f32_(std::nanf(""));
@@ -168,64 +186,27 @@ TEST(net_wire_roundtrip) {
     CHECK(nr.f32_() == 0.0f);
 }
 
-TEST(net_quat_smallest_three) {
-    // Random rotations: the packed orientation is within 0.25 degrees.
-    u32 x = 12345;
-    auto rnd = [&] {
-        x = x * 1664525u + 1013904223u;
-        return float(x >> 8) / float(1 << 24) * 2 - 1;
-    };
-    float worst = 0;
-    for (int i = 0; i < 2000; ++i) {
-        sim::Quat q = race::normalize(sim::Quat{rnd(), rnd(), rnd(), rnd()});
-        sim::Quat p = net::unpack_quat(net::pack_quat(q));
-        float d = std::fabs(q.w * p.w + q.x * p.x + q.y * p.y + q.z * p.z);
-        float angle = 2 * std::acos(std::min(1.0f, d)) * 57.29578f;
-        worst = std::max(worst, angle);
-    }
-    std::printf("  smallest three: worst error %.3f deg\n", worst);
-    CHECK(worst < 0.25f);
-    sim::Quat id = net::unpack_quat(net::pack_quat(sim::Quat{}));
-    CHECK(std::fabs(id.w - 1) < 1e-3f);
-}
-
-TEST(net_snapshot_completion_matches_vehicle) {
-    // What the wire leaves out (CoG, wheel contacts) rebuilt from the car's setup agrees with
-    // the simulation's own values for a car driving and turning.
-    struct Flat : sim::TrackQuery {
-        sim::SurfaceHit probe(float, float, float y_max) const override {
-            sim::SurfaceHit h;
-            h.hit = y_max >= 0;
-            return h;
-        }
-    } ground;
-    auto car = sim::Vehicle::create(sim::CarSpec::test_car());
-    car->reset({10, 0, 20}, {});
-    sim::ControlInputs in;
-    in.throttle = 0.8f;
-    in.steer = 0.4f;
-    for (int i = 0; i < 240; ++i) car->step(in, ground, 1.0 / 60);
-    net::InputFrame f = net::pack_input(in);
-    net::CarSnapshot s = race::make_snapshot(*car, 240, 0, &f, 1);
-    net::Writer w;
-    net::write_snapshot(w, s);
-    net::Reader r(w.data);
-    net::CarSnapshot t;
-    CHECK(net::read_snapshot(r, t));
-    race::complete_snapshot(t, car->setup(), car->spec().mass, 4.0);
-    sim::collide::Body b = car->collision_body();
-    float dx = t.body_x - float(b.pos.x), dz = t.body_z - float(b.pos.z);
-    float worst = 0;
-    // The simulation's contact points are from the start of the tick (one tick of motion behind
-    // the published pose); the rebuilt ones are at the pose.
-    sim::Vec3 tick_motion = car->state().velocity * float(1.0 / 60);
-    for (size_t i = 0; i < 4; ++i)
-        worst = std::max(worst, (t.state.wheels[i].contact - (car->state().wheels[i].contact + tick_motion)).length());
-    std::printf("  completion: CoG off by %.4f m, wheel contacts by %.4f m, race time %.3f\n", std::hypot(dx, dz), worst,
-                t.race_time);
-    CHECK(std::hypot(dx, dz) < 0.01f);
-    CHECK(worst < 0.05f);
-    CHECK(std::fabs(t.race_time - 0.0f) < 1e-4f); // tick 240 = 4 s after a 4 s countdown
+TEST(net_snapshot_completion) {
+    // What the wire leaves out: the race time from the clock, the physics frame (Z up) in the course frame, the lamps.
+    net::CarSnapshot s;
+    s.clock = 4500;
+    s.motion.pos = {fbits(10), fbits(20), fbits(1.5f)};
+    s.motion.vel = {fbits(3), fbits(-4), fbits(0.5f)};
+    s.motion.heading = fbits(0.5f), s.motion.yaw_rate = fbits(0.25f);
+    s.motion.gear = 0;
+    s.inputs[0].brake = 2048;
+    s.input_count = 1;
+    race::complete_snapshot(s);
+    CHECK(std::fabs(s.race_time - 1.5f) < 1e-6f);
+    CHECK(s.state.position.x == 10 && s.state.position.y == 1.5f && s.state.position.z == -20);
+    CHECK(s.state.velocity.x == 3 && s.state.velocity.y == 0.5f && s.state.velocity.z == 4);
+    CHECK(std::fabs(s.state.speed_kmh - std::sqrt(25.25f) * 3.6f) < 1e-3f);
+    CHECK(s.body_x == 10 && s.body_z == -20 && s.heading == 0.5f && s.yaw_rate == 0.25f);
+    CHECK(s.state.gear == -1 && std::fabs(s.brake - 0.5f) < 1e-6f);
+    // The heading's rotation turns the car's nose (-Z) to the physics frame's forward axis (cos h, sin h) in the course
+    // frame (x, -y).
+    sim::Vec3 nose = race::rotate(s.state.orientation, {0, 0, -1});
+    CHECK(std::fabs(nose.x - std::cos(0.5f)) < 1e-5f && std::fabs(nose.z + std::sin(0.5f)) < 1e-5f);
 }
 
 TEST(net_resolve) {
@@ -299,9 +280,9 @@ static void session_flow(float loss) {
     for (u32 t = 1; t <= 20; ++t) {
         net::CarSnapshot s;
         s.tick = t;
-        s.state.position = {float(t), 0, 0};
+        s.motion.pos = {fbits(float(t)), 0, 0};
         c1.send_state(s);
-        s.state.position = {0, 0, float(t)};
+        s.motion.pos = {0, 0, fbits(float(t))};
         host.send_state(s);
         for (net::Session* x : all) x->poll();
     }
@@ -310,10 +291,9 @@ static void session_flow(float loss) {
         const net::Session::Remote* b = c2.remote(0);
         return a && b && a->snap.tick >= 15 && b->snap.tick >= 15;
     }));
-    // Each car's own state (positions travel in 1 mm steps, so most whole metres arrive a hair
-    // off; with loss the newest state to arrive may be any tick from 15 on).
-    CHECK(c2.remote(1)->snap.player == 1 && std::fabs(c2.remote(1)->snap.state.position.x - float(c2.remote(1)->snap.tick)) < 0.001f);
-    CHECK(std::fabs(c2.remote(0)->snap.state.position.z - float(c2.remote(0)->snap.tick)) < 0.001f);
+    // Each car's own state, bit for bit (with loss the newest state to arrive may be any tick from 15 on).
+    CHECK(c2.remote(1)->snap.player == 1 && c2.remote(1)->snap.motion.pos[0] == fbits(float(c2.remote(1)->snap.tick)));
+    CHECK(c2.remote(0)->snap.motion.pos[2] == fbits(float(c2.remote(0)->snap.tick)));
     CHECK(!c2.remote(2)); // never our own car
 
     // A finish is relayed to everyone.
@@ -427,6 +407,41 @@ TEST(net_clock_sync) {
     double real_host = host.race_start_ms(), real_client = c1.race_start_ms() - 5000;
     std::printf("  start instants differ by %.2f ms\n", real_client - real_host);
     CHECK(std::fabs(real_client - real_host) < 5);
+}
+
+TEST(net_old_protocol_told_to_update) {
+    // A game of the previous online protocol (3: another physics' states) joins: the host refuses it with a text that
+    // tells it to update (it shows the host's text as it is), instead of a race whose states it cannot read.
+    FakeClock clock;
+    net::Session host;
+    if (!host.host(0, "Host", "a", 0)) SKIP("no UDP sockets here");
+    net::Address ha;
+    CHECK(net::resolve("127.0.0.1:" + std::to_string(host.port()), 0, ha));
+    net::UdpSocket old;
+    CHECK(old.open_for(ha));
+    // Its first datagram: "GT3N", protocol 3, ack 0, one reliable message (seq 0: Hello), no unreliable ones.
+    net::Writer hello;
+    hello.u8_(u8(net::Msg::Hello));
+    hello.u16_(3);
+    hello.str("Old"), hello.str("r34_gtr_v_99"), hello.u8_(0), hello.str("0.3.0"), hello.u8_(0);
+    net::Writer w;
+    w.bytes(ByteSpan(reinterpret_cast<const u8*>("GT3N"), 4));
+    w.u16_(3), w.u16_(0), w.u8_(1), w.u16_(0), w.u16_(u16(hello.data.size()));
+    w.bytes(hello.data);
+    w.u8_(0);
+    CHECK(old.send_to(ha, w.data));
+    std::string reply;
+    CHECK(pump({&host}, [&] {
+        u8 buf[2048];
+        net::Address from;
+        while (size_t n = old.recv_from(from, buf, sizeof buf)) reply.append(reinterpret_cast<const char*>(buf), n);
+        return reply.find("update") != std::string::npos;
+    }));
+    CHECK(reply.find("update required: the host has a newer version of the game (online protocol 4, yours 3)") !=
+          std::string::npos);
+    CHECK(host.players().size() == 1); // not let in
+    // The other way round: a newer game is told the host must update.
+    CHECK(net::protocol_mismatch(net::kProtocolVersion + 1).find("the host needs to update") != std::string::npos);
 }
 
 TEST(net_session_rejects_when_racing) {
@@ -968,6 +983,14 @@ TEST(net_online_car_roundtrip) {
     m.package_size = 1234567;
     std::optional<game::OnlineCar> md = game::decode_online_car(game::encode_online_car(m));
     CHECK(md && md->package == m.package && md->package_size == 1234567);
+    game::OnlineCar a;
+    a.kind = game::OnlineCar::Kind::Arcade;
+    a.car = "nsx_s_zero_97";
+    a.arcade = "nsx_s_zero_97_290";
+    std::optional<game::OnlineCar> ad = game::decode_online_car(game::encode_online_car(a));
+    CHECK(ad && ad->kind == game::OnlineCar::Kind::Arcade && ad->car == a.car && ad->arcade == a.arcade);
+    a.arcade.clear(); // an arcade car without its label
+    CHECK(!game::decode_online_car(game::encode_online_car(a)));
     // Malformed: truncated, bad hash, unknown kind, empty label.
     CHECK(!game::decode_online_car(ByteSpan(b.data(), b.size() - 5)));
     m.package = "zz";
@@ -1024,7 +1047,7 @@ TEST(net_garage_car_spec_disc) {
     std::optional<sim::CarSpec> rebuilt = game::online_car_spec(db, *sent);
     CHECK(rebuilt.has_value());
     CHECK(rebuilt->mass == direct->mass && rebuilt->engine.curve_torque == direct->engine.curve_torque);
-    CHECK(rebuilt->axle[0].susp.k == direct->axle[0].susp.k && rebuilt->axle[0].susp.k > 0);
+    CHECK(rebuilt->axle[0].ride_height == direct->axle[0].ride_height && rebuilt->axle[0].ride_height > 0);
     std::printf("  garage R34: %.0f kg, peak torque x%.3f (engine condition)\n", rebuilt->mass, f);
 }
 
@@ -1222,8 +1245,7 @@ TEST(net_mod_package_validation_disc) {
         refuses(p, "online_test_ev", "donor not on this disc");
     }
     // Install: the files land in mods/dl-<hash>/ and nowhere else.
-    std::string dir = (std::filesystem::temp_directory_path() / "gt3r_test_mods").string();
-    std::filesystem::remove_all(dir);
+    std::string dir = test::temp_path("mods").string();
     std::string hash = sha256_hex(game::serialize_mod_package(good));
     std::optional<std::string> where = game::install_mod_package(good, hash, dir, "Online Test EV", "Matt", &err);
     CHECK(where.has_value());
@@ -1257,118 +1279,6 @@ TEST(net_mod_packages_of_installed_mods) {
         ++n;
     }
     CHECK(n > 0);
-}
-
-// --- prediction ------------------------------------------------------------------------
-
-namespace {
-struct FlatTrack : sim::TrackQuery {
-    sim::SurfaceHit probe(float, float, float y_max) const override {
-        sim::SurfaceHit h;
-        h.hit = y_max >= 0;
-        return h;
-    }
-};
-
-// The owner's scripted driving: launch, hard braking, a weave and a long corner.
-sim::ControlInputs script_input(int tick) {
-    double t = tick / 60.0;
-    sim::ControlInputs in;
-    in.automatic = true;
-    in.controller_kind = 2;
-    if (t < 4) in.throttle = 1;
-    else if (t < 5.5) in.brake = 0.9f;
-    else if (t < 10) in.throttle = 0.7f, in.steer = float(0.6 * std::sin((t - 5.5) * 2.4));
-    else in.throttle = 0.5f, in.steer = 0.35f;
-    return in;
-}
-
-struct PredictionError {
-    double rms_shown = 0, rms_body = 0, max_body = 0;
-};
-
-// Owner car driven by the script; its states reach the remote predictor `latency` ticks late
-// (through the wire format). Errors of the prediction against the owner's true car.
-PredictionError measure(bool physics, int latency, int every = 1) {
-    FlatTrack ground;
-    auto owner = sim::Vehicle::create(sim::CarSpec::test_car());
-    owner->reset({0, 0, 0}, {});
-    race::RemoteCar rc;
-    if (physics) rc.attach(sim::Vehicle::create(sim::CarSpec::test_car()), &ground, nullptr);
-    std::deque<net::CarSnapshot> wire;
-    net::InputFrame hist[net::kInputHistory];
-    int nh = 0;
-    const double countdown = 0;
-    double se = 0, sb = 0, mb = 0;
-    int n = 0;
-    for (int tick = 1; tick <= 60 * 14; ++tick) {
-        sim::ControlInputs in = script_input(tick);
-        owner->step(in, ground, 1.0 / 60);
-        std::copy_backward(hist, hist + net::kInputHistory - 1, hist + net::kInputHistory);
-        hist[0] = net::pack_input(in);
-        nh = std::min(nh + 1, net::kInputHistory);
-        if (tick % every == 0) {
-            net::CarSnapshot s = race::make_snapshot(*owner, u32(tick), 0, hist, nh);
-            net::Writer w;
-            net::write_snapshot(w, s);
-            net::Reader r(w.data);
-            net::CarSnapshot back;
-            net::read_snapshot(r, back);
-            race::complete_snapshot(back, owner->setup(), owner->spec().mass, countdown);
-            wire.push_back(back);
-        }
-        double now = tick / 60.0 - countdown; // the owner's race time after this tick = ours
-        while (!wire.empty() && int(wire.front().tick) <= tick - latency) {
-            rc.receive(wire.front(), now - 1.0 / 60);
-            wire.pop_front();
-        }
-        if (!rc.has() || tick < 60) continue;
-        race::RemoteCar::Pose p = rc.predict(now);
-        sim::collide::Body b = owner->collision_body();
-        double eb = std::hypot(p.body_x - b.pos.x, p.body_z - b.pos.z);
-        double es = (p.state.position - owner->state().position).length();
-        se += es * es, sb += eb * eb, mb = std::max(mb, eb), ++n;
-    }
-    PredictionError e;
-    e.rms_shown = std::sqrt(se / std::max(n, 1));
-    e.rms_body = std::sqrt(sb / std::max(n, 1));
-    e.max_body = mb;
-    return e;
-}
-} // namespace
-
-TEST(net_physics_prediction_beats_dead_reckoning) {
-    for (int latency : {6, 9}) {
-        PredictionError dead = measure(false, latency), phys = measure(true, latency);
-        std::printf("  %3d ms late: dead reckoning rms %.3f m (max %.2f), physics rms %.3f m (max %.2f); shown %.3f / %.3f m\n",
-                    latency * 1000 / 60, dead.rms_body, dead.max_body, phys.rms_body, phys.max_body, dead.rms_shown,
-                    phys.rms_shown);
-        CHECK(phys.rms_body < dead.rms_body * 0.6);
-        CHECK(phys.rms_shown < dead.rms_shown * 0.6);
-        // The worst moment is right after the driver changes input (the shadow keeps the old input
-        // for the latency): briefly worse than dead reckoning, still bounded.
-        CHECK(phys.max_body < dead.max_body * 2.5 && phys.max_body < 0.3);
-    }
-    // States at 20 Hz instead of 60 (a bad connection dropping two of three): still bounded.
-    PredictionError sparse = measure(true, 6, 3);
-    std::printf("  100 ms late, 20 Hz states: physics rms %.3f m (max %.2f)\n", sparse.rms_body, sparse.max_body);
-    CHECK(sparse.rms_body < 1.0);
-}
-
-TEST(net_prediction_cost) {
-    // Shadows step a remote car's physics: one tick per frame, plus up to 15 to catch up when a
-    // state arrives. Report what a vehicle tick costs.
-    FlatTrack ground;
-    auto v = sim::Vehicle::create(sim::CarSpec::test_car());
-    v->reset({}, {});
-    sim::ControlInputs in;
-    in.throttle = 0.8f, in.steer = 0.2f;
-    auto t0 = std::chrono::steady_clock::now();
-    const int n = 20000;
-    for (int i = 0; i < n; ++i) v->step_tick(in, ground, 1.0 / 60);
-    double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / n;
-    std::printf("  vehicle tick %.2f us: worst case 5 remote cars x 16 ticks = %.2f ms per frame\n", us, us * 80 / 1000);
-    CHECK(us * 80 < 4000); // well inside a 16.7 ms frame even in a debug build
 }
 
 // --- contact messages ------------------------------------------------------------------
@@ -1405,55 +1315,6 @@ TEST(net_contact_routing) {
     }
 }
 
-TEST(net_contact_impulse_applies) {
-    FlatTrack ground;
-    auto v = sim::Vehicle::create(sim::CarSpec::test_car());
-    v->reset({0, 0, 0}, {});
-    sim::collide::Body b0 = v->collision_body();
-    // Through the CoG: pure translation, dv = J / m.
-    v->apply_impulse(b0.pos, {0, 1200});
-    sim::collide::Body b1 = v->collision_body();
-    CHECK(std::fabs(b1.vel.z - 1200 / v->spec().mass) < 1e-6 && std::fabs(b1.yaw_rate) < 1e-9);
-    // Off-centre: it also turns the car (yaw += (r x J) / I).
-    v->apply_impulse({b0.pos.x + 1.5, b0.pos.z}, {0, 1200});
-    sim::collide::Body b2 = v->collision_body();
-    double expect = b0.inv_inertia * sim::collide::V2{1.5, 0}.cross({0, 1200});
-    CHECK(std::fabs(b2.yaw_rate - expect) < 1e-9 && b2.yaw_rate != 0);
-    // A non-finite impulse is ignored.
-    v->apply_impulse(b0.pos, {std::nan(""), 0});
-    CHECK(std::isfinite(v->collision_body().vel.x));
-}
-
-TEST(net_remote_hit_sign) {
-    // The impulse the field reports for a remote car (World::Contact normal points from a to b):
-    // a remote car driving into our parked car is pushed back, against its motion.
-    FlatTrack g;
-    sim::World world(g);
-    int me = world.add(sim::Vehicle::create(sim::CarSpec::test_car()));
-    int rem = world.add(sim::Vehicle::create(sim::CarSpec::test_car()));
-    world.vehicle(me).reset({0, 0, 0}, {});
-    world.vehicle(rem).reset({0.3f, 0, -12}, {0, 0, 1, 0});
-    world.set_kinematic(rem, true);
-    sim::collide::Body body = world.vehicle(rem).collision_body();
-    sim::VehicleState st = world.vehicle(rem).state();
-    body.vel = {0, 8};
-    st.velocity = {0, 0, 8};
-    bool seen = false;
-    for (int i = 0; i < 120 && !seen; ++i) {
-        body.pos.z += 8.0 / 60;
-        st.position.z += 8.0f / 60;
-        world.vehicle(rem).set_remote_pose(st, body);
-        world.step(1.0 / 60);
-        for (const sim::World::Contact& c : world.contacts()) {
-            float sign = c.b == rem ? 1.0f : -1.0f;
-            float jz = c.normal.z * c.impulse * sign;
-            CHECK(jz < 0); // the remote car (moving +z) is pushed towards -z
-            seen = true;
-        }
-    }
-    CHECK(seen);
-}
-
 // --- lobby car rules -------------------------------------------------------------------
 
 TEST(net_car_rules_disc) {
@@ -1468,13 +1329,152 @@ TEST(net_car_rules_disc) {
     std::printf("  R34 V-spec: %.0f PS\n", ps);
     CHECK(ps > 250 && ps < 400);
     std::string why;
-    CHECK(game::car_meets_rules(r34, &*spec, false, 0, &why));
-    CHECK(game::car_meets_rules(r34, &*spec, true, 500, &why)); // a disc car is stock
-    CHECK(!game::car_meets_rules(r34, &*spec, false, 200, &why));
+    game::CarFacts f = game::online_car_facts(db, nullptr, r34);
+    CHECK(f.known && f.built && std::fabs(f.power_ps - ps) < 0.01f);
+    CHECK(f.drive == 3 && f.turbo && f.category == 0); // 4WD, turbo, a production car
+    game::CarRules r;
+    CHECK(game::car_meets_rules(r34, f, r, &why));
+    r.stock_only = true, r.max_ps = 500;
+    CHECK(game::car_meets_rules(r34, f, r, &why)); // a disc car is stock
+    r = {};
+    r.max_ps = 200;
+    CHECK(!game::car_meets_rules(r34, f, r, &why));
     std::printf("  200 PS limit: %s\n", why.c_str());
+    r = {};
+    r.drive = 2; // FR only
+    CHECK(!game::car_meets_rules(r34, f, r, &why));
+    std::printf("  FR only: %s\n", why.c_str());
+    r.drive = 3; // 4WD
+    CHECK(game::car_meets_rules(r34, f, r, &why));
+    r = {};
+    r.aspiration = 1; // NA only
+    CHECK(!game::car_meets_rules(r34, f, r, &why));
+    r.aspiration = 2;
+    CHECK(game::car_meets_rules(r34, f, r, &why));
+    r = {};
+    r.category = 2; // race and rally cars only
+    CHECK(!game::car_meets_rules(r34, f, r, &why));
+    r.category = 1;
+    CHECK(game::car_meets_rules(r34, f, r, &why));
+    // A disc car is in no class list: classed as GT3 classes a garage car, by kg / PS on a
+    // road course (the R34 V-spec: 1560 kg / 336 PS = 4.6, Class A), a rally car on dirt.
+    std::printf("  R34 V-spec: %.2f kg/PS, %s\n", double(f.kg_per_ps), game::car_class_text(f, false).c_str());
+    CHECK(f.arcade_class == 0 && f.weight_class == 3 && game::car_class(f, false) == 3 && game::car_class(f, true) == 5);
+    r = {};
+    r.car_class = 3;
+    CHECK(game::car_meets_rules(r34, f, r, &why));
+    r.car_class = 4;
+    CHECK(!game::car_meets_rules(r34, f, r, &why));
+    std::printf("  Class S only: %s\n", why.c_str());
+    r.dirt_course = true; // on dirt: a rally car, and not refused there
+    CHECK(!game::car_meets_rules(r34, f, r, &why));
+    r.car_class = 5;
+    CHECK(game::car_meets_rules(r34, f, r, &why));
+    r.car_class = 0;
+    CHECK(game::car_meets_rules(r34, f, r, &why));
+    // A garage car counts as tuned only when its parts or settings differ from the stock car's.
     game::OnlineCar garage = r34;
     garage.kind = game::OnlineCar::Kind::Garage;
-    CHECK(!game::car_meets_rules(garage, &*spec, true, 0, &why));
+    garage.parts = db.car("r34_gtr_v_99")->parts;
+    garage.settings = sim::stock_settings(db, "r34_gtr_v_99", garage.parts);
+    r = {};
+    r.stock_only = true;
+    CHECK(game::car_meets_rules(garage, game::online_car_facts(db, nullptr, garage), r, &why));
+    garage.settings.final_drive += 100;
+    CHECK(!game::car_meets_rules(garage, game::online_car_facts(db, nullptr, garage), r, &why));
+    // A mod car this machine lacks passes what needs the car; mods off refuses it.
+    game::OnlineCar mod;
+    mod.kind = game::OnlineCar::Kind::Mod;
+    mod.car = "not_on_this_disc";
+    r = {};
+    r.max_ps = 200, r.drive = 2, r.car_class = 1;
+    CHECK(game::car_meets_rules(mod, game::online_car_facts(db, nullptr, mod), r, &why));
+    r.allow_mods = false;
+    CHECK(!game::car_meets_rules(mod, game::online_car_facts(db, nullptr, mod), r, &why));
+}
+
+TEST(net_car_rules_arcade_classes) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    data::CarDatabase db;
+    CHECK(db.load(disc->volume()));
+    game::GtData gd;
+    const Volume& vol = disc->volume();
+    CHECK(gd.load([&](const std::string& p) -> std::optional<Bytes> {
+        if (p == Vfs::kProgramFile) return vol.read_program();
+        const Volume::Entry* e = vol.find(p);
+        if (!e) return std::nullopt;
+        return vol.read(*e);
+    }));
+    // Every car of the road and rally class lists is an arcade car on its base car.
+    int total = 0;
+    for (int cls = 1; cls <= game::kArcadeClasses; ++cls) {
+        auto it = gd.arcade_classes.find(game::arcade_class_tag(cls));
+        CHECK(it != gd.arcade_classes.end());
+        if (it == gd.arcade_classes.end()) continue;
+        for (const game::GtData::ArcadeCar& a : it->second) {
+            game::OnlineCar oc = game::online_car_from_arcade(db, a.label, 0);
+            if (oc.car.empty()) continue; // region-hidden labels (the Vauxhalls on NTSC-U)
+            ++total;
+            CHECK(oc.kind == game::OnlineCar::Kind::Arcade && db.car(oc.car));
+            CHECK(game::arcade_class_of(gd, oc.arcade) == cls);
+            game::CarFacts f = game::online_car_facts(db, &gd, oc);
+            CHECK(f.built && f.arcade_class == cls);
+        }
+    }
+    std::printf("  %d arcade class cars\n", total);
+    CHECK(total >= 60);
+    // The GT-One of Class S: its arcade racing tyres ("_k", arc_racing) grip more than its stock ones.
+    game::OnlineCar gt1 = game::online_car_from_arcade(db, "arm_gt_one_race_99", 0);
+    CHECK(gt1.kind == game::OnlineCar::Kind::Arcade && gt1.car == "gt_one_race_99");
+    std::optional<sim::CarSpec> arc = game::online_car_spec(db, gt1, nullptr, "trialmt");
+    CHECK(arc.has_value());
+    const race::ExactCarSource src = race::exact_online_source(db, gt1, "trialmt");
+    CHECK(src.tire_stage == 10); // (its stage-10 tyres, "_k": arc_racing)
+    std::printf("  GT-One: %s, tyre stage %d\n", src.label.c_str(), src.tire_stage);
+    game::CarFacts f = game::online_car_facts(db, &gd, gt1);
+    CHECK(f.arcade_class == 4 && f.category != 0);
+    std::string why;
+    game::CarRules r;
+    r.car_class = 4;
+    CHECK(game::car_meets_rules(gt1, f, r, &why));
+    r.car_class = 2;
+    CHECK(!game::car_meets_rules(gt1, f, r, &why));
+    std::printf("  Class B only: %s\n", why.c_str());
+    // The class page's surface rule: road classes not on dirt, the rally class not on roads.
+    r = {};
+    r.dirt_course = true;
+    CHECK(!game::car_meets_rules(gt1, f, r, &why));
+    std::printf("  on dirt: %s\n", why.c_str());
+    game::OnlineCar wrc = game::online_car_from_arcade(db, "impreza_wrc_99_304", 0);
+    game::CarFacts fw = game::online_car_facts(db, &gd, wrc);
+    CHECK(fw.arcade_class == 5);
+    CHECK(game::car_meets_rules(wrc, fw, r, &why));
+    r.dirt_course = false;
+    CHECK(!game::car_meets_rules(wrc, fw, r, &why));
+    // The stock car of an arcade car is in no list: it has its weight's class.
+    game::OnlineCar stock_gt1 = game::online_car_from_db(db, "gt_one_race_99", 0);
+    game::CarFacts fs = game::online_car_facts(db, &gd, stock_gt1);
+    CHECK(fs.arcade_class == 0 && fs.weight_class == 4 && game::car_class(fs, false) == 4);
+    // The weight rule against the road class lists: nearly every listed car is in the class
+    // its weight per power gives (the misses sit near a boundary).
+    int same = 0, listed = 0;
+    for (int cls = 1; cls < game::kArcadeClasses; ++cls)
+        for (const game::GtData::ArcadeCar& a : gd.arcade_classes[game::arcade_class_tag(cls)]) {
+            game::OnlineCar oc = game::online_car_from_arcade(db, a.label, 0);
+            if (oc.car.empty()) continue;
+            game::CarFacts fa = game::online_car_facts(db, &gd, oc);
+            ++listed;
+            same += fa.weight_class == cls;
+        }
+    std::printf("  road class cars in their weight's class: %d of %d\n", same, listed);
+    CHECK(listed >= 50 && same >= listed - 6);
+    // Every car of the disc has a class.
+    int classed = 0;
+    for (const data::Car& c : db.cars())
+        classed += game::car_class(game::online_car_facts(db, &gd, game::online_car_from_db(db, c.label, 0)), false) > 0;
+    std::printf("  cars with a class: %d of %zu\n", classed, db.cars().size());
+    CHECK(classed + 2 >= int(db.cars().size()));
 }
 
 TEST(net_settings_carry_rules) {
@@ -1488,10 +1488,13 @@ TEST(net_settings_carry_rules) {
     st.stock_only = true;
     st.max_ps = 350;
     st.allow_mods = false;
+    st.car_class = 2, st.category = 1, st.drive = 4, st.aspiration = 2;
     st.ghost_ping_ms = 0;
     host.set_settings(st);
     CHECK(pump({&host, &c1}, [&] { return c1.settings().max_ps == 350; }));
     CHECK(c1.settings().stock_only && !c1.settings().allow_mods && c1.settings().ghost_ping_ms == 0);
+    CHECK(c1.settings().car_class == 2 && c1.settings().category == 1 && c1.settings().drive == 4 &&
+          c1.settings().aspiration == 2);
 }
 
 // --- cheat warnings --------------------------------------------------------------------
@@ -1588,46 +1591,6 @@ TEST(net_plausibility_flags) {
         auto f = q.on_finish(95.0, 100.0);
         CHECK(f && f->kind == net::FlagKind::FinishTime);
     }
-}
-
-TEST(net_plausibility_honest_drive) {
-    // The scripted owner car (launch, hard braking, weave, corner) as another machine sees it,
-    // 100 ms late with physics prediction: no warnings for honest driving.
-    FlatTrack ground;
-    auto owner = sim::Vehicle::create(sim::CarSpec::test_car());
-    owner->reset({0, 0, 0}, {});
-    race::RemoteCar rc;
-    rc.attach(sim::Vehicle::create(sim::CarSpec::test_car()), &ground, nullptr);
-    race::Plausibility check;
-    check.set_car(game::geared_top_speed(owner->spec()));
-    std::deque<net::CarSnapshot> wire;
-    net::InputFrame hist[net::kInputHistory];
-    int nh = 0, flags = 0;
-    for (int tick = 1; tick <= 60 * 14; ++tick) {
-        sim::ControlInputs in = script_input(tick);
-        owner->step(in, ground, 1.0 / 60);
-        std::copy_backward(hist, hist + net::kInputHistory - 1, hist + net::kInputHistory);
-        hist[0] = net::pack_input(in);
-        nh = std::min(nh + 1, net::kInputHistory);
-        net::CarSnapshot s = race::make_snapshot(*owner, u32(tick), 0, hist, nh);
-        net::Writer w;
-        net::write_snapshot(w, s);
-        net::Reader r(w.data);
-        net::CarSnapshot back;
-        net::read_snapshot(r, back);
-        race::complete_snapshot(back, owner->setup(), owner->spec().mass, 0);
-        wire.push_back(back);
-        double now = tick / 60.0;
-        while (!wire.empty() && int(wire.front().tick) <= tick - 6) {
-            rc.receive(wire.front(), now - 1.0 / 60);
-            if (auto f = check.on_state(wire.front(), false)) std::printf("  false warning: %s %.1f\n", net::flag_text(f->kind), f->value), ++flags;
-            if (auto f = check.on_prediction_error(rc.last_error(), rc.last_error_horizon(), false))
-                std::printf("  false warning: %s %.1f\n", net::flag_text(f->kind), f->value), ++flags;
-            wire.pop_front();
-        }
-        rc.predict(now);
-    }
-    CHECK(flags == 0);
 }
 
 TEST(net_flags_and_kick) {
@@ -1759,29 +1722,25 @@ struct RvSix {
     }
 };
 
-// A car state as a race sends it: every field moving, six inputs of history.
+// A car state as a race sends it: every field moving, three different frames of history (analog steering).
 net::CarSnapshot race_state(u32 tick, int player) {
     net::CarSnapshot s;
     s.tick = tick;
+    s.clock = s32(tick * 50);
     float t = float(tick) / 60.0f + float(player);
-    s.state.position = {100 * std::sin(t * 0.1f), 2 + 0.1f * std::sin(t), 100 * std::cos(t * 0.1f)};
-    float c = std::cos(t * 0.05f), sn = std::sin(t * 0.05f);
-    s.state.orientation = sim::Quat{c, 0, sn, 0};
-    s.state.velocity = {30 * std::cos(t * 0.1f), 0.2f, -30 * std::sin(t * 0.1f)};
-    s.state.angular_velocity = {0.01f, 0.1f * std::sin(t), 0.02f};
-    for (auto& w : s.state.wheels) {
-        w.steer_angle = 0.1f * std::sin(t);
-        w.angular_velocity = 90;
-        w.suspension = 0.05f;
-        w.slip_ratio = 0.03f, w.slip_angle = 0.02f;
-        w.grounded = true;
-    }
-    s.state.engine_rpm = 6000 + 500 * std::sin(t);
-    s.state.gear = 4;
-    s.heading = t, s.yaw_rate = 0.1f;
+    net::CarMotion& m = s.motion;
+    m.pos = {fbits(100 * std::sin(t * 0.1f)), fbits(-100 * std::cos(t * 0.1f)), fbits(2 + 0.1f * std::sin(t))};
+    m.vel = {fbits(30 * std::cos(t * 0.1f)), fbits(30 * std::sin(t * 0.1f)), fbits(0.2f)};
+    m.heading = fbits(t * 0.1f), m.pitch = fbits(0.01f * std::sin(t)), m.roll = fbits(0.02f * std::cos(t));
+    m.yaw_rate = fbits(0.1f), m.omega = fbits(600 + 50 * std::sin(t)), m.steer_cmd = fbits(0.1f * std::sin(t));
+    m.axle_speed = {fbits(90), fbits(91)};
+    m.pitch_rate = s16(100 * std::sin(t)), m.roll_rate = s16(50 * std::cos(t));
+    for (size_t w = 0; w < 4; ++w) m.rim_speed[w] = s16(3840 + w), m.susp[w] = s16(-6000 + 100 * std::sin(t));
+    m.gear = 4, m.clutch = 1;
     s.laps = 1;
     s.input_count = net::kInputHistory;
-    for (int i = 0; i < net::kInputHistory; ++i) s.inputs[i] = {s8(20 * std::sin(t)), 230, 0, 8};
+    for (int i = 0; i < net::kInputHistory; ++i)
+        s.inputs[i] = {0x1F, 2, 0, s16(2000 * std::sin(t - 0.02f * float(i))), 3800, 0, 0, 0};
     return s;
 }
 
@@ -2364,6 +2323,107 @@ TEST(net_relay_version_query) {
     int answered = 0;
     for (int i = 0; i < 10; ++i) answered += ask(q, nullptr);
     CHECK(answered == 3 && srv.stats().limited == 7);
+}
+
+TEST(net_relay_logs_ip_tags) {
+    // The log names a source by a keyed hash of its IP, never the IP: one source keeps its tag
+    // (players can still be counted), another gets another, and another relay (a restart or a
+    // new UTC day) draws another key.
+    std::vector<std::string> logged;
+    auto run = [&](net::RelayServer& srv, SlotHost& a, SlotHost& b, SlotHost& c) {
+        use_mailboxes(srv);
+        srv.set_log([&](const std::string& s) { logged.push_back(s); });
+        net::resolve("203.0.113.7:5000", 0, c.addr);
+        double t = 1e6;
+        CHECK(a.reg(1, t) && b.reg(2, t) && c.reg(3, t)); // a, b: 127.0.0.1 from two ports
+        c.send(net::Rv::Lookup, t, [&](net::Writer& w) {
+            w.str(a.code);
+            w.u16_(net::kProtocolVersion);
+            net::put_endpoints(w, {});
+        });
+    };
+    auto tag = [&](const std::string& prefix) {
+        for (const std::string& l : logged)
+            if (l.rfind(prefix, 0) == 0) return l.substr(prefix.size());
+        return std::string("?");
+    };
+    net::RelayServer srv;
+    SlotHost a(srv), b(srv), c(srv);
+    run(srv, a, b, c);
+    CHECK(!logged.empty() && logged[0].rfind("ip tags: new key", 0) == 0);
+    std::string ta = tag("session " + a.code + " registered by "), tc = tag("session " + c.code + " registered by ");
+    CHECK(ta.size() == 8 && tc.size() == 8 && ta != tc);
+    CHECK(tag("session " + b.code + " registered by ") == ta);
+    CHECK(tag("join " + a.code + " from ") == tc);
+    for (const std::string& l : logged) CHECK(l.find("127.0.0.1") == std::string::npos && l.find("203.0.113") == std::string::npos);
+    logged.clear();
+    net::RelayServer srv2;
+    SlotHost a2(srv2), b2(srv2), c2(srv2);
+    run(srv2, a2, b2, c2);
+    CHECK(tag("session " + c2.code + " registered by ") != tc);
+    // A server run with --log-ips logs the IPs instead (no port).
+    logged.clear();
+    net::RelayServer srv3;
+    srv3.set_log_ips(true);
+    SlotHost a3(srv3), b3(srv3), c3(srv3);
+    run(srv3, a3, b3, c3);
+    CHECK(tag("session " + a3.code + " registered by ") == "127.0.0.1");
+    CHECK(tag("join " + a3.code + " from ") == "203.0.113.7");
+    CHECK(tag("ip tags:") == "?");
+    // With --geoip each player's country follows ("??" when the list has no range for it).
+    logged.clear();
+    net::RelayServer srv4;
+    srv4.set_log_country([](const net::Address& a) { return a.to_string().rfind("203.", 0) == 0 ? "NZ" : ""; });
+    SlotHost a4(srv4), b4(srv4), c4(srv4);
+    run(srv4, a4, b4, c4);
+    std::string ta4 = tag("session " + a4.code + " registered by ");
+    CHECK(ta4.size() == 13 && ta4.substr(8) == " (\?\?)");
+    CHECK(tag("join " + a4.code + " from ").substr(8) == " (NZ)");
+}
+
+TEST(net_geoip_ranges) {
+    net::GeoIp geo;
+    auto at = [&](const char* ip) {
+        net::Address a;
+        CHECK(net::resolve(ip, 1, a));
+        return geo.country(a);
+    };
+    CHECK(!geo.parse("garbage\n1.2.3.4,BR\n"));
+    CHECK(geo.ranges() == 0 && at("1.2.3.4").empty());
+    CHECK(geo.parse("0.0.0.0,0.255.255.255,ZZ\r\n"
+                    "\"1.0.0.0\",\"1.0.0.255\",\"AU\"\r\n"
+                    "1.0.1.0,1.0.3.255,CN\n"
+                    "1.0.4.0,1.0.7.255,CN\n" // joins the one before
+                    "2.0.0.0,1.0.0.0,US\n"   // backwards: skipped
+                    "5.0.0.0,5.0.0.255,us\n" // not a country code: skipped
+                    "8.8.8.0,8.8.8.255,US,extra\n"
+                    "2001:db8::,2001:db8:0:ffff:ffff:ffff:ffff:ffff,DE\n"
+                    "2001:db8:1::,2001:db8:1:ffff:ffff:ffff:ffff:ffff,FR\n"
+                    "::ffff:9.9.9.0,::ffff:9.9.9.255,CH\n"
+                    "255.255.255.0,255.255.255.255,ZZ")); // no newline at the end
+    CHECK(geo.ranges() == 8);
+    CHECK(at("1.0.0.7") == "AU" && at("1.0.2.1") == "CN" && at("1.0.7.255") == "CN" && at("1.0.8.0").empty());
+    CHECK(at("8.8.8.8") == "US" && at("9.9.9.9") == "CH" && at("0.1.2.3") == "ZZ" && at("255.255.255.255") == "ZZ");
+    CHECK(at("5.0.0.1").empty() && at("1.5.0.0").empty());
+    CHECK(at("[2001:db8::1]:5") == "DE" && at("[2001:db8:0:5::9]:5") == "DE" && at("[2001:db8:1:2::]:5") == "FR");
+    CHECK(at("[2001:db8:2::1]:5").empty());
+    // Ranges smaller than a /64 (the lookup's unit): a split /64 goes to one country, the same
+    // whatever order the list (or the sort) has them in; an overlap keeps what lies past the
+    // range before.
+    for (const char* csv : {"2001:db8:5::100,2001:db8:5:0:ffff:ffff:ffff:ffff,CA\n"
+                            "2001:db8:5::,2001:db8:5::ff,US\n"
+                            "2001:db8:6::,2001:db8:6:0:ffff:ffff:ffff:ffff,US\n"
+                            "10.0.0.0,10.0.0.255,AA\n10.0.0.128,10.0.1.255,BB\n",
+                            "10.0.0.128,10.0.1.255,BB\n10.0.0.0,10.0.0.255,AA\n"
+                            "2001:db8:6::,2001:db8:6:0:ffff:ffff:ffff:ffff,US\n"
+                            "2001:db8:5::,2001:db8:5::ff,US\n"
+                            "2001:db8:5::100,2001:db8:5:0:ffff:ffff:ffff:ffff,CA\n"}) {
+        CHECK(geo.parse(csv) && geo.ranges() == 4);
+        CHECK(at("[2001:db8:5::1]:5") == "CA" && at("[2001:db8:5::200]:5") == "CA" && at("[2001:db8:6::1]:5") == "US");
+        CHECK(at("10.0.0.200") == "AA" && at("10.0.1.0") == "BB");
+    }
+    // A failed load keeps the list it had.
+    CHECK(!geo.load("/nonexistent/gt3r-geoip.csv") && geo.ranges() == 4);
 }
 
 TEST(net_relay_min_online_enforced) {

@@ -35,7 +35,7 @@ public:
     bool load(render::GpuContext& ctx, ByteSpan env0, ByteSpan tex);
     bool loaded() const { return gpu_ != nullptr; }
     void clear();
-    // One wheel, one 1/60 s tick: `surface_index` = sim::model::surface_index of the wheel,
+    // One wheel, one 1/60 s tick: `surface_index` = sim::surface_index of the wheel,
     // `intensity` = VehicleTelemetry::smoke_emit, `sun` = road shade A under the wheel, `right_side`
     // = wheels 1 / 3.
     void emit(const render::Vec3& contact, int surface_index, float intensity, float sun, bool right_side);

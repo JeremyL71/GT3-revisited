@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace gt3r {
@@ -161,6 +162,62 @@ private:
     bool active_ = false, dragging_ = false;
     u64 id_ = 0;
     float x_ = 0, y_ = 0, sx_ = 0, sy_ = 0;
+};
+
+// Clickable areas of a page, recorded while it draws (UI units), for pointer input.
+struct HitArea {
+    UiRect r;
+    int id = 0, arg = 0;
+};
+class HitList {
+public:
+    void clear() { areas_.clear(); }
+    void add(const UiRect& r, int id, int arg = 0) { areas_.push_back({r, id, arg}); }
+    // The area under (x, y); the one added last (drawn on top) first. Null when none.
+    const HitArea* at(float x, float y) const;
+
+private:
+    std::vector<HitArea> areas_;
+};
+
+// Pointer input for pages with clickable areas: the mouse, fingers, and the VR controller's
+// pointer (which App::xr_pointer sends as mouse events). Fed from Screen::on_event (UI
+// coordinates) and read in update():
+//  - Hover: a mouse or VR pointer moved (no button held). Pages focus what it is over, so one
+//    click chooses. A finger has no hover: a tap on something not focused focuses it and the
+//    next tap chooses (as in the game's menus, MenuController::tap).
+//  - Click: a press and release that did not drag.
+//  - Drag / DragEnd: the press moved more than a few units (now, and where it started).
+//  - Wheel: mouse wheel steps (+ = up / away from the user) at the pointer.
+//  - Back: the right mouse button.
+class PointerInput {
+public:
+    struct Action {
+        enum class Kind : u8 { Hover, Click, Drag, DragEnd, Wheel, Back } kind = Kind::Hover;
+        float x = 0, y = 0;   // where (Drag: the pointer now)
+        float sx = 0, sy = 0; // Drag: where the press started
+        float wheel = 0;      // Wheel: steps
+        bool finger = false;  // a touch
+    };
+    void event(const SDL_Event& e);
+    std::vector<Action> take() { return std::exchange(actions_, {}); }
+    void clear() {
+        actions_.clear();
+        gesture_.cancel();
+    }
+    // Where the mouse / VR pointer last was (hover highlights); false after a touch, or when it
+    // left the window.
+    bool hover_pos(float& x, float& y) const {
+        x = hx_, y = hy_;
+        return hover_known_;
+    }
+
+private:
+    Gesture gesture_;
+    bool finger_ = false;
+    std::vector<Action> actions_;
+    bool hover_known_ = false;
+    float hx_ = 0, hy_ = 0;
 };
 
 // Tap/click position in UI coordinates if `e` is a primary press (left mouse

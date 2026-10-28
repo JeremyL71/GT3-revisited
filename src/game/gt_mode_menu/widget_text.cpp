@@ -41,25 +41,26 @@ std::optional<std::string> widget_text(const std::string& page, const Element& e
         return r ? r->name : std::string();
     }
     // Race prizes and the championship trophy: the place, the prize money and the credits
-    // counting up by it. The prize counter's items: "Cr. %s" (the balance) and "%s Cr. %s"
-    // ("Prize Cr. 991", what is left, counting down; it fades out after the count, see
-    // remain_alpha).
+    // counting up by it. The prize counter's items: the game's "Cr. %s" (the balance) and
+    // "%s Cr. %s" with the language's prefix ("Prize Cr. 991", what is left, counting down; it
+    // fades out after the count, see remain_alpha).
     if ((is_mini_prize(page) || page == "trophy_get") && ms.show) {
         if (c == "rank_disp") return ms.show->rank;
         const Show::Counter& k = ms.show->counter;
         s64 base = ms.show->credited ? st.credits - ms.show->money : st.credits;
         s64 moved = k.started ? k.cur - base : 0;
-        if (c == "get_money_disp") return "Prize Cr. " + format_credits(ms.show->money - moved);
-        if (c == "count" || c == "count_shadow") return "Cr. " + format_credits(base + moved);
+        if (c == "get_money_disp") return prize_remain_text(gt.data().prize_prefix, ms.show->money - moved);
+        if (c == "count" || c == "count_shadow") return credits_text(base + moved);
     }
     if (c == "user_money") return " " + format_credits(st.credits); // a space after the Cr. icon (reference)
     if (c == "user_day") return std::to_string(st.day);
     // The status bar's day counter: the unit widget's own template filled with the day
-    // ("day %d" -> "day 12"); the hidden "user_day" widget is not shown.
+    // ("day %d" -> "day 12"; the NTSC-U layout hides "user_day"). A template without "%d" is a
+    // label beside the "user_day" number and stays as it is (the Japanese layout's "day" kanji).
     if (c == "user_day_unit") {
         std::string t = e.text ? e.text->text : std::string();
         size_t at = t.find("%d");
-        if (at == std::string::npos) return std::to_string(st.day);
+        if (at == std::string::npos) return t;
         return t.substr(0, at) + std::to_string(st.day) + t.substr(at + 2);
     }
     if (c == "eventname") return std::string();     // drawn from the hidden reason element (extra_draws)
@@ -69,15 +70,19 @@ std::optional<std::string> widget_text(const std::string& page, const Element& e
         return s->focus_car.empty() ? std::string() : car_name(gt, s->focus_car);
     }
     if (c == "goods_car_price") {
-        // Widget "<car>_price[N]" on the dealer pages.
+        // Widget "<car>_price[N]" on the dealer pages: "Cr. %s", "----" for a car not
+        // for sale (flag bit 0).
         std::string car = e.name.substr(0, e.name.rfind("_price"));
         if (const DealerCar* d = gt.data().catalog.dealer_car(car)) car = d->car;
-        return gt.db().car(car) ? cr_pre(gt.car_price(car)) : std::string();
+        if (!gt.db().car(car)) return std::string();
+        return gt.car_flags(car) & 1 ? std::string("----") : cr_pre(gt.car_price(car));
     }
     if (c == "car_buy_price") {
         if (starts(page, "hm/") && focus_g) return cr_num(gt.car_price(focus_g->car));
+        // The dealer car page: the price, "----" for a car not for sale (flag bit 0).
         // After the Cr. icon one space in (the reference dealer car pages: " 17,000").
-        return s->focus_car.empty() ? std::string() : " " + cr_num(gt.car_price(s->focus_car));
+        if (s->focus_car.empty()) return std::string();
+        return gt.car_flags(s->focus_car) & 1 ? std::string("----") : " " + cr_num(gt.car_price(s->focus_car));
     }
     if (c == "car_sell_price") {
         // (The garage car page insets its texts instead: extra_draws.)
@@ -137,15 +142,16 @@ std::optional<std::string> widget_text(const std::string& page, const Element& e
         const data::Event* ev = gt.db().event(code);
         if (!ev || ev->bytes.size() < 0x199) return std::string();
         // The start speed (also 0, as "0mph" on the B-1 page); NTSC-U in mph.
-        if (gt.data().imperial) std::snprintf(buf, sizeof buf, "%dmph", int(std::lround(ev->bytes[0x198] * 0.621371)));
+        if (gt.data().imperial()) std::snprintf(buf, sizeof buf, "%dmph", int(std::lround(ev->bytes[0x198] * 0.621371)));
         else std::snprintf(buf, sizeof buf, "%dkm/h", ev->bytes[0x198]);
         return std::string(buf);
     }
     if (starts(c, "race_prize_")) {
+        // The race information page's prizes: the place's prize, "0" included.
         int p = std::atoi(c.c_str() + 11) - 1;
         auto r = gt.rules(s->race_code);
         if (!r || p < 0 || p > 5) return std::string();
-        return r->prize[size_t(p)] ? cr_num(r->prize[size_t(p)]) : std::string("-");
+        return cr_num(r->prize[size_t(p)]);
     }
     if (starts(c, "regulation_")) {
         auto r = gt.rules(s->race_code);
@@ -183,7 +189,7 @@ std::optional<std::string> widget_text(const std::string& page, const Element& e
         }
         if (c == "status_ttl_milage") {
             // NTSC-U: miles (the reference status page shows "0.0 miles").
-            if (gt.data().imperial) std::snprintf(buf, sizeof buf, "%.1f miles", st.distance_m / 1609.344);
+            if (gt.data().imperial()) std::snprintf(buf, sizeof buf, "%.1f miles", st.distance_m / 1609.344);
             else std::snprintf(buf, sizeof buf, "%.1f km", st.distance_m / 1000.0);
             return std::string(buf);
         }
@@ -243,7 +249,7 @@ std::optional<std::string> widget_text(const std::string& page, const Element& e
         if (c == "spec_p_w_ratio" || c == "spec_p_w_ratio_real")
             return sum.power_ps ? num("%.2f kg/PS", double(sum.weight_kg) / sum.power_ps) : std::string("-");
         if (c == "car_kilometrage")
-            return gt.data().imperial
+            return gt.data().imperial()
                        ? (focus_g ? num("%.1fmiles", focus_g->cond.odometer_m / 1609.344) : std::string("0.0miles"))
                        : (focus_g ? num("%.1f km", focus_g->cond.odometer_m / 1000.0) : std::string("0.0 km"));
     }

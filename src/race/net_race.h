@@ -2,30 +2,31 @@
 
 // Online battle helpers for the race scene (docs/dev/ONLINE.md).
 //
-// Each player simulates only its own car; the others arrive as net::CarSnapshot.
-// RemoteCar turns the newest snapshot into the car's pose "now" on the local race
-// clock: dead reckoning along its velocity and spin (capped), and on each new
-// snapshot the jump between what was shown and the new prediction is blended out
-// over ~0.1 s so cars glide instead of popping. Collisions use the unblended
-// prediction (the best guess of where the car really is).
+// Each player runs only its own car on the exact core; the others arrive as net::CarSnapshot (their records' motion and
+// their pad frames). RemoteCar turns the newest snapshot into the car "now" on the local race clock: a prediction shadow
+// (the remote car alone on a one-car exact race of our course, race::exact_shadow) is synced from each snapshot and run on
+// with the owner's newest frame; without one, dead reckoning along the velocity (capped). On each new snapshot the jump
+// between what was shown and the new prediction is blended out over ~0.1 s so cars glide instead of popping. Collisions use
+// the unblended prediction (the best guess of where the car really is).
 //
-// All players start the countdown at the same wall-clock instant (net::Event::Go), so
-// the owner's race_time in a snapshot and the local race clock are the same timeline:
-// age = local race time - snapshot race time.
+// All players start the countdown at the same wall-clock instant (net::Event::Go), so the owner's race clock in a snapshot and
+// the local race clock are the same timeline: age = local race time - snapshot race time.
 
 #include "net/protocol.h"
 #include "sim/sim_types.h"
 
 #include <array>
+#include <deque>
 #include <memory>
 #include <optional>
 
 namespace gt3r::sim {
-class Vehicle;
 struct VehicleSetup;
-class TrackQuery;
-class WorldQuery;
 }
+namespace gt3r::sim::exact {
+struct Car;
+class ExactRace;
+} // namespace gt3r::sim::exact
 
 namespace gt3r::race {
 
@@ -35,27 +36,37 @@ public:
     static constexpr double kBlend = 0.1;             // s, time constant of visual corrections
     static constexpr float kSnapDistance = 8.0f;      // m: larger jumps (respawns) are not blended
 
-    // Physics-based prediction: a vehicle built from the remote car's spec runs on from each
-    // new state with the owner's newest input (braking and turn-in come out right, where dead
-    // reckoning keeps the car going straight at speed). Without it, dead reckoning.
-    void attach(std::unique_ptr<sim::Vehicle> shadow, const sim::TrackQuery* track, const sim::WorldQuery* world);
-    bool physics() const { return shadow_ != nullptr; }
+    RemoteCar();
+    ~RemoteCar();
+    RemoteCar(RemoteCar&&) noexcept;
+    RemoteCar& operator=(RemoteCar&&) noexcept;
 
-    // `local_race_time`: the local race clock when it arrived (NaN = its own race_time).
+    // The prediction shadow: a one-car race of the remote car (its car, entry and grid slot) on our course. `physics`: it
+    // runs on from each state with the owner's newest frame (braking and turn-in come out right, where dead reckoning keeps
+    // the car going straight at speed); false: it is only synced, and carried on along its velocity (dead reckoning).
+    void attach(std::unique_ptr<sim::exact::ExactRace> shadow, const net::CarEntry& entry, bool physics = true);
+    bool attached() const { return shadow_ != nullptr; }
+    bool physics() const { return shadow_ && physics_; }
+    // The entry the shadow was built for (a shadow is rebuilt when the owner's differs; pedal style and driver kind follow
+    // the states).
+    const net::CarEntry& shadow_entry() const { return entry_; }
+
+    // A completed snapshot (complete_snapshot). `local_race_time`: the local race clock when it arrived (kNoTime = its own).
     void receive(const net::CarSnapshot& s, double local_race_time = kNoTime);
     bool has() const { return have_; }
-    const net::CarSnapshot& latest() const { return snap_; }
+    const net::CarSnapshot& latest() const { return newest_; } // the newest received (one ahead of our race waits)
 
     struct Pose {
-        sim::VehicleState state;               // shown (blended)
-        float body_x = 0, body_z = 0;          // collision CoG x/z (unblended)
+        sim::VehicleState state;                  // shown (blended)
+        float body_x = 0, body_z = 0;             // collision CoG x / z (unblended, course frame)
         float heading = 0, yaw_rate = 0;
         float brake = 0;
+        const sim::exact::Car* car = nullptr;     // the predicted record (unblended; valid until the next call)
     };
-    // The car at local race time t (with physics: steps the shadow up to t).
+    // The car at local race time t (with a shadow: steps it up to t, one step per call in play).
     Pose predict(double local_race_time);
-    // How far the prediction was from the owner's state when it arrived (metres, after the
-    // last receive; the horizon is the time between the two states). Plausibility checks.
+    // How far the prediction was from the owner's state when it arrived (metres, after the last receive; the horizon is the
+    // time between the two states). Plausibility checks.
     float last_error() const { return last_error_; }
     double last_error_horizon() const { return last_horizon_; }
     void reset();
@@ -63,23 +74,31 @@ public:
     static constexpr double kNoTime = -1e300;
 
 private:
-    Pose raw(double t) const;            // dead reckoning from snap_
-    Pose shadow_pose() const;
+    static constexpr size_t kPending = 16;
+    void apply(const net::CarSnapshot& s, double t);
+    Pose predict_from_applied(double t);
+    Pose raw(double t) const; // dead reckoning from snap_ (no shadow)
+    Pose shadow_pose(double t);
     void step_shadow();
-    net::CarSnapshot snap_;
+    void sync(const net::CarSnapshot& s);
+    net::CarSnapshot snap_;   // the state the prediction runs from
+    net::CarSnapshot newest_; // the newest received
+    std::deque<net::CarSnapshot> pending_; // received states ahead of our race clock, oldest first
     bool have_ = false;
     sim::Vec3 off_pos_;   // shown - raw at corr_time_
     sim::Quat off_rot_;   // shown = off_rot * raw at corr_time_
     double corr_time_ = 0;
-    // Physics.
-    std::shared_ptr<sim::Vehicle> shadow_;
-    const sim::TrackQuery* track_ = nullptr;
-    const sim::WorldQuery* world_ = nullptr;
+    // The shadow.
+    std::unique_ptr<sim::exact::ExactRace> shadow_;
+    std::unique_ptr<sim::exact::Car> moved_; // dead reckoning: the synced record carried on to now
+    bool physics_ = true;
+    net::CarEntry entry_;
+    std::unique_ptr<sim::VehicleSetup> setup_; // the shadow car's geometry
+    double hz_ = 60;           // the shadow's steps per second
     double sim_time_ = 0;      // race time the shadow has reached
-    u32 sim_tick_ = 0;         // owner tick the shadow has reached
-    sim::ControlInputs input_; // the owner's newest input
-    bool reverse_ = false;
-    std::array<sim::Vec3, 64> history_{}; // shadow position by tick (ring), for last_error()
+    net::PadInput input_;      // the owner's newest frame
+    std::array<std::pair<double, sim::Vec3>, 64> history_{}; // shadow CoG by race time (ring), for last_error()
+    size_t nhistory_ = 0;
     float last_error_ = 0;
     double last_horizon_ = 0;
 };
@@ -125,14 +144,20 @@ public:
     Plausibility() = default;
 };
 
-// The local car's snapshot after a tick. `inputs`: this tick's input first, then older
-// ones (up to net::kInputHistory are sent).
-net::CarSnapshot make_snapshot(const sim::Vehicle& v, u32 tick, int laps, const net::InputFrame* inputs, int n,
-                               bool respawned = false);
+// The record fields a snapshot carries (net::CarMotion) from a car, and back into a car (the shadow's sync): the motion bit
+// for bit, the rates, wheel speeds and suspension in their fixed units; the wheels' ground points moved with the car; then
+// the body axes and hub offsets from the attitude.
+net::CarMotion car_motion(const sim::exact::Car& c);
+void sync_motion(sim::exact::Car& c, const net::CarMotion& m);
+// The race entry flags of a car for its snapshots (asm / tcs: the race entry's Options).
+net::CarEntry car_entry(const sim::exact::Car& c, bool asm_on, bool tcs_on);
 
-// Fills in what the wire leaves out, from the remote car's own setup: the race clock
-// (tick / 60 - countdown), the CoG for collisions, wheel contact points (from the
-// suspension travel), loads (grounded wheels share the weight) and speed.
-void complete_snapshot(net::CarSnapshot& s, const sim::VehicleSetup& setup, float mass_kg, double countdown);
+// The local car's snapshot after a step. race_time: the race clock (s, negative in the countdown); `inputs`: this step's
+// frame first, then older ones (up to net::kInputHistory are sent).
+net::CarSnapshot make_snapshot(const sim::exact::Car& c, const net::CarEntry& entry, u32 tick, double race_time, int laps,
+                               const net::PadInput* inputs, int n, bool respawned = false);
+// Fills in what the wire leaves out: the race time, the CoG and velocity in the course frame (the heading's rotation as the
+// orientation), the speed, the collision body's pose, the brake lamp.
+void complete_snapshot(net::CarSnapshot& s);
 
 } // namespace gt3r::race

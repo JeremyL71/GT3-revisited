@@ -32,83 +32,206 @@ generic HID joysticks, wheels and pedals. Devices hot-plug at any time.
 
 | Feature | How it is used |
 |---|---|
-| Rumble | DS2 large motor → low-frequency motor, small motor → high-frequency motor |
+| Rumble | DS2 large motor → low-frequency motor, small motor → high-frequency motor. In races the motors follow GT3's own vibration: each step's level (suspension movement, curbs under the front wheels, the front tires' drive and brake forces, wall hits) on the large motor as GT3 sends it (at most half strength), never the small motor; a car the AI drives, as after the finish, does not vibrate |
 | Phone vibration (Android, off by default) | `[player1] phone_vibration = on` (Settings → Controls → Phone vibration): player 1's rumble on the device's own motor, only while the controls driving them have no rumble motor (built-in handheld controls, touch, a controller without motors). A controller that rumbles keeps it; the phone stays still |
 | Impulse triggers (Xbox One/Series) | `InputManager::set_trigger_rumble`, for brake/ABS feedback |
 | Player LEDs / light bars | Set to the player number |
 | Button labels | The UI shows Cross/Circle on PlayStation pads and A/B on Xbox pads |
 | Motion sensors | `tilt` source: steer by rolling the controller (DualSense, DS4, Switch Pro, or a phone's own accelerometer on Android) |
-| Wheels and pedals | Raw joystick axes with `pedal` and `invert` options; the `wheel` preset |
+| Wheels and pedals | Raw joystick axes with `pedal` and `invert` options; the wheel layout |
 | Keyboard "analog" | `ramp=` smooths digital keys into analog throttle/steering |
 
-## Presets
+## Controller
 
-| Preset | Description |
+Each player picks one **Controller** (Settings → Controls, `[playerN]
+controller`): **Auto** (`auto`), a connected pad or wheel by name (`controller`
+holds part of its name; one that isn't connected stays listed as "(not
+connected)"), or **Keyboard only** (`keyboard`; offered only when a keyboard
+is connected, never in VR builds). Left/Right changes it; Cross does nothing
+there. Auto takes a device SDL identifies as a wheel, otherwise the first free
+gamepad, otherwise any other joystick (SDL also lists flight sticks and some
+keyboards, mice and macro pads as joysticks, so those never take a player's
+gamepad); Settings shows it as "Auto: <name>". A device chosen by name is used
+whatever its type.
+
+The kind of device in use picks the buttons; players don't choose a layout:
+
+| Kind | Buttons |
 |---|---|
-| `racing` (default) | DualShock 2 layout 1:1 (triggers → L2/R2 pressure), plus back paddles → R2/L2 |
-| `classic` | Exact DualShock 2 layout: triggers → L2/R2 |
-| `wheel` | Axis 0 steering, axes 1/2 pedals (resting at +1); typical Logitech layout |
-| `keyboard` | Keyboard only |
-| `quest` (VR builds only, their default) | `racing` with B as Triangle (back) and Y as Circle |
+| Gamepad | DualShock 2 layout 1:1 (triggers → L2/R2 pressure); back paddles → R2 / L2 (right up, left down: GT3's shift buttons) |
+| Wheel (a device SDL identifies as a wheel) | Axis 0 steering, axes 1/2 pedals (resting at +1); typical Logitech layout. Races use GT3's steering-wheel path |
+| Joystick (any other device SDL doesn't map as a gamepad) | None: nothing is pressed until its inputs are bound in Settings → Controls (saved to `[playerN.joystick.*]`) |
+| Keyboard (Keyboard only, or no device connected) | Keyboard only |
 
-These are menu pad presets. Every preset also includes the keyboard layout, so
-player 1 can always use the keyboard: arrows = D-pad, W/S = Cross/Square
-(ramped), A/D = left stick, Enter = Cross, Space = Circle, Esc/Backspace =
-Triangle, Q/E = L1/R1, Z/C = L2/R2, F/G = L3/R3, P = Start, Tab = Select, IJKL
-= right stick. (While driving with the modern layout the keyboard has its own
-race keys, below.) On any screen, F11 toggles fullscreen and F12 saves a
+VR builds' gamepad layout has B as Triangle (back) and Y as Circle. Every
+layout also includes the player's keyboard layout. Player 1's: arrows = D-pad,
+W/S = Cross/Square (ramped), A/D = left stick, Enter = Cross, Space = Circle,
+Esc/Backspace = Triangle, Q/E = L1/R1, Z/C = L2/R2, F/G = L3/R3, P = Start,
+Tab = Select, Home/End = right stick X, Page Up/Page Down = right stick Y (the
+race camera's look; they were I/J/K/L before 0.4, now player 2's). Player 2's
+keys sit around I / J / K / L, apart from player 1's, so both can share one
+keyboard: I/K/J/L = D-pad, O = Cross, U = Triangle, ; = Circle, H = Square,
+comma/period = L1/R1, N/M = L2/R2, ' = Start, / = Select. No default key is in
+both players' sets. (While driving with the modern layout the keyboard has its
+own race keys, below.) On any screen, F11 toggles fullscreen and F12 saves a
 screenshot.
 
-`keyboard = off` stops the keyboard driving a player, except player 1 with a
-profile that has no controller bindings (the `keyboard` preset, or custom
-bindings with only keys): their keyboard stays live, so the game can't be left
-with no way to control it.
+**Keyboard** (`keyboard = off`, hidden under Keyboard only) stops the keyboard
+also driving a player, except player 1 with buttons only the keyboard can
+drive (no device connected, or custom bindings with only keys): their keyboard
+stays live, so the game can't be left with no way to control it. Keyboard only
+always drives the player with the keyboard.
+
+Configs from before the Controller choice used `preset` (`racing`, `classic`,
+`wheel`, `keyboard`) and `device`; they are read once: `racing` and `classic`
+are the gamepad (with the paddles), `wheel` is Auto (so a wheel is preferred),
+`keyboard` is Keyboard only (unless its custom bindings had controller inputs:
+then its device stays), and a named `device` stays. `wheel` with a named
+`device` also keeps the wheel layout for that device whatever SDL makes of it
+(`[playerN] wheel_device`). Custom bindings go by input type: `pad.*` to the
+gamepad's set, `joy.*` to the wheel's, keys, mouse buttons and `tilt` to the
+keyboard's. The config still carries `preset` and `device` for older builds.
+
+When nothing player 1 has can drive the menus (no device and no keyboard to
+use, or nothing readable bound to Cross and Up / Down), the menus outside races
+(ours and the game's) read every connected controller with the gamepad layout's
+buttons and the keyboard with its default keys, as Settings does, so the game
+can't be left without a way back. Races always read each player's own controls.
+
+Settings (every page, from our main menu or from the game's Key Configuration)
+also reads every connected controller with the gamepad layout's buttons and the
+keyboard with its default keys, besides player 1's own controls, so a choice or
+bindings that leave player 1 without a working controller can always be changed
+back. The game's menus and races follow the player's controls only, and nothing
+else reads while a binding is being captured.
 
 ## Remapping in the app
 
-**Controller setup** has two pages per player, **menu buttons** and **race
-controls** (L2/R2 switches page, L1/R1 switches player). Each row has a live
-meter (pressure values are shown numerically). Select a row, then:
+In Settings, choices, switches and sliders change only with Left/Right or a
+tap on their arrows, switch or track; Cross never changes a setting (it runs
+actions and starts a rebind).
 
-- **Cross**: press the new input to replace that control's bindings
-- **Square**: add an additional input
-- **Select**: clear the control
-- **Left/Right** on the preset / layout row: load a preset or race layout
-- **Start** (hold): test rumble
-- **L1/R1**: switch player
+**Settings → Controls** holds every control setting, for player 1 and player 2
+(split screen) alike: under each player's **Controller**, **Race controls**,
+**Keyboard** and **Test rumble** rows come their bindings, inline:
 
-Any edit turns that page's profile into a custom one for that player only,
-saved to `config.ini` (`[playerN.bindings]` or `[playerN.race]`). Each player
-(controller) is remapped independently. Editing a race control under the `gt3`
-layout starts from that player's menu bindings.
+- **Player N race controls**: the race actions in driving order (Accelerate,
+  Brake, Shift up, Shift down, Handbrake, Reverse, Change view, Look back,
+  Pause, Steer, Steer left / right, the performance overlay);
+- **Player N menu buttons**: a reset row, then the DualShock 2's buttons and
+  sticks, as the game's menus read them.
+
+Each row has a live meter (the button's pressure, or the stick's position) and
+two columns: the **controller's** inputs and the **keyboard's**. Select a row,
+then:
+
+- **Cross** (or a tap): release everything, then press the new input. A key
+  replaces that action's keyboard input; any other input (a pad button,
+  trigger or stick, a back paddle, a wheel axis or button) replaces its
+  controller input. The other column keeps its input. Esc, Android Back or a
+  tap / click cancels instead (so those keys can't be captured: choose the
+  layout again to get them back), and mouse buttons aren't captured (set them
+  in `config.ini`, e.g. `mouse.left`). A button or key on Steer or a stick axis
+  is refused: it could push it only one way (bind it to Steer left / Steer
+  right, or the D-pad).
+- **Square**: add an input instead of replacing
+- **Select** (Delete on the keyboard): clear the highlighted column
+- **Left/Right**: switch between the two columns
+
+While an input is being captured (up to 6 s) Settings takes nothing else, and
+the captured press does not also act on the page.
+
+A player's bindings are two sets. The **controller's** is one per kind of
+controller (gamepad, wheel), saved to `[playerN.bindings]` / `[playerN.race]`
+for a gamepad and `[playerN.wheel.bindings]` / `[playerN.wheel.race]` for a
+wheel. The **keyboard's** is one per player whatever the controller (Keyboard
+only included), saved to `[playerN.keyboard.bindings]` /
+`[playerN.keyboard.race]`. Custom profiles from before the two sets are split
+once by input type (above). The keyboard's set also holds `tilt`, so tilt
+steering works whatever the controller, a phone with no pad included.
+
+**Race controls** offers **Modern**, **GT3 original** and, once custom race
+controls exist, **Custom**; the **Menu buttons** row offers the device kind's
+layout and **Custom**. Choosing a layout keeps the custom set: it stays saved
+(`[playerN] race_custom = off` / `menu_custom = off`) and choosing Custom brings
+it back. Editing a row while a layout is chosen makes custom bindings from that
+layout as it stands (both sets) plus the edit; if another custom set is kept,
+Settings asks first ("Replace your custom race controls with GT3 original plus
+this change?", Cancel focused).
+
+Under **GT3 original** the race reads the menu pad, so the race list shows each
+action's menu button ("Accelerate (Cross)") and the menu buttons' inputs.
+Editing one there starts custom race controls from GT3 original's mapping plus
+the change.
+
+**Inputs from other devices.** Any binding can come from any connected
+controller, for either player: a brake pedal set, a second pad's trigger, a
+shifter. Capture takes every connected pad, wheel and joystick. An input from
+the player's own Controller is saved as usual. One from another device names
+that device and shows its name ("DualSense Wireless Controller 2: Left trigger",
+"G29 Pedals: Axis 2"; numbered among connected devices of that name). The
+binding's `device=` option holds the name, then what tells devices of that name
+apart: the device's serial number when the system reports one (Sony pads give
+their Bluetooth address), otherwise its USB port path, otherwise its order among
+them (`#2`). The name must match first; a binding whose serial or port path
+isn't connected does nothing (it never falls back to a look-alike), and a tag
+never reads the player's own Controller. Auto never gives a named device to the
+other player. The layouts' own buttons stay on the Controller. Races use GT3's
+steering-wheel path when Steer (LX) is bound to a wheel, and wheel forces go to
+that wheel; rumble stays on the Controller.
+
+The back paddles are controls of their own: capture takes them like any
+button and they show as **Right paddle**, **Left paddle** (and **Right paddle
+2**, **Left paddle 2** for a second pair). A paddle does one thing: binding it to
+an action (Reverse, say) takes it off the one it had (shift); clearing Shift up
+or down, or rebinding it to another button, takes shift off the paddle.
 
 The **Settings** screen (Controls, Force feedback and Touch pages) edits the
-`[playerN]` preset/device/keyboard/race keys (and `[player1] phone_vibration`
-on Android), every `[ffb]` key
-and every `[touch]` key described below, applies them immediately and opens
-this rebinding screen from **Button mapping...**.
+`[playerN]` controller/keyboard/race keys and bindings (and `[player1]
+phone_vibration` on Android), every `[ffb]` key and every `[touch]` key
+described below, and applies them immediately.
+
+In the game's own menus, Options → **Key Configuration** shows a **Controller
+Settings** button in place of the DualShock 2 table: Cross or Circle (or a tap)
+opens Settings on the Controls page over the game, with player 1's Controller
+row selected and the bindings below it. Its back button then reads **Back to
+game**; it, or Triangle / Esc, returns to the Key Configuration page as it was
+from anywhere on the page (buttons still held at that moment are ignored until
+released). Triangle / Esc on **Customize layout...** (Touch) also goes straight
+back to the game; the layout editor's **Done** returns to Settings.
 
 ## Config syntax
 
 ```ini
 [player1]
-preset = racing        ; used when there is no [player1.bindings] section
-device = auto          ; or part of a device name, e.g. "DualSense" or "G29"
+controller = auto      ; auto, part of a device name ("DualSense", "G29"), or keyboard (only)
 keyboard = on
 race = modern          ; race layout (modern | gt3), used when there is no [player1.race]
 phone_vibration = off  ; Android, player 1 only: rumble on the device's own motor (see Native features)
 
-[player1.bindings]     ; the menu pad
-Cross  = pad.south | key.Return
-LX     = pad.leftx deadzone=0.08 | tilt curve=1.5
+[player1.bindings]     ; the menu pad, a gamepad's inputs ([player1.wheel.bindings], [player1.joystick.bindings])
+Cross  = pad.south
+LX     = pad.leftx deadzone=0.08
+
+[player1.keyboard.bindings]  ; the menu pad, the keyboard's and tilt (whatever the controller)
+Cross  = key.Return
+LX     = tilt curve=1.5
 
 [player1.race]         ; the race pad: targets are GT3's buttons (Cross = accelerate ...)
-Cross  = pad.righttrigger curve=1.4 | key.W ramp=0.12
-Square = pad.lefttrigger | key.S ramp=0.08
+Cross  = pad.righttrigger curve=1.4
+Square = pad.lefttrigger
 LX     = pad.leftx deadzone=0.08
+
+[player1.keyboard.race]
+Cross  = key.W ramp=0.12
+Square = key.S ramp=0.08
 LX-    = key.A ramp=0.2
 LX+    = key.D ramp=0.2
 ```
+
+Each section replaces its set's layout when present and keeps only that set's
+inputs: keys, mouse buttons and `tilt` in the `.keyboard` sections, everything
+else in the others.
 
 **Targets:** `Select L3 R3 Start Up Right Down Left L2 R2 L1 R1 Triangle
 Circle Cross Square`, and the axes `LX LY RX RY`, optionally as halves
@@ -139,32 +262,39 @@ Circle Cross Square`, and the axes `LX LY RX RY`, optionally as halves
 | `pedal` | Map a −1..1 axis to 0..1 (combine with `invert` for pedals resting at +1) |
 | `ramp=0.2` | Seconds to reach full value (makes digital inputs analog) |
 | `threshold=0.3` | Pressure at which an analog source counts as a digital press |
+| `device=G29%20Pedals` | Read it from that device instead of the player's Controller (below; `%20` = space, `@s:` serial, `@p:` port path) |
 
 When several bindings target the same button, the strongest value wins.
-Axis contributions are summed and clamped.
+Axis contributions are summed and clamped. A binding whose source isn't there
+(device not connected, no such axis or button, a key while the keyboard
+doesn't drive the player) does nothing, whatever its options.
 
 ## Race controls
 
 The race pad's buttons keep GT3's meaning, and the race layout (per player:
 `[playerN] race`, or **Race controls** in Settings) chooses what drives them:
 
-| Action (race pad button) | `modern` (default) | `gt3` (the original's DS2 layout) | Modern keyboard |
-|---|---|---|---|
-| Steer (LX, D-pad) | Left stick / D-pad | Left stick / D-pad | A/D (ramped), ←/→ |
-| Accelerate (Cross, pressure) | Right trigger | Cross | W / ↑ (ramped) |
-| Brake (Square, pressure) | Left trigger | Square | S / ↓ (ramped) |
-| Handbrake (Circle) | Circle / B | Circle | Space |
-| Shift up / down (R2 / L2) | Cross / Square (A / X), back paddles | R2 / L2 | E / Q |
-| Reverse (Triangle, pressure) | L1 (held) | Triangle | R |
-| Change view (R1) | Triangle / Y | R1 | C |
-| Look back, held (L1) | R3 | L1 | X |
-| Respawn (Select, ours) | unbound (keyboard / touch only) | unbound | Backspace |
-| Pause (Start) | Start | Start | Esc, P |
-| Performance overlay (R3, ours; developer tool) | unbound | unbound | unbound |
+| Action (race pad button) | `modern` (default) | `gt3` (the original's DS2 layout) | Modern keyboard, player 1 | Modern keyboard, player 2 |
+|---|---|---|---|---|
+| Steer (LX, D-pad) | Left stick / D-pad | Left stick / D-pad | A/D (ramped), ←/→ | J/L (ramped) |
+| Accelerate (Cross, pressure) | Right trigger | Cross | W / ↑ (ramped) | I (ramped) |
+| Brake (Square, pressure) | Left trigger | Square | S / ↓ (ramped) | K (ramped) |
+| Handbrake (Circle) | Circle / B | Circle | Space | M |
+| Shift up / down (R2 / L2) | Cross / Square (A / X), back paddles | R2 / L2 | E / Q | O / U |
+| Reverse (Triangle, pressure) | L1 (held) | Triangle | R | H |
+| Change view (R1) | Triangle / Y | R1 | C | period |
+| Look back, held (L1) | R3 | L1 | X | comma |
+| Pause (Start) | Start | Start | Esc, P | ; |
+| Performance overlay (R3, ours; developer tool) | unbound | unbound | unbound | unbound |
 
-Respawn and the performance overlay are off controllers by default (under `gt3`
-the menu pad's Select and R3 do nothing in a race); bind them in a custom race
-layout in **Controller setup** if wanted. Respawn works offline only.
+Players without these keys rebind them in Settings → Controls.
+
+There is no respawn, as in GT3: a car stays where it is. The performance overlay
+is off controllers by default (under `gt3` the menu pad's R3 does nothing in a
+race); bind it under the race controls in **Settings → Controls** if wanted. In time
+trials, free runs, machine tests and licence tests the controller's own Select (the
+menu pad's: Back / Select, Tab on the keyboard) shows or hides the ghost, as in the
+original.
 
 Change view cycles in-car (with mirror), in-car without mirror, chase and far
 chase; `[race] views = gt3` (Settings: Race views) keeps GT3's own two, in-car
@@ -172,11 +302,24 @@ and chase. Races start in the view last used, in-car at first.
 
 With `gt3` the race reads the menu pad itself, so every button does what it
 did on a DualShock 2. In the modern layout shifting down at a standstill also
-selects reverse (as in GT3). Wheels (`preset = wheel`) keep their pedals and
-buttons in both layouts. Configs from before per-player layouts used
+selects reverse (as in GT3). Wheels keep their pedals and buttons in both
+layouts, and the back paddles shift in both (under `gt3` they press R2 / L2).
+Configs from before per-player layouts used
 `[race] buttons = gt3 | ours | auto`; it is read once as the default
-(`ours` → `modern`; `auto` → `gt3` with the `classic` preset). The touch
+(`ours` → `modern`; `auto` → `gt3` with the old `classic` preset). The touch
 controls press the race pad's buttons directly.
+
+In every race the race pad goes through GT3's own pad read, as a DualShock 2 with pressure buttons (the D-pad's
+pressure steers with GT3's digital turn-in, R2 / L2 shift; a wheel as
+GT3's steering wheel). **Analog response** (Settings > Controls, `[race]
+analog_response`): `linear` (default) makes every analog input, sticks, triggers
+and pressure buttons, wheels, touch and tilt, steer, accelerate, brake and pull
+the handbrake exactly as far as it is moved, after GT3's own shaping (from its
+least step: 10 % of a pedal); `original` keeps GT3's DualShock 2 curves as they
+are (no steering over the stick's inner 29 %, full lock from 88 %; full throttle
+from 18 % of the pressure range, brake 33 %, handbrake 10 %). The physics is the
+same either way, and replays keep what the race got. The automatic or manual
+gearbox is the race entry's pedal style (the gearbox setting, as in GT3).
 
 Replays, the pause window and the quick menus read the menu pad, as in GT3.
 Start opens the pause, in replays too. In a replay, Cross switches between the
@@ -232,7 +375,7 @@ Each screen picks a layout:
 | Layout | Controls |
 |---|---|
 | Menu (default) | D-pad (slide between directions), Cross / Circle / Square / Triangle, L1, R1, Select, Start. Taps away from the controls go to the screen underneath |
-| Driving (race screen, while racing; its pause and quick menus use Menu) | Steering zone on the left half: put a finger down anywhere and drag sideways (the touch-down point is centre). Gas (Cross) and brake (Square) pedals on the right: the higher the finger on the pedal, the more pressure; a finger can slide from brake to gas. Shift up / down above the pedals, handbrake (Circle), and pause (Start), camera and respawn at the top; they press the race pad's buttons, so they work with any [race layout](#race-controls) (respawn: not under `gt3`) |
+| Driving (race screen, while racing; its pause and quick menus use Menu) | Steering zone on the left half: put a finger down anywhere and drag sideways (the touch-down point is centre). Gas (Cross) and brake (Square) pedals on the right: the higher the finger on the pedal, the more pressure; a finger can slide from brake to gas. Shift up / down above the pedals, handbrake (Circle), and pause (Start) and camera at the top; they press the race pad's buttons, so they work with any [race layout](#race-controls) |
 
 ```ini
 [touch]
@@ -245,15 +388,49 @@ tilt_deadzone = 0.04   ; fraction of full lock
 opacity = 0.50
 size = 1.00            ; 0.6 .. 1.6
 left_handed = off      ; mirror the layout (pedals on the left)
+drive.gas = left 60 bottom 120 size 1.2   ; the layout editor's changes (below)
+drive.camera = hidden
 ```
+
+### Customizing the layout
+
+Settings → Touch → **Customize layout...** shows the controls on the whole
+screen as they sit in a race (Driving) or the game's menus (Menus). Tap a
+control to select it, drag it anywhere, resize it with a pinch, the mouse
+wheel or − / + (50–200 %, on top of `size`), and hide it or bring it back.
+Reset puts one control back; Reset layout the whole page. Every change is
+saved at once; Done or the back key leaves. The toolbar hides while a control
+is dragged, then takes the free spot nearest the middle (when there is none,
+it covers as little as it can and never most of a control); drag its
+background to put it somewhere else. The four face buttons move and
+resize together. Hidden controls are not drawn and take no touches; a
+control placed over the steering zone takes its touches first.
+
+Each changed control is one `[touch]` key, `drive.<control>` or
+`menu.<control>`:
+
+| Layout | Controls |
+|---|---|
+| `drive.` | `gas`, `brake`, `up`, `down`, `handbrake`, `pause`, `camera` |
+| `menu.` | `dpad`, `buttons` (Cross, Circle, Square, Triangle), `l1`, `r1`, `select`, `start` |
+
+The value is `[left|center|right <x> top|bottom <y>] [size <s>] [hidden]`:
+the control's centre `x` units in from the left or right edge (or from the
+screen's centre line, + = right) and `y` in from the top or bottom edge of
+the area the controls keep to (the screen less a 14-unit margin, the cutout
+and the rounded corners; the game area is 640×360 units). Measured from the
+nearest edge, a layout carries over to screens of other shapes; a control
+that would not fit is moved back inside. Positions are for the right-handed
+layout: `left_handed` mirrors a custom layout too. Controls without a key
+stay where the layout puts them.
 
 Controls anchor to the edges of the whole screen, not the letterboxed
 16:9 game area, so on wide (20:9) phones they move into the side bars and on
 16:10 tablets into the top and bottom bars. They keep clear of the display
 cutout (`SDL_GetWindowSafeArea`) and, on phones, of the rounded screen
 corners (`TouchControls::set_insets`, fed by `App::safe_area_window()`).
-`opacity`, `size` and `left_handed` are previewed live on the Settings →
-Touch page.
+`opacity`, `size`, `left_handed` and the custom layout are previewed live on
+the Settings → Touch page.
 
 The frontend's own screens (first-run setup, main menu, Developer options, Settings) are
 operated by tapping and dragging directly (tap a row, tab or button; drag a
@@ -271,7 +448,9 @@ mouse (or a VR controller's pointer) focuses the item it hovers over, so one cli
 (a scrolling row such as the tune shop's parts holds still meanwhile; vertical scrolling
 lists, which centre the cursor's item, still take a tap to move and one to choose). In the arcade course, class and
 car pickers, tap an icon of the strip to move there and tap it again to choose; taps elsewhere
-on the left / right third step through the entries.
+on the left / right third step through the entries. The online lobby's pages work the same
+way: rows and tiles follow a hovering mouse, a finger's first tap focuses, "<" ">" and the
+footer's actions are buttons (docs/dev/ONLINE.md "Pickers").
 
 Screens choose their layout by overriding `Screen::touch_layout()`
 (`TouchLayout::Menu`, `Driving` or `None`). On desktop, `GT3R_PHONE=1`
@@ -279,7 +458,8 @@ opens a window shaped like a 20:9 phone (cutout, rounded corners, phone UI
 sizing, whole-window `--shot`s) and `GT3R_TOUCH_SHOW=1` shows the controls
 without a touch, for screenshots. The logic is in
 `src/input/touch_controls.*` (unit-tested in `tests/test_platform_touch.cpp`),
-drawing and SDL event routing in `src/app/screen_touch_overlay.*`.
+drawing and SDL event routing in `src/app/screen_touch_overlay.*`, the layout
+editor in `src/app/screen_touch_editor.cpp`.
 
 ## Windows: Xbox controllers without XInput
 

@@ -9,6 +9,8 @@
 
 namespace gt3r::game {
 
+void forget_mod_menu_plan(); // gt_mode_mods.cpp
+
 namespace gt_menu {
 
 MenuState& menu_state() {
@@ -16,8 +18,8 @@ MenuState& menu_state() {
     return state;
 }
 
-std::string cr(s64 v) { return format_credits(v) + " Cr."; } // log lines
-std::string cr_pre(s64 v) { return "Cr. " + format_credits(v); }
+std::string cr(s64 v) { return format_credits(v) + " Cr."; } // log lines (English, not shown in the game)
+std::string cr_pre(s64 v) { return credits_text(v); }
 std::string cr_num(s64 v) { return format_credits(v); }
 
 std::string car_name(const GtMode& gt, const std::string& label) {
@@ -103,5 +105,10 @@ const Element* hidden_element(const menu::Page& p, const std::string& name) {
 
 // Everything is in MenuState, so a fresh one forgets it all.
 void reset_gt_mode_menu_for_tests() { gt_menu::menu_state() = gt_menu::MenuState{}; }
+void close_gt_mode() { gt_menu::menu_state() = gt_menu::MenuState{}; }
+void reload_gt_mode_data() {
+    gt_menu::menu_state().data.reset();
+    forget_mod_menu_plan(); // an updated mod can keep its file names
+}
 
 } // namespace gt3r::game

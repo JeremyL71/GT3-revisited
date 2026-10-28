@@ -27,14 +27,14 @@ bool fades_in(const Element& e) { return ((e.flags >> 4) & 0xF) != 0; }   // ele
 bool fades_out(const Element& e) { return ((e.flags >> 8) & 0xF) != 0; }  // element flag bits 24-27
 bool has_parts(const Element& e) { return (e.type & 0x7) != 0; }
 
-// DecideEffect alphas (centre, edge) at frame f (1-based) of the effect.
+// Decide effect alphas (centre, edge) at frame f (1-based) of the effect.
 void decide_alpha(int f, float& centre, float& edge) {
     auto ramp = [](float t) { return std::clamp(t, 0.0f, 1.0f) * 0.4f; };
     centre = f <= 11 ? ramp(f / 3.0f) : ramp(1.0f - (f - 11) / 6.0f);
     edge = f <= 18 ? ramp((f - 4) / 6.0f) : ramp(1.0f - (f - 18) / 6.0f);
 }
 
-// Free buttons (FreeButton: the name-entry key rows and its OK row).
+// Free buttons (free button: the name-entry key rows and its OK row).
 bool is_free_row(const MenuController::ItemState& s) { return s.flow && s.flow->name.rfind("free", 0) == 0; }
 
 int feedback_frames(u16 fb) { return fb == 0 ? 0 : fb == 0x40 ? 26 : 30; }
@@ -107,25 +107,9 @@ const Element* scroller_window(const Page& p) {
 // `x` = each item's left edge in the row (cumulative widths + 4 px), `total` the row width.
 template <class Items>
 float row_layout(const Items& items, float scroll, float window_w, std::vector<float>& x, float& total) {
-    x.clear();
-    float pos = 0;
-    for (const auto& it : items) {
-        x.push_back(pos);
-        pos += (it.element ? it.element->w : 0.0f) + 4.0f;
-    }
-    total = std::max(0.0f, pos - 4.0f);
-    if (x.empty()) return 0;
-    // The focused position, interpolated while the scroll eases.
-    int i0 = std::clamp(int(std::floor(scroll)), 0, int(x.size()) - 1), i1 = std::min(i0 + 1, int(x.size()) - 1);
-    float t = std::clamp(scroll - float(i0), 0.0f, 1.0f);
-    auto w_of = [&](int i) { return items[size_t(i)].element ? items[size_t(i)].element->w : 0.0f; };
-    float left = x[size_t(i0)] + (x[size_t(i1)] - x[size_t(i0)]) * t;
-    float fw = w_of(i0) + (w_of(i1) - w_of(i0)) * t;
-    float right = total - left - fw;
-    if (total <= window_w) return (window_w - total) * 0.5f;
-    if (left < window_w * 0.5f) return 0;
-    if (right < window_w * 0.5f) return window_w - total;
-    return window_w * 0.5f - (left + fw * 0.5f);
+    std::vector<float> widths;
+    for (const auto& it : items) widths.push_back(it.element ? it.element->w : 0.0f);
+    return menu::flow::row_layout(widths, scroll, window_w, x, total);
 }
 
 // Text style flags (TextStyle::align bits 4-7): 0x10 marquee (enters from the
@@ -158,6 +142,49 @@ void apply_text_effects(ElementDraw& d, const Element& e, u32 age) {
 }
 
 } // namespace
+
+namespace {
+
+// GT3's button list placement: along the list's axis, buttons of the given sizes kRowGap
+// apart. A list that fits the window is centred (`centre_fit`, a horizontal row) or at its
+// start (a vertical list); else at the window's start while the focused button begins less
+// than half a window from the list's start, at its end while less than half a window follows
+// the focused button, else the focused button centred. Returns the list's start from the
+// window's start.
+float list_layout(const std::vector<float>& sizes, float scroll, float window, std::vector<float>& pos, float& total,
+                  bool centre_fit) {
+    pos.clear();
+    float at = 0;
+    for (float w : sizes) {
+        pos.push_back(at);
+        at += w + kRowGap;
+    }
+    total = std::max(0.0f, at - kRowGap);
+    if (pos.empty()) return 0;
+    // The focused position, interpolated while the scroll eases.
+    int i0 = std::clamp(int(std::floor(scroll)), 0, int(pos.size()) - 1), i1 = std::min(i0 + 1, int(pos.size()) - 1);
+    float t = std::clamp(scroll - float(i0), 0.0f, 1.0f);
+    float start = pos[size_t(i0)] + (pos[size_t(i1)] - pos[size_t(i0)]) * t;
+    float fs = sizes[size_t(i0)] + (sizes[size_t(i1)] - sizes[size_t(i0)]) * t;
+    float after = total - start - fs;
+    if (total <= window) return centre_fit ? (window - total) * 0.5f : 0.0f;
+    if (start < window * 0.5f) return 0;
+    if (after < window * 0.5f) return window - total;
+    return window * 0.5f - (start + fs * 0.5f);
+}
+
+} // namespace
+
+float row_layout(const std::vector<float>& widths, float scroll, float window_w, std::vector<float>& x, float& total) {
+    return list_layout(widths, scroll, window_w, x, total, true);
+}
+
+float column_layout(const std::vector<float>& heights, float focus, float window_h, std::vector<float>& y,
+                    float& total) {
+    return list_layout(heights, focus, window_h, y, total, false);
+}
+
+float ease_scroll(float value, float target) { return value + (target - value) * kScrollFactor; }
 
 MenuController::MenuController(const MenuSet& set) : set_(set) {}
 
@@ -226,14 +253,22 @@ void MenuController::build(const std::string& name, const std::string& from, boo
             s.nested_horizontal = it.unk142 & 0x10;
             s.nested_wrap = it.unk142 & 0x20;
             for (const MblItem& c : it.children) s.children.push_back(find(c.name));
-            // The button list only builds buttons for page items it finds.
-            if (!s.element) continue;
+            // The button list only builds buttons for page items it finds, and not for the
+            // items control code leaves out.
+            if (!s.element || (listed && !listed(name, it))) continue;
             lv.items.push_back(s);
         }
         // Initial focus (menus §4.2): the control's hook, else the first item leading to the
         // page we came from, else 0. There is no remembered focus: a page opened again starts
         // by the same rule.
         int f = initial_focus ? initial_focus(name) : -1;
+        if (f < 0 && initial_item)
+            if (const std::string want = initial_item(name); !want.empty())
+                for (int i = 0; i < int(lv.items.size()); ++i)
+                    if (lv.items[size_t(i)].flow->name == want) {
+                        f = i;
+                        break;
+                    }
         if (f < 0 && !from.empty())
             for (int i = 0; i < int(lv.items.size()); ++i)
                 if (lv.items[size_t(i)].flow->link == from) {
@@ -346,6 +381,13 @@ void MenuController::tick(MenuKeys held) {
     for (Level& lv : levels_) {
         step_layers(lv);
         if (!lv.pinned) lv.scroll += (float(lv.focus) - lv.scroll) * kScrollFactor;
+        const Element* window = nullptr;
+        std::vector<float> xs;
+        float total = 0, target = 0;
+        if (horizontal_row(lv, window, xs, total, target)) {
+            if (!lv.row_off_set) lv.row_off = target, lv.row_off_set = true;
+            else if (!lv.pinned) lv.row_off = ease_scroll(lv.row_off, target);
+        }
     }
     if (!levels_.empty()) {
         Level& t = top();
@@ -465,7 +507,7 @@ bool MenuController::move_focus(int delta, int dir_code) {
     int f = lv.focus + delta;
     f = (lv.flags & page_flag::kWrap) ? (f + n) % n : std::clamp(f, 0, n - 1);
     if (f == lv.focus) return false;
-    // Free buttons keep the column across rows (FreeButton, name entry): after a Left /
+    // Free buttons keep the column across rows (free button, name entry): after a Left /
     // Right, or coming from a row with at least as many keys, the new row's key is the one
     // under the previous key's centre (keys 24 wide, 28 apart; a one-key row's button
     // centre is 223 px in); else the row keeps the key it had.
@@ -640,9 +682,11 @@ bool MenuController::item_box(int index, SDL_FRect& box, SDL_FRect* clip) const 
         float spacing = 32;
         if (lv.items.size() >= 2 && lv.items[0].element && lv.items[1].element)
             spacing = std::fabs(lv.items[0].element->y - lv.items[1].element->y);
-        if (lv.flags & page_flag::kHorizontal) {
-            std::vector<float> xs;
-            float total = 0, off = row_layout(lv.items, lv.scroll, window->w, xs, total);
+        const Element* row_win = nullptr;
+        std::vector<float> xs;
+        float total = 0, target = 0;
+        if (horizontal_row(lv, row_win, xs, total, target)) {
+            const float off = row_offset(lv, target);
             box = {window->x + off + xs[size_t(index)], window->y + (window->h - e->h) * 0.5f, e->w, e->h};
             return true;
         }
@@ -700,10 +744,20 @@ void MenuController::set_focus(int index) {
     if (index >= 0 && index < int(lv.items.size()) && index != lv.focus) {
         lv.focus = index;
         lv.scroll = float(index);
+        lv.row_off_set = false; // (placed at once, as the scroll)
         lv.pinned = false;
         lv.pulse = 0.25f;
         refresh_layers(lv, 0);
     }
+}
+
+bool MenuController::horizontal_row(const Level& lv, const Element*& window, std::vector<float>& x, float& total,
+                                    float& target) const {
+    if (!lv.page || !(lv.flags & page_flag::kHorizontal) || lv.items.empty()) return false;
+    window = scroller_window(lv.page.layout());
+    if (!window) return false;
+    target = row_layout(lv.items, float(lv.focus), window->w, x, total);
+    return true;
 }
 
 bool MenuController::set_focus(std::string_view item) {
@@ -781,32 +835,42 @@ void MenuController::add_level_draws(std::vector<ElementDraw>& out, const Level&
                 if (e.widget_class && *e.widget_class == "blink") a *= blink_alpha(frame_);
                 const bool diag_in = e.widget_class && *e.widget_class == "diagonal_in";
                 const bool diag_out = e.widget_class && *e.widget_class == "diagonal_out";
+                // A horizontal selector's "scroll_bar" (menus §4.6; GT3's ScrollBar): nothing at
+                // all, track included, while the row is no longer than the bar; else the track
+                // and the hidden "pinch" over the visible share of the row at its scroll
+                // position: x = bar x - offset x bar w / row w, width = window w x bar w / row w
+                // (offset: the row's start from the window's left edge, as it eases).
+                const Element* bar_win = nullptr;
+                float row_off = 0, row_total = 0;
+                if (e.name == "scroll_bar") {
+                    std::vector<float> xs;
+                    float target = 0;
+                    if (horizontal_row(lv, bar_win, xs, row_total, target)) {
+                        if (row_total <= e.w) continue;
+                        row_off = row_offset(lv, target);
+                    } else {
+                        bar_win = nullptr;
+                    }
+                }
                 // Movie widgets: their colours modulate the movie (drawn by game code), they
                 // are not a quad of their own.
                 ElementDraw& wd = push(ref.scene, &e, a, true);
                 wd.hide_parts = code;
                 if (diag_in || diag_out) diagonal_alpha(frame_, diag_in, wd.corner_alpha);
-                // A horizontal selector's "scroll_bar": the visible share of the row, at
-                // its scroll position.
-                if (e.name == "scroll_bar" && (lv.flags & page_flag::kHorizontal) && !lv.items.empty() &&
-                    lv.items[0].element)
-                    if (const Element* win = scroller_window(lv.page.layout())) {
-                        std::vector<float> xs;
-                        float total = 0, off = row_layout(lv.items, lv.scroll, win->w, xs, total);
-                        float frac = std::min(1.0f, win->w / total);
-                        // The track stays; the hidden "pinch" colour marks the visible share.
-                        const Element* pinch = nullptr;
-                        for (const Layer& hl : lv.page.layout().layers)
-                            if (hl.name == "hidden")
-                                for (const Element& he : hl.elements)
-                                    if (he.name == "pinch") pinch = &he;
-                        if (pinch) {
-                            ElementDraw& pd = push(ref.scene, pinch, a);
-                            pd.has_box = true;
-                            pd.box = {e.x + (-off / total) * e.w, e.y, e.w * frac, e.h};
-                            pd.z = wd.z + 0.001f;
-                        }
+                if (bar_win) {
+                    const Element* pinch = nullptr;
+                    for (const Layer& hl : lv.page.layout().layers)
+                        if (hl.name == "hidden")
+                            for (const Element& he : hl.elements)
+                                if (he.name == "pinch") pinch = &he;
+                    if (pinch) {
+                        const float z = wd.z; // (push may move `wd`)
+                        ElementDraw& pd = push(ref.scene, pinch, a);
+                        pd.has_box = true;
+                        pd.box = {e.x - row_off * e.w / row_total, e.y, bar_win->w * e.w / row_total, e.h};
+                        pd.z = z + 0.001f;
                     }
+                }
             }
         }
     };
@@ -864,15 +928,17 @@ void MenuController::add_level_draws(std::vector<ElementDraw>& out, const Level&
             float cy = window->y + window->h * 0.5f + (float(i) - lv.scroll) * -spacing;
             box_override.has_box = true;
             box_override.box = {window->x + (window->w - e.w) * 0.5f, cy - e.h * 0.5f, e.w, e.h};
-            if (lv.flags & page_flag::kHorizontal) {
-                std::vector<float> xs;
-                float total = 0, off = row_layout(lv.items, lv.scroll, window->w, xs, total);
-                box_override.box = {window->x + off + xs[size_t(i)], window->y + (window->h - e.h) * 0.5f, e.w, e.h};
+            const Element* row_win = nullptr;
+            std::vector<float> xs;
+            float total = 0, target = 0;
+            if (horizontal_row(lv, row_win, xs, total, target)) {
+                box_override.box = {window->x + row_offset(lv, target) + xs[size_t(i)], window->y + (window->h - e.h) * 0.5f,
+                                    e.w, e.h};
                 cy = window->y + window->h * 0.5f;
             }
             box_override.has_clip = true;
             box_override.clip = {window->x, window->y, window->w, window->h};
-            // Title list (TopButtonList): items fade with their distance d from the window
+            // Title list (top button list): items fade with their distance d from the window
             // centre, alpha 1 - d / (1.8 x item height), gone beyond; the focused one stays.
             if (window->name == "menu_top" && !is_focus) {
                 float d = std::fabs(cy - (window->y + window->h * 0.5f)), lim = 1.8f * e.h;

@@ -5,30 +5,29 @@
 
 #include "app/screen_race_impl.h"
 
+#include "sim/exact/race.h"
+
 namespace gt3r::race_screen {
 
-// Every player simulates only its own car; the others are posed from their snapshots
-// (RemoteCar prediction) as kinematic cars in the field. All players start the
-// countdown at the same wall-clock instant and pace their ticks from it.
+// Every player runs only its own car on the exact core; the others are posed from their snapshots (RemoteCar prediction)
+// in the field's race (race::exact_shadow, ExactRace::pose). All players start the countdown at the same wall-clock instant
+// and pace their steps from it.
 
 namespace {
 
-constexpr double kOnlineCountdown = 4.0; // s on the grid after the synchronised start
 constexpr u32 kGoDelayMs = 1500;          // host: Go -> countdown start
-constexpr double kTicksPerMs = sim::kDefaultTickHz / 1000.0;
-constexpr double kContactWindow = 12.0 / sim::kDefaultTickHz; // our own contact this recent: theirs is a duplicate
-constexpr double kStartGhost = 3.0; // s after the start signal
+constexpr double kClockEase = 0.05;       // racing: a start-time correction runs our race clock at most 5% fast or slow
+constexpr double kContactWindow = 0.2;    // s: our own contact this recent makes theirs a duplicate
+constexpr double kStartGhost = 3.0;       // s after the start signal
 
 } // namespace
 
 void RaceScreen::configure_online_field(FieldConfig& cfg) {
     net::Session& ns = net::online();
-    cfg.countdown = kOnlineCountdown;
     cfg.opponents.clear();
     cfg.max_opponents = 0;
     cfg.event.clear();
-    cfg.wear = {};
-    net_.player.clear(), net_.paint.clear(), net_.names.clear();
+    net_.player.clear(), net_.paint.clear(), net_.names.clear(), net_.top_speed.clear();
     const std::vector<u8>& grid = ns.grid();
     for (size_t slot = 0; slot < grid.size(); ++slot) {
         u8 id = grid[slot];
@@ -38,22 +37,29 @@ void RaceScreen::configure_online_field(FieldConfig& cfg) {
         }
         const net::Player* p = ns.player(id);
         if (!p) continue; // left before the race
-        FieldConfig::Remote rm{p->car, int(slot), nullptr};
-        // Their car as they race it (garage parts and settings: weight and size count in contact).
+        FieldConfig::Remote rm{p->car, int(slot), {}, {}};
+        float top_speed = 150.0f; // (m/s: unknown gearing, a generous bound)
+        // Their car as they race it (garage parts and settings, arcade tyres: weight, size and
+        // grip count in contact and prediction). The lobby has checked that it races here as
+        // its owner races it; one that does not is the stock car, or a stand-in when unknown.
         if (const Bytes* info = ns.car_info(id))
             if (std::optional<game::OnlineCar> oc = game::decode_online_car(*info)) {
-                rm.car = oc->car;
+                std::string base = game::online_car_base(db_, *oc); // an arcade car's twin on this disc
+                rm.car = base.empty() ? oc->car : base;
                 std::string err;
-                if (std::optional<sim::CarSpec> sp = game::online_car_spec(db_, *oc, &err))
-                    rm.spec = std::make_shared<const sim::CarSpec>(std::move(*sp));
+                if (std::optional<sim::CarSpec> sp = game::online_car_spec(db_, *oc, &err, preset_.course))
+                    top_speed = game::geared_top_speed(*sp);
                 else LOG_WARN("Online: %s's car: %s", p->name.c_str(), err.c_str());
+                if (!base.empty()) rm.source = exact_online_source(db_, *oc, preset_.course, &rm.condition);
             }
+        net_.top_speed.push_back(top_speed);
         cfg.remote.push_back(rm);
         net_.player.push_back(id);
         net_.paint.push_back(p->paint);
         net_.names.push_back(p->name);
     }
-    net_.cars.assign(net_.player.size(), RemoteCar{});
+    net_.cars.clear();
+    net_.cars.resize(net_.player.size());
     net_.wait = ns.joined() ? NetWait::Loading : NetWait::None;
     net_.lost = !ns.joined();
     net_.ticks = 0;
@@ -62,7 +68,6 @@ void RaceScreen::configure_online_field(FieldConfig& cfg) {
     net_.ghost.clear();
     net_.checks.clear();
     net_.claims.clear();
-    net_.respawn_ticks = 0;
     net_.finish_sent = net_.loaded_sent = false;
 }
 
@@ -100,6 +105,8 @@ void RaceScreen::online_event(App& app, const net::Event& e) {
             if (field_->last_contact_with(i) >= field_->race_time() - kContactWindow) break;
             field_->apply_player_impulse(e.contact.point_x, e.contact.point_z, e.contact.jx, e.contact.jz);
             ++net_.contacts_applied;
+            LOG_INFO("Online: %s's machine saw a hit ours missed (%.0f N s), applied", net_.names[size_t(i)].c_str(),
+                     std::hypot(e.contact.jx, e.contact.jz));
         }
         break;
     case K::Flag: { // host: a warning about a player
@@ -132,7 +139,7 @@ void RaceScreen::online_event(App& app, const net::Event& e) {
 }
 
 // Every frame: network in/out and the start handshake. false = skip the rest of the frame.
-bool RaceScreen::online_update(App& app) {
+bool RaceScreen::online_update(App& app, double dt) {
     net::Session& ns = net::online();
     ns.poll();
     while (std::optional<net::Event> e = ns.next_event()) {
@@ -147,7 +154,13 @@ bool RaceScreen::online_update(App& app) {
         }
         if (net_.wait == NetWait::Loading) toast("Waiting for the other players...");
     }
-    if (ns.race_start_ms() > 0) net_.start_at = ns.race_start_ms(); // refined by the clock sync
+    // The start time as the clock sync refines it. Once racing, a correction is eased in: in one
+    // jump, the few ms the host clock's estimate moves by over a long link moved everything drawn
+    // by part of a tick at once.
+    if (const double refined = ns.race_start_ms(); refined > 0) {
+        const double ease = net_.wait == NetWait::None && net_.start_at > 0 ? kClockEase * dt * 1000.0 : 1e300;
+        net_.start_at = std::clamp(refined, net_.start_at - ease, net_.start_at + ease);
+    }
     if (net_.wait == NetWait::Starting) {
         if (ns.now() >= net_.start_at) net_.wait = NetWait::None, step_.reset();
         else toast("Get ready!");
@@ -159,6 +172,12 @@ bool RaceScreen::online_update(App& app) {
         for (const RaceField::Standing& st : field_->standings())
             if (st.car == -1) t = st.time;
         ns.send_finish(t, track_->best_lap_time());
+        LOG_INFO("Online: finished in %.3f s; contacts: %d hits sent, %d applied from the others", t, net_.contacts_sent,
+                 net_.contacts_applied);
+        for (size_t i = 0; i < net_.cars.size() && i < net_.names.size(); ++i)
+            LOG_INFO("Online: %s: %u states, prediction %s, last error %.3f m", net_.names[i].c_str(),
+                     ns.remote(u8(net_.player[i])) ? ns.remote(u8(net_.player[i]))->count : 0u,
+                     net_.cars[i].physics() ? "exact shadow" : "dead reckoning", net_.cars[i].last_error());
     }
     return true;
 }
@@ -171,10 +190,10 @@ int RaceScreen::online_ticks(int n) {
         return 0;
     }
     if (net_.lost || net_.start_at <= 0) return n;
-    long long target = (long long)std::floor((net::online().now() - net_.start_at) * kTicksPerMs);
-    int k = int(std::clamp<long long>(target - net_.ticks, 0, 30));
-    net_.ticks += k;
-    return k;
+    // The drawn blend between ticks follows the same clock: blended by the frame times instead,
+    // above 60 fps the picture stepped half a tick back on every other frame.
+    const double per_ms = (field_ ? field_->tick_hz() : sim::kDefaultTickHz) / 1000.0;
+    return step_.follow((net::online().now() - net_.start_at) * per_ms, net_.ticks, 30);
 }
 
 void RaceScreen::online_before_step(double dt) {
@@ -182,33 +201,31 @@ void RaceScreen::online_before_step(double dt) {
     net::Session& ns = net::online();
     double now = field_->race_time();
     for (size_t i = 0; i < net_.player.size() && int(i) < field_->opponents(); ++i) {
-        // Physics-based prediction: a shadow of their car on our course.
-        if (!net_.cars[i].physics() && net_.physics)
-            if (const sim::Vehicle* ov = field_->opponent_vehicle(int(i))) {
-                std::unique_ptr<sim::Vehicle> sh = sim::Vehicle::create(ov->spec());
-                sh->set_dirt_course(net_.dirt);
-                net_.cars[i].attach(std::move(sh), &track_->query(), &track_->world());
-            }
-        if (const net::Session::Remote* r = ns.remote(u8(net_.player[i]));
-            r && (!net_.cars[i].has() || r->snap.tick > net_.cars[i].latest().tick)) {
+        RemoteCar& rc = net_.cars[i];
+        const net::Session::Remote* r = ns.remote(u8(net_.player[i]));
+        // The prediction shadow: their car alone on a one-car race of our course, built for their entry (ASM / TCS, the
+        // steering wheel, the AI's autopilot) once their first state is here.
+        auto built_for = [](const net::CarEntry& a, const net::CarEntry& b) {
+            return a.asm_on == b.asm_on && a.tcs_on == b.tcs_on && a.wheel_type == b.wheel_type && (a.control == 1) == (b.control == 1);
+        };
+        if (r && (!rc.attached() || !built_for(rc.shadow_entry(), r->snap.entry)))
+            if (std::unique_ptr<sim::exact::ExactRace> sh = exact_shadow(*field_, int(i), r->snap.entry))
+                rc.attach(std::move(sh), r->snap.entry, net_.physics);
+        if (r && (!rc.has() || r->snap.tick > rc.latest().tick)) {
             net::CarSnapshot snap = r->snap;
-            const sim::Vehicle* ov = field_->opponent_vehicle(int(i));
-            complete_snapshot(snap, field_->opponent_setup(int(i)), ov ? ov->spec().mass : 1200.0f, kOnlineCountdown);
-            net_.cars[i].receive(snap, now);
+            complete_snapshot(snap);
+            rc.receive(snap, now);
             // Plausibility (what their car can physically do); the host hears about it.
             if (net_.checks.size() < net_.player.size()) {
                 net_.checks.resize(net_.player.size());
-                for (size_t k = 0; k < net_.checks.size(); ++k)
-                    if (const sim::Vehicle* cv = field_->opponent_vehicle(int(k)))
-                        net_.checks[k].set_car(game::geared_top_speed(cv->spec()));
+                for (size_t k = 0; k < net_.checks.size() && k < net_.top_speed.size(); ++k) net_.checks[k].set_car(net_.top_speed[k]);
             }
             bool contact = field_->last_contact_with(int(i)) > now - 1.0;
             auto report = [&](std::optional<Plausibility::Flag> f) {
                 if (f) ns.report_flag(u8(net_.player[i]), f->kind, f->value);
             };
             report(net_.checks[i].on_state(snap, contact));
-            if (net_.cars[i].physics())
-                report(net_.checks[i].on_prediction_error(net_.cars[i].last_error(), net_.cars[i].last_error_horizon(), contact));
+            if (rc.physics()) report(net_.checks[i].on_prediction_error(rc.last_error(), rc.last_error_horizon(), contact));
         }
         // Its finish claim against when we saw it cross the line.
         if (i < net_.claims.size() && net_.claims[i] >= 0 && field_->remote_observed_finish(int(i)) >= 0 &&
@@ -217,27 +234,49 @@ void RaceScreen::online_before_step(double dt) {
                 ns.report_flag(u8(net_.player[i]), f->kind, f->value);
             net_.claims[i] = -1;
         }
-        if (net_.cars[i].has()) field_->set_remote_pose(int(i), net_.cars[i].predict(now + dt));
+        if (rc.has()) {
+            const RemoteCar::Pose p = rc.predict(now + dt);
+            field_->set_remote_pose(int(i), p);
+            // GT3R_NET_DEBUG=1: our car, the pose and the newest state twice a second.
+            static const bool debug = SDL_getenv("GT3R_NET_DEBUG") != nullptr;
+            if (debug && p.car && (net_.state_tick % 30) == 0)
+                if (const sim::exact::ExactRace* race = exact_race_of(*field_)) {
+                    const sim::exact::Car& me = race->cars()[0];
+                    LOG_INFO("Online debug: t %.3f us (%.2f %.2f) v (%.2f %.2f); %s posed (%.2f %.2f) v (%.2f %.2f) for t %.3f; "
+                             "state t %.3f (%.2f %.2f)",
+                             now, me.pos.x.host(), me.pos.y.host(), me.vel.x.host(), me.vel.y.host(), net_.names[i].c_str(),
+                             p.car->pos.x.host(), p.car->pos.y.host(), p.car->vel.x.host(), p.car->vel.y.host(), now + dt,
+                             rc.latest().race_time, rc.latest().state.position.x, -rc.latest().state.position.z);
+                }
+        }
     }
 }
 
 void RaceScreen::online_after_step() {
     net::Session& ns = net::online();
-    const sim::Vehicle* sv = vehicle_->sim_vehicle();
-    if (!field_ || !sv || !ns.joined()) return;
-    // This tick's input in front of the last ones (each state repeats them: no input is lost
-    // with a datagram).
+    const sim::exact::ExactRace* race = field_ ? exact_race_of(*field_) : nullptr;
+    const std::vector<sim::exact::PadFrame>* frames = field_ ? exact_frames_of(*field_) : nullptr;
+    const std::optional<net::CarEntry> entry = field_ ? exact_player_entry(*field_) : std::nullopt;
+    if (!race || !frames || frames->empty() || !entry || !ns.joined()) return;
+    // This step's frame in front of the last ones (each state repeats them: no input is lost with a datagram).
     std::copy_backward(net_.inputs, net_.inputs + net::kInputHistory - 1, net_.inputs + net::kInputHistory);
-    net_.inputs[0] = net::pack_input(last_in_, controls_.reverse());
+    const sim::exact::PadFrame& f = (*frames)[0];
+    net_.inputs[0] = {f.flags, f.kind, f.shift, f.steer, f.throttle, f.brake, f.back, f.third};
     net_.input_count = std::min(net_.input_count + 1, net::kInputHistory);
-    ns.send_state(make_snapshot(*sv, ++net_.state_tick, track_->laps_completed(), net_.inputs, net_.input_count,
-                                net_.respawn_ticks > 0));
-    if (net_.respawn_ticks > 0) --net_.respawn_ticks;
+    ns.send_state(make_snapshot(race->cars()[0], *entry, ++net_.state_tick, field_->race_time(), track_->laps_completed(),
+                                net_.inputs, net_.input_count));
     // Hits our machine saw: their owners apply them if their machines missed them.
     for (const RaceField::RemoteHit& h : field_->take_remote_hits())
         if (size_t(h.opponent) < net_.player.size()) {
             net::Event::Hit hit{net_.state_tick, h.point_x, h.point_z, h.jx, h.jz};
             ns.send_contact(u8(net_.player[size_t(h.opponent)]), hit);
+            ++net_.contacts_sent;
+            const sim::exact::Car& me = race->cars()[0];
+            const sim::exact::Car& them = race->cars()[size_t(1 + h.opponent)];
+            LOG_INFO("Online: our car hit %s's (%.0f N s) at %.2f s: ours at (%.2f %.2f) %.1f km/h, theirs posed at (%.2f %.2f) "
+                     "%.1f km/h",
+                     net_.names[size_t(h.opponent)].c_str(), std::hypot(h.jx, h.jz), field_->race_time(), me.pos.x.host(),
+                     me.pos.y.host(), me.speed.host() * 3.6f, them.pos.x.host(), them.pos.y.host(), them.speed.host() * 3.6f);
         }
     ns.poll(); // out at once
 }

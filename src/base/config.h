@@ -27,6 +27,8 @@ public:
     Section& get_or_add(std::string_view section);
     std::optional<std::string> get(std::string_view section, std::string_view key) const;
     void set(std::string_view section, std::string_view key, std::string_view value);
+    // Drops every `key` line of `section` (nothing when there is none).
+    void remove(std::string_view section, std::string_view key);
 
     std::vector<Section>& sections() { return sections_; }
     const std::vector<Section>& sections() const { return sections_; }

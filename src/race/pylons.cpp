@@ -5,6 +5,7 @@
 #include "formats/model/gtm1.h"
 #include "render/gpu_context.h"
 #include "render/gpu_model.h"
+#include "track/track.h"
 
 #include <algorithm>
 #include <cmath>
@@ -234,34 +235,59 @@ void Pylons::ground_contact(Body& b, const Type& t, const sim::TrackQuery& groun
     impulse(b, t, mul(b.rot, t.hull[size_t(k)]), n, {}, 0.25f, 1.0f, 0.5f);
 }
 
-void Pylons::wall_contact(Body& b, const Type& t, const Vec3& old_pos, const sim::WorldQuery& walls) {
-    // Wall edges near the motion (x/z span old -> new, grown by 8 m); sensor edges have no wall.
+namespace {
+
+// The wall edges within `reach` of `c` in x / z and in the height band [-5 m, +8 m] around it (bridges); an edge starting
+// at a kWallSensor point has no wall.
+struct WallEdge {
+    double ax, az, bx, bz;
+};
+void wall_edges(std::span<const track::WallLine> walls, const Vec3& c, float reach, std::vector<WallEdge>& out) {
+    for (const track::WallLine& line : walls) {
+        const size_t n = line.points.size();
+        const size_t edges = line.closed ? n : (n ? n - 1 : 0);
+        for (size_t i = 0; i < edges; ++i) {
+            const auto& pa = line.points[i];
+            const auto& pb = line.points[(i + 1) % n];
+            if (pa.flags & track::kWallSensor) continue;
+            const Vec3 &p = pa.pos, &q = pb.pos;
+            if (c.y < std::min(p.y, q.y) - 8.0f || c.y > std::max(p.y, q.y) + 5.0f) continue;
+            if (c.x < std::min(p.x, q.x) - reach || c.x > std::max(p.x, q.x) + reach) continue;
+            if (c.z < std::min(p.z, q.z) - reach || c.z > std::max(p.z, q.z) + reach) continue;
+            out.push_back({p.x, p.z, q.x, q.z});
+        }
+    }
+}
+
+} // namespace
+
+void Pylons::wall_contact(Body& b, const Type& t, const Vec3& old_pos, std::span<const track::WallLine> walls) {
+    // Wall edges near the motion (x/z span old -> new, grown by 8 m).
     Vec3 mid = (old_pos + b.pos) * 0.5f;
     float reach = 0.5f * std::hypot(b.pos.x - old_pos.x, b.pos.z - old_pos.z) + 8.0f;
-    std::vector<sim::collide::Segment> segs;
-    if (!walls.wall_segments(mid, reach, segs)) return;
-    for (const sim::collide::Segment& sg : segs) {
-        if (sg.sensor) continue;
-        float sx = float(sg.b.x - sg.a.x), sz = float(sg.b.z - sg.a.z);
+    std::vector<WallEdge> segs;
+    wall_edges(walls, mid, reach, segs);
+    for (const WallEdge& sg : segs) {
+        float sx = float(sg.bx - sg.ax), sz = float(sg.bz - sg.az);
         float len2 = sx * sx + sz * sz;
         if (len2 < 1e-8f) continue;
         float len = std::sqrt(len2);
         Vec3 n{sz / len, 0, -sx / len}; // the drivable side (the track lies left of each edge)
-        auto side = [&](const Vec3& p) { return sx * (p.z - float(sg.a.z)) - sz * (p.x - float(sg.a.x)); }; // > 0: behind
-        float dx = b.pos.x - float(sg.a.x), dz = b.pos.z - float(sg.a.z);
+        auto side = [&](const Vec3& p) { return sx * (p.z - float(sg.az)) - sz * (p.x - float(sg.ax)); }; // > 0: behind
+        float dx = b.pos.x - float(sg.ax), dz = b.pos.z - float(sg.az);
         float u = (dx * sx + dz * sz) / len2;
         float c_new = side(b.pos), c_old = side(old_pos);
         bool moved = false;
         if (u > 0 && u < 1 && std::fabs(c_new) / len < t.radius) {
             // Overlapping: the centre goes to the radius on the drivable side.
-            float fx = float(sg.a.x) + u * sx, fz = float(sg.a.z) + u * sz;
+            float fx = float(sg.ax) + u * sx, fz = float(sg.az) + u * sz;
             b.pos.x = fx + t.radius * n.x, b.pos.z = fz + t.radius * n.z;
             moved = true;
         } else if (c_new >= 0 && c_old <= 0 && c_new - c_old > 1e-9f) {
             // Crossed this frame within the edge: back along the motion onto the wall line.
             float f = c_new / (c_new - c_old);
             Vec3 p = b.pos + (old_pos - b.pos) * f;
-            float pu = ((p.x - float(sg.a.x)) * sx + (p.z - float(sg.a.z)) * sz) / len2;
+            float pu = ((p.x - float(sg.ax)) * sx + (p.z - float(sg.az)) * sz) / len2;
             if (pu >= 0 && pu <= 1) b.pos = p, moved = true;
         }
         if (!moved) continue;
@@ -278,7 +304,7 @@ void Pylons::wall_contact(Body& b, const Type& t, const Vec3& old_pos, const sim
 }
 
 unsigned Pylons::step(const sim::TrackQuery& ground, const std::vector<Car>& cars, double dt_d,
-                      const sim::WorldQuery* walls) {
+                      std::span<const track::WallLine> walls) {
     const float dt = float(dt_d);
     unsigned hits = 0;
     for (Body& b : bodies_) {
@@ -364,7 +390,7 @@ unsigned Pylons::step(const sim::TrackQuery& ground, const std::vector<Car>& car
         b.pos += b.vel * dt;
         b.vel.y -= 9.81f * dt;
         ground_contact(b, t, ground);
-        if (walls && b.active) wall_contact(b, t, old_pos, *walls);
+        if (!walls.empty() && b.active) wall_contact(b, t, old_pos, walls);
     }
     return hits;
 }

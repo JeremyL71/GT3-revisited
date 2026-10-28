@@ -30,6 +30,7 @@
 #include "formats/menu/pmb.h"
 #include "game/data/car_database.h"
 #include "game/gt_mode.h"
+#include "game/language_rules.h"
 #include "menu/flow/game_hooks.h"
 #include "menu/flow/menu_set.h"
 #include "race/field.h"
@@ -61,12 +62,12 @@ std::string ascii(const std::string& s) {
 bool starts(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
 
 // The titles the GT Mode menus show for their items: every menu/gt_mode.mbl item with a
-// focus layer (MblItem::str80) whose layout (the page in menu/US/gt_mode<N>.pmb, that layer)
+// focus layer (MblItem::str80) whose layout (the page in menu/<lang>/gt_mode<N>.pmb, that layer)
 // holds a title text - the league pages' "event_text" widgets ("Sunday Cup", "Seattle 100
 // Miles") and the licence pages' "license_title<n>" ("Practical Cornering I"). Keyed by the
 // page the item opens (a series page, "r/beginner/gsunday_e"), else by the item (a test,
 // "L0B0001").
-std::map<std::string, std::string> game_menu_titles(const Vfs& vfs) {
+std::map<std::string, std::string> game_menu_titles(const Vfs& vfs, const std::string& lang) {
     std::map<std::string, std::string> out;
     std::optional<Bytes> mb = vfs.read("menu/gt_mode.mbl");
     if (!mb) return out;
@@ -77,7 +78,7 @@ std::map<std::string, std::string> game_menu_titles(const Vfs& vfs) {
             if (!starts(p.name, "r/") && !starts(p.name, "lc/")) continue;
             int n = menu::flow::pmb_number(p);
             if (!pmbs.count(n)) {
-                std::optional<Bytes> b = vfs.read("menu/US/gt_mode" + std::to_string(n) + ".pmb");
+                std::optional<Bytes> b = vfs.read("menu/" + lang + "/gt_mode" + std::to_string(n) + ".pmb");
                 pmbs[n] = b ? std::optional<menu::PmbFile>(menu::PmbFile::parse(*b)) : std::nullopt;
             }
             const std::optional<menu::PmbFile>& pmb = pmbs[n];
@@ -188,6 +189,7 @@ public:
     }
 
     void on_event(App& app, const SDL_Event& e) override {
+        if (page_ == Page::Cars) car_picker_.event(e); // the car page's pointer (online_pickers.h)
         float x = 0, y = 0;
         if (page_ == Page::Cars || !pointer_down(e, x, y)) return;
         // Taps: a row is selected; the selected row is chosen (as Cross).
@@ -241,7 +243,7 @@ private:
             return;
         }
         if (!db_.load(*app.vfs())) {
-            error_ = "Car database: " + db_.error();
+            error_ = db_.player_error();
             return;
         }
         auto data = std::make_shared<game::GtData>();
@@ -250,12 +252,17 @@ private:
         for (const data::Car& c : db_.cars()) {
             std::string model = db_.model_of(c);
             if (model.empty() || !app.vfs()->exists("cars/day/" + model)) continue; // as the race screen lists them
-            PickerCar e{c.label, ascii(c.name.empty() ? c.label : c.name), model, -1, db_.mod_car(c.label) != nullptr, c.maker, 0, {}};
+            PickerCar e{c.label, ascii(c.name.empty() ? c.label : c.name), model, -1, db_.mod_car(c.label) != nullptr, c.maker, 0, {}, {}, 0, {}};
             if (e.mod) e.name += " (mod)";
             cars_.push_back(e);
         }
         std::sort(cars_.begin(), cars_.end(), [](const PickerCar& a, const PickerCar& b) { return a.name < b.name; });
-        build_events(app, *data);
+        try {
+            build_events(app, *data);
+        } catch (const std::exception& e) { // (a disc whose events or menus cannot be read)
+            LOG_WARN("Quick race: events: %s", e.what());
+            categories_.clear(), events_.clear();
+        }
         for (const Category& c : categories_) {
             rows_.push_back({&c - categories_.data(), -1});
             for (int e : c.events) rows_.push_back({&c - categories_.data(), e});
@@ -281,7 +288,7 @@ private:
     // Every event, by category: the GT Mode leagues in their menus' order, the licence tests,
     // the machine tests, then arcade mode's single race classes and time trials.
     void build_events(App& app, const game::GtData& data) {
-        std::map<std::string, std::string> titles = game_menu_titles(*app.vfs());
+        std::map<std::string, std::string> titles = game_menu_titles(*app.vfs(), app.language());
         const game::Catalog& cat = data.catalog;
         auto playable = [&](const std::string& code) {
             const data::Event* ev = db_.event(code);
@@ -337,7 +344,9 @@ private:
                         const data::Event* ev = db_.event(code);
                         std::string name = license_label(code);
                         if (titles.count(code)) name += "  " + titles[code];
-                        add(c, {code, code, name, Kind::License, {}, ev->entries.empty() ? "" : ev->entries[0]});
+                        // The test's car in the game's language (gt_mode §21, docs/dev/GT_MODE.md "Language").
+                        add(c, {code, code, name, Kind::License, {},
+                                ev->entries.empty() ? "" : game::license_car(db_, *ev, db_.language()).entry});
                     }
             if (!c.events.empty()) categories_.push_back(std::move(c));
         }
@@ -403,11 +412,7 @@ private:
         return code + (cls == "D" ? "AD" : cls + "T") + "0001";
     }
 
-    bool has_course(App& app, const std::string& label) {
-        for (const char* region : {"US", "JP", "UK", "EU"})
-            if (app.vfs()->exists(std::string("courses/") + region + "/" + label)) return true;
-        return false;
-    }
+    bool has_course(App& app, const std::string& label) { return !course_file_path(*app.vfs(), label).empty(); }
 
     std::string course_name(const std::string& label) const {
         for (const data::Course& c : db_.courses())
@@ -428,7 +433,7 @@ private:
 
     std::string car_name(const std::string& id) const {
         const data::Car* c = db_.car(base_car(id));
-        return c ? ascii(c->name.empty() ? c->label : c->name) : std::string();
+        return c ? ascii(c->latin_name.empty() ? c->label : c->latin_name) : std::string();
     }
 
     int find_car(const std::string& label) const {
@@ -484,7 +489,7 @@ private:
         own_car_ = e.test_car.empty();
         if (car_ >= 0) return;
         if (const data::Event* ev = db_.event(event_code()); ev && !ev->entries.empty())
-            car_ = find_car(base_car(ev->entries[0]));
+            car_ = find_car(base_car(e.kind == Kind::License && !e.test_car.empty() ? e.test_car : ev->entries[0]));
         if (car_ < 0) car_ = find_car("r34_gtr_v_99");
         if (car_ < 0) car_ = 0;
         paint_ = 0;

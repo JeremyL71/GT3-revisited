@@ -10,11 +10,11 @@
 //            tag-specific u32 fields, the NUL-terminated name, then
 //            tag-specific data. Names within a section are sorted.
 //
-// Tags used by GT mode (product.gcf): 10 prices / constants (`initial`
-// 18,000 = starting credits, `car_wash` 50, `oil_change` 250, `wheel` 500;
-// value = u32 at entry +4), 4 GT-mode race codes (364), 6 courses (44),
-// 13 license / challenge tests, 15 prize keys (prize cars), 14 arcade
-// classes, 8 arcade modes, 12 demo races.
+// Tags used by GT mode (product.gcf / product_eu.gcf): 10 the game's sums by name
+// (`initial` = a new game's credits, `car_wash`, `oil_change`, `wheel` = the shop prices;
+// value = u32 at entry +4, in the disc's money units: the Japanese game shows them x100),
+// 4 GT-mode race codes, 6 courses, 13 license / challenge tests, 15 prize keys (prize cars),
+// 14 arcade classes, 8 arcade modes, 12 demo races.
 
 #include "base/bytes.h"
 

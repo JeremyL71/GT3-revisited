@@ -89,7 +89,7 @@ int TheaterPage::tick(MenuKeys held, std::vector<std::string>& sounds) {
             if (r >= top_ + kRows) top_ = r - kRows + 1;
         }
     } else if (key(MenuKey::Confirm)) {
-        if (n == 0) {
+        if (n == 0 || !entries_[size_t(cursor_)].playable) {
             sounds.push_back("disable");
         } else {
             sounds.push_back("ok");

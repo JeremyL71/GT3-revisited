@@ -1,12 +1,12 @@
-# GT Mode: rules and behaviour
+# GT Mode: rules and behavior
 
 This document describes what GT Mode does in GT3 Revisited: money and prizes,
-dealers, the garage, the tune shop, car condition, licences, races and championships,
+dealers, the garage, the tune shop, car condition, licenses, races and championships,
 records, game progress, endings and what a save holds. It also covers the arcade
 progression, because the game keeps it in the same game state and save as GT Mode.
 
 Code comments cite its sections as `gt_mode §n`; a few comments in the same files cite
-other behaviour pages (physics, presentation, menus).
+other behavior pages (physics, presentation, menus).
 Numbers 1, 2, 3 and so on are used in order, with these exceptions:
 
 - **§9 and §11 are not used.** In the race code those numbers name sections of
@@ -22,9 +22,10 @@ TMPDIR=$PWD/build/tmp GT3R_DISC=disc/GT3.iso ./build/gt3r_tests gtmode
 ```
 
 The test names quoted below (`gtmode_disc_*`, `gtmode_menu_disc_*`, `gtmode_synth_*`,
-`save_library_*`, `random_*`, `race_*`) are in `tests/test_gtmode.cpp`, `tests/test_gtmode_menu.cpp`,
-`tests/test_gtmode_menu_synth.cpp`, `tests/test_save_library.cpp`, `tests/test_random.cpp`,
-`tests/test_race_presentation.cpp` and `tests/test_race_lap_events.cpp`.
+`save_library_*`, `random_*`, `race_*`, `exact_game_*`, `engine_condition_rules`) are in
+`tests/test_gtmode.cpp`, `tests/test_gtmode_menu.cpp`, `tests/test_gtmode_menu_synth.cpp`,
+`tests/test_save_library.cpp`, `tests/test_random.cpp`, `tests/test_race_presentation.cpp`,
+`tests/test_race_lap_events.cpp`, `tests/test_exact_solo.cpp` and `tests/test_car_spec.cpp`.
 Figures marked "on this disc" come from the NTSC-U data set (`GT3.iso`, PBPX-95503
 1.10) that the tests run on.
 
@@ -39,7 +40,7 @@ where noted. `GtData::load` (`src/game/gt_mode.cpp`) reads:
 |---|---|
 | `database/paramdb_us.db` (+ string tables) | cars (price, flags, category, region), parts, events, regulations, courses (`docs/formats/database.md`) |
 | `gameconf/product.gcf` (`src/game/gcf.*`) | constants (`initial`, `car_wash`, `oil_change`, `wheel`), section 0 (title idle time), section 4 (the 364 GT-mode result codes and their unlock level), section 12 (attract demos), section 15 (prize sets), sections 8 and 14 (arcade course and car lists) |
-| `menu/gt_mode.mbl` (`src/game/gt_catalog.*`) | what GT Mode offers: dealer cars (`cd/` pages, action `set_car_code`), race series (`r/<tier>/<series>` pages, `set_race_code` / `set_race_code_champ`), licence tests (`lc/lc_<id>` pages, `go_license`), tune-shop pages. The game has no separate list of these: its menus are the list. |
+| `menu/gt_mode.mbl` (`src/game/gt_catalog.*`) | what GT Mode offers: dealer cars (`cd/` pages, action `set_car_code`), race series (`r/<tier>/<series>` pages, `set_race_code` / `set_race_code_champ`), license tests (`lc/lc_<id>` pages, `go_license`), tune-shop pages. The game has no separate list of these: its menus are the list. |
 | `database/carcolor.db` / `.sdb` | paint lists per body model and paint names (§7) |
 | `bgm/ads.inf` | the race songs, for the options block of a PS2 save (§12) |
 | the game program on the disc | the 30 built-in record holder names (§16) |
@@ -49,7 +50,7 @@ and its region index is 1 (US). A refusal is reported by its menu page, for exam
 `00cmn/no_money`. Every rule that can refuse returns a `Check` (`src/game/gt_mode.h`),
 and §3.3 lists the pages.
 
-Units: credits (Cr) are whole numbers held as 64-bit integers. Distances are in metres,
+Units: credits (Cr) are whole numbers held as 64-bit integers. Distances are in meters,
 times in seconds and frames at 60 Hz. Money is printed with thousands separators
 ("18,000", `format_credits`) and times as m'ss.mmm ("1'02.400", `format_time_ms`).
 Some menu figures are computed in single precision with the console's rounding (the
@@ -60,10 +61,10 @@ the screens.
 
 **New game** (`GtMode::new_game`): credits = gcf `initial`, which is 18,000 on this
 disc. The day is 1, the garage is empty, there is no ride car, and every record,
-licence and result is cleared. The GT-mode random state is kept, not reset (§20.2).
+license and result is cleared. The GT-mode random state is kept, not reset (§20.2).
 `gtmode_disc_constants` checks these values.
 
-**Fixed prices** (gcf constants; the engine's fallback values are the same):
+**Fixed prices** (gcf constants `car_wash`, `oil_change` and `wheel`; on this disc):
 
 | Item | Price |
 |---|---|
@@ -71,11 +72,22 @@ licence and result is cleared. The GT-mode random state is kept, not reset (§20
 | Oil change | 250 Cr |
 | Wheel (any) | 500 Cr |
 
+The starting money and these three prices come only from the disc's game configuration;
+the engine has no values of its own. When the configuration lacks one of the four,
+`GtData::load` refuses the data, naming the missing value, and GT Mode does not open
+(`gtmode_synth_game_config_sums`).
+
+**Japanese.** In Japanese every sum of money is 100 times the value the disc stores: the
+starting money and fixed prices, car and part prices, race prizes and championship
+bonuses (`GtData::money`). The Japanese disc's starting money of 15,000 therefore shows
+as 1,500,000 Cr. The other languages show the stored values
+(`region_disc_money_from_data` in `tests/test_region.cpp`).
+
 Car and part prices come from the database (§5–§7). Money comes in from race prizes
 (§22), championship bonuses (§22.2) and selling cars (§5). The balance never goes
 negative, because every purchase is checked against it first.
 
-**Days.** The day counter rises by 1 each time the player starts a race, a licence test,
+**Days.** The day counter rises by 1 each time the player starts a race, a license test,
 a machine test or a free run (the menu's `go_race`, `go_license`, `go_machine_test`
 and `go_free_run`; `GtMode::enter`). Starting a championship counts once. Later rounds
 do not cost a day, whether they follow on directly or resume from a save. Shopping,
@@ -87,12 +99,12 @@ selling and settings never cost a day. The status bar shows "day N".
 |---|---|
 | Wins / Races | race wins / races entered (championship rounds count as races) |
 | Win ratio | wins / races × 100, one decimal; "0 %" before any race |
-| Total distance | all distance driven, shown in miles (metres / 1609.344) on NTSC-U |
+| Total distance | all distance driven, shown in miles (meters / 1609.344) on NTSC-U |
 | Prize money | total prize money won, bonuses included |
 | Trophies | see §3.2 |
-| Cars, total value | garage size; sum of the cars' catalogue prices |
+| Cars, total value | garage size; sum of the cars' catalog prices |
 | Prize cars | prize cars received |
-| Licence medals | counts of gold, silver and bronze medals over the 48 tests |
+| License medals | counts of gold, silver and bronze medals over the 48 tests |
 | Game status | completion (§4) |
 
 ## §3 The game state
@@ -106,7 +118,7 @@ saved (§12).
 | races, wins, prize money, distance | status counters (§2) |
 | garage, ride | up to 200 cars, newest first; index of the ride car, or none (§5) |
 | wheels | wheel inventory (§7) |
-| licence tests | 6 × 8 records: best medal and best time (§21) |
+| license tests | 6 × 8 records: best medal and best time (§21) |
 | race results | best finishing place per race code; "never raced" is place 8 |
 | prizes given | names of the prize sets already awarded (§23) |
 | championship | the championship in progress, if any (§22.2) |
@@ -156,12 +168,12 @@ earned:
 | 1 << ((class − 5) × 3 + place) | a GT-mode cup: trophy class 5–8, place 0–2 (0 = 1st) |
 | 0x10000 | a GT-mode consolation prize (places 4–6 with prize money) |
 | 0x1000 << difficulty | an arcade Single Race won at Easy (0), Normal (1), Hard (2) or Professional (3) |
-| 0x20000 << medal | a licence medal: gold (0), silver (1), bronze (2) |
+| 0x20000 << medal | a license medal: gold (0), silver (1), bronze (2) |
 
 The **prize-model flags** are a second word:
 
-- bit 1 << licence (B, A, IB, IA, S, R) is set when that licence card is presented,
-  that is, when the licence is obtained (§21);
+- bit 1 << license (B, A, IB, IA, S, R) is set when that license card is presented,
+  that is, when the license is obtained (§21);
 - bit 0x40 << *i* is set when championship trophy `champ_0i` is won (§18).
 
 For example, finishing 3rd in a Sunday Cup race (trophy class 5) sets award bit 0x4
@@ -182,16 +194,16 @@ item. The checks:
 | Wheel shop; change wheel in the garage | ride car (wheel shop only); the car allows wheel changes (bit value 4) | `00cmn/ride_car`, `not_for_change_wheel` |
 | Buy a wheel | ride car, wheel flag, already in the inventory, money | as above, `00cmn/already_you_have`, `no_money` |
 | Buy a part | §6.2 | `ts/already_you_have`, `ts/not_exist`, `00cmn/no_money` |
-| Buy all tyres | §6.4 | `ts/already_you_have_all_tires`, `no_money` |
-| Free run on a dirt course | ride car owns dirt tyres | `hm/need_dirt_tire` |
+| Buy all tires | §6.4 | `ts/already_you_have_all_tires`, `no_money` |
+| Free run on a dirt course | ride car owns dirt tires | `hm/need_dirt_tire` |
 | Enter a race | ride car, then the entry rules (§8) | `00cmn/ride_car`, `license_violation`, `regulation_violation` |
-| Open a licence page / take a test | §21 | `lc/no_license_<id>`, `lc/no_last_exam` |
+| Open a license page / take a test | §21 | `lc/no_license_<id>`, `lc/no_last_exam` |
 | Car wash / oil change | ride car, money | `00cmn/ride_car`, `no_money` |
 | After buying a car with others in the garage | — | `00cmn/cd_ride_sure` ("ride the new car?") |
 | Trade: buy a guest car | §19 | `not_for_buy`, `no_money`, `max_car` |
 
 Race series whose gcf section-4 unlock level is 1 (the F1 series, `Gf1_h_1000`… on this
-disc) are disabled until the S licence is held (`GtMode::series_unlocked`).
+disc) are disabled until the S license is held (`GtMode::series_unlocked`).
 
 ### §3.4 What a race result records
 
@@ -218,10 +230,10 @@ The completion ratio (`GtMode::completion`) counts four kinds of clear:
 
 | Term | Meaning | Total |
 |---|---|---|
-| W | GT-mode result codes won (gcf section 4: the 337 series races plus the 27 championships' own codes) | 364 |
-| A | arcade Clear Status count (§16) | 102 |
+| W | GT-mode result codes won (gcf section 4: the 337 series races plus the 27 championships' own codes) | the number of gcf section-4 entries: 364 on this disc |
+| A | arcade Clear Status count over the courses of the gcf `SINGLE_RACE` list (§16) | fixed 102 |
 | T | arcade time trials cleared (best rank 0) | 10 |
-| L | licence tests with any medal | 48 |
+| L | license tests with any medal | 48 |
 
 The total is 524 on this disc. The ratio is exactly 1 only when everything is cleared.
 Otherwise it is capped at 0.99, so a nearly complete game never shows 100 %.
@@ -230,8 +242,8 @@ How the ratio is shown (all values are truncated, never rounded):
 
 - **Status page:** the ratio × 1000 in single precision, truncated to per mille and
   capped at 999, printed "2.0 %". "100.0 %" appears only when the game is complete.
-- **Save thumbnail:** the per cent value (ratio × 100) as a float.
-- **File lists:** that per cent value truncated to one decimal, "2.0%".
+- **Save thumbnail:** the percent value (ratio × 100) as a float.
+- **File lists:** that percent value truncated to one decimal, "2.0%".
 
 With 11 of 524 clears (2.0992 %) every text reads "2.0", never "2.1"
 (`gtmode_disc_completion_texts`). The ratio also sets the `achieve_*` prize thresholds
@@ -244,7 +256,7 @@ of 0.5, 0.75 and 1.0 (§23).
 - **The first car** in an empty garage becomes the ride car (so does any car added while
   there is no ride car). After buying a car when
   the garage already has one or more, the dealer asks whether to ride the new one.
-- **Selling** pays a quarter of the catalogue price (car +0xEC), whatever the car's
+- **Selling** pays a quarter of the catalog price (car +0xEC), whatever the car's
   condition or parts. Cars with the cannot-sell flag (bit value 2: prize-only models)
   are refused, and their sell price shows "----". Selling the ride car leaves the
   player without one, and races are then refused (`gtmode_disc_dealer_and_garage`:
@@ -257,17 +269,24 @@ of 0.5, 0.75 and 1.0 (§23).
 | 0 date | serial, newest first | — |
 | 1 name | car name A–Z | — |
 | 2 maker | maker, then name | maker |
-| 3 colour | paint index | paint name |
-| 4 price | catalogue price, highest first | "N Cr." |
+| 3 color | paint index | paint name |
+| 4 price | catalog price, highest first | the sale price (a quarter of the catalog price), digits only ("13,995"); "-" for a car that cannot be sold |
 | 5 distance | odometer, highest first | "N.N km" |
 | 6 power | power figure (below), highest first | "325 HP" |
 | 7 drive | drive type of the fitted drivetrain | FF / FR / … |
 | 8 aspiration | NA before turbo (fitted turbine kit +0x11 ≠ 0) | "NA" / "TURBO" |
 
+**The list.** Up / Down move the cursor, stopping at the ends, with the `cursor` sound
+when it moves. The list scrolls to keep the cursor in view, and choosing a sort key
+puts the cursor back on the first car. A hovering pointer moves the cursor to the row
+under it, a tap on another row moves the cursor there, and a tap on the cursor's row
+opens the car. How the rows and the scroll bar are drawn is in menus §9.7
+(`gtmode_menu_disc_vertical_lists`, `gtmode_synth_garage_list_scroll`).
+
 **Power figures.** The garage, tune shop and settings menu show the car's computed
-peak power, not the catalogue figure (`GtMode::power_peak`, `spec_power_peak` in
-`src/game/net_car.cpp`). The engine builds the car's physics spec with its fitted
-parts and settings (the spec itself has no engine condition in it). It samples the
+peak power, not the catalog figure (`GtMode::power_peak`, `spec_power_peak` in
+`src/game/net_car.cpp`). The engine builds the car's menu description (`sim::CarSpec`,
+`GtMode::car_spec`) from its fitted parts and settings; it holds no engine condition. It samples the
 torque curve every 100 rpm, from the first curve point rounded to 100 rpm up to the
 rev limit, and multiplies each looked-up torque by the car's condition factor f (§13)
 in single precision:
@@ -279,7 +298,7 @@ menus convert to HP as PS × 0.98619 and truncate ("325HP/6800rpm").
 
 A new car is running in, so it shows 97 % of its full figure
 (`gtmode_disc_garage_power`). The dealer pages show the stock car's computed figure,
-and `spec_max_power` the catalogue text. The garage mileage is shown in miles on
+and `spec_max_power` the catalog text. The garage mileage is shown in miles on
 NTSC-U.
 
 ## §6 Tune shop
@@ -301,10 +320,10 @@ parts table and a stage (part record +0x10). The ids are consecutive per table
 | 10–12 | displacement (9) | stock, up 1, up 2 |
 | 13–14 | engine balance (8) | stock, balanced |
 | 15–18 | flywheel (14) | stock, light, chromoly, light chromoly |
-| 19–22 | transmission (17) | stock, close, super close, fully customisable |
+| 19–22 | transmission (17) | stock, close, super close, fully customizable |
 | 23–25 | intercooler (19) | stock, sports, racing |
 | 26–29 | weight reduction (4) | stock, stages 1–3 |
-| 30–35 | LSD (21) | stock, 1-way, 2-way, 1.5-way, fully customisable, AYC |
+| 30–35 | LSD (21) | stock, 1-way, 2-way, 1.5-way, fully customizable, AYC |
 | 36–39 | muffler (20) | stock, sports, semi-racing, racing |
 | 40–43 | NA tune (11) | stock, stages 1–3 |
 | 44–45 | port polish (7) | stock, polished |
@@ -312,8 +331,8 @@ parts table and a stage (part record +0x10). The ids are consecutive per table
 | 48–49 | racing modification (5) | stock, modified |
 | 50–53 | suspension (18) | stock, sports, semi-racing, racing |
 | 54–55 | traction control (22) | stock, on |
-| 56–66 | front tyres (28) | stages 0–9 (stock, sports, super hard … super soft, control), then dirt = stage 12 |
-| 67–77 | rear tyres (29) | as the front, +11 |
+| 56–66 | front tires (28) | stages 0–9 (stock, sports, super hard … super soft, control), then dirt = stage 12 |
+| 67–77 | rear tires (29) | as the front, +11 |
 | 78–82 | turbine kit (12) | stock / NA, stages 1–4 |
 | 83–84 | stability control (23) | stock, on |
 | 85–86 | drivetrain (13) | stock, VCD |
@@ -321,9 +340,9 @@ parts table and a stage (part record +0x10). The ids are consecutive per table
 Only the ids the US menu offers can be bought (§6.4). Racing modification (49),
 traction control (55) and stability control (84) are not among them.
 
-**Stock goods.** A new car owns the goods of its stock parts. Owning a front tyre also
-owns the matching rear tyre. Rally cars (car category 2, car +0xF1) also own dirt
-tyres (`set_stock_ownership`).
+**Stock goods.** A new car owns the goods of its stock parts. Owning a front tire also
+owns the matching rear tire. Rally cars (car category 2, car +0xF1) also own dirt
+tires (`set_stock_ownership`).
 
 ### §6.2 Buying a part
 
@@ -336,11 +355,11 @@ tyres (`set_stock_ownership`).
    +0x08 must equal the car (`ts/not_exist`). A turbo car, for example, has no NA tune;
 4. the credits cover the part's price (`00cmn/no_money`).
 
-Buying takes the price and marks the goods owned. A front tyre also marks its rear
-tyre. A tyre set costs the front record's price, and the rear record counts as free.
+Buying takes the price and marks the goods owned. A front tire also marks its rear
+tire. A tire set costs the front record's price, and the rear record counts as free.
 The shop's price widgets show "Purchased" for goods the car owns and "----" for parts
 that do not exist. Measured on an R34 GT-R: turbo stages 1–4 cost 4,800 / 13,500 /
-42,500 / 80,000 Cr, and the soft racing tyre set 35,000 Cr (`gtmode_disc_tune_shop`).
+42,500 / 80,000 Cr, and the soft racing tire set 35,000 Cr (`gtmode_disc_tune_shop`).
 
 ### §6.3 Fitting a part
 
@@ -366,7 +385,7 @@ that do not exist. Measured on an R34 GT-R: turbo stages 1–4 cost 4,800 / 13,5
    | traction control | TCS level |
    | stability control | ASCC words |
 
-4. A front tyre also fits the matching rear tyre.
+4. A front tire also fits the matching rear tire.
 
 A fitted change counts as "tuned" (§8). The shop shows the power before and after a
 part (`power_with`: the same peak computation on a copy with the part fitted). After
@@ -379,39 +398,63 @@ Each shop menu item maps to goods and a flow (`shop_items`). The flows are:
 - **buy, then ask** "install now?": most parts;
 - **buy and fit at once**: port polish, engine balance, displacement, weight reduction
   stages;
-- **buy only**: dirt tyres. The shop never fits them. Owning them is what dirt events
+- **buy only**: dirt tires. The shop never fits them. Owning them is what dirt events
   ask for (§8).
 
-**Buy all tyres** buys every racing compound from super hard to super soft (goods
+**Buy all tires** buys every racing compound from super hard to super soft (goods
 58–64) that the car does not own and that exists for it, each with its rear set. The
 price is the sum of their front prices. When none is left to buy, the shop refuses with
 `ts/already_you_have_all_tires`.
 
 ## §7 Dealers, paints and wheels
 
-**Dealers.** The dealer catalogue is every `set_car_code` item on the `cd/` pages,
+**Dealers.** The dealer catalog is every `set_car_code` item on the `cd/` pages,
 grouped by region page (jp, us, gr, fr, it, uk, bel, aus). An item name that is not a
 car label but becomes one without its leading `_` is resolved to that label. On this
 disc there are 151 dealer cars. 124 of them can be bought (no not-for-sale flag), and
 11 are affordable with the starting 18,000 Cr. The cheapest costs 11,140 Cr
-(`gtmode_disc_catalog`). The price is the catalogue price (car +0xEC).
+(`gtmode_disc_catalog`). The price is the catalog price (car +0xEC). A car whose
+not-for-sale flag (car +0xF0 bit 0) is set shows "----" as its price, both on the
+dealer's list and on the dealer's car page.
 
 **Paint.** On a dealer car page, Up / Down picks a paint from the car's model list in
 `carcolor.db`. The index resets to 0 whenever the focused car changes, and the car is
 bought in the chosen paint, clamped to the list. Paint names come from
-`carcolor.sdb`: each colour definition {id, name, alternate name, RGB} gives the name
+`carcolor.sdb`: each color definition {id, name, alternate name, RGB} gives the name
 index (`GtData::load`). Mod cars for sale join their maker's dealer page, or a dealer of
 their own on the region page (`src/game/gt_mode_mods.cpp`, `docs/MODDING.md` "Dealers and
 makers"); those with their own paints number those paints themselves.
-A prize car gets its prize set's fixed colour when the model's list has it, or a random
+A prize car gets its prize set's fixed color when the model's list has it, or a random
 paint otherwise (§20.3).
 
-**Wheels.** Every wheel costs 500 Cr. A bought wheel goes into a player-wide inventory
-of at most 200 wheels and is never used up. Any garage car that allows wheel changes
-can wear any wheel in the inventory, or go back to stock. Cars whose flag bit value 4
-is set never change wheels. A wheel already in the inventory cannot be bought again.
-The wheel shop previews the focused wheel on the car. The fitted wheel shows on menu
-renders and is used in races.
+**Wheels.** Every wheel costs the gcf `wheel` price (500 Cr on this disc, §2). A bought
+wheel goes into a player-wide inventory and is never used up. The inventory has 200
+slots and the stock-wheel placeholder takes one, so 199 wheels can be bought. A wheel
+already in the inventory cannot be bought again. Any garage car that allows wheel
+changes can wear any wheel in the inventory, or go back to stock. Cars whose flag bit
+value 4 is set never change wheels (§3.3). The fitted wheel shows on menu renders and
+is used in races.
+
+The **wheel shop** works on the ride car. A brand page opens on the wheel the ride car
+wears when that brand sells it, otherwise on its first wheel. The focused wheel is
+previewed on the car. After a purchase the shop asks whether to fit the wheel, and yes
+puts it on the ride car at no charge. When no slot is free, the purchase adds nothing
+and charges nothing, but the shop still asks, and yes puts the wheel on the ride car
+for free without it entering the inventory. The car keeps that wheel, in native and
+PS2 saves, until its wheel is changed. After that it cannot be put back, because the
+garage offers only the inventory's wheels (`gtmode_menu_disc_wheel_inventory_full`).
+
+**Garage > car > Wheel** shows the wheels the chosen garage car can wear, in one row:
+the stock-wheel button first (the car's own wheels), then the bought wheels in the
+order they were bought. A mark is drawn on the entry the car wears and the cursor
+starts there. A car wearing a wheel the inventory does not hold has no mark, and the
+cursor starts on the first button. Left / Right move the cursor, stopping at the ends,
+with the `cursor` sound when it moves, and the car on the page shows the wheel under
+the cursor. A hovering pointer or a tap moves the cursor to the button under it.
+Confirm, or a tap on the cursor's button, asks whether to equip the wheel, and yes
+fits it; the stock-wheel button puts the car back on its own wheels. The row's layout
+and scroll bar are in menus §9.7 (`gtmode_menu_disc_garage_wheel_list`,
+`gtmode_synth_garage_wheel_list`).
 
 ## §8 Event entry rules
 
@@ -420,8 +463,8 @@ event-record bytes (`docs/formats/database.md`, table 32). Each rule fails on it
 
 | Rule | Field | The car fails when |
 |---|---|---|
-| Dirt tyres | +0x1D2 = 9 | it does not **own** dirt tyres (goods 66) |
-| Licence | +0x19B: 1 B … 5 S, 6 R | the player does not hold that licence |
+| Dirt tires | +0x1D2 = 9 | it does not **own** dirt tires (goods 66) |
+| License | +0x19B: 1 B … 5 S, 6 R | the player does not hold that license |
 | Drivetrain | +0x1F6: 1 FF, 2 FR, 3 4WD, 4 MR, 5 RR | the fitted drivetrain's type differs (values above 5 always fail) |
 | Regulation | +0x190 → table 33 list | the car label is not in the list |
 | Aspiration | +0x1F5: 1 NA only, 2 turbo only | its fitted turbine kit makes it turbo (record +0x11 ≠ 0) when NA is asked, or NA when turbo is asked |
@@ -433,16 +476,19 @@ part, or when its settings differ from the stock settings of its stock parts.
 `GtMode::can_enter` turns the result into one popup:
 
 1. no ride car gives `00cmn/ride_car`;
-2. a licence failure gives `license_violation` (it wins over the others);
+2. a license failure gives `license_violation` (it wins over the others);
 3. any other failure gives `regulation_violation`.
 
 The race information page shows each rule ("No Limitations" when the field is 0). The
 "Cars Permitted" list shows each car of the regulation as name plus second name; a
-string that occurs more than once is shown only at its last place.
+string that occurs more than once is shown only at its last place. Up / Down move its
+cursor, stopping at the ends, and the list scrolls to keep the cursor in view; a
+hovering pointer or a tap moves the cursor, and a tap does nothing more (layout:
+menus §9.7; `gtmode_menu_disc_vertical_lists`).
 
 The same rules guard the settings menu during a race's pre-race setup (§14).
 `gtmode_disc_entry_rules` checks examples: an FF series refuses an R34 on drivetrain
-and licence, and the Altezza races refuse it on regulation but show the licence popup.
+and license, and the Altezza races refuse it on regulation but show the license popup.
 
 ## §10 Endings
 
@@ -494,23 +540,38 @@ is moved (`save_library_unreadable_kept`, `save_library_disc_unreadable_attach`)
 ### §12.2 The PS2 game file
 
 Saves can be exported to, and imported from, the original game's memory-card save
-(`import_ps2_save`, `export_ps2_save`). Import reads the data file alone, the save
-folder, a folder memory card, a `.psu` or a `.ps2` / `.mcd` card image; export writes a
-`.psu`, a card image or a folder (`import_ps2_save_path`, `export_ps2_save_path`). The
-card directory `BASCUS-97102GAMEDATA` holds four files, written in this order:
+(`import_ps2_save`, `export_ps2_save`). Import reads the data file alone (under any
+name), the save folder, a folder memory card, a `.psu` or a `.ps2` / `.mcd` card image;
+export writes a `.psu`, a card image, the data file alone (`.raw`) or a folder
+(`import_ps2_save_path`, `export_ps2_save_path`).
+
+On the save page, Export to PS2 first asks for the format, the same on every platform:
+"PS2 save (.psu)", "PS2 card (.ps2)" (a new memory-card image holding only this save)
+or "Raw save (.raw)" (the game data file alone, the file PS2 save editors open). The
+file dialog then only picks the place. It starts on the save's name with the format's
+extension, a name typed without an extension gets that extension, and the chosen format
+is written whatever the file is called (`SavePage::kExportFormats`). `gt3tool
+save-export` picks the format from the file name instead: `.psu`, `.ps2` / `.mcd`,
+`.raw`, anything else a folder (`gtmode_ps2_export_format`,
+`gtmode_disc_ps2_save_containers`). Import recognizes the data file by its header,
+whatever it is called. A data file changed in a save editor imports when its CRC-32
+is right, also when it was put back into its `.psu` padded with zeros, and is refused
+when the CRC-32 does not match (`gtmode_disc_ps2_raw_save_edited`).
+
+The card directory `BASCUS-97102GAMEDATA` holds four files, written in this order:
 
 | File | Contents |
 |---|---|
 | `icon0.ico` | the disc's `menu/icon/ICON_a_spec.ico` |
 | `icon.sys` | the disc's `menu/icon/icon.sys` with the title "GT3 GAME DATA" and the icon names filled in |
 | `BASCUS-97102GAMEDATA` | the game data: header (version 7.1), every payload byte inverted, CRC-32 (`docs/FORMATS.md`) |
-| `thumbnail` | 0x60 bytes the file list reads without loading the game: credits, number of cars, highest licence (−1 none), day, completion per cent (§4), file name |
+| `thumbnail` | 0x60 bytes the file list reads without loading the game: credits, number of cars, highest license (−1 none), day, completion percent (§4), file name |
 
 The game data holds:
 
 - the scalars (including the GT-mode random state);
 - cars and wheels;
-- licence records;
+- license records;
 - race results in gcf section-4 order;
 - prize flags in gcf section-15 order;
 - the last name entered (scalar block +0x70, up to 15 characters and a 0; longer names
@@ -573,7 +634,7 @@ GT3 Revisited's own options, its race playlist included, are kept in `config.ini
 **Not carried** from a PS2 save:
 
 - a championship suspended between rounds (it restarts);
-- licence rankings beyond the best time;
+- license rankings beyond the best time;
 - the prize-car origin;
 - the endings-seen flags and the file name;
 - the setting files, which are separate card files (§19).
@@ -590,7 +651,7 @@ that autosave replaces the copy (`src/game/gt_mode_menu/session.cpp`):
 - **A GT single race** (not a championship round, not a practice run) that finished
   classified is written as its result is taken, before its replay: the place, the prize
   and the best place, as §3.4 records them (`save_race_run`).
-- **A licence test** run with a medal (not a practice run or the demonstration) is
+- **A license test** run with a medal (not a practice run or the demonstration) is
   written as soon as it is judged (`save_license_run`).
 - **A championship round's "Save game"** (the result quick menu) opens the save page over
   a snapshot of the game with this round recorded: the engine condition, the dirt, the
@@ -605,20 +666,29 @@ that autosave replaces the copy (`src/game/gt_mode_menu/session.cpp`):
 Each garage car carries four condition values (`CarCondition`). They are changed only
 by driving, an oil change or a wash:
 
-| Value | Starts at | Driving *d* metres |
+| Value | Starts at | Driving *d* meters |
 |---|---|---|
 | odometer | 0 | + *d*, counted in 2 m units (below) |
 | engine wear *E* | −300,000 m (a new car is running in) | *E* = min(*E* + *d*, 600,000) |
 | oil *O* | 0 (no bonus) | *O* + *d*. If *O* goes from negative to ≥ 0 it jumps to 300,000. Capped at 300,000 |
-| dirt | 0 | set from the race's result, 0–0.8 |
+| dirt | 0 | set from the run's result, 0–0.8 (below) |
 
-The odometer counts whole 2 m units (`sim::model::odometer_step`): the metres driven are
-truncated and halved, and the odd metre is carried on within the run. It stops at
-0xEE6B27A6 units. The total distance of the game grows by 2 m for every unit the run
-added. Which runs drive the car is in §13.1.
+The odometer counts whole 2 m units (`sim::odometer_step`, the same rule as the race
+car's own odometer): the meters driven forward are truncated and halved, and the odd meter
+is carried on within the run. It stops at 0xEE6B27A6 units. *E* and *O* grow with the
+distance driven in either direction; reversing adds nothing to the odometer.
+`engine_condition_rules` checks the steps. The total distance of the game grows by 2 m for
+every unit the run added. Which runs drive the car is in §13.1.
+
+**Dirt.** The race car gets dirty as it drives (physics page §8.3b), up to 0.8. After every
+GT-mode run (races, championship rounds, license tests, machine tests, free runs) the ride
+car takes the dirt the race car ended with, at most 0.8 (`gtmode_synth_hook_branches` checks
+the cap). In races, machine tests and free runs the race car starts with the ride car's
+dirt. A license test drives the event's car, which starts
+clean, so the ride car comes back with that car's dirt.
 
 **Engine factor.** The car's whole torque curve is multiplied by f = f_E × f_O
-(`GtMode::engine_factor`, which uses `model::engine_condition_factor`; the physics
+(`GtMode::engine_factor`, which uses `sim::engine_condition_factor`; the physics
 description owns the formula):
 
 | *E* | f_E |
@@ -644,8 +714,8 @@ In practice:
 - **Car wash** (50 Cr) sets dirt to 0. Dirt only changes how the car looks: menu and
   race renders reflect 1 − dirt.
 
-Measured with `GtMode::engine_factor` (and checked by `gtmode_engine_factor` and
-`gtmode_engine_factor_floor`): f_E =
+Measured with `GtMode::engine_factor` (and checked by `gtmode_engine_factor`,
+`gtmode_engine_factor_floor` and `engine_condition_rules`): f_E =
 0.97, 0.985, 1.0, 0.99 and 0.98 at −300, −150, 0, 550 and 600 km, and f_O = 1.05,
 1.025 and 1.0 at −100, −50 and 0 km. The race HUD reads the race car's odometer and oil
 counter for its odometer and oil lamp (the lamp is lit at the worn value, *O* ≥ 300,000).
@@ -661,10 +731,12 @@ oil both read 0, 150 km after a change reads 0.5, and worn oil reads 1
 
 A run of a garage car starts with the car's condition and hands it back at the end
 (`GtMode::carries_engine_condition`, `run_condition`, `end_run`; `gt_menu::fill_condition`
-and `apply_condition` in `src/game/gt_mode_menu/races.cpp`). The race car advances the
-odometer, *E* and *O* as it drives, tick by tick, and its power follows the factor f as it
-changes during the run (physics page §10.3). Garage cars' physics specs carry no
-condition; only the run and the menus' power figures (§5) apply it.
+and `apply_condition` in `src/game/gt_mode_menu/races.cpp`). The race car starts with the
+condition and advances the odometer, *E* and *O* every step as it drives, and its power
+follows the factor f as it changes during the run (physics page §10.3). The menus apply f to
+their power figures (§5). Within one visit to the race screen the condition carries on from
+run to run: a retry, and the race after a free practice (§22.5), start where the last live
+run left the car; a replay changes nothing.
 
 | Run | Condition |
 |---|---|
@@ -672,13 +744,13 @@ condition; only the run and the menus' power figures (§5) apply it.
 | arcade Single Race and free run with a home-garage car | that car's; handed back |
 | arcade Single Race and free run with an arcade car | a fresh engine (all zero); only the total distance grows |
 | arcade run with a guest-garage car (§19) | the guest car's; nothing is handed back to it, only the total distance grows |
-| licence tests, time trials, 2 Player Battle | a fresh engine, also with a garage car; nothing is handed back and no distance is counted |
+| license tests, time trials, 2 Player Battle | a fresh engine, also with a garage car; nothing is handed back and no distance is counted |
 
 The condition goes back into the garage car before any prize car is added to the garage.
 A GT-mode run hands it back whether it finished or not, including a championship round
 that is quit (§22.2). An arcade run hands it back finished or not; an unfinished arcade
-run that carried a condition is then saved (§12.1). The attract demo leaves the car's
-dirt alone. `gtmode_engine_condition_run` checks the words and the hand-back.
+run that carried a condition is then saved (§12.1). The attract demo leaves the ride car's
+dirt alone (§13). `gtmode_engine_condition_run` checks the words and the hand-back.
 
 ### §13.2 Car wash and oil change pages
 
@@ -708,7 +780,7 @@ The car is shown with the dirt it came in with until the wash is over, then clea
 - frame 62: an `oil` effect; the oil drains by 0.01 of the cylinder a frame and is empty
   at frame 163;
 - 61 frames' wait; at frame 224 a second `oil` effect, the new oil is in (the gauge takes
-  the fresh colour) and it fills back by 0.01 a frame;
+  the fresh color) and it fills back by 0.01 a frame;
 - frame 325: full. The controls come back.
 
 If the gauge is no longer on screen the animation stops; the oil change itself is
@@ -716,10 +788,10 @@ already done. A page that takes the controls away with nothing running to give t
 gives them back once it has settled.
 
 **The oil gauge** (`oil_change_cylinder`, drawn by `oil_gauge_draws`) is a cylinder that
-is always full of oil outside an oil change. Its colour shows the oil age (§13): each
-corner of the page's hidden `clean` colouring is blended into the hidden `dirty` one by
-the oil age, so fresh oil has the clean colour and 300 km-old oil the dirty one. During
-an oil change the old oil keeps its colour while it drains. The gauge is drawn at its
+is always full of oil outside an oil change. Its color shows the oil age (§13): each
+corner of the page's hidden `clean` coloring is blended into the hidden `dirty` one by
+the oil age, so fresh oil has the clean color and 300 km-old oil the dirty one. During
+an oil change the old oil keeps its color while it drains. The gauge is drawn at its
 widget's depth, under the cylinder's glass and the page frame, on the oil page and under
 its progress popup.
 
@@ -775,7 +847,7 @@ transmission resets the reference to its stock final (§6.3).
 **Event guard.** When the menu is opened from a race's pre-race setup, a non-gear
 slider move that would make the car fail the event's entry rules (§8) is refused and
 the old value is kept. A part change that would break them opens `not_to_change`, and
-tyres cannot be changed for a dirt event (`dirt_tire_only`).
+tires cannot be changed for a dirt event (`dirt_tire_only`).
 
 **Part change pages.** The `chg/` pages list the parts the car owns. Choosing one fits
 it at once (§6.3) and saves. Items for goods the car does not own are disabled. The
@@ -791,12 +863,14 @@ The setting files are in §19.
 ## §15 Attract demo field
 
 After 20 s idle on the title (gcf section 0), the title plays demo races from gcf
-section 12 in turn. The F1 demos (level 1) play only once the save holds the S licence.
+section 12 in turn. The F1 demos (level 1) play only once the save holds the S license.
 There are 10 demos on this disc, two of them F1. Every demo on the disc has no car of
 its own (word +8 is empty). The engine therefore draws the **whole** field, slots 0 to
 cars − 1, from the event's pool with the race generator (§20.4). Slot 0 is the car the
 cameras follow. A demo that names its own car keeps it in slot 0 and draws only slots
-1 to cars − 1 (`screen_race_launch.cpp`; `gtmode_disc_attract_demo_field`).
+1 to cars − 1 (`screen_race_launch.cpp`; `gtmode_disc_attract_demo_field`). The demo is a
+race in which the computer drives every car, slot 0 included; it records nothing and any
+button ends it.
 
 Known difference: the followed car keeps its default paint, because the engine builds
 its look before the paint draw.
@@ -853,7 +927,8 @@ result that improves a best place runs the unlock pass.
 
 `gtmode_disc_arcade_unlocks` walks through these cases.
 
-**Clear Status count** (`arcade_completion`, 0–102). For each course and for each of
+**Clear Status count** (`arcade_completion`, 0–102 on this disc: three per course of the
+`SINGLE_RACE` list). For each course and for each of
 Easy, Normal and Hard, the course counts if it was won at that difficulty or a harder
 one up to Hard. Winning at Hard therefore counts three times.
 
@@ -871,10 +946,10 @@ open. Professional is chosen by confirming Hard with L1 + R1 held.
   times of the event (+0x1C4 / +0x1C8 / +0x1CC; the first challenge's are 1'25.553,
   1'26.952 and 1'27.355).
 - A run is one timed lap, whatever lap count the event gives (2 for the challenges is
-  not read; `race::kTimeTrialLaps`). The car finishes on the tick it completes its first
-  lap, since a flying start's first line crossing only starts that lap
-  (`race::solo_run_finished`; `race_time_trial_one_lap`). The record overlay then follows
-  as before.
+  not read; `race::kTimeTrialLaps`). The race's time-trial rules end the run when that lap
+  is done: the flying start's first line crossing starts the lap and the next one finishes
+  it. Leaving the course fails the run (`exact_game_solo_modes`). The record overlay then
+  follows as before.
 - Every finished run of a challenge is recorded with its best lap as the run ends,
   before its replay, and one that makes the ranking asks for a name (§17, §17.1); the
   record's car is the challenge's base car. A run left with EXIT before its lap is
@@ -895,7 +970,7 @@ loaded.
 
 **Garage classes.** The arcade car pages can also list the home garage's cars and a
 loaded guest garage's cars (§19; not in Single Race), each as tuned. A garage car on a dirt course needs
-dirt tyres. Road classes are refused on dirt courses and the Dirt class on road
+dirt tires. Road classes are refused on dirt courses and the Dirt class on road
 courses, and a garage class without cars is refused. Mod cars with an arcade class join
 the end of that class's list (`docs/MODDING.md`).
 
@@ -907,8 +982,8 @@ from the car, keeping the difficulty letter of the race code (`arcade_prepare`,
 `src/game/gt_mode_menu/arcade.cpp`):
 
 - on a dirt course, the dirt race (`A?AD0001`, `?` the difficulty);
-- on a road course, by its weight per power, kg / PS: the spec's mass less 120 kg over the
-  car's computed power (§5):
+- on a road course, by its weight per power, kg / PS: the mass of the car's menu description
+  (§5) less 120 kg, over the car's computed power (§5):
 
   | kg / PS below | 2.1 | 3.0 | 3.5 | 5.0 | 5.8 | 6.3 | 9.0 | else |
   |---|---|---|---|---|---|---|---|---|
@@ -926,7 +1001,7 @@ GT Mode keeps rankings (`GtMode::add_record`):
 
 | Key | Entries | Order | Filled by |
 |---|---|---|---|
-| `lic:<test>` | 6 | fastest first | finished licence tests with a medal; the car is the test's car |
+| `lic:<test>` | 6 | fastest first | finished license tests with a medal; the car is the test's car |
 | `mt:M400`, `mt:M1000` | 12 | fastest first | machine tests (0–400 m, 0–1000 m) |
 | `mt:MMAX` | 12 | highest speed first | the top-speed machine test |
 | `at:<code>` | 12 | fastest first | arcade time trials (§16) |
@@ -938,7 +1013,7 @@ not recorded. Each entry keeps the value, the car, the GT-mode day, the name and
 stamp: the local time in seconds since 2000-01-01 00:00, never 0 (`record_stamp_now`;
 0 means none, as in entries from saves written before the stamps).
 
-**When a run is recorded.** A licence run with a medal, a finished machine test (the
+**When a run is recorded.** A license run with a medal, a finished machine test (the
 top-speed test also when a pause EXIT once its car had moved was its finish), a
 finished, not failed arcade time-trial challenge and a free run with a best lap go into
 their ranking as soon as the run ends, when its exit transition is over and before its
@@ -946,11 +1021,11 @@ replay (`RaceScreen::record_run`, `src/app/screen_race_quick_menu.cpp`, called f
 `RaceScreen::after_run`, `src/app/screen_race_post_run.cpp`; `add_license_record`,
 `add_machine_test_record`, `add_time_trial_record`, `add_course_time_trial_record`).
 Every such run counts, not only the last of the visit. A run that makes the ranking
-opens the name entry there, before the run's replay (a licence test has none) and the
+opens the name entry there, before the run's replay (a license test has none) and the
 quick menu (§18), and the quick menu's Top 3 is read
 again when it closes. Only the race records runs. The result posted after the race
 screen is left records nothing in any ranking and queues no name entry, whether it is
-an arcade or a GT-mode result (time trial, free run, licence test, machine test, GT
+an arcade or a GT-mode result (time trial, free run, license test, machine test, GT
 Mode's free run). This holds even when its time is better than every run's
 (`gtmode_synth_machine_test_runs`, `gtmode_synth_course_time_trials`,
 `gtmode_menu_disc_arcade_class_and_time_trial`). `GameResult::records_done` only marks
@@ -1006,13 +1081,19 @@ trial with no ranking yet shows its seeded records (§16).
 There are always three rows; a place with no entry shows no name, "--'--.---" and a speed
 of " 0.0 km/h" (or " 0.0 mph"). A top speed is printed "%4.1f %s", rounded to tenths, in
 the race screens' unit (the game data's, mph on NTSC-U, km/h × 0.62139; the `[race]
-units` setting overrides it): 200 km/h reads "124.3 mph". The free time trial's list
-shows each entry's car name in its car column, "---" for an entry without a car. The
+units` setting, Settings → Display → Speed units, overrides it): 200 km/h reads
+"124.3 mph". The free time trial's list shows each entry's car name in its car column,
+"---" for an entry without a car. The
 quick menu's Records item opens the run's ranking on the records page (a free run: its
 course's).
 
 **Records page** (`draw_records`, `src/game/gt_mode_menu/extra_draws.cpp`). The page draws
-every place of the table, 12 (a licence test's 6), each with its rank. A place with no
+every place of the table, 12 (a license test's 6), each with its rank, in a list that
+scrolls: a license test's six places fill the window, and the twelve scroll. The cursor
+starts on the first place each time a ranking is opened, and its bar is drawn
+highlighted. Up / Down move it over all the places, stopping at the ends, with the
+`select` sound, and the list scrolls to keep it in view; a hovering pointer moves it
+too. The bars are 60 apart (layout: menus §9.7; `gtmode_menu_disc_vertical_lists`). A place with no
 entry has no name, the time "--'--.---" (a top speed "---.-mph") and the date "--/--/--".
 Columns:
 
@@ -1026,10 +1107,10 @@ Columns:
   day later ("01/03/28" for 29 February 2028, "32/12/28" for 31 December 2028;
   `gtmode_record_dates`);
 - on the machine-test and course time-trial pages only, the car icon and the car's name
-  ("<name> <second name>", nothing for an entry without a car). Licence and arcade
+  ("<name> <second name>", nothing for an entry without a car). License and arcade
   time-trial pages show no car.
 
-**The race's record table.** A licence test, machine test or arcade time trial started
+**The race's record table.** A license test, machine test or arcade time trial started
 from the menus (not a practice run) reads its ranking, up to 12 entries, as the run's
 stored records (`RaceScreen::records_key`, `stored_records` in
 `src/app/screen_race_quick_menu.cpp`): `lic:<test>`, `mt:<code>` or `at:<code>`. An
@@ -1056,13 +1137,13 @@ A run and its result can queue presentation pages. They are shown in this order:
    replays. When the race did not show it (`GameResult::prize_shown` unset), the result
    queues it ahead of the pages below;
 2. name entry (§17.1; queued by the race, not by a result: after a time trial, free run
-   or machine test it runs before the run's replay, after a licence test, which has no
+   or machine test it runs before the run's replay, after a license test, which has no
    replay, before the quick menu, §17);
 
-The race then plays the run's replay (none after a licence test) and opens its result
+The race then plays the run's replay (none after a license test) and opens its result
 or quick menu. The pages below come after the race screens, when the result is posted:
 
-3. the licence card;
+3. the license card;
 4. the championship trophy;
 5. each prize car;
 6. "Garage is full" (§18b).
@@ -1071,7 +1152,7 @@ Times are in frames at 60 Hz, counted from the page's first frame. The model dra
 each page is the disc's prize scene file (`.prm`) with its own camera, lights and
 animation. The animation starts when the model begins to fade in.
 
-**Licence card** (`license_get`, `menu/lic_<b|a|ib|ia|s|d>.prm`):
+**License card** (`license_get`, `menu/lic_<b|a|ib|ia|s|d>.prm`):
 
 - the model fades in over frames 120–180;
 - message 0 shows until frame 240;
@@ -1101,7 +1182,7 @@ aperture radius (depth of field). Pass *i* is blended over the passes before it 
   the frame of a step, never on the step that finishes (`gtmode_synth_prize_counter_steps`);
 - 15 frames after the count ends, and not before frame 345, message 1 and OK appear.
 
-The trophy is drawn in four passes. It sits 160 pixels left of the page centre, an
+The trophy is drawn in four passes. It sits 160 pixels left of the page center, an
 offset the code marks as measured rather than confirmed. Winning a trophy sets its
 prize-model flag (§3.2).
 
@@ -1116,7 +1197,7 @@ The reason line is a hidden text element of the `car_get` page, chosen by the pr
 
 | Prize set | Reason element (text on NTSC-U where known) |
 |---|---|
-| licence `L??0000` | `license_<id>_all_gold`, id b, a, ib, ia, s or r ("B License all gold") |
+| license `L??0000` | `license_<id>_all_gold`, id b, a, ib, ia, s or r ("B License all gold") |
 | a series' `_0000` set | `solo_race_clear` ("Event Winner") |
 | endurance `E…` | `enduro_win` |
 | championship (also `arcade_compulsory_complete`) | `championship_win` ("Championship winner") |
@@ -1133,11 +1214,12 @@ again once there is room. The random state is still stirred (§20.3).
 ## §19 Trade and setting files
 
 **Trade.** Home → Trade loads a guest garage from any save file, native or PS2. Its
-cars can be viewed and copies bought (`GtMode::can_buy_guest_car`, `buy_guest_car`):
+cars are shown in the garage list (§5) and can be viewed and copies bought
+(`GtMode::can_buy_guest_car`, `buy_guest_car`):
 
 - **Refusals, in order:** models with the cannot-sell flag (bit value 2: the S2000
   variants, Stratos, 996 GT3 and other prize-only models) give `not_for_buy`; then the
-  money (the model's catalogue price) gives `no_money`; then a full garage gives
+  money (the model's catalog price) gives `no_money`; then a full garage gives
   `max_car`.
 - **The copy** keeps the car's parts, owned goods, settings, paint and condition. It
   gets a new serial and the stock wheel, because the wheel is not in the buyer's
@@ -1212,7 +1294,7 @@ values come out, not their distribution.
 
 The draws are made in single precision with the console's rounding:
 
-- **Prize paint** (a candidate without a fixed colour in its model's list): int(*n* ×
+- **Prize paint** (a candidate without a fixed color in its model's list): int(*n* ×
   u + 0.5) for a list of *n* paints, with *n* mapped to 0. Every paint is equally likely.
 - **Prize car pick:** weights (at least 1) are summed in list order. The first
   candidate whose running sum reaches total × u wins.
@@ -1231,7 +1313,7 @@ The order of draws matters for reproducing the game:
 
 - **Prize cars.** One award check stirs once, before the first eligible prize set, even
   when the garage is full. Then, for each set, every candidate's paint is drawn in list
-  order (candidates with a fixed colour draw nothing), and then the pick is made.
+  order (candidates with a fixed color draw nothing), and then the pick is made.
 - **Championship win.** The trophy (stir, then pick) is drawn before the prize-car
   award, as the trophy page comes before the car page.
 
@@ -1240,7 +1322,7 @@ The order of draws matters for reproducing the game:
 The opponents come from the event's **entry pool**: the car variant labels at +0x10,
 up to the first "-", at most 32. They are drawn with the **race module's** state
 (`race::draw_opponents`, `src/race/pool_draw.cpp`), which also gives the race's paint
-colours. For each of the *k* cars to draw:
+colors. For each of the *k* cars to draw:
 
 1. index = trunc(u × pool size);
 2. move forward from it, wrapping round, to the first entry not taken yet;
@@ -1261,38 +1343,43 @@ Who draws:
 - **Arcade Single Race** draws the same way (`screen_race_launch.cpp`).
 - **The attract demo** draws every slot (§15).
 
-## §21 Licences
+## §21 Licenses
 
-There are six licences, each with 8 tests: B, A, IB, IA, S and R (rally; menu id `d`).
+There are six licenses, each with 8 tests: B, A, IB, IA, S and R (rally; menu id `d`).
 Test codes are `L0B000t`, `L0A`, `LIB`, `LIA`, `L0S` and `L0R`, with *t* = 1–8.
 
 **Access** (`can_open_license_page`, `can_take_test`):
 
 - B and R are always open. A needs B; IB needs B and A; and so on up to S, which needs
   B, A, IB and IA.
-- A page whose licence is not yet reachable opens `lc/no_license_<id>`.
+- A page whose license is not yet reachable opens `lc/no_license_<id>`.
 - Test 8 needs a medal in tests 1–7 (`lc/no_last_exam`).
 
-**Judging** (`GtMode::judge`). A test that is not finished gets no medal. The time,
-rounded to whole ms, is compared with the event's gold / silver / bronze targets
-(+0x1C4 / +0x1C8 / +0x1CC, stored as minutes, seconds and ms): at or under gold gives
-gold, and so on; slower than bronze gives nothing. B-1's targets are 35.100 / 35.400 /
-35.800 s (`gtmode_disc_licenses`). The race screen judges the run itself, and GT Mode
-takes that medal and logs any difference from its own judgement.
+**Judging.** The race judges the run on its own clock (`docs/dev/RACE.md` "Licence tests";
+`exact_game_solo_modes`): its time in whole ms is compared with the event's gold / silver /
+bronze targets as the disc being played stores them (+0x1C4 / +0x1C8 / +0x1CC, minutes,
+seconds and ms). At or under gold gives gold, and so on. A run slower than bronze ends as
+TIME EXPIRED: it finishes with its time but no medal, so it records nothing here. A run that
+leaves the course (or hits hard) fails with no time. The rules follow the disc's release: on a PAL disc a stop
+test's car counts as stopped at up to 1.5 km/h instead of 1 km/h. B-1's targets are
+35.100 / 35.400 / 35.800 s on this disc (`gtmode_disc_licenses`). GT Mode takes the race's
+medal and logs any difference from its own judgment (`GtMode::judge`: an unfinished test
+gets no medal, otherwise the same comparison on the time rounded to whole ms). A visit
+posts its best run: a retry that does worse keeps the medal already earned.
 
 **Recording** (`record_license_medal`):
 
 - a medal sets its award bit (§3.2);
 - the best medal and the best time of the test are kept;
-- when the eighth medal of a licence arrives, the licence is **obtained**. The licence
+- when the eighth medal of a license arrives, the license is **obtained**. The license
   card is presented and its prize-model flag set;
-- when every test of a licence is gold and the new medal is gold, the licence's prize
+- when every test of a license is gold and the new medal is gold, the license's prize
   set (`L0B0000`, …) is checked (§23). The B all-gold car is a Roadster RS on this disc.
 
-The **highest licence** (status page, file list, thumbnail) is the highest of B … S
-held. Rally does not count. A licence test drives the event's entry-0 car in the
-event's slot-0 colour, not a garage car. A finished test with a medal also enters the
-licence ranking (§17).
+The **highest license** (status page, file list, thumbnail) is the highest of B … S
+held. Rally does not count. A license test drives the event's entry-0 car in the
+event's slot-0 color, not a garage car. A finished test with a medal also enters the
+license ranking (§17).
 
 ## §22 Races, championships and endurance
 
@@ -1310,7 +1397,7 @@ The race pages are `r/<tier>/<series>`. On this disc there are 85 series:
 
 Of these, 27 are championships: 6 beginner, 11 amateur and 10 professional. A race
 code is the event label, for example `Gsunday_e_0001`. The race information page shows
-the six prizes ("-" for none) and the rules (§8).
+the six prizes (a prize of 0 as "0") and the rules (§8).
 
 Each race fields the event's car count (6 for races). The opponents are a fresh draw
 (§20.4). The result is recorded as in §3.4. GT Mode lines the opponents up by
@@ -1318,7 +1405,8 @@ power-to-weight with the strongest car on pole, and the player starts behind the
 grid itself belongs to the race description.
 
 After a race, the ride car takes back the engine condition the race advanced (§13.1),
-and its dirt is set from the race.
+and its dirt is set from the race (§13). Before the race the pre-race menu offers a free
+practice (§22.5).
 
 ### §22.2 Championships
 
@@ -1360,10 +1448,10 @@ GT Mode records an endurance result exactly like a single race (§3.4). Each end
 race is its own prize set with several candidates, so every win rolls a prize car
 (§23). Winning all ten completes the endurance league (`gtmode_enduro_complete`).
 
-Tyre wear, the pit lane and pit stops (driven by the computer, 5 s stop, fresh tyres,
-no fuel) are race and physics behaviour, described in `docs/dev/RACE.md` "Pit stops
-and tyre wear". From GT Mode's side, wear is on in single-player races on non-dirt
-courses, using the event's wear bytes.
+Tire wear, the pit lane and pit stops (the computer drives the car through the lane and
+fits fresh tires) are race behavior, described in `docs/dev/RACE.md` "Pit stops and tyre
+wear" and the physics page §8. From GT Mode's side, wear is on in single races and free
+practice on courses that are not dirt, using the event's wear bytes.
 
 ### §22.4 Machine tests and free runs
 
@@ -1373,30 +1461,53 @@ finished run updates the best of its test and the ranking (§17). In the top-spe
 pause EXIT once the car has moved, before its goal, is the run's finish (a second EXIT
 ends the run; `race::pause_exit_finishes`, `race_pause_exit_finish`). The car's engine
 condition is handed back (§13.1). A free run on a course also costs a day. It needs dirt
-tyres on a dirt course and hands the condition back in the same way. Its pause EXIT after
+tires on a dirt course and hands the condition back in the same way. Its pause EXIT after
 at least one lap is the run's finish, with the record overlay. Each free run with a best
 lap goes into its course's time-trial ranking (§17).
+
+A free run's best lap and its ghost car last the whole visit, through every restart, until
+the player leaves. The best lap of the visit becomes the ghost (at once with the Ghost
+option on, otherwise after "Update Ghost?"), and at each line crossing the ghost car is put
+back on the start of that lap and drives it again (`exact_game_free_run_visit`). A visit's
+first run starts without a ghost and gets one from its own laps, as above.
+
+### §22.5 Free practice before a race
+
+The pre-race menu of a GT race or championship round has FREE RUN, a free practice on the
+race's course: the ride car alone, no opponents and no lap count (`RaceScreen::start_free_run`,
+`src/app/screen_race_quick_menu.cpp`). The car starts in its pit box on the course's pit stop
+line and the computer drives it out of the pits (physics page §9.4); it then runs lap after
+lap, keeping the session's best lap (`exact_game_solo_modes`). Tire wear and pit stops work
+as in the race (§22.3). Pause EXIT returns to the pre-race menu with the race's field set up
+again. Free practice costs no day, records nothing and has no replay; the engine condition and dirt it leaves carry on into the race (§13.1).
+
+- On a dirt course the menu turns FREE RUN off (`race::QuickMenuItems`).
+- On a course without a pit box (a pit stop line with fewer than 4 points,
+  `race::exact_has_pit_box`) free practice is refused: the message "Free run is not
+  available on this course." appears and the pre-race menu stays. GT Mode's courses
+  without a pit box are its dirt courses (they have no pit stop line), where FREE RUN is
+  already off, so GT Mode's own races never show the message.
 
 ## §23 Prize cars
 
 The prize sets are in gcf section 15. On this disc there are 101 sets with 211
 candidate cars. 37 sets have several candidates (all 27 championships and all 10
-endurance races), and 64 have one. Each set is a name and a list of {car, colour id,
+endurance races), and 64 have one. Each set is a name and a list of {car, color id,
 weight}.
 
 **When a set is eligible** (`GtMode::award_prizes`). A check is made:
 
 - after a race win, with that race's code;
 - after a championship title, with its own code;
-- after a gold medal in a licence whose eight tests are then all gold, with the
-  licence's set name;
+- after a gold medal in a license whose eight tests are then all gold, with the
+  license's set name;
 - after every arcade time-trial run the race records (§17).
 
 Every set is examined each time:
 
 | Set | Eligible when |
 |---|---|
-| named exactly as the code being checked: a championship, endurance race or licence set | the code is won (place 0); for a licence set, all 8 tests gold |
+| named exactly as the code being checked: a championship, endurance race or license set | the code is won (place 0); for a license set, all 8 tests gold |
 | `<series>_0000` (a non-championship series) | every race of that series is won |
 | `gtmode_beginner/amateur/pro/dirt/enduro_complete` | that league is complete (§10) |
 | `gtmode_complete` (the whole game) | the code being checked is a GT-mode code, and every GT-mode result code (gcf section 4: 364 on this disc) is won (`all_races_won`) |
@@ -1409,13 +1520,13 @@ checked, and then on every win. So every championship title and every endurance 
 rolls a car, while league and achievement sets come once.
 
 **The whole game's set.** A GT-mode code (`GtMode::gt_mode_code`) is a series race or
-championship (`G…`), an endurance race (`E…`), a rally race (`D…`), a licence test or
-licence set (`L` with B, A, R or S as its third character: `L0B…`, `LIA…`, `L0S…`,
+championship (`G…`), an endurance race (`E…`), a rally race (`D…`), a license test or
+license set (`L` with B, A, R or S as its third character: `L0B…`, `LIA…`, `L0S…`,
 `L0R…`), or a machine test (`M400`, `M1000`, `MMAX`). Arcade codes (`A…`) and anything
 else are not. So `gtmode_complete` can come with a race win, a championship title or a
-licence turning all gold, never with a time-trial run. It is not the 100 % completion
-rule (`achieve_complete`, §4), which also needs the arcade and the licences. On this
-disc the set has one car, the F688/S (label `mclaren_mp4_4`), with no fixed colour, so
+license turning all gold, never with a time-trial run. It is not the 100 % completion
+rule (`achieve_complete`, §4), which also needs the arcade and the licenses. On this
+disc the set has one car, the F688/S (label `mclaren_mp4_4`), with no fixed color, so
 it comes once, in a random paint (`gtmode_disc_game_complete_prize`,
 `gtmode_synth_game_complete_prize`).
 
@@ -1435,7 +1546,7 @@ are won (`gtmode_disc_races_and_prizes`, `gtmode_menu_disc_buy_and_race`).
 ## Open questions
 
 - The engine takes the hardware random value from the clock (§20.2). The game's exact
-  timing of that value is not modelled.
+  timing of that value is not modeled.
 - The championship trophy's 160-pixel offset and the options-block defaults beyond the
   screen mode, sound switches and music list are marked in the code as measured rather
   than confirmed (§12, §18).

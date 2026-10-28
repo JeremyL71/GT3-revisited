@@ -18,6 +18,7 @@ its sections); this page describes the code.
 | `src/game/gt_state.h` | `GameState` / `GarageCar` / `CarCondition` / `ArcadeProgress`: plain data |
 | `src/game/gt_setting.*` | car settings menu rules: slider ranges / values / texts, locks, setting files |
 | `src/game/gt_mode.*` | `GtData` (disc data, loaded once) and `GtMode` (all rules; deterministic) incl. the bridge to `sim::CarSpec` |
+| `src/game/language_rules.*` | what the game's language decides: prize-car labels, Opel / Vauxhall dealer buttons, the licence car and S-1's `_uk` demonstration, which paint name shows (car names: `data::car_name_fields`) |
 | `src/game/gt_save.*` | native save (text, versioned) and import/export of the original PS2 GAMEDATA file |
 | `src/game/save_library.*` | the save library: any number of native saves in `<user data>/saves/`, the current one, migration of older saves |
 | `src/menu/flow/save_page.*` | the save page (title Load / Save / File Operation, home Save, Trade, Load Garage, Load / Save Settings) on the original's file list art |
@@ -31,6 +32,12 @@ its sections); this page describes the code.
 
 - **New game**: credits = gcf `initial` (18,000 on this disc), day 1, empty
   garage, no ride car.
+- **Money**: every sum read from the disc (car and part prices, prizes and bonuses, the gcf
+  tag-10 sums) goes through `GtData::money` (×100 in Japanese, `money_scale`); there are no
+  built-in amounts, and `GtData::load` refuses a game config that lacks one of the tag-10
+  values. The prize pages' texts are `credits_text` / `prize_remain_text`, the latter with
+  `GtData::prize_prefix` (`text/realtime.dat` in the game's language, else the game's
+  built-in word). Mod car prices are stored like disc prices (docs/MODDING.md).
 - **Cars**: `buy_car` (checks not-for-sale flag, money, 200-car garage;
   newest first; the first car becomes the ride car), `sell_car` (price / 4,
   refused for flag bit 1), `ride`, `add_prize_car`. A new car gets the
@@ -43,7 +50,9 @@ its sections); this page describes the code.
   the part's settings group is re-initialised), `buy_all_tires`,
   `power_with` (before/after PS).
 - **Wheels / wash / oil**: inventory of bought wheels (500 Cr each, never
-  used up), `fit_wheel`, `wash` (50), `change_oil` (250). `engine_factor()`
+  used up), `fit_wheel` (the garage's change: inventory wheels or stock),
+  `fit_shop_wheel` (the shop's "fit it?": the focused wheel, held or not), `wash` (50),
+  `change_oil` (250). `engine_factor()`
   is the condition's power multiplier (physics §10.3) the menus' power figures use.
 - **Engine condition through a run** (gt_mode §13): GT races and championships,
   machine tests, free runs and arcade races carry the car's condition
@@ -60,7 +69,7 @@ its sections); this page describes the code.
   the license prize car once), `can_open_license_page` (B → A → IB → IA → S;
   B and rally always open), `can_take_test` (8th test needs 1–7).
 - **Races**: `rules(code)` decodes the event record fields GT mode needs;
-  `check_entry` reproduces RegurationResult (dirt tires, license,
+  `check_entry` reproduces reguration result (dirt tires, license,
   drivetrain, regulation list, NA/turbo, car class/tuned); `can_enter` maps
   it to the license / regulation popups. `record_race` pays the place prize
   (every time), keeps the best place, counts races/wins and awards prize
@@ -77,6 +86,14 @@ its sections); this page describes the code.
   (`all_races_won`: 364 on this disc); it is not the 100 % completion
   rule (`achieve_complete`). Prize sets are checked after a race win, a
   championship title and a licence turning all gold, as in the game.
+- **Language**: `GtData::prize_candidate` puts each candidate's label through
+  `prize_car_label` before the paints and the pick (a swapped one gets a random paint), also for
+  the car_get candidate list; the cd/ region pages leave out the `opel` / `vauxhall` button
+  (`gt_menu::listed` → `MenuController::listed`); licence tests drive `license_car` (race launch,
+  the quick race, the GT-mode request, the theater) and load `demo_replay_path`'s run.
+  `Car::name` / `name_alt` and `GtData::color_name` are in the language (game text: kana in
+  Japanese, drawn by the game fonts); the app's own screens, race overlays that cut text to
+  ASCII and online descriptors use `Car::latin_name` / `color_name_latin`.
 - **Bridge**: `car_spec(GarageCar)` = `sim::build_car_spec(db, car, parts,
   settings)`; the engine condition is not in the spec (the race car carries it,
   above). `power_peak()` / `power_ps()` are the original's computed menu figure
@@ -173,7 +190,10 @@ hooks, `intercept` / `enabled`, and the widget hooks on `ar/goodies`
   `00cmn/car_reguration`: `permitted_car_names`, each car of the event's
   regulation as name + second name, a string once at its last place, rows of
   the `link_menu` template in `menu_regulated_car`, Up/Down; "No Limitations"
-  without a list), the status bar day number (hidden-layer widget), and the wheel
+  without a list), the records page's places (`records_free_tt`, Up/Down); these
+  three are GT3's vertical button list (`ListRows`, `menu::flow::column_layout`:
+  rows 4 apart, the cursor row centred, the offset eased in `MenuState::list_off`, the
+  scroll bar by `list_scroll_bar`), the status bar day number (hidden-layer widget), and the wheel
   inventory cursor. Dealer pages (maker and car lists) are tile strips in the
   controller's scrolling window (`menu_car_goods`, and `menu_dealer` on the England and
   Germany pages, are among its window widgets; items parked off the screen vertically,
@@ -259,9 +279,9 @@ Phase 4: **car settings menu** (`src/game/gt_setting.*`,
 pre-race quick menu; `gt3r --screen gtsetting` with `GT3R_GTSETTING_EVENT`).
 `begin_setting(event)` makes the working copy of the ride car; sliders
 (`slider_range` / `slider_set`) edit it, OK commits it to the garage car
-(saved), Back discards it; the values feed `sim::CarSettings` and
-`build_car_spec` through `GtMode::car_spec` (`gt_ride_car_spec()` gives the
-rebuilt spec). `GarageCar::ref_final` holds the gear reference final
+(saved), Back discards it; the values feed `sim::CarSettings`, the race's
+parameter block (the ride car's parts and settings) and the menus' `build_car_spec`
+through `GtMode::car_spec`. `GarageCar::ref_final` holds the gear reference final
 (garage car settings word +0x1AC, gt_mode §3.1; saved). Value texts, locks (`disable_*` overlays, status boxes),
 fitted-part marks (`attach_*`), slider markers and the part-change pages
 (`set_*`, with the `not_to_change` / `dirt_tire_only` guards) are bound in
@@ -463,7 +483,7 @@ exactly (`ShowroomCamera`: single = look-at 0.25 -> 0.5 m, 10 degrees, yaw
 with the game's yaw used directly (180 = in front: head-on at ~2 s, side-on
 at ~6 s, matching the timed captures); the logo pair's corner-diagonal fade
 (`ElementDraw::corner_alpha`); the colour column easing (30 % per frame,
-clip bands); the Blur2D behind the car page steps (3 x 3 offset copies of
+clip bands); the 2-D blur behind the car page steps (3 x 3 offset copies of
 the background movie, radius 0 -> 2); the step buttons over the car; the 2
 Player car page's player-1 half (gauges, colour column, badges, small 3D
 car); no AREA badge outside Single Race.
@@ -586,6 +606,11 @@ gt_mode §3 / gt_mode §16 / gt_mode §18, presentation §F, menus §9.7 "GT Mod
   the reference pixel rows.
 - Wheel shop: tiles are the page's wheel photographs (and "sold out"), no 3D wheels; the
   car's fitted wheel in menus is `menu/wheel/<code>`.
+- Garage wheel list (`hm/hm_wheel`, `WheelList`): a row of the page's 60 x 60 `wheel` frames
+  in `menu_wheel`, the stock-wheel button (`default_wheel`) first, then the bought wheels' tiles;
+  the `mark` on the wheel the car wears, where the cursor starts; the scroll bar only for a row
+  longer than the window. A wheel shop brand page opens on the wheel the ride car wears
+  (`GtModeHooks::initial_item`).
 - Showroom cars: accumulation anti-aliasing (4 / 2 jittered passes, mirror 2 / 1); one pass
   on phones and tablets (`platform::is_mobile`), where each pass's render and composite cost
   ~15 ms (5 fps → 75 fps on a Galaxy A15).
@@ -604,7 +629,8 @@ GT mode, its menus and the arcade progression are complete except for:
   list art and was not matched against captures. PS2 save interop is verified
   (Save format below).
 - **Presentation details**: the showroom's pass reordering while a car fades in; the
-  wheel tile spacing (56.5 units) and focus wash are measured on captures; a
+  wheel shop's focus wash is measured on captures (its tile spacing is GT3's button gap:
+  56); a
   two-digit status-bar day was not captured (the 10-unit right inset is measured on
   "day 1"). The trophy page itself was not captured on the original (its timeline and
   texts follow gt_mode §18 and presentation §F). The prize counter rounds its floats to
@@ -626,12 +652,24 @@ GT3 Revisited does not model the PS2's memory cards: GT-mode saves are plain
 files, any number of them (`game/save_library.*`):
 
 - **Library**: `<user data dir>/saves/*.sav` (`SDL_GetPrefPath("GT3Revisited",
-  "GT3Revisited")`, or the executable's folder in portable mode). A save's
+  "GT3Revisited")`, or the executable's folder in portable mode, or `GT3R_DATA_DIR`). A save's
   name is its `fcomment` (the original's file name, Edit file name) or its file
   name without `.sav`; file names follow the names (sanitised, made unique with
   " 2", " 3"...). `saves/current.txt` holds the file name of the game being
   played, which autosaves into it after every race (and on shop actions) as
   before; the next launch continues it.
+- **Regions**: each release has its own library, as each had its own memory
+  card folder: `saves/` (NTSC-U), `saves/jp/`, `saves/eu/`
+  (`SaveLibrary::user_dir(Region)`). Changing discs drops the GT-mode session
+  and data (`close_gt_mode`). Versions up to 0.3 kept every disc's games in
+  `saves/` (on the NTSC-U data set, which the PAL set extends: the same cars and
+  wheels plus the Vauxhall variants), so the first time a PAL disc's library is
+  used, `saves/eu/` starts with copies of `saves/*.sav` and its current save
+  (`SaveLibrary::copy_library`; once, the originals stay). A native save records
+  no region; the PS2 export does (the language word at +0xC8, the GAMEDATA
+  minor version, the folder name). PS2 import / export uses the release's folder
+  name, GAMEDATA minor version (7.0 NTSC-J, 7.1 NTSC-U, 7.2 PAL) and language
+  word (+0xC8); see docs/COMPATIBILITY.md "Regions".
 - **Migration**: when `saves/` does not exist yet, the single save of earlier
   versions (`<user data dir>/gtmode.sav`) and its second "memory card slot"
   (`gtmode_2.sav`) are copied into it (the first becomes current). The
@@ -650,11 +688,18 @@ The save page (`menu/flow/save_page.*`, `SavePage`) is drawn on the original's
 file list art (`memorycard.mbl` page `file_operation`): the left panel lists the
 saves (12 visible, rows scroll; "New Save" first where it applies), the right
 panel "FROM A FILE" opens the platform file dialog (`SDL_ShowOpenFileDialog`;
-the system picker on Android, content:// URIs), the info panel shows the
+the system picker on Android, content:// URIs; on macOS our own sheet,
+platform/mac_dialog.h, which makes the window key again when it closes: after
+SDL's the game could stay without keyboard focus, no keys and no controller,
+until a click), the info panel shows the
 focused save (size, date, day, credits, license, cars, Game Status %) and the
 bottom bar its name ("(playing)" on the current one). There is no slot choice,
-no "working" / "Complete" window and no memory-card wording; only Overwrite (of
-another save) and Delete ask once. The original's operation menu (op1 art,
+no "working" / "Complete" progress and no memory-card wording; only Overwrite (of
+another save) and Delete ask once. The "working" window art is ours twice: while
+a file dialog is open ("Waiting for the file window...", CANCEL: any key or a tap
+gives the dialog up, FileDialogs::cancel, which closes it on macOS and drops its
+late answer) and after an export ("Exported as <file>", OK). The page takes mouse
+/ touch itself (SavePage::hover / tap). The original's operation menu (op1 art,
 stretched to five buttons) holds:
 
 | Page | Opened from | Operations |
@@ -668,9 +713,19 @@ stretched to five buttons) holds:
 The save being played is never deleted. Import copies a save from elsewhere
 into the library (`read_any_save`: native by its magic, else any PS2 container
 below; a `.psu` is also recognised by its first entry for paths without an
-extension). Export writes a `.psu` or a new `.ps2` card image (the save
-dialog's file type; a name without extension gets `.psu`,
-`export_ps2_save_container`). `game::begin_snapshot_save(state)` +
+extension; the data file is read under any name, e.g. a save editor's `.raw`).
+Export to PS2 first asks for the format in the page itself, the same on every
+platform (`SavePage::kExportFormats`: a window in the operation menu's art with
+"PS2 save (.psu)", "PS2 card (.ps2)", "Raw save (.raw)"): a `.psu`, a new `.ps2`
+card image or the data file alone (the raw save PS2 save editors such as
+GT3SaveEditor open). The backend runs the format chosen (`OpExportPsu` /
+`OpExportCard` / `OpExportRaw`, `export_ps2_save_container`) whatever the file is
+called; the platform dialog only picks the place, starting on "<save
+name>.<ext>" (no file types; the browser downloads that name), and a name typed
+without an extension gets the format's. Import recognises files by their
+contents (a card image, the data file's header, a `.psu`'s first entry), so a
+renamed file still imports; an Android import is named after the document's
+display name (`FileDialogs::name`). `game::begin_snapshot_save(state)` +
 `GameFlow::open_save_game(...)` (or `GameFlow::start_save_game()` for the page on
 its own) save a given state as a new or existing save without touching the running
 game: the championship result quick menu's Save game (`make_game_save_screen`,
@@ -741,10 +796,13 @@ the race playlist (the block's music list, `race::RacePlaylist`) included, live 
 config.ini `[options]` and are not read from or written into that block.
 
 File level (`import_ps2_save_path`, `export_ps2_save_path`, `gt3tool
-save-import` / `save-export`, user steps in the README): the data file, its
-save folder, a PCSX2 folder memory card, a `.psu` and an 8 MB card image
-(`.ps2` / `.mcd`, with or without ECC) are read; `.psu`, a new card image and a
-folder are written. The folder holds what the game writes
+save-import` / `save-export`, user steps in the README): the data file (under
+any name), its save folder, a PCSX2 folder memory card, a `.psu` and an 8 MB
+card image (`.ps2` / `.mcd`, with or without ECC) are read; `.psu`, a new card
+image, the data file alone (`.raw`) and a folder are written. A save editor's
+changes (GT3SaveEditor: values in place, cars added or removed with the payload
+size and CRC-32 updated, the 64-byte padding kept) import like the game's own
+file (`gtmode_disc_ps2_raw_save_edited`). The folder holds what the game writes
 (`export_ps2_save_files`): `icon0.ico` (the disc's `menu/icon/ICON_a_spec.ico`),
 `icon.sys` (the disc's `menu/icon/icon.sys` with the title and icon names
 filled in), the data file and the 0x60-byte `thumbnail`. The containers are in

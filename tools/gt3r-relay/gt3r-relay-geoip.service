@@ -1,0 +1,10 @@
+# Refreshes the relay's country list (gt3r-relay --geoip; tools/gt3r-relay/update-geoip.sh).
+# Started monthly by gt3r-relay-geoip.timer; deploy.sh installs both.
+[Unit]
+Description=GT3 Revisited relay server: refresh the country list
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gt3r-relay-update-geoip

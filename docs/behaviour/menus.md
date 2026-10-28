@@ -1,4 +1,4 @@
-# Menus: behaviour
+# Menus: behavior
 
 This page describes how GT3 Revisited runs the game's menus: the page manager
 (pages, items, focus, popups), how menu screens are drawn and animated, the
@@ -6,7 +6,7 @@ transitions, and the flow between the title menu, GT Mode, arcade mode,
 options, the save pages and the Replay Theater. Code comments cite its
 sections as `menus §n`.
 
-GT Mode's own rules (prices, entry checks, prizes, licences, championships)
+GT Mode's own rules (prices, entry checks, prizes, licenses, championships)
 are on a separate page. This page covers them only where the menus need them.
 The menu file formats (`.mbl` flow files, `.pmb` layouts, IMGS sets) are in
 `docs/formats/menu.md`, which this page assumes.
@@ -53,13 +53,13 @@ control at a time, with one `flow::MenuController` for its pages:
 
 | Control (set) | What it is |
 |---|---|
-| `gt_mode` | the title menu (page `root`), the Replay Theater page, and every GT Mode page (map, home, dealers, shops, races, licences) |
+| `gt_mode` | the title menu (page `root`), the Replay Theater page, and every GT Mode page (map, home, dealers, shops, races, licenses) |
 | `arcade` | arcade mode (`ar/...` pages, §8) |
 | `option` | the title Options menu (§10) |
 | `memorycard` | the save page, the save name entry and the Replay Theater file list (§12, §13) |
 | `logger` | the Analyzer (§13) |
 | `setting`, `records` | GT Mode car settings and records (§12.4), opened from a race's quick menu |
-| `car_get`, `lc_get`, `trophy_get`, `name_entry`, `arcade_mini`, `gtmode_mini`, `consolation_prize`, `not_get_car` | presentations after a result: prize car, licence card, trophy, record name entry, race prize pages (§7.6) |
+| `car_get`, `lc_get`, `trophy_get`, `name_entry`, `arcade_mini`, `gtmode_mini`, `consolation_prize`, `not_get_car` | presentations after a result: prize car, license card, trophy, record name entry, race prize pages (§7.6) |
 
 The race quick menus (§11) use the same page manager in the race screen, one
 set per layout (`qm_*`).
@@ -72,7 +72,7 @@ set of **logical keys** (`menu_keys` in `src/app/screen_race.cpp`,
 
 | Logical key | Pad |
 |---|---|
-| Up / Down | D-pad up / down, or the left stick's Y below 0x40 / above 0xC0 (centre 0x80) |
+| Up / Down | D-pad up / down, or the left stick's Y below 0x40 / above 0xC0 (center 0x80) |
 | Left / Right | D-pad left / right, or the left stick's X below 0x40 / above 0xC0 |
 | Confirm | Circle **or** Cross |
 | Cancel | Triangle **or** Square |
@@ -129,8 +129,11 @@ opens are ignored until they are released.
   under it, so one click then confirms. On a horizontal scrolling row (such
   as every dealer page, test `menu_flow_disc_dealer_strips`), the row then
   holds still (it is **pinned**) until the focus next moves by key.
-  Vertical scrolling selectors ignore hovering, because they centre the
-  focused item by design.
+  Vertical scrolling selectors ignore hovering, because they center the
+  focused item by design. GT Mode's code-drawn lists handle hover and tap
+  themselves (§9.7), and so does the save page (§12.1).
+- A mouse's right click is Cancel, held for one frame (`GameFlow::back`); on
+  the title menu it leaves for our main menu, as Cancel does.
 - Taps and hovers are ignored while the menu is busy, while a progress popup
   holds the controls (§3), while switching controls or while waiting for
   gameplay.
@@ -176,8 +179,8 @@ are listed below. When each one applies is a GT Mode rule.
 | `00cmn/max_car` | the garage is full |
 | `00cmn/not_for_buy` | the guest car cannot be bought (Trade) |
 | `ts/already_you_have`, `00cmn/already_you_have` | the part or wheel is already owned |
-| `lc/no_license_<id>`, licence and regulation popups | the event's entry rules are not met |
-| `not_to_change`, `dirt_tire_only` | car settings: a part change would break the event's rules, or tyres cannot change for a dirt event |
+| `lc/no_license_<id>`, license and regulation popups | the event's entry rules are not met |
+| `not_to_change`, `dirt_tire_only` | car settings: a part change would break the event's rules, or tires cannot change for a dirt event |
 | `ar/cannot_ending` | arcade Clear Status "Goal" before an ending is open |
 
 **One popup level.** A popup is a second level drawn over the base page. The
@@ -233,9 +236,12 @@ The first rule that gives an answer decides:
    - the level page focuses the difficulty last chosen, capped at Hard;
    - the title page `root` always opens on the title focus (§7.1), however it
      is reached;
-   - a GT Mode race series or licence page opens on the item of the stored
+   - a GT Mode race series or license page opens on the item of the stored
      race code (below);
-   - a page opened with an explicit focus uses it.
+   - a page opened with an explicit focus uses it;
+   - otherwise game code may name the item (`initial_item`): a GT Mode wheel
+     shop brand page (`at/ws/ws_...`) opens on the wheel the ride car wears,
+     when that page sells it (test `gtmode_menu_disc_garage_wheel_list`).
 2. The first item that links to the page we came from. Going back therefore
    lands on the item you entered by, or on the first of several items that
    lead to the same page.
@@ -244,14 +250,14 @@ The first rule that gives an answer decides:
 Nothing remembers the item confirmed last: a page opened again starts by the
 same rules (test `menu_flow_initial_focus_rule`).
 
-**Race series and licence pages** (`race_page_hook`, `race_page_focus` in
+**Race series and license pages** (`race_page_hook`, `race_page_focus` in
 `src/menu/flow/game_flow.cpp`). The `gt_mode` control keeps one stored race
 code (§7.4) with its type (race, spot race or championship). Which pages
 read it:
 
 | Page | Which ones | Focus |
 |---|---|---|
-| licence page | `lc/lc_<x>` with `go_license` items (6 on the disc) | the code's last digit − 1; 0 if that is outside 0..7 |
+| license page | `lc/lc_<x>` with `go_license` items (6 on the disc) | the code's last digit − 1; 0 if that is outside 0..7 |
 | race series | `r/<class>/<series>`, not an `_entry` page, with `set_race_code` items (49) | the code's last digit |
 | championship series | as above, with a `set_race_code_champ` item (27) | the code's last two digits as a number, plus 1 unless the stored code is a championship's |
 
@@ -260,7 +266,7 @@ read it:
 - On the disc the race information item comes first, then the championship
   item (if any), then the races, so each race's own code gives its own item
   (test `menu_flow_disc_race_page_hooks`, all 403 race items).
-- Page names must be lower case: the nine endurance series pages spelt with a
+- Page names must be lower case: the nine endurance series pages spelled with a
   capital E (such as `r/end/Eakasaka_n`) are not hooked and use rules 2 and 3.
 - Every build of a hooked page reads the stored code and clears it; closing
   a popup builds nothing. So the first visit opens on the first item (the
@@ -293,7 +299,7 @@ read it:
 
   `key = clamp(⌊centre / 28⌋, 0, keys − 1)`
 
-  where centre = 28 × (old key) + 12, or 223 for a one-key row. Otherwise the
+  where center = 28 × (old key) + 12, or 223 for a one-key row. Otherwise the
   new row keeps the key it last had.
 
 ### §4.4 Item kinds and cancel
@@ -373,21 +379,32 @@ The list places the items itself:
   dealers' maker and car lists, and the race quick menus, whose icons are
   parked above the screen): the items
   form a row with 4 units between them.
-  - If the whole row fits in the window, it is centred.
+  - If the whole row fits in the window, it is centered.
   - Otherwise, near the start it is left-aligned (while the focused item's
     left edge is less than half a window width from the row's start), near
-    the end it is right-aligned, and in between the focused item is centred.
-  - A `scroll_bar` widget then shows the visible share of the row. The page's
-    hidden `pinch` element is drawn over the bar's track, as wide as that
-    share and at the row's scroll position.
+    the end it is right-aligned (while less than half a window width follows
+    the focused item), and in between the focused item is centered.
+  - The row's offset in the window eases towards the offset for the focused
+    item by 30 % of the remaining distance per frame. A page that is built,
+    or a focus set by game code, places the row at once.
+  - A `scroll_bar` widget draws nothing at all, track included, while the
+    row is no wider than the bar. Otherwise it draws its track, and the
+    page's hidden `pinch` element over it: as wide as window width × bar
+    width / row width, at bar x − offset × bar width / row width, where the
+    offset is the row's start from the window's left edge as it eases. On
+    the disc, 113 pages are horizontal selectors; only the three GT Mode
+    league pages (`r/beginner/beginner`, `r/amateur/amateur`, `r/pro/pro`,
+    with 20, 23 and 22 event tiles) have a row longer than their bar (tests
+    `menu_flow_horizontal_scroll_bar`, `menu_flow_disc_league_scroll_bars`,
+    `menu_flow_disc_horizontal_selectors`).
 
-The scroll position eases towards the focus by 30 % of the remaining distance
-per frame. A confirm feedback waits until the list is within 1/32 of an item
-of its place (a row pinned by a hovering pointer does not wait). Items are
-clipped to the window.
+The scroll position (in items) eases towards the focus by 30 % of the
+remaining distance per frame; it places the vertical lists. A confirm
+feedback waits until it is within 1/32 of an item of the focus (a row pinned by a hovering pointer does
+not wait). Items are clipped to the window.
 
-On the title list (window `menu_top`) the neighbours fade with their distance
-d from the window centre:
+On the title list (window `menu_top`) the neighbors fade with their distance
+d from the window center:
 
 `alpha = 1 − d / (1.8 × item height)`, and 0 beyond that.
 
@@ -396,6 +413,28 @@ The focused item is always fully drawn.
 Page items that the flow does not list (and that are not choices of a multi
 item) are drawn as static art, unless the page is a selector or the item is
 parked off-screen.
+
+**Code-drawn lists** (§9.7) use the same button-list placement
+(`menu::flow::row_layout`, `column_layout`, `ease_scroll`):
+
+- **Rows** (the wheel shop's tiles, the garage's wheel list) are placed as a
+  horizontal row above, 4 units between buttons, with the same easing and
+  scroll bar.
+- **Vertical lists** (the garage and trade lists, Cars Permitted, the
+  records page) stack the page's row 4 units apart from the top of their
+  window. A list that fits the window stays at its top (it is not
+  centered), and its `scroll_bar` draws nothing, track included. A longer
+  list is held at the window's top while the focused row starts less than
+  half a window down the list, at the window's bottom while less than half a
+  window follows the focused row, and in between the focused row is
+  centered. Its offset eases 30 % per frame towards that place, it is placed
+  at once when its page opens, and the rows are clipped to the window. Its
+  scroll bar (the garage, trade and Cars Permitted pages have one; the
+  records page has none) then shows the track and the `pinch`, as high as
+  window height × bar height / list height and as far down the bar as the
+  list has scrolled, times bar height / list height (tests
+  `menu_flow_column_layout`, `gtmode_menu_disc_vertical_lists`,
+  `gtmode_synth_garage_list_scroll`).
 
 ## §5 Drawing
 
@@ -407,27 +446,27 @@ level add 1,000 to their z, so a popup covers its base page. Full-screen fades
 are at z 10,000 and the decide glow (§5.4) at 100,000.
 
 An element's parts are drawn as in `docs/formats/menu.md`: the image
-modulated by the four corner colours (alpha 0..255), then the text. The
-layout lists the corner colours from the bottom-left (bottom-left,
+modulated by the four corner colors (alpha 0..255), then the text. The
+layout lists the corner colors from the bottom-left (bottom-left,
 bottom-right, top-right, top-left; menu space is y up), and the renderer
 paints them on those corners (`MenuRenderer::draw_elements`). Text
-colours use the GS alpha scale, so 0x80 is opaque. The runtime can change, per
+colors use the GS alpha scale, so 0x80 is opaque. The runtime can change, per
 element:
 
-- the offset, a scale about the box centre, the alpha, a brightness (0.5 is
+- the offset, a scale about the box center, the alpha, a brightness (0.5 is
   the disabled look), a per-channel tint and per-corner alpha;
-- replacement corner colours, in the same order, modulated as usual (the GT Mode oil gauge
-  blends two elements' colourings this way);
+- replacement corner colors, in the same order, modulated as usual (the GT Mode oil gauge
+  blends two elements' colorings this way);
 - an additive second pass (over-bright highlights), a replacement box and a
   clip rectangle;
-- the text (code-filled widgets) and the text colour;
+- the text (code-filled widgets) and the text color;
 - whether the element's own art is skipped (`MenuRenderer::draw_elements`).
 
 The renderer also draws four primitives with no element behind them:
 
 | Primitive | What it draws |
 |---|---|
-| additive grey quad | the focus highlight of items that have no focused look |
+| additive gray quad | the focus highlight of items that have no focused look |
 | glow strip | the decide effect (§5.4) |
 | flat fill | full-screen fades |
 | ring segment | the car page gauges (§9.3) |
@@ -469,9 +508,9 @@ Items have a focus style (element type bits 12–13): pulsing (0x2000), static
   once, on themselves (tests
   `menu_flow_highlight_on_its_item`, `menu_flow_disc_highlights_on_their_items`).
   The chosen child of a multi item is drawn the same way.
-- **Items without a focused look** get an additive grey quad of level p
+- **Items without a focused look** get an additive gray quad of level p
   (pulsing) or 0.5 (static).
-- **A `focus` widget** on the page replaces that quad. It is drawn centred on
+- **A `focus` widget** on the page replaces that quad. It is drawn centered on
   the focused item at alpha min(1, p + 0.5).
 - **Disabled items** are drawn at half brightness, or under the page's
   `disable` widget if it has one (a focused one's highlight then at half
@@ -485,7 +524,7 @@ Page flags 0xC0 choose what a confirmed item does before its effect runs
 | Flags | Name | Frames | Look |
 |---|---|---|---|
 | 0x00 | none | 0 | the effect runs at once |
-| 0x40 | decide glow | 26 | an additive white strip over the item: centre alpha 0.4 × clamp(f/3) up to frame 11, then 0.4 × clamp(1 − (f − 11)/6); edge alpha 0.4 × clamp((f − 4)/6) up to frame 18, then 0.4 × clamp(1 − (f − 18)/6) |
+| 0x40 | decide glow | 26 | an additive white strip over the item: center alpha 0.4 × clamp(f/3) up to frame 11, then 0.4 × clamp(1 − (f − 11)/6); edge alpha 0.4 × clamp((f − 4)/6) up to frame 18, then 0.4 × clamp(1 − (f − 18)/6) |
 | 0x80 | flicker | 30 | the focused look, with the normal look over it at alpha 1 − q[f mod 4], q = (0.4, 0.6, 0.8, 1.0) |
 | 0xC0 | blink | 30 | the focused look at alpha × q[f mod 5], q = (1, 0.8, 0.6, 0.4, 0.2) |
 
@@ -499,8 +538,8 @@ switch starts (measured on the disc).
 Text is drawn with the game fonts (`menu::make_game_font_drawer`). When the
 fonts are missing it falls back to SDL's debug font at the font's pixel size.
 The low nibble of the text style's align field picks a 3 × 3 anchor in the
-element's box (0 top-left … 4 centre … 8 bottom-right; values above 8 count
-as centre). Two align flags animate text (`apply_text_effects`):
+element's box (0 top-left … 4 center … 8 bottom-right; values above 8 count
+as center). Two align flags animate text (`apply_text_effects`):
 
 - **0x10, marquee.** The text enters from the box's right edge and scrolls
   left by one box width every 240 frames, clipped to the box. It restarts once
@@ -512,19 +551,19 @@ as centre). Two align flags animate text (`apply_text_effects`):
 
 ### §5.6 Animated widgets
 
-| Widget class | Behaviour |
+| Widget class | Behavior |
 |---|---|
 | `blink` | alpha over a 32-frame cycle: (f + 1)/6 for f < 6, 1 at f = 6, then 1 − (f − 6)/24 (floored at 0) |
 | `diagonal_in` / `diagonal_out` | the arcade pages' logo pair, a 10 s cycle. `in` is hidden for 2 s; its top-left and bottom-right corners rise over 0.5 s, then the other two over the next 0.5 s; it shows for 4 s and goes in reverse order. `out` is the complement, corner by corner |
-| `mpeg`, `mpeg_course`, `mpeg_class` | a movie drawn by the menu screen. The widget's corner colours modulate the movie (GS scale, 0x80 = 1) instead of drawing a quad, and their alphas blend it into the page: the arcade car pages' `mpeg` (alpha 0 at its bottom corners) fades out at its bottom edge |
+| `mpeg`, `mpeg_course`, `mpeg_class` | a movie drawn by the menu screen. The widget's corner colors modulate the movie (GS scale, 0x80 = 1) instead of drawing a quad, and their alphas blend it into the page: the arcade car pages' `mpeg` (alpha 0 at its bottom corners) fades out at its bottom edge |
 | `focus`, `disable` | overlays for the focused or disabled item (§5.3) |
-| `scroll_bar` | the visible share of a horizontal row (§4.6) |
+| `scroll_bar` | the visible share of a horizontal row or a code-drawn list; nothing while the row or list fits (§4.6) |
 
 ### §5.7 Text inset
 
 Text that is left- or right-aligned in its box is drawn 12 menu units in from
 the box's edge (`menu::kTextInset`, `menu::apply_text_inset`): +12 for the
-left column of anchors and −12 for the right column. Centred text is
+left column of anchors and −12 for the right column. Centered text is
 unchanged. The engine applies the inset where its screens were checked
 against the game's:
 
@@ -583,8 +622,8 @@ shows a Fadeout over black instead.
 race loop ends after a run, or on EXIT from the pause menu of a live run
 (`RaceScreen::pause_exit`, unless that EXIT counts as the run's finish,
 §11.2), the last race frame stays up with nothing simulated for 10 frames.
-Then the DelayFadeout's grey wash (type 1 below) builds up over it for 8
-frames: grey 0.1 (12.8 / 255) at alpha 1 − 0.5^(n − 10) after n frames
+Then the DelayFadeout's gray wash (type 1 below) builds up over it for 8
+frames: gray 0.1 (12.8 / 255) at alpha 1 − 0.5^(n − 10) after n frames
 (`ScreenTransition::delay_fadeout_cover`, test `race_exit_wash`). Then what
 follows (§11.1: the prize page, the name entry, the replay, the quick menu, or
 the menus) appears as a cut. The same transition runs over the last frame of
@@ -606,16 +645,16 @@ The flow only ever asks for type 0. Type 1's wash is what a run's exit draws
 
 | Type | Name | Per frame | Covered after |
 |---|---|---|---|
-| 0 | Fadeout | colour (12, 12, 12) at alpha 0x0C / 0x80 over the whole frame (the picture keeps 0.906 of itself each frame) | 48 frames (≈ 1 % left) |
-| 1 | DelayFadeout | nothing for 10 frames, then colour (0.1, 0.1, 0.1) at alpha 0.5 | 18 frames |
+| 0 | Fadeout | color (12, 12, 12) at alpha 0x0C / 0x80 over the whole frame (the picture keeps 0.906 of itself each frame) | 48 frames (≈ 1 % left) |
+| 1 | DelayFadeout | nothing for 10 frames, then color (0.1, 0.1, 0.1) at alpha 0.5 | 18 frames |
 | 2 | Lineout | opaque black 1-unit columns, every other one, sweeping in from both edges at 16 units per frame (even columns from the left, odd from the right) | 21 frames |
-| 3 | Combout | 256 bars, each 2 units high, growing from the left edge at 640/24 units per frame, colour 32/255 at alpha 0x60 / 0x80; each bar starts at a random position in [−320, 0) | 36 frames |
+| 3 | Combout | 256 bars, each 2 units high, growing from the left edge at 640/24 units per frame, color 32/255 at alpha 0x60 / 0x80; each bar starts at a random position in [−320, 0) | 36 frames |
 
 The Combout start positions come from a linear congruential generator seeded
 with 100. The pattern is a stand-in and not the game's own sequence.
 
 **Loading indicator.** 3 s (180 frames) after any transition starts, a
-16 × 16 square at (20, 20) from the top-left blinks between light grey (0.9)
+16 × 16 square at (20, 20) from the top-left blinks between light gray (0.9)
 and black every 32 frames. DelayFadeout's first 10 frames draw nothing at
 all, not even the indicator.
 
@@ -665,8 +704,10 @@ idle time comes from the disc's game configuration and is 20 s, or 1,200
 frames, on this disc (measured).
 
 - **Demo races.** Attract mode runs demo races one after another (mode
-  `attract_demo`). They cycle through the configuration's demo list. Demos
-  marked for the S licence (the F1 demos) are skipped until the S licence is
+  `attract_demo`). Each is an all-CPU race: the computer drives every car,
+  the player's slot too, and nothing is recorded. They cycle through the
+  configuration's demo list. Demos
+  marked for the S license (the F1 demos) are skipped until the S license is
   held.
 - **When a demo ends on its own,** the next demo starts, up to five. After
   the fifth, the opening movie `stream/opening.pss` plays, then the title.
@@ -728,7 +769,7 @@ their entry's movie once the cursor rests (§9.1).
   map, or the back action `go_top`, returns to the title with the focus on
   Gran Turismo Mode.
 - **Race codes.** The flow keeps one stored race code and its type, which
-  the race series and licence pages read for their focus (§4.2):
+  the race series and license pages read for their focus (§4.2):
   - `set_race_code` (type race) and `set_race_code_spot` (type spot race)
     store the confirmed item's name;
   - `set_race_code_champ` stores the name with its last character advanced
@@ -760,10 +801,11 @@ replay, the flow raises a **request** (`flow::GameRequest`):
 
 - the mode;
 - the race code;
-- the course, car, class and paint, plus the arcade transmission and tyre
+- the course, car, class and paint, plus the arcade transmission and tire
   choices;
 - player 2's choices;
-- for GT Mode, the garage car's built spec and its opponents;
+- for GT Mode, the garage car's parts and settings (the race builds the car
+  from them) and its opponents; the same for player 2's garage car;
 - the replay files.
 
 The request comes after the 40-frame Fadeout (§6). The menu then stops
@@ -789,13 +831,18 @@ ticking until gameplay returns (`waiting_for_game`). When gameplay returns
 
 If nothing handles a request, the menu screen goes straight back to the menu.
 
+**A race that cannot be built.** If the race screen cannot set up the race
+the menus (or the online lobby) asked for, it shows a black page reading "The
+race cannot start." with the reason under it. Cross, Circle, Triangle or
+Start returns to the menus (`RaceScreen::render`, `RaceScreen::update`).
+
 ### §7.6 Presentations
 
 After a GT Mode or arcade result, game code can queue **presentations**:
 
 - the record name entry (queued by the race screen as a run is recorded,
   §11);
-- the licence card (`lc_get`);
+- the license card (`lc_get`);
 - a prize car (`car_get`);
 - the championship trophy (`trophy_get`);
 - the race prize pages (`gtmode_mini`, `arcade_mini`, `consolation_prize`),
@@ -852,7 +899,7 @@ race code (§7.4).
 - **Step 1** chooses the car and its paint.
 - **Step 2** chooses AUTOMATIC / MANUAL. It starts on the Options menu's
   transmission setting.
-- **Step 3** chooses RACING / DRIFT tyres. Step 3 is skipped for the home and
+- **Step 3** chooses RACING / DRIFT tires. Step 3 is skipped for the home and
   guest garage classes and on a dirt course.
 
 Confirm on step 1 or 2 opens the next step (SE `next`). Left / Right choose
@@ -926,7 +973,7 @@ The pickers are `ar/select_course`, `ar/select_class`, `ar/select_car` and
 
 **The strip.** Every entry's `_mini` icon appears in a row along the strip
 element, with 4 units between icons. The row is placed like a horizontal
-selector (§4.6) inside the strip's width centred on the screen, and eases
+selector (§4.6) inside the strip's width centered on the screen, and eases
 30 % per frame.
 
 - **Focused icon.** It pulses: its brightness factor b starts at 1 on a move,
@@ -947,7 +994,7 @@ in from 640 units to the right over 15 frames.
 
 ### §9.2 The car page
 
-The car page shows the car itself in 3D, centred above the strip (§9.5).
+The car page shows the car itself in 3D, centered above the strip (§9.5).
 Around it:
 
 - **Paint column.** Up / Down choose the paint. The choice clamps (`cursor`
@@ -962,13 +1009,13 @@ Around it:
   - A garage car shows only its own paint.
 - **Spec ticker** (`flow_spec`). A new label/value line starts every second
   and cycles through the car's figures (`arcade_specs`: Length, Height,
-  Width and Wheelbase, in millimetres). The ticker also runs on the
+  Width and Wheelbase, in millimeters). The ticker also runs on the
   time-trial page. Each line fades in over 0.5 s, holds,
   and fades out over 0.5 s within 4 s, drifting up 40 units per second. The
   text is at 0.6 scale, with the value 14 units below the label.
 - **Step buttons.** AUTOMATIC / MANUAL and RACING / DRIFT (§8) are the
   layout's `auto`/`manu` and `racing`/`dri` buttons. The `_yes` art marks the
-  current choice and `_no` the other, centred at x = 220 and 420.
+  current choice and `_no` the other, centered at x = 220 and 420.
   - On each step the whole page springs up by 488 (step − 1) + 134.4 units, so
     the step's buttons sit in the cross band.
   - The strip fades out over 0.5 s while a step is open.
@@ -980,7 +1027,7 @@ Around it:
 Three ring gauges (`handling_gauge`, `speed_gauge`, `acceleration_gauge`)
 ride with the car's art:
 
-- **Background ring:** 22° to 238° in dark grey (0.2), half the radius thick.
+- **Background ring:** 22° to 238° in dark gray (0.2), half the radius thick.
 - **Value arc:** runs from 230° clockwise, 0.3 of the radius thick. For a
   value v it ends at 230° − 200° × v. It is orange up to 0.8 of full (the arc
   down to 70°) and red beyond.
@@ -1007,14 +1054,17 @@ The **showroom top speed** (`sim::showroom_top_speed`) is found by a sweep:
 
   F_drive > rolling(v) · c_rr · (m g + c_down v²) + c_drag v²
 
-  Here rolling(v) is the speed-dependent rolling factor and c_rr the tarmac
-  rolling coefficient of the tyre model. c_down is the sum of front and rear
+  Here rolling(v) is the speed-dependent rolling factor and c_rr = 0.1 the
+  tarmac rolling coefficient. c_down is the sum of front and rear
   downforce, c_drag the drag coefficient as built (air density 1.2), m the
   car's mass and g = 9.8 m/s².
+- The gears are the car's stored gear words, the ones the race uses
+  (`sim::build_car_spec`). For a computed gearbox these are the words its
+  gear slider generated; they are not generated again here.
 
 On the disc this gives 297 km/h for `nsx_s_zero_97`, 283 for `rx7_rz_00`
 and 249 for `xsara_wrc_99`. These are within 2 km/h of the game's
-gauges (test `sim_showroom_top_speed`).
+gauges (test `car_spec_showroom_top_speed`).
 
 ### §9.4 The time-trial page
 
@@ -1107,8 +1157,8 @@ page opens and side-on (yaw 90°) after about 7.4 s.
   2 → 6 m spring. It fades in from frame 5 to frame 45, with the floor
   reflection at 0.3. The model loads once the choice has rested 8 frames (3
   if a car is already shown).
-- **Icon strip** (`strip_target`). If the row fits in 600 units it is centred
-  on x = 320 and stays still. Otherwise the focused icon is centred, with the
+- **Icon strip** (`strip_target`). If the row fits in 600 units it is centered
+  on x = 320 and stays still. Otherwise the focused icon is centered, with the
   row's ends held at 20 and 620. The focused icon's pulse is
   1 − (frames mod 12) / 24.
 - **Paint column.** It shows the current paint with up to two slots above
@@ -1151,9 +1201,48 @@ The menus need these GT Mode screens; their content is GT Mode's.
 - **Status bar** (`00cmn/status`, imported by most GT Mode pages). It shows
   the credits and "day N". The day text ends 10 units before its box's right
   edge.
-- **Lists and rows.** Garage lists, the wheel shop's tile row and the
-  regulated-car list are drawn by game code over the page (`extra_draws`).
-  Taps and hovers there use game code's own hit tests.
+- **Lists and rows.** Game code draws these over the page (`extra_draws`),
+  placed as in §4.6, with its own keys and hit tests (`on_frame`,
+  `garage_hover`, `garage_tap`):
+
+  | Page | List | Spacing |
+  |---|---|---|
+  | `hm/hm_gr`, `hm/hm_gr_trade` (garage, trade) | vertical, 24-unit rows (`car1`, `car_a1` on the cursor) in the 304-unit `menu_garage` / `menu_garage_trade` window | 28 |
+  | `00cmn/car_reguration` (Cars Permitted) | vertical, 20-unit rows (`link_menu`, `active_menu` on the cursor) in the 232-unit `menu_regulated_car` window | 24 |
+  | `records_free_tt` (records, §12.4) | vertical, 56-unit bars in the 356-unit `menu_records` window | 60 |
+  | `at/ws/ws_...` (wheel shop brand pages) | a row of 52 × 52 tiles in `menu_wheel_shop` | 56 |
+  | `hm/hm_wheel` (the garage's wheel list, below) | a row of 60 × 60 buttons in the 620-unit `menu_wheel` window | 64 |
+
+  - Up / Down move a vertical list's cursor, held at the ends: SE `cursor`
+    (the records: `select`). Changing the garage's sort order puts the
+    cursor on the first car and places the list at once.
+  - A hovering pointer moves the cursor to the row or button under it (SE
+    `select`), and the list or row then holds still until a key moves the
+    cursor, so the row stays under the pointer.
+  - A tap on another row or button moves the cursor there; a tap on the
+    cursor's row or button acts as Confirm. On Cars Permitted a tap only
+    moves the cursor.
+  - A wheel shop brand page opens on the wheel the ride car wears (§4.2).
+- **The garage's wheel list** (`hm/hm_wheel`, Garage > car > Wheel). One
+  button per wheel the car can wear: the stock-wheel button first (the car's
+  own wheels, the hidden tile `default_wheel`), then the bought
+  wheels in the order they were bought, each with its own hidden tile. Each
+  button is the page's `wheel` frame with the 52 × 52 tile in its middle; the
+  cursor's button shows the frame's focused look (`wheel1`). The row is
+  centered while it fits (up to 9 buttons) and scrolls with the cursor
+  beyond that, with its scroll bar (§4.6).
+  - The hidden orange `mark` frame is drawn over the button of the wheel the
+    car wears, and the cursor starts there: on the stock-wheel button for a
+    car on its own wheels. A car wearing a wheel the inventory does not hold
+    has no button marked, and the cursor starts on the first button.
+  - Left / Right move the cursor, held at the ends (SE `cursor` when it
+    moves). The car on the page shows the wheel under the cursor.
+  - Confirm asks "Equip this wheel?" (`hm/hm_change_wheel_sure`, a popup
+    over which the list is not drawn). Yes puts the wheel on the car (the
+    stock-wheel button: its own wheels) and shows `hm/hm_wheel_changed`.
+    What a car may wear is GT Mode's (tests
+    `gtmode_menu_disc_garage_wheel_list`,
+    `gtmode_synth_garage_wheel_list`).
 
 ## §10 Options
 
@@ -1170,7 +1259,7 @@ multi item. Its value is stored in `config.ini` section `[options]` as
 | Race | `gear_auto` (transmission), `assist_asm`, `assist_tcs` | on, off |
 | 2P Battle | `split_tire_damage` | on, off (default **off**) |
 | 2P Battle | `split_boost` | none, low, high (default **low**) |
-| Ghost | `ghost` | on, off |
+| Ghost | `ghost` | on, off (whether a better run replaces the ghost at once or after "Update Ghost?"; it never hides the ghost, presentation §G11) |
 | GT Force 1P / 2P | `assist_1p` / `assist_2p` | type1 … type4 |
 | GT Force 1P / 2P | `force_feedback_1p` / `force_feedback_2p` | on, off |
 
@@ -1188,7 +1277,7 @@ its default.
   negative value gives player 1 the head start.
 
 Left / Right on a slider change it (SE `cursor`). The slider's yellow marker
-sits at x + (laps − 1)/98 × w, or at the centre + handicap/150 × w/2. The
+sits at x + (laps − 1)/98 × w, or at the center + handicap/150 × w/2. The
 handicap shows as a yellow line of length |h|/150 × w on the leading player's
 side, with that player's car icon at its end.
 
@@ -1202,10 +1291,17 @@ option. Only the art of the current values is drawn
 
 **Fixed pages.**
 
-- The key configuration page shows the race controls of the DualShock 2 for
-  player 1: steering on the left stick, accelerate Cross, brake Square,
-  reverse Triangle, handbrake Circle, shift up R2, shift down L2, rear view
-  L1, change view R1. The player 2 column stays empty.
+- The Key Configuration page (`key/key`) and its view on the top page (layer
+  `m5`) show a **Controller Settings** button instead of the DualShock 2
+  table. The action rows, their labels and the 1P / 2P headings are not
+  drawn; the panel (`bace_7`, 64, 28, 512 × 324) and its title bar stay. The
+  button is a 260 × 26 box in the middle of the panel (x 190–450, y 177–203)
+  with "Controller Settings" in white. It has the color of the title bar:
+  orange on the page, gray in the view.
+- On the page, Confirm or a tap on the button chooses it (SE `ok`). A tap up
+  to 6 units above or below the box also counts; taps elsewhere on the page
+  do nothing. The menu screen then opens Settings on its Controls page over
+  the menus, which wait on the page (§15). Cancel leaves the page as before.
 - The music page is the music list (§10.1).
 
 **Music.** No page of the option set plays menu music (§7.3). The music list
@@ -1252,7 +1348,7 @@ the check mark or on the title.
 - **Confirm on a check mark** takes the song into or out of the list (SE
   `ok`).
 - **Confirm on a title lifts the song** (SE `ok`). Up / Down then carry it
-  past its neighbours, never onto the last row (SE `cursor`, `disable` at
+  past its neighbors, never onto the last row (SE `cursor`, `disable` at
   the first or last song). Left / Right do nothing, and Confirm puts it down
   (SE `select`).
 - Confirm on the Order / Shuffle row does nothing.
@@ -1264,7 +1360,7 @@ quarter of the way each frame (test `music_list_page_scroll`).
 
 **Look.** The cursor's row, check mark or title is drawn with its focused
 art, its brightness pulsing from 1.5 down to 1 over 30 frames. A lifted song
-is drawn as a bar (`pop_label_check_box`) centred on its row, its brightness
+is drawn as a bar (`pop_label_check_box`) centered on its row, its brightness
 pulsing from 1.5 down to 0.5.
 
 **Previews.** The focused song's intro plays, looping, at level 1.0, whatever
@@ -1297,7 +1393,7 @@ the menu SEs.
 
 | Run | Before the run | After the run |
 |---|---|---|
-| licence test | `qm_gt_license1` | `qm_gt_license1` |
+| license test | `qm_gt_license1` | `qm_gt_license1` |
 | 2 Player Battle | — | `qm_arc_2p_result1` |
 | machine test (GT Mode) | `qm_gt_mt_10001` (code `M1000`), `qm_gt_mt_max1` (`MMAX`), else `qm_gt_mt_4001` | the same |
 | a run with no opponents | `qm_arc_tt_ltd1` with a lap count (the arcade time trial), else `qm_arc_tt_free1` | the same |
@@ -1305,7 +1401,7 @@ the menu SEs.
 | championship round | `qm_gt_event_champ1` | `qm_gt_result_champ1` |
 | arcade race | — | `qm_arc_result1` |
 
-The menu comes **before** the first run for GT races, machine tests, licence
+The menu comes **before** the first run for GT races, machine tests, license
 tests, GT free runs, time trials and arcade free runs. The arcade race and 2
 Player Battle start driving at once.
 
@@ -1322,11 +1418,12 @@ Player Battle start driving at once.
   - the names as stored with the records, times as `m'ss.mmm`;
   - the top-speed test (MMAX) shows speeds as `%4.1f %s`, rounded to tenths,
     for example "218.8 mph", in the game data's speed unit (mph on the
-    NTSC-U data) unless the `race` / `units` setting picks one;
+    NTSC-U data) unless the `race` / `units` setting (Settings → Display →
+    Speed units) picks one;
   - the time-trial list's car column (`qm_list_car_name<n>`) is the entry's
     car name, or `---` for an entry without a car or an empty place (a free
     run's list: the car each lap was driven in).
-- **Licence tests** show the test's name and target times.
+- **License tests** show the test's name and target times.
 
 **Records after a run** (`RaceScreen::record_run`). When a live run started
 from the menus (not a Quick race practice, a replay or a `qm_demo` run)
@@ -1335,7 +1432,7 @@ ranking at once, once per run:
 
 | Run | Recorded when | Value | Ranking |
 |---|---|---|---|
-| licence test | it finished with a medal | its time | `lic:<test>` (`game::add_license_record`) |
+| license test | it finished with a medal | its time | `lic:<test>` (`game::add_license_record`) |
 | machine test | it finished (the top-speed test also by a pause EXIT that counts as its finish, §11.2) | the time (M400, M1000) or the top speed (MMAX) | `mt:<code>` (`game::add_machine_test_record`) |
 | arcade time-trial challenge | it finished (its one lap, `race::kTimeTrialLaps`), not failed, with a best lap | its best lap | `at:<code>` (`game::add_time_trial_record`) |
 | free run (arcade time attack, GT Mode free run) | it has a best lap, however it ended | its best lap in whole ms, with the run's car | `ct:<course>` (`game::add_course_time_trial_record`) |
@@ -1346,11 +1443,11 @@ over 0x3FFFFF ms is not entered. A new value ranks ahead of an equal one
 already stored. A run that makes the
 ranking opens the record name entry (§12.2, §7.6) before its replay (§11.1),
 so the quick menu that opens after the replay shows the name just entered; a
-licence test has no replay, its name entry opens over the quick menu and the
+license test has no replay, its name entry opens over the quick menu and the
 Top 3 is read again when it closes. Every finished run is recorded this way, not
 only the session's last one, and only this way: the menus never record from
 the result posted when the race screen is left (time trial, free run,
-licence test, machine test, GT free run), so a time trial left by EXIT before
+license test, machine test, GT free run), so a time trial left by EXIT before
 its lap is done records nothing. `GameResult::records_done` (a run of this
 visit was recorded) only makes the arcade result save the game when the last
 run did not finish.
@@ -1377,8 +1474,9 @@ menu stops it. The race reads the option when it starts.
   `race_quick_menu_cancel`). The championship menus and the dialog popups
   (`exit_sure`, `ghost_dlg`) have no cancel flag and ignore it.
 - An item that links to a dialog page opens it as a popup: "Retire from
-  championship?" (`exit_sure`) or "Update ghost?" (`ghost_dlg`). The dialog's
-  yes / no is reported.
+  championship?" (`exit_sure`). "Update ghost?" (`ghost_dlg`) opens by itself after a
+  run better than the ghost while the Options menu's Ghost is off (presentation
+  §G11). The dialog's yes / no is reported.
 - At most 8 frames run per screen update.
 - **Touch controls.** While a quick menu is up, before or after a run, the
   on-screen touch controls show their menu layout (D-pad and face buttons,
@@ -1393,8 +1491,8 @@ dialog pages have none.
 
 | Item | Enabled |
 |---|---|
-| `replay`, `save_replay` | after a live run (finished, failed or left with pause EXIT), except a licence test left with pause EXIT; off again after `demonstration`, until the next run |
-| `save_ghost`, `data_logger` | once a run of the visit set a session record: a time trial's lap, a 0-400 m / 0-1000 m time or a judged licence run at or under the visit's best so far, or a free run's lap under it (any lap when there is none yet) |
+| `replay`, `save_replay` | after a live run (finished, failed or left with pause EXIT), except a license test left with pause EXIT; off again after `demonstration`, until the next run |
+| `save_ghost`, `data_logger` | once a run of the visit set a session record: a time trial's lap, a 0-400 m / 0-1000 m time or a judged license run (a medal or TIME EXPIRED; not a FAIL) at or under the visit's best so far, or a free run's lap under it (any lap when there is none yet) |
 | `setting`, `save_setting`, `load_setting` | not in a time trial; not in an arcade race or free run with a car that is not a garage car |
 | `free_session` | not before a GT race on a dirt course (a championship round keeps it) |
 | `exit`, `save_game` | not once a championship's last round has been run |
@@ -1412,11 +1510,12 @@ The item actions:
 | Action | Item |
 |---|---|
 | `qm_start`, `qm_try_again` | run (again) |
-| `qm_free_run` | the course alone before a GT race |
+| `qm_free_run` | the free practice before a GT race: the course alone, the player's car starting in its pit box (below) |
 | `qm_replay` | watch the replay (§11.1) |
-| `qm_demo` | the computer drives |
-| `qm_save_replay`, `qm_save_ghost` | save the replay |
-| `qm_load_ghost` | load the best-lap ghost |
+| `qm_demo` | the disc's demonstration of the event plays as a recorded race; without one, the computer drives the player's car |
+| `qm_save_replay` | save the replay |
+| `qm_save_ghost` | save the visit's best run (a free run: the run of its best lap), presentation §G11 |
+| `qm_load_ghost` | load a saved ghost at once, from the saved replays that can be played here (§13), presentation §G11 |
 | `qm_records` | records (§12.4, or a panel, §11.4) |
 | `qm_logger` | the Analyzer over the session (§11.4) |
 | `qm_option` | options (§11.4) |
@@ -1428,6 +1527,15 @@ The item actions:
 
 Every action in the disc's 12 quick-menu layouts (97 items, 17 actions) has a
 meaning in this table (test `race_quick_menu_actions_disc`).
+
+**Free practice needs a pit box** (`RaceScreen::start_free_run`). The free
+practice starts the player's car in its pit box on the course's pit stop
+line. On a course whose stop line has fewer than 4 points it has no pit box
+(`race::exact_has_pit_box`): FREE RUN is then refused with the message "Free
+run is not available on this course." and the pre-race menu stays up. A
+course that cannot be loaded is refused the same way. GT Mode's courses without
+a pit box are its dirt courses (no pit stop line), where `free_session` is
+already off, so its own races never show the message.
 
 **The result is taken when the live run ends** (`race::RaceResultLatch`,
 `RaceScreen::latch_result`), for every run. The
@@ -1455,7 +1563,7 @@ in order, then the quick menu:
 | 2 Player Battle | — | yes |
 | GT race, championship round | the prize page (cup or consolation prize, §7.6) if it finished | yes, also after a pause EXIT |
 | time trial, free run, machine test | the name entry if it ranks | yes |
-| licence test | the name entry if it ranks (over the quick menu) | no |
+| license test | the name entry if it ranks (over the quick menu) | no |
 | GT free run (free practice) | — | no; back to the race's pre-race menu |
 
 - The replay plays by itself after every run in the table that has one,
@@ -1473,7 +1581,7 @@ in order, then the quick menu:
   by the race screen, only for runs started from the menus that are not a
   Quick race practice, and posted as `GameResult::prize_shown`.
 
-A licence test left with pause EXIT: its menu's preview box shows the disc's
+A license test left with pause EXIT: its menu's preview box shows the disc's
 demonstration instead of the run, and its REPLAY item is disabled (§11).
 
 ### §11.2 Pause EXIT as a finish
@@ -1486,10 +1594,13 @@ Pause EXIT ends a live run at once (§6), except
   has not reached its goal.
 
 There the press is the run's finish: nothing is timed after it, the
-recording is closed at the press (the replay ends there), the record
+race's recordings close at the press (the replay ends there), the record
 overlay shows over the running race (5 s after the press; the top-speed
-test's 0.1 s) and the end-of-run driver takes the car, as after any
-finish. A second EXIT ends the run.
+test's 0.1 s). The race ends the car's run at the press and the end-of-run
+driver takes the car: a free run's car stops with the wheels straight on
+the pit surface, else drives on without slowing; the top-speed test's car
+drives on as at its goal (presentation §E5, `RaceScreen::exit_as_finish`,
+test `exact_game_exit_as_finish`). A second EXIT ends the run.
 
 ### §11.3 What is drawn behind the menu
 
@@ -1501,7 +1612,7 @@ finish. A second EXIT ends the run.
 | time trial, free run, machine test (before and after a run) | the race, full frame |
 | GT race, championship round, before the race (also after a free practice) | the race, full frame |
 | result menus: arcade race, 2 Player Battle, GT race, championship round | no race: the layout's own opaque checker background over the whole frame |
-| licence test | the 280 × 210 preview box whose top-left corner is 32 units in and 58 down from the frame's top-left: the run, or the demonstration |
+| license test | the 280 × 210 preview box whose top-left corner is 32 units in and 58 down from the frame's top-left: the run, or the demonstration |
 
 - The race behind the menu replays the last run endlessly: from the run's
   start, records off, the view mode picked at random as for the attract
@@ -1535,7 +1646,9 @@ title Options (§10).
 Saves and car setting files are plain files in the engine's storage
 (`flow::SavePage`). The engine draws them on the game's file list page
 (`menu/memorycard.mbl` page `file_operation`). The page has no memory-card
-slots, no "working" windows and no capacity. It has two icon panels:
+slots, no "working" progress windows and no capacity (its window art only
+waits for a file dialog and says where an export went). It has two icon
+panels:
 
 - **Left panel** (SAVED GAMES or SETTING FILES): a 4 × 3 grid of 64-unit icons
   at a 70-unit pitch, scrolling by rows.
@@ -1569,6 +1682,52 @@ The grid spacing comes from screenshots and is approximate.
   says so.
 - In the operation menu, Up / Down choose and Confirm runs the operation.
 - Cancel goes back one level, and from the list it leaves the page.
+- Mouse and touch (`SavePage::tap`, `hover`): a hovering pointer moves the
+  cursor to the icon, button or OK / CANCEL under it (SE `cursor`); a tap does
+  the same, and on what is already focused it is Confirm. A tap outside the
+  open operation, format or question window is Cancel; a tap anywhere closes
+  the error and "Exported" windows (test `gtmode_menu_disc_save_page_dialogs`).
+
+**Export to PS2** (the same on every platform). The operation opens a format
+window in the operation menu's place, drawn the same way, with three buttons,
+top first:
+
+| Button | Writes |
+|---|---|
+| PS2 save (.psu) | the save as a `.psu` |
+| PS2 card (.ps2) | a new PCSX2 memory card image holding only this save |
+| Raw save (.raw) | the save's data file alone, which PS2 save editors open |
+
+- It starts on the first. Up / Down choose, held at the ends (SE `cursor`);
+  Cancel goes back to the operation menu (SE `cancel`).
+- Confirm (SE `ok`) opens the platform's save dialog, which only picks the
+  place. It starts on the file's name (`GT3` without one) with the format's
+  extension. The chosen format is written whatever the file is called; a
+  name typed without an extension gets the format's. In the browser the file
+  is downloaded under that name. On macOS the dialog starts in the folder of
+  the last export, or in Documents.
+- Cancelling the dialog returns to the format window (test
+  `save_page_flow`).
+- A written file shows "Exported as" and its name in the "working" window
+  with OK; either key or a tap closes it, back to the list.
+
+**While a file dialog is open** (export or import) the page shows the
+original's "working" window with "Waiting for the file window..." and one
+CANCEL button. Either key, or a tap on CANCEL, stops waiting (SE `cancel`):
+back to the format window for an export, to the list for an import. The
+dialog is closed where the platform allows it (macOS), and an answer it still
+sends is ignored (test `save_page_dialog_cancel`). On macOS the dialog is a
+sheet on the game's window: a controller's buttons reach the page while it is
+up, and when it closes the window takes the keyboard and the controller again
+(macOS leaves no window with the keyboard after such a sheet).
+
+**Import.** "Import a save" (and "Open a file") accepts the engine's `.sav`
+saves and PS2 saves: a `.psu`, a memory card image (`.ps2`, `.mcd`), or the
+save's data file alone under any name, such as a `.raw` from a save editor,
+recognized by its header (tests `gtmode_disc_ps2_save_containers`,
+`gtmode_disc_ps2_raw_save_edited`). An imported save without its own file
+comment takes the picked file's name without its extension (on Android
+the name the system's picker shows), or "PS2 GAME".
 
 **One question at most.** Delete and overwrite each ask one question. Delete
 starts on CANCEL and overwrite starts on OK. Overwriting the save being played
@@ -1603,7 +1762,7 @@ Cancel goes back where the page was opened from.
   current save, or "New game" / "New save" / "New file".
 - The info panel shows the focused file's details.
 - **Operation menu.** It is a window 256 units wide and
-  max(140, 44 + 32 (n − 1)) high for n operations. It is centred on the
+  max(140, 44 + 32 (n − 1)) high for n operations. It is centered on the
   focused icon and kept inside the panel. Buttons sit 116 units in, the first
   36 units below the top, 32 apart.
 
@@ -1616,7 +1775,7 @@ positions (`GameFlow::draw_list_impl`):
 
 - **Rows.** Seven rows (six key rows and the OK row) stack down from the
   window's top, 32 units high with 4 units between them.
-- **Keys.** In each key row the keys are 24 wide at a 28-unit pitch, centred
+- **Keys.** In each key row the keys are 24 wide at a 28-unit pitch, centered
   on the window. The OK key is left-aligned in its row.
 
 **The text box** (`flow::TextBox`). Both uses, the save page's name entry
@@ -1659,11 +1818,11 @@ after the text before it: box x + 12 + width of that text + 1, with the
 width measured with the game font (`GameFlow::draw_list`; the record entry's
 cursor comes from `GtModeHooks::name_cursor`). With the cursor at the start
 it is at box x + 13. The box is lighter at the top and the caret brightest at
-its bottom (the layout's corner colours run from the bottom-left).
+its bottom (the layout's corner colors run from the bottom-left).
 
 ### §12.4 The records page
 
-The quick menu's Records item (§11) of a licence test, a machine test, an
+The quick menu's Records item (§11) of a license test, a machine test, an
 arcade time trial or a free run (the arcade time attack, GT Mode's free run)
 started from the menus opens the GT Mode records page (control `records`,
 page `records_free_tt`; `make_records_screen`, `game::begin_records`) on that
@@ -1678,10 +1837,20 @@ A new game has them empty: unlike the arcade challenges they have no built-in
 records.
 
 The page draws every place of the ranking (`draw_records` in
-`src/game/gt_mode_menu/extra_draws.cpp`), as many as fit in the
-`menu_records` window: 12 places, 6 for a licence test. Each place is a
-`record_bar` stacked down from the window's top, one bar height apart, with
-its texts:
+`src/game/gt_mode_menu/extra_draws.cpp`): 12 places, 6 for a license test.
+Each place is a 56-unit `record_bar` with its texts, in a vertical list in
+the 356-unit `menu_records` window, 60 units apart from its top (§4.6, §9.7):
+
+- **Cursor.** The page opens on the first place, its bar drawn with the
+  focused look (`record_bar1`). Up / Down move the cursor through the
+  places, held at the ends (SE `select`); a hovering pointer or a tap moves
+  it as in §9.7, and a tap on the cursor's place acts as Confirm.
+- **Scrolling.** Six places show at once. The 12 places scroll with the
+  cursor, held at the window's top and bottom near the ends; a license
+  test's 6 fill the window and do not scroll. The page has no scroll bar
+  (test `gtmode_menu_disc_vertical_lists`).
+
+The texts of each place:
 
 | Text | A stored entry | An empty place |
 |---|---|---|
@@ -1715,7 +1884,8 @@ challenge record takes the challenge's car.
 Page `replay_theater` (from the title) offers three items:
 
 - **Load Replay:** the saved replays, newest first.
-- **Demonstration:** the disc's demonstration runs.
+- **Demonstration:** the disc's demonstration runs, each played as a
+  recorded race.
 - **Analyzer.**
 
 **File list** (`flow::TheaterPage`, drawn on the game's DEMONSTRATION page
@@ -1726,6 +1896,13 @@ Page `replay_theater` (from the title) offers three items:
   shows the focused file's course, car, time, laps, power, mode, date and
   size.
 - **Confirm** plays the file at once. With no files it plays `disable`.
+- **Older replays.** A saved replay of a format before 11 is still listed,
+  but its info panel shows only "-", its date and size, with the comment
+  "Recorded with an older version". Confirm on it plays `disable`; Start can
+  delete it (`game::replay_theater_entries`, test `replay_library_files`).
+- **Release and data.** A replay plays only on the game release and with the
+  game data it was recorded with. Otherwise it does not play and a message
+  says why.
 - **Start** deletes a saved replay after one "Delete OK?" question, which
   starts on CANCEL. Demonstrations cannot be deleted.
 - **Cancel** returns to `replay_theater`, with the focus on the item that
@@ -1757,16 +1934,16 @@ through the voice mixer (`flow::MenuSounds::play`):
 - **Volume.** Each effect plays at volume 1.0 × its region's level, clamped
   to 0x3FFF.
 - **One-region effects** are started twice, panned hard left and hard right,
-  so they sound centred at full level.
+  so they sound centered at full level.
 - **Region-pair effects** (`next` 2–3, `return` 7–8) play only their first
-  region, centred with the sine pan law.
+  region, centered with the sine pan law.
 - **Overlap.** Earlier sounds are not stopped.
 - **Menu SE off.** With the Menu SE option off, nothing plays.
 
 | SE | When |
 |---|---|
-| `select` | the focus moves; a multi item's choice changes; an arcade picker moves; a tap focuses an item; a lifted song is put down (§10.1) |
-| `ok` | confirm on a page without feedback; game code opens a popup; save and Theater page confirms; a music list check mark or lift (§10.1) |
+| `select` | the focus moves; a multi item's choice changes; an arcade picker moves; a tap focuses an item; a hovering pointer moves a code-drawn list's cursor (§9.7); the records page's cursor moves (§12.4); a lifted song is put down (§10.1) |
+| `ok` | confirm on a page without feedback; game code opens a popup; save and Theater page confirms; a music list check mark or lift (§10.1); the Key Configuration page's button (§10) |
 | `next` | confirm on a page with feedback; arcade picker confirm; arcade car page step |
 | `cancel` | cancel to a back page; arcade step back; save and Theater page back |
 | `return` | a popup closes; cancel ends the menu (no back page) |
@@ -1787,7 +1964,8 @@ through the voice mixer (`flow::MenuSounds::play`):
   and plays at most one effect per frame. The page's own code runs first and
   its effect wins the frame: the settings sliders (`param`, or `disable` at
   an end or when refused), the code-drawn lists (the dealer's paint, the
-  garage list, the Cars Permitted list, the wheel inventory: `cursor`), and
+  garage list, the Cars Permitted list, the garage's wheel list: `cursor`;
+  the records page: `select`), and
   the prize counter's beep (`cursor`), which plays on the frame of its step.
   A queued map pointer move (`cursor`) plays on the next frame on which the
   page's code plays none.
@@ -1816,6 +1994,22 @@ game's menus.
   or the face buttons when left-handed) and a tap reaches it
   (`TouchControls::clear_above`, test
   `touch_clear_above_moves_buttons_off_controls`).
+- **Controller Settings.** When the Key Configuration page's button is
+  chosen (§10), the screen opens the engine's Settings on its Controls page
+  over the menus, which stay on that page. Settings' back button then reads
+  "< Back to game", and its key hints end in "Triangle/Esc: back to game".
+  That button, Triangle or Esc closes Settings, and the menus go on from the
+  Key Configuration page as they were, from anywhere on the page. Settings
+  opens with player 1's Controller row selected; the bindings of both players
+  are on the same page below (docs/INPUT.md, Remapping in the app). The screen
+  Settings opens there, **Customize layout...** (Touch), also leads straight
+  back: Triangle or Esc (Android back) closes it and Settings together,
+  keeping the changes made on it. The layout editor's **Done** still returns
+  to Settings. Player 1's buttons still held when Settings closes are ignored
+  by the menus until released, so the Triangle that closed it does not also
+  leave the page. If the menu language was
+  changed in Settings meanwhile, the menus start again from the title in the
+  new language.
 - **Language.** The menus use the language folder `[gt3menu] lang`
   (default US), or the first language on the disc if that one is missing.
 - **Debug overlay** (`[gt3menu] debug = on` or `GT3R_GT3MENU_DEBUG=1`). It
@@ -1845,7 +2039,12 @@ scratch programs over the engine library:
 - Tests `menu_flow_*` (navigation, auto-repeat, popups, return / import,
   the initial focus rule, disabled items, fades, disc targets, the disc's
   race page hooks and dealer strips, the highlights on their items,
-  title → time trial → back),
+  title → time trial → back, the Key Configuration button, the horizontal
+  rows' scroll bars and easing, the vertical list layout, every horizontal
+  selector on the disc), `gtmode_menu_disc_vertical_lists`,
+  `gtmode_synth_garage_list_scroll`, `gtmode_menu_disc_garage_wheel_list`,
+  `gtmode_synth_garage_wheel_list`, `save_page_flow`,
+  `gtmode_disc_ps2_save_containers`, `gtmode_disc_ps2_raw_save_edited`,
   `gtmode_synth_title_focus_on_return`, `gtmode_synth_race_page_focus`,
   `gtmode_synth_attract_mode`, `gtmode_synth_options_music_list`,
   `music_list_*`, `gtmode_menu_disc_wash_and_oil`,
@@ -1853,9 +2052,10 @@ scratch programs over the engine library:
   `race_loading_picture_frames`,
   `race_quick_menu_actions_disc`, `race_quick_menu_cancel`, `menu_flow_text_box`, `gtmode_record_dates`,
   `gtmode_synth_machine_test_runs`, `gtmode_synth_course_time_trials`,
-  `gtmode_disc_course_time_trials_and_save`, `sim_showroom_top_speed`,
+  `gtmode_disc_course_time_trials_and_save`, `car_spec_showroom_top_speed`,
+  `replay_library_files`,
   `touch_clear_above_moves_buttons_off_controls` and `sound_menu_effects` pass.
-- Read with `gt3tool menu-pmb`: the corner colours of the arcade car pages'
+- Read with `gt3tool menu-pmb`: the corner colors of the arcade car pages'
   `bg2` and `mpeg` and of the name entry's `text_box` and `cursor` (§5.1,
   §5.6, §12.3), and the `car` slot's z of 5 (§9.5).
 - Measured with a scratch program:

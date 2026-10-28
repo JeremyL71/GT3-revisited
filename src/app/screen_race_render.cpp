@@ -29,11 +29,8 @@ bool RaceScreen::update_env_cube() {
     // sphere map before the car; we build them in its space as our lookup reads it: axis
     // towards the viewer, tilted 15 degrees up).
     if (gt3_scene && point_lights_.active() && e.has_env && app_ && app_->gpu()) {
-        const track::Track* rt = track_ ? track_->runtime() : nullptr;
-        const sim::WheelState& w0 = render_state_.wheels[0];
-        RoadShade fl = rt ? road_shade(rt->road(), w0.contact.x, w0.contact.z, w0.contact.y + 1.0f) : RoadShade{};
         std::vector<ReflectionDisc> discs =
-            point_lights_.reflection_discs(e, {p.x, p.y, p.z}, fl.hit ? int(fl.raw_a) : 0);
+            point_lights_.reflection_discs(e, {p.x, p.y, p.z}, car_lamp_index(render_state_, 0));
         render::Mat4 v = camera_.view();
         render::Vec3 x{v.at(0, 0), v.at(0, 1), v.at(0, 2)}, y{v.at(1, 0), v.at(1, 1), v.at(1, 2)};
         render::Vec3 z = render::cross(x, y);
@@ -163,17 +160,28 @@ void RaceScreen::draw_car_icon(App& app, int car, const SDL_FRect& rc, size_t sl
     icon_views_[slot]->draw(app.renderer(), rc, view, proj, eye, items, o);
 }
 
+// The lamp index a car's lights and reflection discs are picked around (point-light courses):
+// its front-left wheel's road attribute A as a signed value (-1 on the start-line strip), kept
+// while the wheel finds no road (docs/formats/course.md "Point-light courses").
+int RaceScreen::car_lamp_index(const sim::VehicleState& s, size_t slot) const {
+    if (lamp_index_.size() <= slot) lamp_index_.resize(slot + 1, 0);
+    const track::Track* rt = track_ ? track_->runtime() : nullptr;
+    const sim::WheelState& w = s.wheels[0];
+    RoadShade fl = rt ? road_shade(rt->road(), w.contact.x, w.contact.z, w.contact.y + 1.0f) : RoadShade{};
+    if (fl.hit) lamp_index_[slot] = lamp_index(fl.raw_a);
+    return lamp_index_[slot];
+}
+
 // A car's look this frame: GT3 averages the road shade (vertex attributes A, B) under the four
 // wheels and scales the Env0 car light colours and the light shadow by it; the reflection is
 // weakened by the car's dirt (the player's garage car; others are clean).
-CarLook RaceScreen::car_look(const sim::VehicleState& s, bool player) const {
+CarLook RaceScreen::car_look(const sim::VehicleState& s, bool player, size_t slot) const {
     CarLook look;
     const SunParams& e = sun_.params();
     const track::Track* rt = track_ ? track_->runtime() : nullptr;
     if (rt && e.has_env && point_lights_.active()) {
-        RoadShade fl = road_shade(rt->road(), s.wheels[0].contact.x, s.wheels[0].contact.z, s.wheels[0].contact.y + 1.0f);
         render::Vec3 p{s.position.x, s.position.y, s.position.z};
-        std::vector<SelectedLamp> sel = point_lights_.select(e, p, fl.hit ? int(fl.raw_a) : 0);
+        std::vector<SelectedLamp> sel = point_lights_.select(e, p, car_lamp_index(s, slot));
         render::ItemLights& il = item_lights_.emplace_back();
         for (int i = 0; i < 3; ++i) il.ambient[i] = e.global_ambient[size_t(i)];
         for (const SelectedLamp& l : sel) {
@@ -253,14 +261,14 @@ void RaceScreen::collect_items(const render::Vec3& eye, const sim::Vec3& right, 
     }
     player_items_[0] = player_items_[1] = items_.size();
     if (player) {
-        CarLook look = car_look(render_state_, true);
+        CarLook look = car_look(render_state_, true, 0);
         look.lamp = brake_lamps_.factor(0); look.brake_now = brake_lamps_.now(0);
         car_visual_->add_items(items_, render_state_, vehicle_->setup(), eye, look);
         player_items_[1] = items_.size();
     }
     if (second && field_ && field_->has_second()) {
         const CarVisual* v2 = car2_visual_ ? car2_visual_.get() : car_visual_.get();
-        CarLook look = car_look(render_state2_, false);
+        CarLook look = car_look(render_state2_, false, 1);
         look.lamp = brake_lamps_.factor(1); look.brake_now = brake_lamps_.now(1);
         v2->add_items(items_, render_state2_, field_->second_setup(), eye, look);
     }
@@ -270,26 +278,35 @@ void RaceScreen::collect_items(const render::Vec3& eye, const sim::Vec3& right, 
             {
                 sim::VehicleState os =
                     interpolate(field_->opponent_prev_state(i), field_->opponent_state(i), step_.alpha());
-                CarLook look = car_look(os, false);
+                CarLook look = car_look(os, false, 2 + size_t(i));
                 look.lamp = brake_lamps_.factor(2 + size_t(i)); look.brake_now = brake_lamps_.now(2 + size_t(i));
                 size_t first = items_.size();
                 opp_visuals_[size_t(i)]->add_items(items_, os, field_->opponent_setup(i), eye, look);
                 if (field_->opponent_ghost(i)) // online: a ghosted remote car (no contact)
                     for (size_t k = first; k < items_.size(); ++k) items_[k].alpha = 0.5f;
             }
-    // Best-lap ghost, in step with the current lap clock.
+    // The ghost (presentation §G11), live only, while Select's switch is on: a car of the race (a whole run's ghost car:
+    // licence tests, time trials, machine tests; the free run's ghost car), drawn as the race draws it (not while the
+    // computer drives it). The Analyzer's REPLAY: track B's lap in step with track A's.
     sim::VehicleState gs;
-    // (The Analyzer's REPLAY: track B's lap in step with track A's.)
     const bool logger_ghost = logger_mode_ && replaying_;
-    const double ghost_t = logger_ghost ? (double(player_.tick()) - double(logger_begin_) + step_.alpha() - 1.0) * step_.step()
-                                        : (double(lap_ticks_) + step_.alpha() - 1.0) * step_.step();
-    if (((ghost_on_ && !replaying_ && track_->lap_started()) || logger_ghost) && !ghost_.empty() &&
-        ghost_.state_at(ghost_t, 1.0 / step_.step(), gs)) {
+    const bool live_ghost = preset_.ghost && ghost_shown_ && !replaying_ && !demo_ && !preview_;
+    const sim::VehicleSetup* ghost_setup = nullptr;
+    auto add_ghost = [&](const sim::VehicleSetup& su) {
         size_t first = items_.size();
         CarLook ghost_look;
         ghost_look.instance = 1; // its own morph geometry (the car's is drawn this frame too)
-        car_visual_->add_items(items_, gs, vehicle_->setup(), eye, ghost_look);
+        car_visual_->add_items(items_, gs, su, eye, ghost_look);
         for (size_t i = first; i < items_.size(); ++i) items_[i].alpha = 0.4f;
+    };
+    if (live_ghost && exact_field() && (whole_run_ghost() || (lap_ghost() && track_->lap_started())) &&
+        exact_ghost(*exact_field(), step_.alpha(), gs, &ghost_setup)) {
+        add_ghost(*ghost_setup);
+    } else if (logger_ghost && analysis_ && exact_field() && exact_ghost(*exact_field(), step_.alpha(), gs, &ghost_setup)) {
+        add_ghost(*ghost_setup); // the Analyzer's race: track B's car, car 1 of the race
+    } else if (logger_ghost && !logger_ghost_.empty()) {
+        const double ghost_t = (double(player_.tick()) - double(logger_begin_) + step_.alpha() - 1.0) * step_.step();
+        if (logger_ghost_.state_at(ghost_t, 1.0 / step_.step(), gs)) add_ghost(vehicle_->setup());
     }
 }
 
@@ -338,21 +355,18 @@ HudData RaceScreen::hud_data(int player) {
         d.trip_m = odometer_m_;
         // The car's own odometer and oil counter as it drives (physics §10.3): in GT mode the
         // garage car's words the run started with; the oil lamp lights once the oil is worn.
-        if (vehicle_->sim_vehicle()) {
+        if (vehicle_->facts()) {
             const sim::EngineCondition c = vehicle_->engine_condition();
             d.odometer_km = 2.0 * double(c.odometer) / 1000.0;
-            d.oil_lamp = sim::model::oil_worn(c.oil_m);
+            d.oil_lamp = sim::oil_worn(c.oil_m);
         } else {
             d.odometer_km = odometer_m_ / 1000.0;
         }
         d.handbrake_lamp = in.handbrake;
-        if (const sim::Vehicle* sv = vehicle_->sim_vehicle()) {
-            const sim::AidsSpec& sp = sv->spec().aids;
-            const sim::VehicleTelemetry& t = sv->telemetry();
-            bool tcs_on = sp.tcs_gain > 0, asm_on = sim::model::asm_lamp_lit(sp);
-            d.tcs_lamp = !tcs_on ? 0 : t.tcs_active ? 2 : 1;
-            d.asm_lamp = asm_on ? 1 : 0;
-            d.clutch_engaged = t.clutch_locked;
+        if (const sim::VehicleTelemetry* t = vehicle_->telemetry(); t && t->tcs_status >= 0) {
+            d.tcs_lamp = t->tcs_status; // the car's own lamp states (F+0x521 / +0x520)
+            d.asm_lamp = t->asm_status > 0 ? 1 : 0;
+            d.clutch_engaged = t->clutch_locked;
         }
     }
     d.rev_limiter = s.rev_limiter;
@@ -371,14 +385,17 @@ HudData RaceScreen::hud_data(int player) {
         d.last_lap = track_->last_lap_time();
         d.best_lap = track_->best_lap_time();
         d.wrong_way = track_->wrong_way();
-        // Machine tests (presentation §D4): "Best" and "Time" for the time tests, the clock from
-        // GO, both at the time to the goal once it is reached; the top-speed test the speed
-        // lines.
+        // Machine tests (presentation §D4): "Time" for the time tests, the clock from GO, then
+        // the time to the goal once it is reached; the top-speed test the speed lines.
         if (machine_) {
             d.lap_time = finished_ ? machine_time_ : race_time_;
-            d.best_lap = finished_ ? machine_time_ : -1;
             d.best_kmh = hud_top_kmh_;
         }
+        // Best in the solo runs (time trials, free runs, machine tests, licence tests): the
+        // visit's best lap (time to the goal, judged time), kept across retries, dashes until
+        // one; the session best (best_splits_) is that car's alone (presentation §D4).
+        if (whole_run_ghost() || lap_ghost())
+            d.best_lap = best_splits_.best_lap() >= 0 ? double(best_splits_.best_lap()) / 1000.0 : -1;
     }
     // The layout (presentation §D4) and what its time lines show.
     HudModeSelect sel;
@@ -424,8 +441,10 @@ HudData RaceScreen::hud_data(int player) {
         // Flying start: START for 1 s from the signal at the line (presentation §B2).
         d.countdown = race_time_ - flying_go_t_ < 1.0 ? 0 : -1;
     }
-    // Pit lane / flying start run-up: AUTO DRIVE; pit-in pop-up; tyre gauge when wear is on.
-    d.auto_drive = !replaying_ && ((two_player_ && (p2 ? finished2_ : finished_)) || pit_.driving() || flying_runup());
+    // Pit lane (the race's AI drives the car: driver kinds 2-4) / flying start run-up: AUTO DRIVE; pit-in pop-up; tyre
+    // gauge when wear is on.
+    const int kind = p2 ? 0 : driver_kind();
+    d.auto_drive = !replaying_ && ((two_player_ && (p2 ? finished2_ : finished_)) || (kind >= 2 && kind <= 4) || flying_runup());
     // The event display: lap time, splits, gaps, "+N Laps", "Pitting in..." (presentation §D6).
     {
         const EventDisplay& ev = event_display_[p2 ? 1 : 0];
@@ -436,21 +455,22 @@ HudData RaceScreen::hud_data(int player) {
         event_icon_car_[p2 ? 1 : 0] = icon.car;
     }
     if (!p2)
-        if (const sim::Vehicle* sv = vehicle_->sim_vehicle())
-            if (sv->tire_wear_params().on()) {
-                d.show_tires = true;
-                for (int i = 0; i < 4; ++i) d.tire_levels[size_t(i)] = sv->telemetry().wear_level[size_t(i)];
-            }
+        if (const sim::VehicleTelemetry* t = vehicle_->telemetry(); t && t->wear_on) {
+            d.show_tires = true;
+            for (int i = 0; i < 4; ++i) d.tire_levels[size_t(i)] = t->wear_level[size_t(i)];
+        }
     if (license_times_.valid() && !p2) {
         for (int i = 0; i < 3; ++i) d.license_targets[size_t(i)] = license_times_.ms[size_t(i)] / 1000.0;
+        // (Best: the visit's best judged time, medal or not, above: the licence time is the only
+        // "lap" a licence test posts.)
         // The licence clock (the original's HUD: clock - start): standing tests from GO,
         // flying ones from the first line crossing (0 before it); frozen at the result.
         // After the run ends the original's HUD reads the car's recorded time: the finish
         // time, or 359,999,999 after a FAIL, which its formatter shows as -'--.---.
         if (license_.state() == LicenseRun::State::Finished) d.lap_time = license_.time();
         else if (license_.state() == LicenseRun::State::Failed) d.lap_time = -1;
-        else if (!license_.rules().standing && license_.lap_counter() <= 0) d.lap_time = 0;
-        else d.lap_time = std::max(0.0, race_time_ - double(license_.start_ms()) / 1000.0);
+        else if (!license_.rules().standing && !track_->lap_started()) d.lap_time = 0;
+        else d.lap_time = std::max(0.0, race_time_ - license_clock_start_);
     }
     d.car_name = ascii(car_.name);
     d.course_name = course_name_;
@@ -737,9 +757,10 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
         if (show_perf_) {
             char line[160];
             const render::DrawStats& ds = view_->stats();
-            std::snprintf(line, sizeof(line), "%.1f ms  %d/%d meshes  %zuk tris  %s / %s", perf_.avg_frame,
-                          ds.meshes_drawn, ds.meshes_drawn + ds.meshes_culled, ds.triangles / 1000,
-                          vehicle_->backend_name(), track_->backend_name());
+            std::snprintf(line, sizeof(line), "%.1f ms  3D %dx%d  %d/%d meshes  %zuk tris  %s / %s", perf_.avg_frame,
+                          view_->pixel_width(), view_->pixel_height(), ds.meshes_drawn,
+                          ds.meshes_drawn + ds.meshes_culled, ds.triangles / 1000, vehicle_->backend_name(),
+                          track_->backend_name());
             ui.text(10, 52, line, Color{200, 205, 215, 200});
         }
     }
@@ -820,12 +841,6 @@ void RaceScreen::render_drive(App& app, Ui& ui) {
         }
     } else if (finished2_ && two_player_ && !replaying_) {
         results_.draw(ui.renderer(), hud_.fonts(), result_rows(), finish_wait_, menu_dst);
-    }
-    if (replaying_) {
-        // (GT3 shows only the mark; the replay clock is in the pause menu.)
-    } else if (!ghost_.empty() && preset_.hud) {
-        std::string g = "GHOST " + Hud::format_time(ghost_time_);
-        ui.text(std::floor(Ui::kWidth / 2.0f - Ui::text_width(g) / 2), 12, g, Color{170, 200, 255, 220});
     }
     if (exit_transition_ > kExitHold) { // the accumulated grey wash of the delayed fade-out (presentation §C1)
         const SDL_FColor w = menu::flow::ScreenTransition::delay_fadeout_cover(exit_transition_);

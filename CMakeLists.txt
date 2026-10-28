@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(GT3Revisited VERSION 0.3.0 LANGUAGES C CXX)
+project(GT3Revisited VERSION 0.4.0 LANGUAGES C CXX)
 
 # GT3 Revisited: an open reimplementation of the Gran Turismo 3 engine.
 # No game data is part of this project; everything is read at runtime from
@@ -35,7 +35,7 @@ add_library(gt3r_engine STATIC ${GT3R_ENGINE_SOURCES})
 target_include_directories(gt3r_engine PUBLIC src)
 target_link_libraries(gt3r_engine PUBLIC SDL3::SDL3 ZLIB::ZLIB)
 if(APPLE)
-  target_link_libraries(gt3r_engine PUBLIC objc) # platform/mac_layer.cpp
+  target_link_libraries(gt3r_engine PUBLIC objc) # platform/mac_layer.cpp, mac_dialog.cpp
 endif()
 # VR headsets (src/xr, docs/dev/VR.md). The code compiles to nothing without GT3R_XR.
 if(GT3R_XR)
@@ -107,7 +107,7 @@ target_include_directories(${GT3R_APP_TARGET} SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}
 if(GT3R_BUILD_TOOLS AND NOT ANDROID)
   # The online relay server (also builds on its own: tools/gt3r-relay/CMakeLists.txt).
   add_executable(gt3r-relay tools/gt3r-relay/main.cpp src/net/socket.cpp src/net/protocol.cpp
-                 src/net/rendezvous.cpp src/net/relay_server.cpp)
+                 src/net/rendezvous.cpp src/net/relay_server.cpp src/net/geoip.cpp)
   target_include_directories(gt3r-relay PRIVATE src)
   if(WIN32)
     target_link_libraries(gt3r-relay PRIVATE ws2_32)

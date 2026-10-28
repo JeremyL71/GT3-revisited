@@ -1,24 +1,21 @@
 # Contributing
 
-Thanks for helping. GT3 Revisited is an independent reimplementation written
-from documented behaviour (the disc's file formats and how the game
-behaves), verified against the original's observable behaviour. It contains
-no original code, data or assets; game content is read from the player's
-own disc at runtime. The rules about what may go into the repository keep it
-that way, so please read them first.
+Thanks for helping. GT3 Revisited is an independent reimplementation,
+verified against the original. It contains no game data or assets; game
+content is read from the player's own disc at runtime. The rules about what
+may go into the repository keep it that way, so please read them first.
 
 ## Project rules
 
-1. **Never commit original code**, in any form: not the game program or
-   parts of it, not listings or translations of it, not code written by
-   transcribing it. This applies to code, docs, comments, issues and pull
-   requests.
+1. **Never commit the game program**: not the program or any part of it,
+   including listings of its code. This applies to code, docs, comments,
+   issues and pull requests.
 2. **Never commit game data**: no files from the disc, extracted assets,
    textures, sounds, hex dumps of assets, screenshots of game textures used
    as fixtures, or test files cut from the disc. Tests that need game data
    read the user's disc at run time (`test_disc()`, `GT3R_DISC`) and skip
    without it.
-3. **Record behaviour and facts, then implement from that description.**
+3. **Record behaviour and facts.**
    File layouts, constants, table values, algorithms described in prose and
    observed behaviour are fine to record. File formats go in
    [docs/FORMATS.md](docs/FORMATS.md) and [docs/formats/](docs/formats/);
@@ -60,6 +57,11 @@ GT3R_DISC="/path/to/image.iso" ./build/gt3r_tests ai_    # tests whose name cont
   parses, every car builds, races run, saves round-trip. They skip when no
   disc is configured. Run them before sending changes to formats, physics,
   AI, menus or GT Mode.
+- Each `gt3r_tests` run writes only in its own temporary folder
+  (`gt3r-tests-<pid>-<random>`, removed when it ends; `GT3R_KEEP_TEST_TMP=1` keeps it),
+  the code's user data folder included (`GT3R_DATA_DIR`), so runs with different discs can
+  go at once. Tests write files through `test::temp_path` / `test::temp_dir`, never in the
+  working directory.
 - Online code has fuzz targets (`-DGT3R_FUZZ=ON`, see
   [docs/dev/ONLINE.md](docs/dev/ONLINE.md#fuzzing)).
 

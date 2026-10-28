@@ -80,15 +80,18 @@ Plan& plan() {
     return p;
 }
 
-// The database with mod cars, loaded through the set's reader (cached per mod list).
+// The database with mod cars, loaded through the set's reader (cached per mod list and region).
 const data::CarDatabase* database(const menu::flow::FileReader& read) {
     Plan& p = plan();
     auto list = read(Vfs::kModCarsList);
-    std::string text = list ? std::string(list->begin(), list->end()) : std::string();
+    if (!list || list->empty()) {
+        p = Plan{};
+        return nullptr;
+    }
+    std::string text = std::string(region_key(region_data(read).region)) + "\n" + std::string(list->begin(), list->end());
     if (p.db && text == p.list) return p.db.get();
     p = Plan{};
     p.list = text;
-    if (text.empty()) return nullptr;
     auto db = std::make_shared<data::CarDatabase>();
     if (!db->load(read)) return nullptr;
     p.db = db;
@@ -492,5 +495,7 @@ void install_mod_menu_patches() {
         else if (set == "arcade") patch_arcade_layout(read, scene);
     };
 }
+
+void forget_mod_menu_plan() { plan() = Plan{}; }
 
 } // namespace gt3r::game

@@ -9,6 +9,7 @@
 #include "formats/model/wheel_spec.h"
 #include "game/data/car_database.h"
 #include "game/gt_mode_menu.h"
+#include "game/net_car.h"
 #include "menu/flow/menu_set.h"
 #include "menu/flow/menu_sound.h"
 #include "menu/flow/options.h"
@@ -139,6 +140,7 @@ struct PickerArt::Art {
     std::vector<const menu::MenuScene*> scenes;
     std::map<std::string, Ref> car_icons, course_icons, course_maps, course_logos;
     std::map<std::string, Ref> makers, tuner_logos; // by maker_key()
+    std::map<std::string, Ref> class_logos;        // "class_c" ... "class_dirt", "home_garage"
     std::map<std::string, int> maker_region;       // by maker_key(): index into region_flags
     std::vector<Ref> region_flags;
     Ref reflection;
@@ -162,8 +164,8 @@ void PickerArt::load(App& app) {
     if (!app.vfs()) return;
     Art& a = *art_;
     menu::flow::FileReader read = menu::flow::vfs_reader(*app.vfs());
-    std::string lang = app.config().get("gt3menu", "lang").value_or("US");
-    if (!app.vfs()->exists("menu/" + lang + "/arcade1.pmb")) lang = "US";
+    std::string lang = app.language();
+    if (!app.vfs()->exists("menu/" + lang + "/arcade1.pmb")) lang = text::language_code(app.vfs()->region().default_language());
     auto ref_of = [](int scene, const menu::Element& e) {
         Ref r;
         r.scene = scene;
@@ -219,6 +221,10 @@ void PickerArt::load(App& app) {
     });
     for (const auto& [name, r] : others)
         if (a.course_icons.count(name)) a.course_maps[name] = r;
+    // Arcade class page: "<class>_logo" (250 x 130) per class and the home garage.
+    page("arcade", "ar/select_class", [&](const menu::Element& e, const Ref& r) {
+        if (ends(e.name, "_logo")) a.class_logos[e.name.substr(0, e.name.size() - 5)] = r;
+    });
     // GT Mode's car dealers (gt_mode.mbl): "cd/cd" lists the regions (Japan, USA, Germany,
     // ...), each region page its dealers: item "dealer<n>" links "cd/cd_<region>_<maker>",
     // and its layer (str80, "s_0<n>") holds the maker's logo "logo<n>" (475 x 190); the
@@ -316,6 +322,11 @@ bool PickerArt::car_icon(App& app, const std::string& car, const SDL_FRect& dst,
     return draw_ref(app, lookup(art_->car_icons, car), dst, alpha, bright);
 }
 
+bool PickerArt::has_car_icon(App& app, const std::string& car) {
+    load(app);
+    return lookup(art_->car_icons, car) != nullptr;
+}
+
 bool PickerArt::course_icon(App& app, const std::string& course, const SDL_FRect& dst, float alpha) {
     load(app);
     return draw_ref(app, lookup(art_->course_icons, course), dst, alpha);
@@ -391,6 +402,14 @@ bool PickerArt::course_still(App& app, const std::string& course, const SDL_FRec
     SDL_SetTextureAlphaModFloat(t, std::clamp(alpha, 0.0f, 1.0f));
     SDL_RenderTexture(app.renderer(), t, &src, &d);
     return true;
+}
+
+bool PickerArt::class_logo(App& app, int cls, const SDL_FRect& dst, float alpha) {
+    load(app);
+    static const char* const kKeys[] = {"home_garage", "class_c", "class_b", "class_a", "class_s", "class_dirt"};
+    if (cls < 0 || cls > 5) return false;
+    auto it = art_->class_logos.find(kKeys[cls]);
+    return it != art_->class_logos.end() && draw_ref(app, &it->second, dst, alpha);
 }
 
 PickerArt::Image PickerArt::reflection_map(App& app) {
@@ -482,8 +501,8 @@ void CarTurntable::draw(App& app, const SDL_FRect& dst, const data::CarDatabase&
                 if (wheel_file) opt.wheel_override = *wheel_file;
                 scene::Model m = load_car_model(*file, opt, car.model);
                 // Showroom pose: the body rides q (ride height) above the floor, the wheels on it.
-                if (auto spec = sim::build_car_spec(db, car.label); spec && spec->axle[0].susp.valid) {
-                    float q = spec->axle[0].susp.ride_height;
+                if (auto spec = sim::build_car_spec(db, car.label); spec && spec->axle[0].ride_height > 0) {
+                    float q = spec->axle[0].ride_height;
                     for (scene::Mesh& mesh : m.meshes)
                         if (mesh.name.rfind("wheel_", 0) != 0) mesh.transform[13] += q;
                     m.bounds_max[1] += q;
@@ -555,7 +574,58 @@ void CarTurntable::draw(App& app, const SDL_FRect& dst, const data::CarDatabase&
     SDL_FlushRenderer(r);
 }
 
+std::string car_icon_name(const PickerCar& c) {
+    if (c.arcade.empty()) return c.label;
+    game::GtData::ArcadeCar a;
+    a.label = c.arcade;
+    return a.image();
+}
+
+// --- footers and hover ---
+
+bool hovering(const PointerInput& pointer, const UiRect& r) {
+    float x = 0, y = 0;
+    return pointer.hover_pos(x, y) && r.contains(x, y);
+}
+
+void footer_actions(Ui& ui, std::string_view hint, const std::vector<FooterAction>& actions, HitList& hits, int id,
+                    const PointerInput& pointer) {
+    const float y = ui.height() - 16;
+    ui.fill(0, y, ui.width(), 16, colors::kPanel);
+    float x = ui.safe().right() - 4;
+    for (auto it = actions.rbegin(); it != actions.rend(); ++it) {
+        const float w = Ui::text_width(it->label) + 12;
+        x -= w;
+        const UiRect r{x, y + 1.5f, w, 13};
+        const bool hot = hovering(pointer, r);
+        ui.fill_round(r.x, r.y, r.w, r.h, 3, hot ? colors::kHighlight : Color{40, 44, 58});
+        ui.frame_round(r.x, r.y, r.w, r.h, 3, 1, hot ? colors::kAccent : colors::kOutline);
+        ui.text(r.x + 6, y + 4, it->label, hot ? colors::kAccent : colors::kText);
+        hits.add(r, id, it->arg);
+        x -= 4;
+    }
+    const float room = x - (ui.safe().x + 8) - 6;
+    if (room > 16) ui.text(ui.safe().x + 8, y + 4, Ui::clip(hint, room), colors::kDim);
+}
+
 // --- car picker ---
+
+namespace {
+
+// The car page's strip and paint column (menus §9.5).
+constexpr float kStripStep = 55, kStripIconW = 51, kStripIconH = 27, kStripY = 272;
+constexpr float kPaintX = 34, kPaintY = 120, kPaintPitch = 20;
+constexpr float kTabsY = 24, kTabsH = 18;
+// The group pages' tiles: 4 x 4 makers, 3 x 2 classes (the class logos are 250 x 130).
+struct Grid {
+    int cols, rows;
+    float w, h, gap, y0;
+    float x0() const { return (Ui::kWidth - (float(cols) * w + float(cols - 1) * gap)) / 2; }
+};
+constexpr Grid kMakerGrid{4, 4, 148, 56, 6, 48};
+constexpr Grid kClassGrid{3, 2, 200, 116, 8, 50};
+
+} // namespace
 
 CarPicker::CarPicker() = default;
 CarPicker::~CarPicker() = default;
@@ -567,7 +637,7 @@ std::vector<PaintInfo> CarPicker::paints(App& app, const PickerCar& c) const {
     auto info = [&](u32 id) {
         PaintInfo p;
         p.rgb = gd ? gd->color_rgb(id) : 0x808080;
-        std::string n = gd ? ascii(gd->color_name(id)) : "";
+        std::string n = gd ? ascii(gd->color_name_latin(id)) : "";
         if (!n.empty() && n[0] != '-') p.name = n; // names starting with '-' show nothing (menus §9.5)
         return p;
     };
@@ -595,20 +665,34 @@ std::vector<PaintInfo> CarPicker::paints(App& app, const PickerCar& c) const {
     return out;
 }
 
-// The garage first, then the makers by dealer region in GT Mode's order (Japan, USA,
-// Germany, ...) and name; makers without a dealer last.
+// Maker page: the garage first, then the makers by dealer region in GT Mode's order (Japan,
+// USA, Germany, ...) and name; makers without a dealer last. Class page: the arcade class
+// page's order, classes C, B, A, S, rally cars, then the garage. Only the allowed cars when
+// filtering; groups left empty are dropped.
 void CarPicker::build_groups(App& app) {
     groups_.clear();
-    Group garage{"", "GARAGE", {}, -1};
+    auto listed = [&](size_t i) { return !filtering() || allowed_(int(i)); };
+    Group garage{"", by_class_ ? "Garage" : "GARAGE", {}, -1, by_class_ ? 0 : -1};
+    for (size_t i = 0; i < cars_->size(); ++i)
+        if ((*cars_)[i].garage >= 0 && listed(i)) garage.cars.push_back(int(i));
+    if (by_class_) {
+        for (int k = 1; k <= game::kArcadeClasses; ++k) {
+            Group g{"", game::arcade_class_name(k), {}, -1, k};
+            for (size_t i = 0; i < cars_->size(); ++i) {
+                const PickerCar& c = (*cars_)[i];
+                if (c.garage < 0 && c.arcade_class == k && listed(i)) g.cars.push_back(int(i));
+            }
+            if (!g.cars.empty()) groups_.push_back(std::move(g));
+        }
+        if (!garage.cars.empty()) groups_.push_back(std::move(garage));
+        return;
+    }
     // By maker_key(): the database spells some makers two ways ("CHEVROLET" with and without
     // a trailing space).
     std::map<std::string, std::pair<std::string, std::vector<int>>> by_maker;
     for (size_t i = 0; i < cars_->size(); ++i) {
         const PickerCar& c = (*cars_)[i];
-        if (c.garage >= 0) {
-            garage.cars.push_back(int(i));
-            continue;
-        }
+        if (c.garage >= 0 || !c.arcade.empty() || !listed(i)) continue; // arcade cars: the class page
         std::string maker = ascii(c.maker);
         while (!maker.empty() && maker.back() == ' ') maker.pop_back();
         if (maker.empty()) maker = "OTHER";
@@ -619,28 +703,58 @@ void CarPicker::build_groups(App& app) {
     if (!garage.cars.empty()) groups_.push_back(std::move(garage));
     size_t first = groups_.size();
     for (auto& [key, g] : by_maker)
-        groups_.push_back({g.first, title_case(g.first), std::move(g.second), art_->maker_region(app, g.first)});
+        groups_.push_back({g.first, title_case(g.first), std::move(g.second), art_->maker_region(app, g.first), -1});
     std::stable_sort(groups_.begin() + ptrdiff_t(first), groups_.end(), [](const Group& a, const Group& b) {
         return unsigned(a.region) < unsigned(b.region); // -1 (no dealer) last
     });
 }
 
+void CarPicker::regroup(App& app) {
+    build_groups(app);
+    bool found = false;
+    for (size_t g = 0; g < groups_.size() && !found; ++g)
+        for (size_t k = 0; k < groups_[g].cars.size() && !found; ++k)
+            if (groups_[g].cars[k] == car_) group_ = int(g), pos_ = int(k), found = true;
+    if (!found) {
+        in_group_ = false;
+        group_ = std::clamp(group_, 0, std::max(0, int(groups_.size()) - 1));
+        pos_ = 0;
+    }
+    if (groups_.empty()) in_group_ = false;
+    group_scroll_ = 0;
+    drag_pos_ = -1;
+    if (in_group_) strip_x_ = strip_target(int(groups_[size_t(group_)].cars.size()), pos_, kStripStep, kStripIconW);
+}
+
 void CarPicker::open(App& app, PickerArt& art, const data::CarDatabase& db, const std::vector<PickerCar>& cars, int selected,
-                     int paint, std::function<std::string(int, int)> note) {
+                     int paint, std::function<std::string(int, int)> note, std::function<bool(int)> allowed) {
     art_ = &art;
     db_ = &db;
     cars_ = &cars;
     note_ = std::move(note);
-    build_groups(app);
+    allowed_ = std::move(allowed);
     car_ = std::clamp(selected, 0, std::max(0, int(cars.size()) - 1));
     paint_ = paint;
-    group_ = 0, pos_ = 0;
-    for (size_t g = 0; g < groups_.size(); ++g)
-        for (size_t k = 0; k < groups_[g].cars.size(); ++k)
-            if (groups_[g].cars[k] == car_) group_ = int(g), pos_ = int(k);
-    in_group_ = !groups_.empty();
-    maker_scroll_ = 0;
-    strip_x_ = in_group_ ? strip_target(int(groups_[size_t(group_)].cars.size()), pos_, 55, 51) : 0;
+    pointer_.clear();
+    wheel_ = 0;
+    has_classes_ = std::any_of(cars.begin(), cars.end(), [](const PickerCar& c) { return c.arcade_class > 0; });
+    if (!has_classes_) by_class_ = false;
+    // Open at the car: on the page that lists it (this view, else the other one).
+    in_group_ = true;
+    regroup(app);
+    if (!in_group_ && has_classes_) {
+        by_class_ = !by_class_;
+        in_group_ = true;
+        regroup(app);
+        if (!in_group_) { // on neither: the page left with tiles
+            by_class_ = !by_class_;
+            regroup(app);
+            if (groups_.empty()) {
+                by_class_ = !by_class_;
+                regroup(app);
+            }
+        }
+    }
     paint_y_ = float(paint_);
     pulse_ = 0;
 }
@@ -652,122 +766,281 @@ void CarPicker::enter_group(int g, int pos) {
     car_ = groups_[size_t(g)].cars[size_t(pos)];
     paint_ = 0;
     paint_y_ = 0;
-    strip_x_ = strip_target(int(groups_[size_t(g)].cars.size()), pos, 55, 51);
+    strip_x_ = strip_target(int(groups_[size_t(g)].cars.size()), pos, kStripStep, kStripIconW);
     pulse_ = 0;
 }
 
-CarPicker::Result CarPicker::update(App& app) {
-    const MenuInput& m = app.menu();
-    ++pulse_;
-    if (groups_.empty()) return m.pressed(PadButton::Triangle) || m.pressed(PadButton::Circle) ? Result::Cancelled
-                                                                                                : Result::None;
-    if (!in_group_) {
-        constexpr int kCols = 4;
-        int n = int(groups_.size());
-        int h = m.horizontal(), v = m.vertical();
-        if (h || v) {
-            int to = std::clamp(group_ + h + v * kCols, 0, n - 1);
-            if (to != group_) group_ = to, picker_sound(app, "cursor");
-            else picker_sound(app, "disable");
-        }
-        if (m.pressed(PadButton::Cross)) {
+void CarPicker::set_pos(App& app, int pos) {
+    const Group& g = groups_[size_t(group_)];
+    int to = std::clamp(pos, 0, int(g.cars.size()) - 1);
+    if (to == pos_) {
+        picker_sound(app, "disable"); // the strip clamps at its ends
+        return;
+    }
+    pos_ = to;
+    car_ = g.cars[size_t(pos_)];
+    paint_ = 0; // each new car starts at its first paint
+    pulse_ = 0;
+    picker_sound(app, "cursor");
+}
+
+void CarPicker::set_paint(App& app, int paint) {
+    const PickerCar& c = (*cars_)[size_t(car_)];
+    int count = c.garage >= 0 ? 1 : int(paints(app, c).size());
+    int to = std::clamp(paint, 0, count - 1);
+    if (to != paint_) paint_ = to, picker_sound(app, "cursor");
+    else picker_sound(app, "disable");
+}
+
+CarPicker::Result CarPicker::footer_action(App& app, int which) {
+    switch (which) {
+    case kChoose:
+        if (in_group_) {
             picker_sound(app, "ok");
-            // Back into the group of the lobby's car at that car, else at its first.
+            return Result::Chosen;
+        }
+        if (!groups_.empty()) { // the focused group's cars, at the lobby's car when it is there
+            picker_sound(app, "ok");
             int pos = 0;
             for (size_t k = 0; k < groups_[size_t(group_)].cars.size(); ++k)
                 if (groups_[size_t(group_)].cars[k] == car_) pos = int(k);
             int keep_paint = groups_[size_t(group_)].cars[size_t(pos)] == car_ ? paint_ : 0;
             enter_group(group_, pos);
             paint_ = keep_paint, paint_y_ = float(paint_);
-        } else if (m.pressed(PadButton::Triangle) || m.pressed(PadButton::Circle)) {
-            picker_sound(app, "cancel");
-            return Result::Cancelled;
         }
-        return Result::None;
-    }
-    const Group& g = groups_[size_t(group_)];
-    int n = int(g.cars.size());
-    int h = m.horizontal();
-    if (m.pressed(PadButton::L1)) h = -10;
-    if (m.pressed(PadButton::R1)) h = 10;
-    if (h) {
-        int to = std::clamp(pos_ + h, 0, n - 1);
-        if (to != pos_) {
-            pos_ = to;
-            car_ = g.cars[size_t(pos_)];
-            paint_ = 0; // each new car starts at its first paint
-            pulse_ = 0;
-            picker_sound(app, "cursor");
-        } else {
-            picker_sound(app, "disable"); // the strip clamps at its ends
-        }
-    }
-    if (int v = m.vertical()) {
-        int count = (*cars_)[size_t(car_)].garage >= 0 ? 1 : int(paints(app, (*cars_)[size_t(car_)]).size());
-        int to = std::clamp(paint_ + v, 0, count - 1);
-        if (to != paint_) paint_ = to, picker_sound(app, "cursor");
-        else picker_sound(app, "disable");
-    }
-    if (m.pressed(PadButton::Cross)) {
-        picker_sound(app, "ok");
-        return Result::Chosen;
-    }
-    if (m.pressed(PadButton::Triangle) || m.pressed(PadButton::Circle)) {
+        break;
+    case kBack:
         picker_sound(app, "cancel");
+        if (!in_group_ || groups_.empty()) return Result::Cancelled;
         in_group_ = false;
+        break;
+    case kToggleFilter:
+        if (!allowed_) break;
+        allowed_only_ = !allowed_only_;
+        picker_sound(app, "ok");
+        regroup(app);
+        break;
+    case kSwitchView:
+        if (!has_classes_) break;
+        by_class_ = !by_class_;
+        picker_sound(app, "cursor");
+        in_group_ = false;
+        group_ = 0; // the other page from its first tile (or at the car)
+        regroup(app);
+        in_group_ = false; // the other page's tiles
+        break;
+    default: break;
     }
     return Result::None;
 }
 
+CarPicker::Result CarPicker::pointer_actions(App& app) {
+    using K = PointerInput::Action::Kind;
+    for (const PointerInput::Action& a : pointer_.take()) {
+        if (a.kind == K::Back) return footer_action(app, kBack);
+        if (a.kind == K::Wheel) {
+            wheel_ += a.wheel;
+            int steps = int(wheel_);
+            wheel_ -= float(steps);
+            if (!steps || groups_.empty()) continue;
+            if (!in_group_) { // a row of tiles per step (wheel down: the next row)
+                const Grid& gr = by_class_ ? kClassGrid : kMakerGrid;
+                int to = std::clamp(group_ - steps * gr.cols, 0, int(groups_.size()) - 1);
+                if (to != group_) group_ = to, picker_sound(app, "cursor");
+            } else if (a.x < kPaintX + 30 && a.y > kPaintY - 3 * kPaintPitch && a.y < kPaintY + 5 * kPaintPitch) {
+                set_paint(app, paint_ - steps);
+            } else {
+                set_pos(app, pos_ - steps);
+            }
+            continue;
+        }
+        if (a.kind == K::Drag || a.kind == K::DragEnd) { // along the strip: one car per step
+            if (!in_group_ || a.sy < kStripY - 6 || a.sy > kStripY + kStripIconH + 6) continue;
+            if (drag_pos_ < 0) drag_pos_ = pos_;
+            int to = std::clamp(drag_pos_ - int(std::lround((a.x - a.sx) / kStripStep)), 0,
+                                int(groups_[size_t(group_)].cars.size()) - 1);
+            if (to != pos_) set_pos(app, to);
+            if (a.kind == K::DragEnd) drag_pos_ = -1;
+            continue;
+        }
+        const HitArea* h = hits_.at(a.x, a.y);
+        if (!h) continue;
+        if (a.kind == K::Hover) { // fixed tiles follow a hovering pointer; the strip does not
+            if (h->id == kTile && !in_group_ && h->arg != group_) group_ = h->arg, picker_sound(app, "cursor");
+            continue;
+        }
+        if (a.kind != K::Click) continue;
+        switch (h->id) {
+        case kTile:
+            if (in_group_) break;
+            if (a.finger && h->arg != group_) { // a finger: the first tap focuses
+                group_ = h->arg;
+                picker_sound(app, "cursor");
+                break;
+            }
+            group_ = h->arg;
+            footer_action(app, kChoose);
+            pointer_.clear();
+            return Result::None; // a new page: its own areas
+        case kTab:
+            if ((h->arg == 1) != by_class_) footer_action(app, kSwitchView);
+            pointer_.clear();
+            return Result::None;
+        case kFilter: footer_action(app, kToggleFilter); return Result::None;
+        case kStrip:
+            if (!in_group_) break;
+            if (h->arg == pos_) return footer_action(app, kChoose); // a second click chooses
+            set_pos(app, h->arg);
+            break;
+        case kStripArrow:
+            if (in_group_) set_pos(app, pos_ + h->arg);
+            break;
+        case kPaint:
+            if (in_group_) set_paint(app, h->arg);
+            break;
+        case kFooter: {
+            Result r = footer_action(app, h->arg);
+            pointer_.clear();
+            return r;
+        }
+        default: break;
+        }
+    }
+    return Result::None;
+}
+
+CarPicker::Result CarPicker::update(App& app) {
+    const MenuInput& m = app.menu();
+    ++pulse_;
+    if (Result r = pointer_actions(app); r != Result::None) return r;
+    if (allowed_ && m.pressed(PadButton::Square)) footer_action(app, kToggleFilter);
+    if (!in_group_ && (m.pressed(PadButton::L1) || m.pressed(PadButton::R1))) footer_action(app, kSwitchView);
+    if (groups_.empty()) {
+        if (m.pressed(PadButton::Triangle) || m.pressed(PadButton::Circle)) return footer_action(app, kBack);
+        return Result::None;
+    }
+    if (!in_group_) {
+        const Grid& gr = by_class_ ? kClassGrid : kMakerGrid;
+        int n = int(groups_.size());
+        int h = m.horizontal(), v = m.vertical();
+        if (h || v) {
+            int to = std::clamp(group_ + h + v * gr.cols, 0, n - 1);
+            if (to != group_) group_ = to, picker_sound(app, "cursor");
+            else picker_sound(app, "disable");
+        }
+        if (m.pressed(PadButton::Cross)) footer_action(app, kChoose);
+        else if (m.pressed(PadButton::Triangle) || m.pressed(PadButton::Circle)) return footer_action(app, kBack);
+        return Result::None;
+    }
+    int h = m.horizontal();
+    if (m.pressed(PadButton::L1)) h = -10;
+    if (m.pressed(PadButton::R1)) h = 10;
+    if (h) set_pos(app, pos_ + h);
+    if (int v = m.vertical()) set_paint(app, paint_ + v);
+    if (m.pressed(PadButton::Cross)) return footer_action(app, kChoose);
+    if (m.pressed(PadButton::Triangle) || m.pressed(PadButton::Circle)) footer_action(app, kBack);
+    return Result::None;
+}
+
 void CarPicker::render(App& app, Ui& ui) {
-    if (!cars_ || groups_.empty()) {
+    hits_.clear();
+    if (!cars_ || cars_->empty()) {
         ui.clear();
         ui.header("CAR SELECT", "");
         ui.text_center(150, "No cars", colors::kBad);
-        ui.footer("Triangle: back");
+        footer_actions(ui, "", {{"Triangle: back", kBack}}, hits_, kFooter, pointer_);
         return;
     }
-    if (in_group_) render_cars(app, ui);
-    else render_makers(app, ui);
+    if (in_group_ && !groups_.empty()) render_cars(app, ui);
+    else render_groups(app, ui);
 }
 
-void CarPicker::render_makers(App& app, Ui& ui) {
+// The Makers / Classes tabs and, with the lobby's rules, the allowed-cars switch.
+void CarPicker::render_tabs(App& app, Ui& ui, float y) {
+    (void)app;
+    float x = 12;
+    for (int t = 0; t < 2 && has_classes_; ++t) {
+        const char* label = t ? "Classes" : "Makers";
+        const bool active = (t == 1) == by_class_;
+        const UiRect r{x, y, ui.tab_width(label), kTabsH};
+        ui.tab(r.x, r.y, r.h, label, active, !active && hovering(pointer_, r));
+        hits_.add(r, kTab, t);
+        x += r.w + 4;
+    }
+    if (has_classes_) ui.text(x + 6, y + 5, "L1/R1", colors::kDim);
+    if (!allowed_) return;
+    const std::string label = "Only cars this lobby allows";
+    const float w = Ui::text_width(label) + 10 + ui.toggle_width();
+    const UiRect r{Ui::kWidth - 12 - w, y, w, kTabsH};
+    if (hovering(pointer_, r)) ui.fill_round(r.x - 4, r.y, r.w + 8, r.h, 4, colors::kHighlight);
+    ui.text(r.x, y + 5, label, allowed_only_ ? colors::kText : colors::kDim);
+    ui.toggle_pill(r.right() - ui.toggle_width(), y + kTabsH / 2, allowed_only_);
+    hits_.add(r, kFilter);
+}
+
+void CarPicker::render_groups(App& app, Ui& ui) {
     ui.clear();
     fill_gradient(ui, 0, 20, Ui::kWidth, Ui::kHeight - 36, Color{24, 28, 40}, Color{8, 9, 12});
-    ui.header("CAR SELECT", "Choose a maker");
-    constexpr int kCols = 4, kRows = 4;
-    constexpr float kW = 148, kH = 60, kGap = 6, kX0 = (Ui::kWidth - (kCols * kW + (kCols - 1) * kGap)) / 2,
-                    kY0 = 30;
-    int row = group_ / kCols;
-    if (row < maker_scroll_) maker_scroll_ = row;
-    if (row >= maker_scroll_ + kRows) maker_scroll_ = row - kRows + 1;
-    for (int i = maker_scroll_ * kCols; i < int(groups_.size()) && i < (maker_scroll_ + kRows) * kCols; ++i) {
+    ui.header("CAR SELECT", by_class_ ? "Choose a class" : "Choose a maker");
+    render_tabs(app, ui, kTabsY);
+    std::vector<FooterAction> foot;
+    if (!groups_.empty()) foot.push_back({"Cross: its cars", kChoose});
+    if (has_classes_) foot.push_back({by_class_ ? "L1/R1: makers" : "L1/R1: classes", kSwitchView});
+    if (allowed_) foot.push_back({allowed_only_ ? "Square: all cars" : "Square: allowed only", kToggleFilter});
+    foot.push_back({"Triangle: back", kBack});
+    if (groups_.empty()) {
+        if (!filtering()) {
+            ui.text_center(130, "No cars here.", colors::kText);
+        } else {
+            ui.text_center(130, by_class_ ? "No class car meets this lobby's rules." : "No maker's car meets this lobby's rules.",
+                           colors::kText);
+            ui.text_center(146, !has_classes_ ? "Show all cars (Square)."
+                                : by_class_   ? "Try the makers (L1/R1), or show all cars (Square)."
+                                              : "Try the classes (L1/R1), or show all cars (Square).",
+                           colors::kDim);
+        }
+        footer_actions(ui, "", foot, hits_, kFooter, pointer_);
+        return;
+    }
+    const Grid& gr = by_class_ ? kClassGrid : kMakerGrid;
+    int row = group_ / gr.cols;
+    if (row < group_scroll_) group_scroll_ = row;
+    if (row >= group_scroll_ + gr.rows) group_scroll_ = row - gr.rows + 1;
+    for (int i = group_scroll_ * gr.cols; i < int(groups_.size()) && i < (group_scroll_ + gr.rows) * gr.cols; ++i) {
         const Group& g = groups_[size_t(i)];
-        float x = kX0 + float(i % kCols) * (kW + kGap), y = kY0 + float(i / kCols - maker_scroll_) * (kH + kGap);
-        bool f = i == group_;
-        ui.fill_round(x, y, kW, kH, 6, f ? Color{58, 64, 92} : Color{30, 33, 44, 230});
-        if (f) ui.frame_round(x, y, kW, kH, 6, 2, colors::kAccent);
+        const float x = gr.x0() + float(i % gr.cols) * (gr.w + gr.gap);
+        const float y = gr.y0 + float(i / gr.cols - group_scroll_) * (gr.h + gr.gap);
+        const bool f = i == group_;
+        ui.fill_round(x, y, gr.w, gr.h, 6, f ? Color{58, 64, 92} : Color{30, 33, 44, 230});
+        if (f) ui.frame_round(x, y, gr.w, gr.h, 6, 2, colors::kAccent);
+        hits_.add({x, y, gr.w, gr.h}, kTile, i);
+        std::string count = std::to_string(g.cars.size()) + (g.cars.size() == 1 ? " car" : " cars");
+        if (by_class_) { // the class page's logo, its name and count under it
+            if (!art_->class_logo(app, g.cls, SDL_FRect{x + 8, y + 6, gr.w - 16, gr.h - 30}, f ? 1.0f : 0.75f))
+                ui.text_big(x + (gr.w - Ui::text_width(g.title, 2)) / 2, y + 36, g.title, 2, f ? colors::kAccent : colors::kText);
+            ui.text_center_in(x, gr.w, y + gr.h - 20, g.title + "  -  " + count, f ? colors::kAccent : colors::kDim);
+            continue;
+        }
         if (!g.maker.empty()) art_->region_flag(app, g.region, SDL_FRect{x + 5, y + 4, 15, 12}, f ? 1.0f : 0.7f);
-        SDL_FRect logo{x + 22, y + 4, kW - 44, kH - 19};
+        SDL_FRect logo{x + 22, y + 4, gr.w - 44, gr.h - 19};
         bool drawn = !g.maker.empty() && art_->maker_logo(app, g.maker, logo, f ? 1.0f : 0.8f);
         if (!drawn) {
-            std::string t = Ui::clip(g.title, kW - 12);
+            std::string t = Ui::clip(g.title, gr.w - 12);
             float tw = Ui::text_width(t, 2);
-            if (tw <= kW - 12) ui.text_big(x + (kW - tw) / 2, y + 14, t, 2, f ? colors::kAccent : colors::kText);
-            else ui.text_center_in(x, kW, y + 18, t, f ? colors::kAccent : colors::kText);
+            if (tw <= gr.w - 12) ui.text_big(x + (gr.w - tw) / 2, y + 13, t, 2, f ? colors::kAccent : colors::kText);
+            else ui.text_center_in(x, gr.w, y + 17, t, f ? colors::kAccent : colors::kText);
         }
-        std::string count = std::to_string(g.cars.size()) + (g.cars.size() == 1 ? " car" : " cars");
         if (g.maker.empty()) count = "GT Mode, " + count;
         else if (drawn) count = g.title + "  -  " + count; // makers may share a logo (two "Chevrolet")
-        ui.text_center_in(x, kW, y + kH - 13, count, colors::kDim);
+        ui.text_center_in(x, gr.w, y + gr.h - 13, count, colors::kDim);
     }
-    int rows = (int(groups_.size()) + kCols - 1) / kCols;
-    if (rows > kRows) {
-        UiRect view{Ui::kWidth - 8, kY0, 4, kRows * (kH + kGap) - kGap};
-        ui.scrollbar(view, float(rows) * (kH + kGap), float(maker_scroll_) * (kH + kGap));
+    int rows = (int(groups_.size()) + gr.cols - 1) / gr.cols;
+    if (rows > gr.rows) {
+        UiRect view{Ui::kWidth - 8, gr.y0, 4, float(gr.rows) * (gr.h + gr.gap) - gr.gap};
+        ui.scrollbar(view, float(rows) * (gr.h + gr.gap), float(group_scroll_) * (gr.h + gr.gap));
     }
-    ui.text_center(kY0 + kRows * (kH + kGap) + 4, groups_[size_t(group_)].title, colors::kAccent);
-    ui.footer("Arrows: maker   Cross: its cars   Triangle: back to the lobby");
+    ui.text_center(gr.y0 + float(gr.rows) * (gr.h + gr.gap) + 2, groups_[size_t(group_)].title, colors::kAccent);
+    footer_actions(ui, "Arrows: choose", foot, hits_, kFooter, pointer_);
 }
 
 void CarPicker::render_cars(App& app, Ui& ui) {
@@ -783,7 +1056,7 @@ void CarPicker::render_cars(App& app, Ui& ui) {
     int paint = c.garage >= 0 ? c.paint : std::clamp(paint_, 0, int(pal.size()) - 1);
     turntable_.draw(app, SDL_FRect{70, 40, 430, 222}, *db_, c, paint, *art_);
 
-    // Name and maker.
+    // Name and maker (an arcade car: its class's logo).
     const data::Car* dc = db_->car(c.label);
     std::string name = c.name.rfind("Garage: ", 0) == 0 ? c.name.substr(8) : c.name;
     if (!art_->maker_logo(app, c.maker, SDL_FRect{12, 24, 96, 32}))
@@ -793,23 +1066,29 @@ void CarPicker::render_cars(App& app, Ui& ui) {
     // Paint column (menus §9.5: the current paint, up to two slots above and four below), eased.
     paint_y_ += (float(c.garage >= 0 ? 0 : paint) - paint_y_) * 0.3f;
     {
-        const float cx = 34, cy = 120, pitch = 20;
         int n = c.garage >= 0 ? 1 : int(pal.size());
         int cur = c.garage >= 0 ? 0 : paint;
         for (int i = 0; i < n; ++i) {
             float off = float(i) - paint_y_;
             if (off < -2.5f || off > 4.5f) continue;
-            float y = cy + off * pitch;
+            float y = kPaintY + off * kPaintPitch;
             float a = off < -1.5f || off > 3.5f ? 0.4f : 1.0f;
             u32 rgb = c.garage >= 0 ? pal[0].rgb : pal[size_t(i)].rgb;
             float sz = i == cur ? 16.0f : 12.0f;
             Color k{u8(rgb), u8(rgb >> 8), u8(rgb >> 16), u8(255 * a)};
-            if (i == cur) ui.fill_round(cx - sz / 2 - 2, y - sz / 2 - 2, sz + 4, sz + 4, 3, colors::kAccent);
-            ui.fill_round(cx - sz / 2 - 1, y - sz / 2 - 1, sz + 2, sz + 2, 2, Color{0, 0, 0, u8(255 * a)});
-            ui.fill_round(cx - sz / 2, y - sz / 2, sz, sz, 2, k);
+            if (i == cur) ui.fill_round(kPaintX - sz / 2 - 2, y - sz / 2 - 2, sz + 4, sz + 4, 3, colors::kAccent);
+            ui.fill_round(kPaintX - sz / 2 - 1, y - sz / 2 - 1, sz + 2, sz + 2, 2, Color{0, 0, 0, u8(255 * a)});
+            ui.fill_round(kPaintX - sz / 2, y - sz / 2, sz, sz, 2, k);
+            if (c.garage < 0) hits_.add({kPaintX - 10, y - kPaintPitch / 2, 20, kPaintPitch}, kPaint, i);
         }
-        if (c.garage < 0 && cur > 0) ui.text_center_in(cx - 10, 20, cy - pitch * 1.0f - 20, "^", colors::kDim);
-        if (c.garage < 0 && cur + 1 < n) ui.text_center_in(cx - 10, 20, cy + pitch * 4.6f, "v", colors::kDim);
+        if (c.garage < 0 && cur > 0) {
+            ui.text_center_in(kPaintX - 10, 20, kPaintY - kPaintPitch * 1.0f - 20, "^", colors::kDim);
+            hits_.add({kPaintX - 10, kPaintY - kPaintPitch - 24, 20, 14}, kPaint, cur - 1);
+        }
+        if (c.garage < 0 && cur + 1 < n) {
+            ui.text_center_in(kPaintX - 10, 20, kPaintY + kPaintPitch * 4.6f, "v", colors::kDim);
+            hits_.add({kPaintX - 10, kPaintY + kPaintPitch * 4.6f - 3, 20, 14}, kPaint, cur + 1);
+        }
         std::string pname = pal[size_t(c.garage >= 0 ? 0 : cur)].name;
         std::string line = c.garage >= 0 ? "the garage car's own paint"
                                          : std::to_string(cur + 1) + " / " + std::to_string(n);
@@ -825,21 +1104,23 @@ void CarPicker::render_cars(App& app, Ui& ui) {
             if (value.empty()) return;
             ui.text(x, y, label, colors::kDim);
             ui.text(x, y + 11, Ui::clip(value, 120), colors::kText);
-            y += 28;
+            y += 27;
         };
         char buf[64];
+        if (!c.arcade.empty()) spec("Class", std::string(game::arcade_class_name(c.arcade_class)) + ", arcade car");
+        else spec("Class", c.class_text);
         if (sm.year) spec("Year", std::to_string(sm.year));
         spec("Drive", ascii(sm.drive));
         // Power as the game's menus show it: a garage car's computed peak (parts and
-        // condition), else the catalogue figure; truncated, HP on NTSC-U data.
+        // condition), else the catalogue figure; truncated, in the language's unit.
         game::GtModeSession* gs = game::gt_mode_session();
-        const bool imperial = gs ? gs->gt().data().imperial : Disc::current_db_suffix() == "_us";
-        const std::string unit = std::string(" ") + game::power_unit(imperial);
+        const Units units = gs ? gs->gt().data().units : language_units(app.vfs() ? app.vfs()->language() : Language::US);
+        const std::string unit = std::string(" ") + game::power_unit(units);
         if (c.garage >= 0 && gs && c.garage < int(gs->gt().state().garage.size())) {
             game::PowerPeak p = gs->gt().power_peak(gs->gt().state().garage[size_t(c.garage)]);
-            spec("Power", std::to_string(game::display_power(p.ps, imperial)) + unit + " / " + std::to_string(p.rpm) + "rpm");
+            spec("Power", std::to_string(game::display_power(p.ps, units)) + unit + " / " + std::to_string(p.rpm) + "rpm");
         } else if (sm.power_ps) {
-            spec("Power", std::to_string(game::display_power(float(sm.power_ps), imperial)) + unit +
+            spec("Power", std::to_string(game::display_power(float(sm.power_ps), units)) + unit +
                               (sm.power_rpm.empty() ? "" : " / " + ascii(sm.power_rpm)));
         }
         if (sm.torque_kgfm > 0) {
@@ -853,32 +1134,44 @@ void CarPicker::render_cars(App& app, Ui& ui) {
 
     // The icon strip.
     int n = int(g.cars.size());
-    constexpr float kStep = 55, kIconW = 51, kIconH = 27, kStripY = 272;
-    strip_x_ += (strip_target(n, pos_, kStep, kIconW) - strip_x_) * 0.3f;
-    ui.fill(0, kStripY - 5, Ui::kWidth, kIconH + 10, kStripBack);
-    SDL_Rect clip{20, int(kStripY - 4), 600, int(kIconH + 8)};
+    strip_x_ += (strip_target(n, pos_, kStripStep, kStripIconW) - strip_x_) * 0.3f;
+    ui.fill(0, kStripY - 5, Ui::kWidth, kStripIconH + 10, kStripBack);
+    SDL_Rect clip{20, int(kStripY - 4), 600, int(kStripIconH + 8)};
     SDL_SetRenderClipRect(app.renderer(), &clip);
     for (int i = 0; i < n; ++i) {
-        float x = strip_x_ + float(i) * kStep;
-        if (x + kIconW < 20 || x > 620) continue;
+        float x = strip_x_ + float(i) * kStripStep;
+        if (x + kStripIconW < 20 || x > 620) continue;
         const PickerCar& e = (*cars_)[size_t(g.cars[size_t(i)])];
         bool f = i == pos_;
         float bright = f ? pulse(pulse_) * 0.4f + 0.6f : 0.7f;
-        SDL_FRect d{x, kStripY, kIconW, kIconH};
-        if (!art_->car_icon(app, e.label, d, 1, bright)) {
-            ui.fill_round(x, kStripY, kIconW, kIconH, 3, Color{50, 54, 70});
+        SDL_FRect d{x, kStripY, kStripIconW, kStripIconH};
+        if (!art_->car_icon(app, car_icon_name(e), d, 1, bright) && !art_->car_icon(app, e.label, d, 1, bright)) {
+            ui.fill_round(x, kStripY, kStripIconW, kStripIconH, 3, Color{50, 54, 70});
             std::string nm = e.name.rfind("Garage: ", 0) == 0 ? e.name.substr(8) : e.name;
-            ui.text_center_in(x, kIconW, kStripY + 9, Ui::clip(nm, kIconW - 4), f ? colors::kAccent : colors::kDim);
+            ui.text_center_in(x, kStripIconW, kStripY + 9, Ui::clip(nm, kStripIconW - 4), f ? colors::kAccent : colors::kDim);
         }
-        if (f) ui.frame_round(x - 2, kStripY - 2, kIconW + 4, kIconH + 4, 3, 1, colors::kAccent);
+        if (f) ui.frame_round(x - 2, kStripY - 2, kStripIconW + 4, kStripIconH + 4, 3, 1, colors::kAccent);
+        else if (hovering(pointer_, {x, kStripY, kStripIconW, kStripIconH}))
+            ui.frame_round(x - 2, kStripY - 2, kStripIconW + 4, kStripIconH + 4, 3, 1, colors::kOutline);
+        const float x0 = std::max(x, 20.0f), x1 = std::min(x + kStripIconW, 620.0f);
+        if (x1 > x0) hits_.add({x0, kStripY - 2, x1 - x0, kStripIconH + 4}, kStrip, i);
     }
     SDL_SetRenderClipRect(app.renderer(), nullptr);
-    if (pos_ > 0) ui.text(6, kStripY + 9, "<", colors::kAccent);
-    if (pos_ + 1 < n) ui.text_right(Ui::kWidth - 6, kStripY + 9, ">", colors::kAccent);
+    if (pos_ > 0) {
+        ui.text(6, kStripY + 9, "<", colors::kAccent);
+        hits_.add({0, kStripY - 4, 20, kStripIconH + 8}, kStripArrow, -1);
+    }
+    if (pos_ + 1 < n) {
+        ui.text_right(Ui::kWidth - 6, kStripY + 9, ">", colors::kAccent);
+        hits_.add({Ui::kWidth - 20, kStripY - 4, 20, kStripIconH + 8}, kStripArrow, 1);
+    }
     std::string note = note_ ? note_(car_, paint) : "";
     if (!note.empty()) ui.text_center(kStripY + 38, Ui::clip(note, 600), colors::kBad);
     else ui.text_center(kStripY + 38, std::to_string(pos_ + 1) + " / " + std::to_string(n), colors::kDim);
-    ui.footer("Left/Right: car (L1/R1: x10)   Up/Down: paint   Cross: choose   Triangle: makers");
+    std::vector<FooterAction> foot{{"Cross: choose", kChoose}};
+    if (allowed_) foot.push_back({allowed_only_ ? "Square: all cars" : "Square: allowed only", kToggleFilter});
+    foot.push_back({by_class_ ? "Triangle: classes" : "Triangle: makers", kBack});
+    footer_actions(ui, "Left/Right: car (L1/R1: x10)   Up/Down: paint", foot, hits_, kFooter, pointer_);
 }
 
 // --- course picker ---
@@ -892,26 +1185,68 @@ void CoursePicker::open(const std::vector<PickerCourse>& courses, int selected,
     strip_x_ = strip_target(int(courses.size()), sel_, 59, 55);
     pulse_ = 0;
     fade_ = 100;
+    drag_sel_ = -1;
+    wheel_ = 0;
+    pointer_.clear();
+}
+
+void CoursePicker::select(App& app, int to) {
+    int n = courses_ ? int(courses_->size()) : 0;
+    if (!n) return;
+    to = std::clamp(to, 0, n - 1);
+    if (to != sel_) {
+        prev_ = sel_;
+        sel_ = to;
+        pulse_ = fade_ = 0;
+        picker_sound(app, "cursor");
+    } else {
+        picker_sound(app, "disable");
+    }
 }
 
 CoursePicker::Result CoursePicker::update(App& app) {
     const MenuInput& m = app.menu();
     ++pulse_, ++fade_;
     int n = courses_ ? int(courses_->size()) : 0;
+    using K = PointerInput::Action::Kind;
+    for (const PointerInput::Action& a : pointer_.take()) {
+        if (a.kind == K::Back) {
+            picker_sound(app, "cancel");
+            return Result::Cancelled;
+        }
+        if (a.kind == K::Wheel) {
+            wheel_ += a.wheel;
+            int steps = int(wheel_);
+            wheel_ -= float(steps);
+            if (steps) select(app, sel_ - steps);
+            continue;
+        }
+        if (a.kind == K::Drag || a.kind == K::DragEnd) { // along the strip (or anywhere above it)
+            if (drag_sel_ < 0) drag_sel_ = sel_;
+            int to = std::clamp(drag_sel_ - int(std::lround((a.x - a.sx) / 59.0f)), 0, std::max(0, n - 1));
+            if (to != sel_) select(app, to);
+            if (a.kind == K::DragEnd) drag_sel_ = -1;
+            continue;
+        }
+        const HitArea* h = a.kind == K::Click ? hits_.at(a.x, a.y) : nullptr;
+        if (!h) continue;
+        if (h->id == kStrip) {
+            if (h->arg != sel_) select(app, h->arg);
+            else if (n) { // a second click chooses
+                picker_sound(app, "ok");
+                return Result::Chosen;
+            }
+        } else if (h->id == kStripArrow) {
+            select(app, sel_ + h->arg);
+        } else if (h->id == kFooter) {
+            picker_sound(app, h->arg ? "cancel" : "ok");
+            if (h->arg || n) return h->arg ? Result::Cancelled : Result::Chosen;
+        }
+    }
     int h = m.horizontal();
     if (m.pressed(PadButton::L1)) h = -10;
     if (m.pressed(PadButton::R1)) h = 10;
-    if (h && n) {
-        int to = std::clamp(sel_ + h, 0, n - 1);
-        if (to != sel_) {
-            prev_ = sel_;
-            sel_ = to;
-            pulse_ = fade_ = 0;
-            picker_sound(app, "cursor");
-        } else {
-            picker_sound(app, "disable");
-        }
-    }
+    if (h && n) select(app, sel_ + h);
     if (m.pressed(PadButton::Cross) && n) {
         picker_sound(app, "ok");
         return Result::Chosen;
@@ -924,12 +1259,13 @@ CoursePicker::Result CoursePicker::update(App& app) {
 }
 
 void CoursePicker::render(App& app, Ui& ui, PickerArt& art) {
+    hits_.clear();
     ui.clear();
     int n = courses_ ? int(courses_->size()) : 0;
     if (!n) {
         ui.header("COURSE SELECT", "");
         ui.text_center(150, "No courses", colors::kBad);
-        ui.footer("Triangle: back");
+        footer_actions(ui, "", {{"Triangle: back", 1}}, hits_, kFooter, pointer_);
         return;
     }
     const PickerCourse& c = (*courses_)[size_t(sel_)];
@@ -970,32 +1306,43 @@ void CoursePicker::render(App& app, Ui& ui, PickerArt& art) {
     }
 
     // The icon strip.
-    constexpr float kStep = 59, kIconW = 55, kIconH = 42, kStripY = 266;
+    constexpr float kStep = 59, kIconW = 55, kIconH = 42, kY = 266;
     strip_x_ += (strip_target(n, sel_, kStep, kIconW) - strip_x_) * 0.3f;
-    ui.fill(0, kStripY - 5, Ui::kWidth, kIconH + 10, kStripBack);
-    SDL_Rect clip{20, int(kStripY - 4), 600, int(kIconH + 8)};
+    ui.fill(0, kY - 5, Ui::kWidth, kIconH + 10, kStripBack);
+    SDL_Rect clip{20, int(kY - 4), 600, int(kIconH + 8)};
     SDL_SetRenderClipRect(app.renderer(), &clip);
     for (int i = 0; i < n; ++i) {
         float x = strip_x_ + float(i) * kStep;
         if (x + kIconW < 20 || x > 620) continue;
         const PickerCourse& e = (*courses_)[size_t(i)];
         bool f = i == sel_;
-        if (!art.course_icon(app, e.label, SDL_FRect{x, kStripY, kIconW, kIconH}, f ? 1.0f : 0.7f)) {
-            ui.fill_round(x, kStripY, kIconW, kIconH, 3, Color{50, 54, 70});
+        if (!art.course_icon(app, e.label, SDL_FRect{x, kY, kIconW, kIconH}, f ? 1.0f : 0.7f)) {
+            ui.fill_round(x, kY, kIconW, kIconH, 3, Color{50, 54, 70});
             std::vector<std::string> lines = Ui::wrap(e.name, kIconW - 4);
             for (size_t l = 0; l < lines.size() && l < 3; ++l)
-                ui.text_center_in(x, kIconW, kStripY + 4 + float(l) * 12, lines[l], f ? colors::kAccent : colors::kDim);
+                ui.text_center_in(x, kIconW, kY + 4 + float(l) * 12, lines[l], f ? colors::kAccent : colors::kDim);
         }
         if (f) {
-            ui.frame_round(x - 2, kStripY - 2, kIconW + 4, kIconH + 4, 3, 1, colors::kAccent);
+            ui.frame_round(x - 2, kY - 2, kIconW + 4, kIconH + 4, 3, 1, colors::kAccent);
             Color glow{255, 255, 255, u8(70 * (pulse(pulse_) - 0.5f) * 2)};
-            ui.fill(x, kStripY, kIconW, kIconH, glow);
+            ui.fill(x, kY, kIconW, kIconH, glow);
+        } else if (hovering(pointer_, {x, kY, kIconW, kIconH})) {
+            ui.frame_round(x - 2, kY - 2, kIconW + 4, kIconH + 4, 3, 1, colors::kOutline);
         }
+        const float x0 = std::max(x, 20.0f), x1 = std::min(x + kIconW, 620.0f);
+        if (x1 > x0) hits_.add({x0, kY - 2, x1 - x0, kIconH + 4}, kStrip, i);
     }
     SDL_SetRenderClipRect(app.renderer(), nullptr);
-    if (sel_ > 0) ui.text(6, kStripY + 17, "<", colors::kAccent);
-    if (sel_ + 1 < n) ui.text_right(Ui::kWidth - 6, kStripY + 17, ">", colors::kAccent);
-    ui.footer("Left/Right: course (L1/R1: x10)   Cross: choose   Triangle: back to the lobby");
+    if (sel_ > 0) {
+        ui.text(6, kY + 17, "<", colors::kAccent);
+        hits_.add({0, kY - 4, 20, kIconH + 8}, kStripArrow, -1);
+    }
+    if (sel_ + 1 < n) {
+        ui.text_right(Ui::kWidth - 6, kY + 17, ">", colors::kAccent);
+        hits_.add({Ui::kWidth - 20, kY - 4, 20, kIconH + 8}, kStripArrow, 1);
+    }
+    footer_actions(ui, "Left/Right: course (L1/R1: x10)", {{"Cross: choose", 0}, {"Triangle: back to the lobby", 1}}, hits_,
+                   kFooter, pointer_);
 }
 
 } // namespace gt3r

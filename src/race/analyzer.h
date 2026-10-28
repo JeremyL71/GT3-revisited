@@ -25,11 +25,14 @@
 #include "menu/menu_scene.h"
 #include "race/ghost.h"
 #include "race/race_panels.h"
+#include "sim/exact/race_flow.h"
 #include "text/game_font.h"
 
 #include <SDL3/SDL_render.h>
 
+#include <array>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,35 +52,65 @@ struct AnalyzerTrack {
     GhostLap ghost;
     double hz = 60;
     std::string title; // "TRACK A" panel's car name
+    // From the data logger's pass (logger_track): each sample's time from the lap's start and the replay frame the car
+    // reached it in (ours), and the logger table's sector times (the course's logger marks; s).
+    std::vector<double> times;
+    std::vector<u32> frames;
+    std::vector<double> sector_times;
+    u32 lap_begin = 0, lap_end = 0; // the replay frames of the lap's start and end
     bool valid() const { return trace.size() > 1; }
-    double time_at(size_t i) const { return double(i) / hz; }
+    double time_at(size_t i) const { return i < times.size() ? times[i] : double(i) / hz; }
     size_t index_at_distance(float d) const; // first sample at or past d
+    // The replay frame the car reaches distance d in, and the distance at frame f (`begin`: the lap's first frame where the
+    // track has no frames of its own: one sample a frame).
+    u32 frame_at_distance(float d, u32 begin) const;
+    float distance_at_frame(u32 f, u32 begin) const;
 };
 
-// The part of a replay the Analyzer shows: its best lap, or the whole run when it has none
-// (ticks [begin, end)).
-struct AnalyzerLap {
-    u32 begin = 0, end = 0;
-    bool whole = true;
+// GT3's Analyzer samples (its pass over a replay): after every step, the car's distance into its first lap (the race
+// progress with its laps less one, the first sample at most 0) in bins of the lap's length / 16383 (at least 0.5 m); per bin
+// its speed (m/s), throttle and brake, each taken as linear between two steps and averaged over the bin, its gear and its
+// drawn position (course x, z) where the bin ends; the speed kept x 40 in 13 bits, the pedals x 255 in a byte, the position
+// in whole metres; at most 16384 bins; at the end each bin's speed and pedals smoothed (1 2 1) with its neighbours'. Ours:
+// each bin's time and frame where it ends.
+struct LoggerBin {
+    u16 word = 0;       // +0 the gear (3 bits), the speed x 40 (13 bits)
+    u8 throttle = 0;    // +2
+    u8 brake = 0;       // +3
+    s16 x = 0, z = 0;   // +4 / +6
+    double time = 0;    // (ours) the race time where the bin ends
+    u32 frame = 0;      // (ours) the step it ends in
+    int gear() const { return word & 7; }
+    float speed() const { return float(word >> 3) / 40.0f; }
 };
-AnalyzerLap analyzer_lap(const Replay& r);
-
-// Builds a track from a run's states, one per tick of the lap (the state before the tick's
-// step and that tick's inputs). Distances (`d`: 0..lap_length on the track) are unwrapped
-// from the lap's first sample: a lap counts from the line, a whole run from 0.
-class LapSampler {
+class LoggerBinner {
 public:
-    LapSampler(double hz, float lap_length, bool whole);
-    void add(const sim::VehicleState& s, const sim::ControlInputs& in, float d);
-    // `lap_time` < 0: the whole run (its length).
-    AnalyzerTrack take(double lap_time);
+    explicit LoggerBinner(ee::F lap_length);
+    // After step `frame` (race time `time`, s): car c's record.
+    void add(const sim::exact::Car& c, double time, u32 frame);
+    // The pass's end: the smoothing.
+    void finish();
+    const std::vector<LoggerBin>& bins() const { return bins_; }
+    ee::F width() const { return w_; }
+    // (ours) The race time and the step where the distance passed 0 (the lap's start).
+    double start_time() const { return start_t_; }
+    u32 start_frame() const { return start_frame_; }
 
 private:
-    AnalyzerTrack t_;
-    float lap_length_;
-    bool whole_;
-    float prev_ = -1, base_ = 0;
+    ee::F w_, inv_w_, lap_;
+    ee::F edge_;                 // the furthest distance so far
+    std::array<ee::F, 3> acc_{}; // the open bin's speed, throttle and brake sums
+    ee::F d_;                    // the last step's distance, speed, pedals and position
+    std::array<ee::F, 3> v_{};
+    ee::F x_, z_;
+    double t_ = 0, start_t_ = 0;
+    u32 start_frame_ = 0;
+    bool first_ = true, started_ = false;
+    std::vector<LoggerBin> bins_;
 };
+// The Analyzer's track from a logger pass: its bins as the trace (km/h, 0..1 pedals), their times from the lap's start, the
+// logger table's sector times (its entries' times to their ends, from the lap's start; `table`: the car's), the lap's frames.
+AnalyzerTrack logger_track(const LoggerBinner& bins, const std::map<s32, sim::exact::Snapshot>* table, double hz);
 
 // The course's data-logger map (logger/<course>, "LGM0"): the 192 x 128 picture, its
 // world -> picture transform (the HUD map's GTCM fields, applied differently: see project())
@@ -123,6 +156,7 @@ public:
     int take_camera_presses() { return std::exchange(camera_presses_, 0); }
     std::optional<float> take_seek() { return std::exchange(seek_, std::nullopt); }
     const AnalyzerTrack& track(int i) const { return i == 0 ? a_ : b_; }
+    const std::vector<float>& sector_starts() const { return sectors_; } // the sectors' starts (track distances)
     int sector_at(float d) const;
 
     void draw(SDL_Renderer* r, const SDL_FRect& dst);

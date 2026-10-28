@@ -74,6 +74,7 @@ public:
     }
 
     ~MoviesScreen() override {
+        stop();
         if (still_tex_) SDL_DestroyTexture(still_tex_);
     }
 
@@ -132,6 +133,7 @@ private:
         stop();
         try {
             app.audio().stop_music();
+            player_.set_audio_device(app.audio().output_device_id());
             player_.start(video::open_movie(*app.vfs(), files_[idx].path), volume_, start);
             playing_ = idx;
             sel_ = idx;
@@ -143,6 +145,8 @@ private:
     }
 
     void stop() {
+        if (playing_ >= 0 && player_.active())
+            LOG_INFO("Movie %s: %s", files_[size_t(playing_)].path.c_str(), player_.summary().c_str());
         player_.stop();
         playing_ = -1;
     }
@@ -237,6 +241,9 @@ class MovieScreen : public Screen {
 public:
     MovieScreen(std::string path, std::function<void(App&)> on_done, MovieScreenOptions opt)
         : path_(std::move(path)), on_done_(std::move(on_done)), opt_(opt) {}
+    ~MovieScreen() override {
+        if (player_.active()) LOG_INFO("Movie %s: %s", path_.c_str(), player_.summary().c_str()); // quit while playing
+    }
 
     void update(App& app, double) override {
         if (!started_) {
@@ -247,6 +254,7 @@ public:
                 if (opt_.stop_music) app.audio().stop_music();
                 Vfs* vfs = app.vfs();
                 if (!vfs) throw FormatError("no disc");
+                player_.set_audio_device(app.audio().output_device_id());
                 if (opt_.loop) {
                     std::string path = path_;
                     player_.start_loop([vfs, path] { return video::open_movie(*vfs, path); }, volume);
@@ -274,6 +282,7 @@ private:
     void finish(App& app) {
         if (done_) return;
         done_ = true;
+        if (player_.active()) LOG_INFO("Movie %s: %s", path_.c_str(), player_.summary().c_str());
         player_.stop();
         app.pop();
         if (on_done_) on_done_(app);

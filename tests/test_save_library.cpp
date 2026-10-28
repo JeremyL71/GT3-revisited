@@ -1,5 +1,5 @@
 // The GT-mode save library (game/save_library.h) and the save page's operations on it
-// (game/gt_mode_menu.cpp through GtModeHooks::save_run). Works in temporary folders only.
+// (game/gt_mode_menu.cpp through GtModeHooks::save_run). Works in the run's temporary folder only.
 
 #include "test_framework.h"
 
@@ -19,12 +19,6 @@ using namespace gt3r::game;
 namespace fs = std::filesystem;
 
 namespace {
-
-fs::path fresh_dir(const char* name) {
-    fs::path d = fs::temp_directory_path() / name;
-    fs::remove_all(d);
-    return d;
-}
 
 GameState make_game(s64 credits, const std::string& comment = {}) {
     GameState s;
@@ -68,10 +62,25 @@ std::vector<std::string> kept_texts(const std::string& path) {
 
 } // namespace
 
+// The run's own folder (test_main): the system temp folder and the user data folder of the
+// code under test (the saves' library, the earlier versions' save) are in it, never the
+// player's, so test runs can go at once.
+TEST(save_library_test_run_folders) {
+    const fs::path root = test::temp_root();
+    std::error_code ec;
+    CHECK(fs::is_directory(root) && root.filename().string().rfind("gt3r-tests-", 0) == 0);
+    CHECK(fs::equivalent(fs::temp_directory_path(ec), root, ec));
+    const fs::path data = user_data_dir();
+    CHECK(fs::equivalent(data, root / "user-data", ec));
+    for (const std::string& p :
+         {SaveLibrary::user_dir(Region::America), SaveLibrary::user_dir(Region::Europe), SaveLibrary::legacy_path()})
+        CHECK(p.rfind(data.string(), 0) == 0);
+}
+
 // Earlier versions' gtmode.sav and gtmode_2.sav are copied into a new library (the
 // originals stay); the first one becomes current; nothing happens once the folder exists.
 TEST(save_library_migration) {
-    const fs::path root = fresh_dir("gt3r_test_lib_migrate");
+    const fs::path root = test::temp_path("lib_migrate");
     fs::create_directories(root);
     const std::string legacy = (root / "gtmode.sav").string();
     CHECK(write_save(legacy, make_game(1000)));
@@ -95,10 +104,45 @@ TEST(save_library_migration) {
     fs::remove_all(root);
 }
 
+// A PAL disc's library the first time: versions up to 0.3 kept every disc's games in saves/,
+// so saves/eu/ starts with copies of its *.sav files (not of its subfolders), the current one
+// staying current; the originals stay, and it happens once.
+TEST(save_library_pal_copies_earlier_saves) {
+    const fs::path root = test::temp_path("lib_pal_copy");
+    const fs::path us = root / "saves";
+    fs::create_directories(us / "jp");
+    CHECK(write_save((us / "Mine.sav").string(), make_game(1000, "MINE")));
+    CHECK(write_save((us / "Other.sav").string(), make_game(2000)));
+    CHECK(write_text((us / "Broken.sav").string(), "not a save")); // copied as it is (listed as unreadable)
+    CHECK(write_text((us / "notes.txt").string(), "x"));
+    CHECK(write_save((us / "jp" / "Japan.sav").string(), make_game(3000)));
+    SaveLibrary(us.string()).set_current((us / "Mine.sav").string());
+
+    SaveLibrary eu((us / "eu").string());
+    CHECK(eu.copy_library(us.string()) == 3);
+    CHECK(fs::exists(us / "eu" / "Mine.sav") && fs::exists(us / "eu" / "Other.sav"));
+    CHECK(fs::exists(us / "eu" / "Broken.sav"));
+    CHECK(!fs::exists(us / "eu" / "notes.txt") && !fs::exists(us / "eu" / "Japan.sav"));
+    CHECK(read_text((us / "eu" / "Mine.sav").string()) == read_text((us / "Mine.sav").string()));
+    CHECK(fs::exists(us / "Mine.sav") && fs::exists(us / "Other.sav")); // the originals stay
+    CHECK(eu.current() == eu.dir() + "Mine.sav");
+    std::optional<GameState> s = read_save(eu.current());
+    CHECK(s && s->credits == 1000);
+    CHECK(eu.list().size() == 3);
+    // Once: the folder exists now (also after its saves are gone).
+    CHECK(write_save((us / "Later.sav").string(), make_game(4000)));
+    CHECK(eu.copy_library(us.string()) == 0 && !fs::exists(us / "eu" / "Later.sav"));
+    // Nothing to copy (no earlier library): an empty library, made once.
+    SaveLibrary fresh((root / "none" / "eu").string());
+    CHECK(fresh.copy_library((root / "none").string()) == 0 && fresh.list().empty() && fresh.current().empty());
+    CHECK(fs::is_directory(root / "none" / "eu"));
+    fs::remove_all(root);
+}
+
 // Listing (newest first, names, unreadable files), unique names and file names, create,
 // rename (the current save stays current), copy, delete.
 TEST(save_library_operations) {
-    const fs::path root = fresh_dir("gt3r_test_lib_ops");
+    const fs::path root = test::temp_path("lib_ops");
     SaveLibrary lib(root.string());
     std::string a, b;
     CHECK(lib.create(make_game(100), "FIRST", &a));
@@ -139,6 +183,10 @@ TEST(save_library_operations) {
     // A tracked = false library (GT3R_GTMODE_SAVE) remembers nothing.
     SaveLibrary untracked(root.string(), false);
     CHECK(untracked.current().empty() && untracked.set_current(b) && lib.current() == a3);
+    // No path: refused, nothing written (not even "<path>.tmp", which would be ".tmp" in the
+    // working directory).
+    std::string err;
+    CHECK(!write_save("", make_game(1), &err) && err == "no save file");
     fs::remove_all(root);
 }
 
@@ -147,7 +195,7 @@ TEST(save_library_operations) {
 // keeps its own copy, and the library does not list the copies. No disc: a session's new
 // game needs no game data (the attach hook, which loads it, is save_library_disc_unreadable_attach).
 TEST(save_library_unreadable_kept) {
-    const fs::path root = fresh_dir("gt3r_test_lib_unreadable");
+    const fs::path root = test::temp_path("lib_unreadable");
     SaveLibrary lib(root.string());
     std::string path;
     CHECK(lib.create(make_game(500, "CAREER"), "CAREER", &path));
@@ -191,7 +239,7 @@ TEST(save_library_unreadable_kept) {
 TEST(save_library_disc_unreadable_attach) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
-    const fs::path root = fresh_dir("gt3r_test_lib_unreadable_attach");
+    const fs::path root = test::temp_path("lib_unreadable_attach");
     fs::create_directories(root);
     const std::string path = (root / "gtmode.sav").string();
     const std::string damaged = "GT3R-GTMODE 1\ncredits 900000\ncar 1 r34_gtr_v_99 0 - -\n settings 1 2 x\nend\n";
@@ -205,7 +253,7 @@ TEST(save_library_disc_unreadable_attach) {
         const Volume::Entry* e = vol->find(p);
         if (!e) return std::nullopt;
         return vol->read(*e);
-    });
+    }, "US");
     GtModeSession* s = gt_mode_session();
     CHECK(s && s->save_path() == path && s->gt().state().credits == 18000); // a new game
     CHECK(!fs::exists(path) && kept_texts(path) == std::vector<std::string>{damaged});
@@ -228,7 +276,7 @@ TEST(save_library_disc_page_ops) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
     using SavePage = menu::flow::SavePage;
-    const fs::path root = fresh_dir("gt3r_test_lib_page");
+    const fs::path root = test::temp_path("lib_page");
     fs::create_directories(root);
     const std::string first = (root / "gtmode.sav").string();
     set_env("GT3R_GTMODE_SAVE", first.c_str());
@@ -241,7 +289,7 @@ TEST(save_library_disc_page_ops) {
     };
     install_gt_mode_menu();
     const menu::flow::GtModeHooks& h = menu::flow::gt_mode_hooks();
-    h.attach(read); // a fresh session on GT3R_GTMODE_SAVE
+    h.attach(read, "US"); // a fresh session on GT3R_GTMODE_SAVE
     GtModeSession* s = gt_mode_session();
     CHECK(s && s->save_path() == first);
     if (!s) return;
@@ -268,8 +316,8 @@ TEST(save_library_disc_page_ops) {
     ps2.credits = 54321;
     ps2.file_comment.clear();
     const std::string psu = (root / "from_ps2").string(), card = (root / "card.ps2").string();
-    CHECK(write_host_file(psu, export_ps2_save_container(ps2, s->gt().data_ptr(), read, false)));
-    CHECK(write_host_file(card, export_ps2_save_container(ps2, s->gt().data_ptr(), read, true)));
+    CHECK(write_host_file(psu, export_ps2_save_container(ps2, s->gt().data_ptr(), read, Ps2Export::Psu)));
+    CHECK(write_host_file(card, export_ps2_save_container(ps2, s->gt().data_ptr(), read, Ps2Export::Card)));
     SavePage::File open;
     open.kind = SavePage::File::Kind::Open;
     CHECK(run(SavePage::Mode::Files, SavePage::OpImport, open, psu) == 0);
@@ -310,12 +358,34 @@ TEST(save_library_disc_page_ops) {
     for (const SavePage::File& f : h.save_list(SavePage::Mode::Files))
         if (f.name == "MY RUN 2") copy = f;
     CHECK(!copy.id.empty() && run(SavePage::Mode::Files, SavePage::OpDelete, copy, {}) == 0 && !fs::exists(copy.id));
-    // Export: by extension (.psu, .ps2), none -> .psu; the exports import again.
-    for (const char* out : {"x.psu", "x.ps2", "plain"}) {
-        CHECK(run(SavePage::Mode::Files, SavePage::OpExport, cur, (root / out).string()) == 0);
-        const std::string written = (root / out).string() + (std::string(out) == "plain" ? ".psu" : "");
-        CHECK(read_any_save(written, s->gt().data()).credits == 54321);
+    // Export in the format chosen on the page, whatever the file is called (a name without
+    // an extension gets the format's); the exports import again, by their contents.
+    const struct {
+        SavePage::Op op;
+        const char* out;
+        const char* written;
+    } exports[] = {{SavePage::OpExportPsu, "x.psu", "x.psu"},       {SavePage::OpExportCard, "x.ps2", "x.ps2"},
+                   {SavePage::OpExportRaw, "x.raw", "x.raw"},       {SavePage::OpExportPsu, "plain", "plain.psu"},
+                   {SavePage::OpExportRaw, "bare", "bare.raw"},     {SavePage::OpExportCard, "mc", "mc.ps2"},
+                   {SavePage::OpExportRaw, "named.psu", "named.psu"}};
+    for (const auto& e : exports) {
+        CHECK(run(SavePage::Mode::Files, e.op, cur, (root / e.out).string()) == 0);
+        CHECK(read_any_save((root / e.written).string(), s->gt().data()).credits == 54321);
     }
+    const Bytes raw = export_ps2_save(s->gt().state(), s->gt().data());
+    for (const char* name : {"x.raw", "bare.raw", "named.psu"}) CHECK(read_host_file((root / name).string()) == raw);
+    CHECK(read_host_file((root / "mc.ps2").string())->size() == 0x840000);
+    CHECK(run(SavePage::Mode::Files, SavePage::OpExport, cur, (root / "y.psu").string()) != 0 && !fs::exists(root / "y.psu"));
+    // A raw save (from a save editor) imports under its file name.
+    GameState edited = s->gt().state();
+    edited.credits = 4242;
+    edited.file_comment.clear();
+    CHECK(write_host_file((root / "edited.raw").string(), export_ps2_save(edited, s->gt().data())));
+    CHECK(run(SavePage::Mode::Files, SavePage::OpImport, open, (root / "edited.raw").string()) == 0);
+    bool raw_imported = false;
+    for (const SavePage::File& f : h.save_list(SavePage::Mode::Files))
+        raw_imported |= f.name == "edited" && read_save(f.id)->credits == 4242;
+    CHECK(raw_imported);
     // A snapshot: saved as a new file, the running game and its save untouched.
     GameState snap = s->gt().state();
     snap.credits = 99;

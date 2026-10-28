@@ -4,12 +4,29 @@
 // (Race screen code map: docs/dev/RACE.md.)
 
 #include "app/screen_race_impl.h"
+#include "sim/exact/race.h"
 
 namespace gt3r::race_screen {
 
 // Free run before a GT race: the course alone (no opponents, no laps); leaving it
 // ("Exit" in the pause menu) returns to the pre-race menu with the field rebuilt.
 void RaceScreen::start_free_run(App& app) {
+    // Free practice starts the player's car in its pit box on the course's stop line (GT3's free practice start). GT3 offers
+    // it only where there is one: its pre-race menu turns FREE RUN off on a dirt course (QuickMenuItems::visit), and every
+    // course of GT mode's races without a stop line is one; a course without a pit box (none of GT mode's) refuses it here.
+    {
+        std::shared_ptr<const sim::exact::RaceCourse> c;
+        if (load_program_data(app)) try {
+                c = exact_course(course_bytes_, courses_[size_t(course_sel_)].label, *exact_data_);
+            } catch (const std::exception& e) {
+                LOG_WARN("Race: free run: %s", e.what());
+            }
+        if (!c || !exact_has_pit_box(*c)) {
+            LOG_WARN("Race: free run refused: the course's stop line has no pit box");
+            toast("Free run is not available on this course.");
+            return;
+        }
+    }
     free_run_ = true;
     quick_ = prerace_ = false;
     race_mode_ = false;
@@ -63,7 +80,7 @@ void RaceScreen::fill_license_menu(App& app) {
     quick_menu_.set_text("qm_license_name", license_title(license_event_));
     std::string page = license_event_;
     for (char& c : page) c = char(std::tolower(static_cast<unsigned char>(c)));
-    quick_menu_.add_page_layout(*app.vfs(), app.renderer(), page); // the test's description panel
+    quick_menu_.add_page_layout(*app.vfs(), app.renderer(), page, lang_); // the test's description panel
     static const char* const kW[] = {"qm_license_time_gold", "qm_license_time_silver", "qm_license_time_bronz"};
     for (int i = 0; i < 3; ++i)
         if (license_times_.ms[size_t(i)] > 0) quick_menu_.set_text(kW[i], Hud::format_time(license_times_.ms[size_t(i)] / 1000.0));
@@ -196,7 +213,7 @@ bool RaceScreen::dirt_course() const {
 
 void RaceScreen::update_quick_menu_items() {
     race::QuickMenuItems q = qm_items_;
-    q.visit(run_kind(), launch_.request.car_spec != nullptr, dirt_course());
+    q.visit(run_kind(), launch_.request.car_parts.has_value(), dirt_course());
     quick_menu_.set_items(q);
 }
 
@@ -205,7 +222,7 @@ void RaceScreen::open_prerace_menu(App& app) {
     prerace_ = true;
     silence(app);
     std::string pmb = quick_menu_layout(true);
-    if (!quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), pmb)) {
+    if (!quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), pmb, lang_)) {
         quick_ = prerace_ = false; // no layout: straight to the race
         return;
     }
@@ -231,7 +248,7 @@ void RaceScreen::open_quick_menu(App& app) {
     quick_ = true;
     silence(app);
     std::string pmb = quick_menu_layout(false);
-    if (!quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), pmb)) quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), "qm_arc_result1.pmb");
+    if (!quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), pmb, lang_)) quick_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), "qm_arc_result1.pmb", lang_);
     update_quick_menu_items();
     // The live race's rows: after a replay (a GT race's own, or the 2P one) the field is the
     // replay's.
@@ -256,6 +273,9 @@ void RaceScreen::update_quick_menu(App& app, double dt) {
         quick_sounds_.load(*app.vfs());
         quick_sounds_.set_enabled(menu::flow::option_value(&app.config(), "menu_se") != "off");
     }
+    // A run (a free run's lap) better than the ghost with the Ghost option off: the menu opens
+    // on "Update Ghost?" (presentation §G11; once its root page can take the popup).
+    if (ghost_ask_ && quick_menu_.on_root() && quick_menu_.open_page("ghost_dlg")) ghost_ask_ = false;
     QuickMenu::Choice choice = quick_menu_.update(menu_keys(app.input().pad(0)), dt);
     for (const std::string& se : quick_menu_.take_sounds()) quick_sounds_.play(app.audio().voices(), se);
     if (!preset_.qm.empty() && quick_menu_.focus(preset_.qm)) { // scripted (screenshots)
@@ -279,9 +299,8 @@ void RaceScreen::update_quick_menu(App& app, double dt) {
             abandoned_ = true;
             quick_ = false;
             leave(app);
-        } else if (choice.page == "ghost_dlg" && act == QmAction::Yes) {
-            load_saved_ghost();
-            toast(ghost_.empty() ? "No saved best lap" : "Ghost: " + Hud::format_time(ghost_time_));
+        } else if (choice.page == "ghost_dlg" && act == QmAction::Yes) { // "Update Ghost?"
+            take_best_run_ghost();
         }
         return;
     }
@@ -303,12 +322,20 @@ void RaceScreen::update_quick_menu(App& app, double dt) {
         update_quick_menu_items();
         start_demo();
         break;
-    case QmAction::SaveReplay:
-    case QmAction::SaveGhost: save_current_replay(); break;
-    case QmAction::LoadGhost:
-        if (!ghost_.empty() && quick_menu_.open_page("ghost_dlg")) return; // "Update Ghost?"
-        load_saved_ghost();
-        toast(ghost_.empty() ? "No saved best lap" : "Ghost: " + Hud::format_time(ghost_time_));
+    case QmAction::SaveReplay: save_current_replay(); break;
+    case QmAction::SaveGhost:
+        // The session's best run (a free run: the run of its best lap), the ghost's source, not
+        // the last run.
+        if (best_run_replay_) {
+            std::optional<std::string> path = save_replay(*best_run_replay_, replay_dir(app));
+            toast(path ? "Replay saved" : "Could not save the replay");
+        } else {
+            save_current_replay();
+        }
+        break;
+    case QmAction::LoadGhost: // at once, no question (the original's LOAD GHOST)
+        toast(load_saved_ghost() ? "Ghost: " + Hud::format_time(ghost_time_)
+                                 : whole_run_ghost() ? "No saved run" : "No saved best lap");
         break;
     case QmAction::Records: {
         // The game's records (GT mode keeps them from the results) for licences, machine
@@ -330,7 +357,7 @@ void RaceScreen::update_quick_menu(App& app, double dt) {
         panel_sel_ = 0;
         break;
     case QmAction::Setting:
-        if (from_menu_ && launch_.request.mode.rfind("go_", 0) == 0 && launch_spec_ && !launch_.request.practice) {
+        if (from_menu_ && launch_.request.mode.rfind("go_", 0) == 0 && launch_.request.car_parts && !launch_.request.practice) {
             // GT mode: the game's car settings menu for the ride car; rebuilt when it closes.
             app.push(make_gt_setting_screen(launch_.request.event.empty() ? launch_.request.race_code
                                                                           : launch_.request.event));
@@ -424,7 +451,7 @@ void RaceScreen::open_records(App& app) {
     records_ = course_records(replay_dir(app), courses_[size_t(course_sel_)].label);
     record_names_.clear();
     for (const RecordEntry& r : records_) record_names_.push_back(car_display_name(r.car));
-    if (!records_loaded_) records_loaded_ = records_panel_.load(*app.vfs(), app.renderer(), hud_.fonts()) || true;
+    if (!records_loaded_) records_loaded_ = records_panel_.load(*app.vfs(), app.renderer(), hud_.fonts(), lang_) || true;
     panel_ = Panel::Records;
 }
 

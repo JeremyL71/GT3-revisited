@@ -75,7 +75,7 @@ Tables 0, 1, 4, 7–21, 28, 29 hold purchasable parts:
 | 0x00 | u64 | id, label `<prefix>_<car>_<stage letter>` e.g. `tk_r34_gtr_v_99_c` |
 | 0x08 | u64 | car this part fits (car label) |
 | 0x10 | u8 | stage: 0 = stock; 1.. = sports / semi-racing / racing ... |
-| last 4 | u32 | price in credits (tires: at 0x14) |
+| last 4 | u32 | price in credits (tires: at 0x14; ×100 in Japanese) |
 
 Prices match the in-game shop (e.g. R34: turbo stages 4,800 / 13,500 /
 42,500 / 80,000; lightweight 1,200 / 5,500 / 22,000).
@@ -151,14 +151,17 @@ and copies/scales fields. Two multipliers start at 1000 (‰, the
 | 0x08 | 26 × u64 | default (stock) parts, in this order: brake, brake controller, steer, chassis, lightweight, racing modify (body), engine, port polish, engine balance, displacement, computer, NA tune, turbo, drivetrain, flywheel, clutch, propeller shaft, LSD, gear, suspension, intercooler, muffler, front tire, rear tire, ASCC, TCSC (0 = none) |
 | 0xD8 | u64 | always 0 (wheel slot? [guess]) |
 | 0xE0 | u16, u16 | maker id (two copies; e.g. Audi 3, Mazda 20) |
-| 0xE4 | u16 | name → paramunistr (`"SKYLINE GT-R V・spec(R34,J)"`) |
+| 0xE4 | u16 | name → paramunistr (`"SKYLINE GT-R V・spec(R34,J)"`), shown in US English, FR, GR, IT, SP |
 | 0xE6 | u16 | second name string (mostly blank) |
 | 0xE8 | u16 | label → paramstr |
 | 0xEA | u16 | model year |
-| 0xEC | u32 | price, credits (R34 V-spec 55,980; S4 39,730) |
+| 0xEC | u32 | price, credits (R34 V-spec 55,980; S4 39,730; ×100 in Japanese, region notes); selling pays a quarter |
 | 0xF0 | u8 | flags: bit 0 not for sale at the dealer, bit 1 cannot be sold / traded, bit 2 wheels cannot be changed [spec] |
 | 0xF1 | u8 | category: 0 production, 1 race car, 2 rally car [spec+data] |
-| 0xF4..0x103 | u16s | more name string indices (alternate names); byte +0xF7 is also read as a region code by the opponent pool draw (0 any region, 1–8 only / not EU, US, outside JP+US, JP) [spec] |
+| 0xF2, 0xF4 | u16, u16 | Japanese name and second string → paramunistr (kana; what the game shows in Japanese) [spec] |
+| 0xF6 | u8 | 1 on the F1 cars, else 0 [data] |
+| 0xF7 | u8 | region byte: the languages the car is offered in (0 all, 1 / 2 only / not British English, 3 / 4 only / not US, 5 / 6 only / not the European languages, 7 / 8 only / not Japanese) |
+| 0x100, 0x102 | u16, u16 | British English name and second string → paramunistr [spec] |
 | 0x104 | u16 | maker name → paramunistr (`"NISSAN"`) |
 
 The car model file is not in this record: it is the `model` field of the
@@ -305,7 +308,7 @@ Other fields (front / rear pairs) [spec]:
 | 0x1D0 | u16 | always 0 |
 | 0x1D2 | u8 | special requirement: 9 = dirt tyres required [spec] |
 | 0x1D3 | u8 | trophy / result-screen class: arcade 1–4, GT 5 beginner, 6 amateur, 7 professional and endurance, 8 rally [spec] |
-| 0x1D4 | 6 × u16 | prize for places 1st–6th in units of 100 Cr (NTSC-U) [spec; Sunday Cup stores 10/9/8/7/6/5 → 1,000 Cr for 1st, the retail payout; Seattle 100 Miles 1500 → 150,000 Cr] |
+| 0x1D4 | 6 × u16 | prize for places 1st–6th in units of 100 Cr (×100 again in Japanese, region notes) [spec; Sunday Cup stores 10/9/8/7/6/5 → 1,000 Cr for 1st, the retail payout; Seattle 100 Miles 1500 → 150,000 Cr] |
 | 0x1E0 | u8 | 4 on professional / endurance / long amateur events [unknown] |
 | 0x1E2 | u16 | championship bonus, units of 100 Cr [spec] |
 | 0x1E4 | u8 | time limit in minutes (the 2-hour endurance races) [spec] |
@@ -376,10 +379,13 @@ id_hash(model id), u32 colour count, u32 offset} sorted by code (286 match
 
 - This disc (`PBPX_955.03`) is the NTSC-U release. The `paramdb` regional sets on it
   (plain, `_us`, `_eu`) hold identical prices.
-- In the NTSC-U game a new GT Mode save starts with **18,000 Cr**. The Japanese release
-  starts with 1,500,000 Cr: Japanese versions use 100× the credit values (so it is
-  worth 15,000 Cr in other releases), and the starting balance was also retuned for
-  the international release. Where the starting balance is stored is not
-  yet known. Verify against a Japanese disc before assuming where the 100× is applied.
-- Prizes were retuned too, not just scaled: Sunday Cup 1st pays 1,000 Cr in the
-  international releases but 600 (×100 = 60,000) in the Japanese release.
+- Money is stored in the same units on every disc; the game shows and pays every sum 100×
+  in Japanese: car prices (+0xEC), part prices, event prizes and championship bonuses
+  (already in hundreds of credits, so ×10,000 there), and the game config's sums
+  (`gameconf/product.gcf` tag 10: `initial`, the new game's balance, and the `wheel`,
+  `car_wash` and `oil_change` prices). The NTSC-U and PAL discs store `initial` 18,000; the
+  Japanese disc 15,000, so its new game starts with 1,500,000 Cr.
+- Prizes were retuned too, not just scaled: Sunday Cup 1st stores 10 hundreds (1,000 Cr) in
+  the international releases, 6 hundreds on the Japanese disc (×100 ×100 = 60,000 Cr). The
+  PAL and Japanese discs price the RSX concept (`rsx_detroitver_01`) at 300,000, the NTSC-U
+  disc at 30,000.

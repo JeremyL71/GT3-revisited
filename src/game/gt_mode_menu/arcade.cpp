@@ -5,6 +5,7 @@
 #include "game/gt_mode_menu/internal.h"
 
 #include "base/log.h"
+#include "game/data/weight_class.h"
 #include "sim/car_spec.h"
 
 #include <algorithm>
@@ -134,7 +135,7 @@ std::vector<std::pair<std::string, std::string>> arcade_parts(const std::string&
         char b[32];
         // NTSC-U: miles with three decimals ("1.494miles"); else metres.
         if (!len) std::snprintf(b, sizeof b, "----");
-        else if (gt.data().imperial) std::snprintf(b, sizeof b, "%.3fmiles", double(len) / 1609.344);
+        else if (gt.data().imperial()) std::snprintf(b, sizeof b, "%.3fmiles", double(len) / 1609.344);
         else std::snprintf(b, sizeof b, "%4um", len);
         out.push_back({"length", b});
     } else if (page == "ar/select_compulsory") {
@@ -185,9 +186,10 @@ std::vector<std::pair<std::string, std::string>> arcade_parts(const std::string&
         std::string drive = sum.drive;
         for (char& ch : drive) ch = char(std::tolower(static_cast<unsigned char>(ch)));
         out.push_back({drive == "4wd" ? "four_wd" : drive, ""});
-        // Power and torque with their rpm: "276HP/7300rpm", "224.21ft.lb/5300rpm" (US).
+        // Power and torque with their rpm: "276HP/7300rpm", "224.21ft.lb/5300rpm" (US English),
+        // "31.0kgm/5300rpm" in the other languages.
         char b[64];
-        if (gt.data().imperial) {
+        if (gt.data().units.torque_ftlb) {
             out.push_back({"ps", power});
             std::snprintf(b, sizeof b, "%.2fft.lb/%s", double(sum.torque_kgfm) * 7.2327, sum.torque_rpm.c_str());
             out.push_back({"kgm", b});
@@ -258,8 +260,7 @@ std::vector<std::pair<std::string, std::string>> arcade_specs(const std::string&
 
 // Arcade races with garage cars: the car as it is in the garage (parts, settings,
 // colour); Single Race picks the race code from its weight / power ratio
-// (dirt course: A?AD0001; road: <2.1 S, <3.0 S+1, <3.5 A, <5.0 A+1, <5.8 B, <6.3 B+1,
-// <9.0 C, else C+1 in the class letter and the last character).
+// (dirt course: A?AD0001; road: data::class_by_weight's class letter and race).
 void arcade_prepare(GameRequest& r) {
     GtModeSession* s = S();
     if (!s) return;
@@ -273,19 +274,10 @@ void arcade_prepare(GameRequest& r) {
             float ps = std::max(1.0f, gt.power_ps(*g1));
             float kg = 1000;
             if (auto sp = gt.car_spec(*g1)) kg = std::max(1.0f, sp->mass - 120.0f);
-            float ratio = kg / ps; // M: weight / power
-            static const struct {
-                float below;
-                char cls, add;
-            } kTable[] = {{2.1f, 'S', 0}, {3.0f, 'S', 1}, {3.5f, 'A', 0}, {5.0f, 'A', 1},
-                          {5.8f, 'B', 0}, {6.3f, 'B', 1}, {9.0f, 'C', 0}, {1e9f, 'C', 1}};
-            for (const auto& t : kTable)
-                if (ratio < t.below) {
-                    r.race_code[2] = t.cls;
-                    r.race_code[3] = 'T';
-                    r.race_code[7] = char('1' + t.add);
-                    break;
-                }
+            const data::WeightClass w = data::class_by_weight(kg / ps); // M: weight / power
+            r.race_code[2] = "?CBAS"[w.cls];
+            r.race_code[3] = 'T';
+            r.race_code[7] = char('1' + w.next);
         }
     }
     if (g1) fill_car(r, gt, g1);
@@ -299,7 +291,8 @@ void arcade_prepare(GameRequest& r) {
         fill_car(p2, gt, g2);
         r.car2 = p2.car;
         r.car2_color = p2.car_color;
-        r.car2_spec = p2.car_spec;
+        r.car2_parts = p2.car_parts;
+        r.car2_settings = p2.car_settings;
         r.car2_model = p2.car_model;
         r.car2_wheel = p2.car_wheel;
         r.racing_gearbox2 = p2.racing_gearbox;

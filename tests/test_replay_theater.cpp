@@ -1,7 +1,8 @@
 // Replay Theater, REPLAY OPTIONS and the Analyzer (docs/dev/RACE.md "Replay Theater"):
-// replay format v7 with the car spec, the replay files the theater lists, the theater's file
-// list page, the replay options' state and the Analyzer's lap analysis.
+// the replay format's theater fields, the replay files the theater lists, the theater's file
+// list page, the replay options' state and the Analyzer's sectors and keys.
 #include "test_framework.h"
+#include "replay_fixtures.h"
 #include "base/config.h"
 #include "base/file.h"
 #include "game/replay_theater.h"
@@ -11,8 +12,7 @@
 #include "race/replay.h"
 #include "race/replay_library.h"
 #include "race/replay_options.h"
-#include "sim/car_spec_io.h"
-#include "sim/vehicle.h"
+#include "sim/exact/race_record.h"
 #include "vfs/vfs.h"
 
 #include <SDL3/SDL.h>
@@ -26,69 +26,12 @@ using namespace gt3r::race;
 
 namespace {
 
-struct FlatRoad : sim::TrackQuery {
-    sim::SurfaceHit probe(float, float, float y_max) const override {
-        sim::SurfaceHit h;
-        h.hit = y_max >= 0;
-        return h;
-    }
-};
-
-class FlatVehicle : public RaceVehicle {
-public:
-    explicit FlatVehicle(const sim::CarSpec& spec = sim::CarSpec::test_car(sim::Drive::FR)) : v_(sim::Vehicle::create(spec)) {}
-    const char* backend_name() const override { return "test"; }
-    void reset(const TrackPose& p) override { v_->reset(p.position, p.orientation); }
-    void step(const sim::ControlInputs& in, double dt) override { v_->step(in, road_, dt); }
-    const sim::VehicleState& state() const override { return v_->state(); }
-    const sim::VehicleSetup& setup() const override { return v_->setup(); }
-    float last_impact() const override { return 0; }
-
-private:
-    FlatRoad road_;
-    std::unique_ptr<sim::Vehicle> v_;
-};
-
-std::string temp_dir(const char* name) {
-    std::filesystem::path p = std::filesystem::temp_directory_path() / name;
-    std::filesystem::remove_all(p);
-    std::filesystem::create_directories(p);
-    return p.string();
-}
+std::shared_ptr<const sim::exact::RaceRecord> record() { return test::race_record_stub(); }
 
 using menu::flow::key_bit;
 using menu::flow::MenuKey;
 
 } // namespace
-
-// Every field of a spec survives the bytes exactly (re-serialising gives the same bytes),
-// and a vehicle built from the copy runs bit-identically.
-TEST(car_spec_io_roundtrip) {
-    sim::CarSpec s = sim::CarSpec::test_car(sim::Drive::AWD);
-    s.label = "test_car", s.name = "Test Car";
-    s.tire[0].compound = "racing_hard";
-    s.engine.turbo.on = true, s.engine.turbo.stage[1].peak = 1.25f;
-    s.drivetrain.lsd_accel = {12, 34};
-    s.aids.ascc_flags = 5;
-    Bytes b = sim::serialize_car_spec(s);
-    std::optional<sim::CarSpec> q = sim::parse_car_spec(b);
-    CHECK(q.has_value());
-    if (!q) return;
-    CHECK(sim::serialize_car_spec(*q) == b);
-    CHECK(q->name == "Test Car" && q->tire[0].compound == "racing_hard" && q->drivetrain.lsd_accel[1] == 34);
-    CHECK(q->engine.curve_torque == s.engine.curve_torque && q->aids.ascc_flags == 5);
-    FlatVehicle a(s), c(*q);
-    TrackPose p{{0, 0, 0}, {}};
-    a.reset(p), c.reset(p);
-    sim::ControlInputs in;
-    in.throttle = 1;
-    for (int i = 0; i < 300; ++i) a.step(in, 1.0 / 60), c.step(in, 1.0 / 60);
-    CHECK(a.state().position.z == c.state().position.z && a.state().engine_rpm == c.state().engine_rpm);
-    // Malformed input is refused.
-    Bytes cut(b.begin(), b.begin() + long(b.size() / 2));
-    CHECK(!sim::parse_car_spec(cut));
-    CHECK(!sim::parse_car_spec({}));
-}
 
 // Replay format v7: what the theater shows, and the run's car.
 TEST(replay_v7_theater_fields) {
@@ -102,71 +45,75 @@ TEST(replay_v7_theater_fields) {
     r.power_ps = 330;
     r.car_model = "ni0137", r.wheel = "rays_01";
     r.saved = 1760000000;
-    r.spec = std::make_shared<const sim::CarSpec>(sim::CarSpec::test_car());
     r.condition = {4321, -12345.5f, 300000}; // v8: the engine condition the run started with
+    r.exact = record();
     Replay q = Replay::parse(r.serialize());
     CHECK(q.condition == r.condition);
     CHECK(q.comment == "My best" && q.kind == ReplayKind::GtRace && q.laps == 3 && q.total_time == 301.5);
     CHECK(q.power_ps == 330 && q.car_model == "ni0137" && q.wheel == "rays_01" && q.saved == 1760000000);
-    CHECK(q.spec && sim::serialize_car_spec(*q.spec) == sim::serialize_car_spec(*r.spec));
-    CHECK(q.ticks() == 20);
+    CHECK(q.ticks() == 20 && q.exact != nullptr);
     CHECK(std::string(replay_kind_name(ReplayKind::License)) == "License");
-    r.spec.reset();
-    CHECK(!Replay::parse(r.serialize()).spec); // no spec: the database car
+    // A version 11 file without a race record (a run before every race ran on the exact core) is refused.
+    r.exact.reset();
+    bool too_old = false;
+    try {
+        Replay::parse(r.serialize());
+    } catch (const ReplayTooOld&) {
+        too_old = true;
+    }
+    CHECK(too_old);
 }
 
 // Replay format v9: the field's rules as the run had them (a GT race's grid by power-to-weight
-// is rebuilt from these in the theater); older files take the grid from their kind.
+// is rebuilt from these in the theater).
 TEST(replay_v9_field_rules) {
     Replay r;
     r.course = "trialmt", r.car = "r34_gtr_v_99", r.event = "Gsunday_e_0001";
     r.kind = ReplayKind::ArcadeRace;
-    r.grid_by_power = true, r.cpu_respawn = false;
+    r.grid_by_power = true;
+    r.exact = record();
     Replay q = Replay::parse(r.serialize());
-    CHECK(q.grid_by_power == std::optional<bool>(true) && q.cpu_respawn == std::optional<bool>(false));
-    // Not recorded stays not recorded (an old replay saved again from the theater).
-    r.grid_by_power.reset(), r.cpu_respawn.reset();
+    CHECK(q.grid_by_power == std::optional<bool>(true));
+    // Not recorded stays not recorded (a replay saved again from the theater).
+    r.grid_by_power.reset();
     q = Replay::parse(r.serialize());
-    CHECK(!q.grid_by_power && !q.cpu_respawn);
-    // A v8 file (no rules byte; with no inputs it is the last byte): the grid from the kind.
-    auto as_v8 = [](const Replay& rp) {
-        Bytes b = rp.serialize();
-        b.pop_back();
+    CHECK(!q.grid_by_power);
+    // A file of a version before 11 is refused (not played approximately).
+    {
+        Bytes b = r.serialize();
         const u32 v8 = 8;
         std::memcpy(b.data() + 8, &v8, 4);
-        return Replay::parse(b);
-    };
-    r.kind = ReplayKind::GtRace;
-    q = as_v8(r);
-    CHECK(q.grid_by_power == std::optional<bool>(true) && !q.cpu_respawn);
-    r.kind = ReplayKind::Practice; // Quick race: the arcade single race's grid
-    CHECK(as_v8(r).grid_by_power == std::optional<bool>(false));
+        bool too_old = false;
+        try {
+            Replay::parse(b);
+        } catch (const ReplayTooOld&) {
+            too_old = true;
+        }
+        CHECK(too_old);
+    }
 
     // 2P battle: the Options menu's settings and player 2's car as the run had them.
     Replay p2;
     p2.course = "trialmt", p2.car = "r34_gtr_v_99", p2.car2 = "supra_rz_97";
+    p2.exact = record();
     for (int i = 0; i < 3; ++i) p2.inputs.push_back(quantize(sim::ControlInputs{})), p2.inputs2.push_back(p2.inputs.back());
     ReplayBattle b;
     b.laps = 5;
-    b.boost_amount = 0.2f, b.boost_start = 10, b.boost_full = 200;
+    b.catchup = 2;
     b.handicap_m = -35;
     b.tyre_damage = true;
     b.model2 = "to0050", b.wheel2 = "rays_02", b.paint2 = 4;
-    sim::CarSpec spec2 = sim::CarSpec::test_car();
-    spec2.aids.tcs_gain = 0;
-    b.spec2 = std::make_shared<const sim::CarSpec>(spec2);
     p2.battle = b;
     q = Replay::parse(p2.serialize());
     CHECK(q.battle.has_value() && q.inputs2.size() == 3);
     if (q.battle) {
         const ReplayBattle& qb = *q.battle;
-        CHECK(qb.laps == 5 && qb.boost_amount == 0.2f && qb.boost_start == 10 && qb.boost_full == 200);
+        CHECK(qb.laps == 5 && qb.catchup == 2);
         CHECK(qb.handicap_m == -35 && qb.tyre_damage && qb.model2 == "to0050" && qb.wheel2 == "rays_02" && qb.paint2 == 4);
-        CHECK(qb.spec2 && sim::serialize_car_spec(*qb.spec2) == sim::serialize_car_spec(spec2));
     }
-    p2.battle->spec2.reset(); // the database car
+    p2.battle->catchup = 1;
     q = Replay::parse(p2.serialize());
-    CHECK(q.battle && !q.battle->spec2);
+    CHECK(q.battle && q.battle->catchup == 1);
     // Not recorded (an older 2P replay saved again) stays not recorded.
     p2.battle.reset();
     q = Replay::parse(p2.serialize());
@@ -175,12 +122,13 @@ TEST(replay_v9_field_rules) {
 
 // The theater's storage: one folder, newest first, delete, Edit file name, info texts.
 TEST(replay_library_files) {
-    const std::string data = temp_dir("gt3r_test_theater");
+    const std::string data = test::temp_dir("theater").string();
     const std::string dir = replay_dir(data);
     CHECK(dir == data + "/replays" || dir == data + "replays");
     Replay r;
     r.course = "trialmt", r.car = "r34_gtr_v_99";
     for (int i = 0; i < 60; ++i) r.inputs.push_back(quantize(sim::ControlInputs{}));
+    r.exact = record();
     std::optional<std::string> p1 = save_replay(r, dir);
     std::optional<std::string> p2 = save_replay(r, dir); // same second: the next stamp
     CHECK(p1 && p2 && *p1 != *p2);
@@ -201,7 +149,21 @@ TEST(replay_library_files) {
     CHECK(replay_time_text(83.4561) == "1:23.456" && replay_time_text(-1) == "-:--.---");
     // The theater backend's entries: replays with their info texts (no disc: labels).
     std::vector<menu::flow::TheaterEntry> e = game::replay_theater_entries(0, dir, nullptr);
-    CHECK(e.size() == 1 && e[0].deletable && e[0].text("course_id") == "trialmt" && e[0].text("comment") == "Fast lap");
+    CHECK(e.size() == 1 && e[0].deletable && e[0].playable && e[0].text("course_id") == "trialmt" && e[0].text("comment") == "Fast lap");
+    // A file of an older version: listed with the reason, not playable, deletable.
+    {
+        Bytes old = r.serialize();
+        const u32 v10 = 10;
+        std::memcpy(old.data() + 8, &v10, 4);
+        CHECK(write_host_file(dir + "/trialmt_r34_gtr_v_99_20250101-120000.gt3replay", old));
+        int too_old = 0;
+        for (const ReplayEntry& le : list_replay_entries(dir)) too_old += le.too_old;
+        CHECK(too_old == 1);
+        bool listed = false;
+        for (const menu::flow::TheaterEntry& t : game::replay_theater_entries(0, dir, nullptr))
+            if (!t.playable) listed = t.deletable && t.text("comment") == "Recorded with an older version";
+        CHECK(listed);
+    }
     std::filesystem::remove_all(data);
 }
 
@@ -324,56 +286,8 @@ TEST(replay_options_state) {
 }
 
 // The Analyzer: a replay's lap sampled tick by tick into a trace (distances from the line), sectors.
-TEST(analyzer_replay_lap) {
-    FlatVehicle live;
-    ReplayRecorder rec;
-    TrackPose start{{0, 0, 0}, {}};
-    rec.begin("test", "test_car", true, 0, start, 60.0);
-    live.reset(start);
-    sim::ControlInputs in;
-    in.throttle = 1;
-    for (int i = 0; i < 600; ++i) live.step(rec.record(in), 1.0 / 60);
-    rec.lap(5.0, 120, 420);
-    Replay r = rec.replay();
-    // Distance along +z on a 400 m "lap"; the run played back as the race screen plays it.
+TEST(analyzer_sectors_and_keys) {
     const float L = 400;
-    auto dist = [&](const sim::Vec3& p) { return std::fmod(std::fabs(p.z) + 1000 * L, L); };
-    auto sample = [&](const Replay& rp) {
-        const AnalyzerLap lap = analyzer_lap(rp);
-        LapSampler s(rp.tick_hz, L, lap.whole);
-        FlatVehicle v;
-        v.place(rp.start);
-        ReplayPlayer p(&rp);
-        while (!p.done() && p.tick() < lap.end) {
-            const u32 k = p.tick();
-            sim::ControlInputs pin = p.next_inputs();
-            if (k >= lap.begin) s.add(v.state(), pin, dist(v.state().position));
-            v.step(pin, 1.0 / rp.tick_hz);
-        }
-        return s.take(lap.whole ? -1 : rp.best_lap);
-    };
-    const AnalyzerLap lap = analyzer_lap(r);
-    CHECK(!lap.whole && lap.begin == 120 && lap.end == 420);
-    AnalyzerTrack t = sample(r);
-    CHECK(t.trace.size() == 300 && t.ghost.size() == 300 && t.trace.time == 5.0);
-    bool rising = true;
-    for (size_t i = 1; i < t.trace.size(); ++i) rising = rising && t.trace.dist[i] >= t.trace.dist[i - 1];
-    CHECK(rising);
-    CHECK(t.index_at_distance(t.trace.dist[150]) <= 150 && t.trace.speed_kmh[299] > t.trace.speed_kmh[0]);
-    CHECK(t.trace.throttle[10] == 1.0f && t.trace.x.size() == 300);
-    // A replay without a lap: the whole run from 0.
-    Replay whole = r;
-    whole.best_lap = -1;
-    CHECK(analyzer_lap(whole).whole && analyzer_lap(whole).end == 600);
-    AnalyzerTrack w = sample(whole);
-    CHECK(w.trace.size() == 600 && w.trace.dist[0] == 0.0f && std::fabs(w.trace.time - 10.0) < 1e-9);
-    // A lap whose first sample is just short of the line counts from 0, not from the lap length.
-    LapSampler ls(60.0, L, false);
-    sim::VehicleState s0;
-    ls.add(s0, in, L - 1.0f), ls.add(s0, in, 2.0f), ls.add(s0, in, 6.0f);
-    AnalyzerTrack short_start = ls.take(1.0);
-    CHECK(short_start.trace.dist[0] == 0.0f && short_start.trace.dist[1] == 2.0f && short_start.trace.dist[2] == 6.0f);
-
     // Sectors from the logger map's points, sorted, deduplicated, starting at 0.
     LoggerMap m;
     m.points = {{0, 0, 250}, {0, 0, 100}, {0, 0, 102}, {0, 0, 399.5f}};
@@ -383,6 +297,12 @@ TEST(analyzer_replay_lap) {
     a.set_course(nullptr, std::nullopt, s, L);
     CHECK(a.sector_at(0) == 0 && a.sector_at(99) == 0 && a.sector_at(100) == 1 && a.sector_at(399) == 2);
     // Keys: R1 jumps to the next sector, L1 back; Triangle leaves.
+    AnalyzerTrack t;
+    for (int i = 0; i < 300; ++i) {
+        t.trace.dist.push_back(float(i) * L / 300), t.trace.speed_kmh.push_back(100), t.trace.throttle.push_back(1);
+        t.trace.brake.push_back(0), t.trace.x.push_back(0), t.trace.z.push_back(float(i));
+    }
+    t.trace.time = 5.0;
     a.set_tracks(t, {});
     a.open(Analyzer::View::Graph);
     a.tick(0);
@@ -456,4 +376,40 @@ TEST(analyzer_logger_maps_disc) {
     CHECK(maps == 81);
     CHECK(on_outline * 100 >= points * 95); // 1347 of 1411 (the old GTCM-style formula: 1109)
     CHECK(trialmt == 19);
+}
+
+// The data logger's bins (GT3's Analyzer pass, LoggerBinner): a car at 10 m/s, 1 m a step, half throttle, from 3 m before
+// the line on lap 0: bins of half a metre (the lap / 16383 is less) from the line on, each the speed x 40 and the throttle
+// x 255 rounded, the drawn position at its end; the first sample counts from at most 0 m; the smoothing keeps a constant.
+TEST(analyzer_logger_bins) {
+    namespace ex = sim::exact;
+    using ee::F;
+    LoggerBinner b(F(1000.0f));
+    CHECK(b.width() == F(0.5f));
+    ex::Car c;
+    c.laps = 0;
+    for (int k = 0; k < 30; ++k) {
+        const float d = float(k) - 3.0f; // the distance into lap 1
+        c.laps = d < 0 ? 0 : 1;
+        c.f3e4 = F(d < 0 ? d + 1000.0f : d);
+        c.speed_abs = F(10.0f);
+        c.throttle_pedal = F(0.5f), c.brake_pedal = F(0.0f);
+        c.gear = 3;
+        c.flow = F(0.0f);
+        c.draw_pos_prev = c.draw_pos;
+        c.draw_pos = {F(d), F(0.0f), F(2.0f * d)};
+        b.add(c, double(k) / 60.0, u32(k + 1));
+    }
+    b.finish();
+    const std::vector<LoggerBin>& bins = b.bins();
+    CHECK(bins.size() == 52); // (26 m from the line in half metres)
+    if (bins.size() == 52) {
+        CHECK(bins[10].gear() == 3 && (bins[10].word >> 3) == 400 && bins[10].throttle == 128 && bins[10].brake == 0);
+        CHECK(bins[10].x == 5 && bins[10].z == 11); // (the end of bin 10: 5.5 m, z 11 m, whole metres)
+        CHECK(b.start_frame() == 4); // (the step that reached the line)
+    }
+    const AnalyzerTrack t = logger_track(b, nullptr, 60.0);
+    CHECK(t.trace.size() == 52 && std::fabs(t.trace.speed_kmh[20] - 36.0f) < 0.01f);
+    CHECK(std::fabs(t.times[1] - 1.0 / 60.0) < 1e-6); // (1 m from the line: one step on)
+    CHECK(t.frame_at_distance(2.0f, 0) == 6);
 }

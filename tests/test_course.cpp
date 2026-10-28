@@ -7,6 +7,7 @@
 #include "formats/course/visibility.h"
 #include "formats/gs_memory.h"
 #include "formats/tex1.h"
+#include "sim/exact/course_query.h"
 
 #include <algorithm>
 #include <chrono>
@@ -418,4 +419,35 @@ TEST(course_line_all_us) {
     }
     std::sort(found.begin(), found.end());
     CHECK(found == expected);
+}
+
+// Another game's course read as GT3's: numbers that point past the course's own tables (an AI line's segment used as the
+// ground query's hint, a segment's checkpoint id) are no segment / no checkpoint, not a read past the tables. A course of one
+// triangle in one 8 m grid cell (invented values).
+TEST(course_query_foreign_indices) {
+    using gt3r::ee::F;
+    Road r;
+    r.length = 100;
+    RoadSegment s;
+    s.vertices = {{0, 0, 0}, {8, 0, 0}, {0, 0, 8}};
+    s.vertex_attrs = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    RoadTriangle t;
+    t.a = 0, t.b = 1, t.c = 2;
+    s.triangles = {t};
+    s.checkpoint_ids = {7}; // the course has one checkpoint
+    r.segments = {s};
+    r.checkpoints = {Checkpoint{0, 0, 8, 0, 0, 0, 1, 0}};
+    r.grid_index.xs = {0, 8}, r.grid_index.zs = {0, 8};
+    r.grid_index.cell_begin = {0, 1}, r.grid_index.refs = {{0, 0}};
+    r.grid_index.cell_group_begin = {0, 1}, r.grid_index.groups = {{0, 0, 1}};
+    const sim::exact::CourseQuery q(r);
+    sim::exact::Ground g;
+    g.x = F(2.0f), g.z = F(2.0f), g.h = F(0.0f);
+    for (s32 hint : {-1, 0, 5}) {
+        g.seg = hint;
+        q.ground(g);
+        if (hint < 1) CHECK(g.miss == 0 && g.seg == 0);
+        else CHECK(g.miss == 1 && g.seg == -1); // a hint past the segments has no neighbours
+    }
+    CHECK(q.progress(F(2.0f), F(0.0f), F(2.0f), 0).bits == 0 && q.progress(F(2.0f), F(0.0f), F(2.0f), -1).bits == 0);
 }

@@ -19,7 +19,17 @@ Code: `src/audio/` (all of it), `src/race/race_audio.*`, `src/race/car_sfx.*`,
 
 ### §1.1 Two output streams
 
-`AudioEngine` opens two output streams on the default device:
+`AudioEngine` opens two output streams on the output device (Settings →
+Audio, `[audio] device`): the system default, which follows the system's own
+choice, or a device chosen by name on Windows, macOS and Linux (Android and the
+browser route sound themselves). A chosen device that is not connected leaves
+the sound on the default; plugging it in moves the sound there, unplugging it
+moves it back (SDL's device added / removed events). Each stream has a device
+of its own on the same hardware, so the race pause can pause the music alone;
+a switch opens the new pair before moving the streams, keeps a pause, and runs
+on a thread of its own (opening or closing a device takes up to ~300 ms on
+macOS). Movies open their sound on the same device. With Settings → Audio
+open, the `cursor` sound plays once a switch has landed, on the new device.
 
 | Stream | Carries | Rate | Gain |
 |---|---|---|---|
@@ -32,8 +42,9 @@ volume; the **effects bus** carries every other voice and its gain is the
 Sound effects volume. So the Sound effects volume never scales the music.
 Both volumes are settings (Settings → Audio, `[audio] music_volume` and
 `[audio] sfx_volume`, 0..1, default 0.8). The game thread starts, stops and
-changes voices; the audio thread renders them. Every mixer call is safe from
-either thread.
+changes voices; the audio thread renders them, a block of a few milliseconds
+at a time. Every mixer call is safe from either thread and never waits for a
+block to render: a change made while one renders applies after it.
 
 ### §1.2 Units
 
@@ -43,7 +54,7 @@ The engine keeps the sound data's own units throughout:
   (its natural rate). Twice the value is an octave up.
 - **Volume**: signed 16-bit, `0x3FFF` is full level (about 1.0); negative
   values invert the phase.
-- **Pan**: 0..127, 0 hard left, 64 about the centre, 127 hard right.
+- **Pan**: 0..127, 0 hard left, 64 about the center, 127 hard right.
 - **Q14**: fixed point with `0x4000` = 1.0.
 
 ### §1.3 Pan law and note pitch
@@ -57,15 +68,15 @@ $$\text{left} = \frac{\text{vol}\cdot t[127-p]}{2^{14}},\qquad
 (`sound::pan_gains`). Pan 0 gives full left and silent right; pan 64 gives
 about 0.703 / 0.711.
 
-A **note** is converted to a pitch relative to a sample's centre note
-(`sound::note_to_pitch`); with note and centre in 1/256 semitone,
+A **note** is converted to a pitch relative to a sample's center note
+(`sound::note_to_pitch`); with note and center in 1/256 semitone,
 
 $$\text{pitch} = \mathtt{0x1000}\cdot 2^{(\text{note}-\text{centre})/3072},$$
 
 evaluated in 1/32-semitone steps through a 384-entry-per-octave table. A
-note at the centre plays at `0x1000`; an octave up at `0x2000`. Sound effects
+note at the center plays at `0x1000`; an octave up at `0x2000`. Sound effects
 are always keyed at their region's lowest key, so an effect region's pitch is
-fixed by its centre and key (`InstRegion::pitch`).
+fixed by its center and key (`InstRegion::pitch`).
 
 ## §2 Voice mixer
 
@@ -86,7 +97,7 @@ only voices whose priority value is **greater than or equal to** the
 request's are candidates; of those the one with the highest priority value,
 and among equals the **oldest**, is taken. If no voice qualifies the
 request is dropped. The sample banks give every region priority 0, so in
-practice the oldest voice is stolen; the tyre loops (§7.6) and the course
+practice the oldest voice is stolen; the tire loops (§7.6) and the course
 ambience (§9.4) set their own priorities so that loud ones are hard to
 steal. A playing voice's priority can be changed (`VoiceMixer::set_priority`);
 these held loops re-send theirs every update as their loudness changes.
@@ -164,7 +175,7 @@ the effects bus, §1.1) and adds the buses. The scaled reverb sends feed the
 reverb (§3), so the reverb return follows the bus gains too. The mixer then
 adds the reverb return, multiplies by the **output trim** 0.5
 (`VoiceMixer::kOutputTrim`) and clamps to 16 bits. A bus gain change applies
-from the next rendered sample.
+from the next block the mixer renders.
 
 The trim gives headroom: full-level voices add up past full scale as on the
 PS2. The streamed music takes the same trim in its output gain
@@ -301,7 +312,7 @@ Up to **47 note slots** are shared by all channels; a new note takes the
 next free slot after the last one used (a slot frees when its voice has
 ended or was stolen). With no free slot the region is not played.
 
-For a region with centre $C$, bend ranges $R_\downarrow$, $R_\uparrow$
+For a region with center $C$, bend ranges $R_\downarrow$, $R_\uparrow$
 (semitones) and channel bend $b$:
 
 $$\text{pitch} = \mathrm{note\_to\_pitch}\!\left(256\cdot\text{key} + \frac{b\cdot R}{32},\ C\right),\quad R = R_\downarrow \text{ if } b<0 \text{ else } R_\uparrow$$
@@ -350,7 +361,7 @@ pitch at the region's lowest key (§1.3), times any factor the caller gives.
 `menu::flow::MenuSounds::play` plays a menu sound at volume 1.0:
 
 - if the effect is a single region, the region is keyed **twice**, at pan 0
-  and at pan 127 (hard left and hard right), so it sounds centred at the
+  and at pan 127 (hard left and hard right), so it sounds centered at the
   region's full level on each side;
 - if it is a range, only its **first** region is keyed, at pan 64.
 
@@ -382,12 +393,12 @@ cap, and a negative gain inverts that side's phase (the surround cue,
 §6.5); pitch = region pitch $\times$ factor. It keys on when either side
 becomes non-zero, updates while playing, keys off when both sides are 0, and
 passes a stealing priority (§2.1), which it re-sends with every update while
-the voice plays. The tyre loops (§7.6) and the course ambience (§9) use it.
+the voice plays. The tire loops (§7.6) and the course ambience (§9) use it.
 
 ## §6 Engine sound model
 
 `EngineSound` (`src/audio/engine_sound.*`) plays a car's engine. Measured
-behaviour: `sound_engine_model`; render with
+behavior: `sound_engine_model`; render with
 `gt3tool engine-wav <iso> <sound-id> <variant> out.wav [view]`.
 
 ### §6.1 Banks
@@ -445,7 +456,9 @@ of its range while the old one fades out.
 ### §6.3 Bank levels
 
 Each car has two levels, one per bank, in 0..127 units. Each tick, with
-$t = \min(\text{throttle}, 1)$:
+$t = \min(\text{throttle}, 1)$ (the car's own throttle after the race step's
+aids and shift cut, `VehicleState::throttle`, the same value as the turbo's
+processed throttle of §7.5):
 
 $$\text{exhaust target} = \min\!\big(127,\ \lfloor (1+3t)\cdot 32\cdot K_1\rfloor\big)$$
 $$\text{engine target} = \min\!\big(127,\ \lfloor (|t-0.375|+0.375)\cdot 127\cdot k\cdot K_2\rfloor\big)$$
@@ -488,14 +501,14 @@ followed car (in a replay its engine uses view 4 even from the cockpit).
 
 ### §6.5 Stereo placement and surround cue
 
-A source at $(x, z)$ in the listener's frame (metres, $x$ to the right, $z$
+A source at $(x, z)$ in the listener's frame (meters, $x$ to the right, $z$
 forward), with $d = \max(\sqrt{x^2+z^2},\ 0.25)$:
 
 $$\alpha = \mathrm{clamp}\!\left(\left(\tfrac{x}{d}+1\right)\tfrac{\pi}{4},\ 0,\ \tfrac{\pi}{2}\right),\qquad
 \text{left} = g\cos\alpha,\quad \text{right} = g\sin\alpha$$
 
-a constant-power pan, 0.7071 each at the centre. The followed car in the
-cockpit view is placed at $(0, 1)$: centred, in front. Otherwise its offset
+a constant-power pan, 0.7071 each at the center. The followed car in the
+cockpit view is placed at $(0, 1)$: centered, in front. Otherwise its offset
 from the camera is taken along the camera's right and forward axes.
 
 **Surround cue** (optional, off by default; Settings → Audio, `[audio]
@@ -506,12 +519,12 @@ right = not left; $x \ge 0$: left = not right). A source behind the listener
 then has its channels out of phase, which a matrix surround decoder steers
 to the rear (`SurroundCue`; on plain stereo it smears the image, hence off
 by default). The engine's flags follow its engine bank and apply to both
-banks; the wind unit (§7.2) and each tyre voice (§7.6) have their own.
+banks; the wind unit (§7.2) and each tire voice (§7.6) have their own.
 
 ### §6.6 Electric motor sound (mod cars)
 
 Electric mod cars (`docs/MODDING.md`) do not use a disc engine bank; the engine
-synthesises two banks in the same layout and plays them through
+synthesizes two banks in the same layout and plays them through
 `EngineSound` unchanged, so rpm tracking, crossfades, Doppler, pan and the
 throttle-driven levels all apply (`make_motor_banks`, `src/audio/motor_sound.*`).
 This is a conventional model of our own, not a sound from the game; render
@@ -527,7 +540,7 @@ it with `gt3tool engine-wav <iso> ev[:order] ...`.
 Layers: base 1500 rpm (0..2500), 5000 (3500..7000), 12000 (9000..25500),
 each a 0.4 s loop (630 frames) at pitch 0x1000, partials rounded to whole
 cycles per loop so it loops seamlessly, partials above 8820 Hz dropped, and
-normalised to a peak of 26000. Parameters from the car's `[sound]` section:
+normalized to a peak of 26000. Parameters from the car's `[sound]` section:
 whine order (clamped 0.25..4), whine level and inverter level (nominally
 0..2; the layer volume is capped at 16383).
 Because the exhaust bank follows the throttle (§6.3), the inverter swells
@@ -536,11 +549,11 @@ electric mod car in the field has no engine note (§8).
 
 ## §7 Other per-car race sounds
 
-Besides the engine, **every** car has its tyre loops (`race::CarSfx`,
+Besides the engine, **every** car has its tire loops (`race::CarSfx`,
 §7.6). Each **followed** car (player 1, and player 2 in a 2P battle) also
 has collision effects (§7.7) and a set of extra sounds
 (`race::CarExtraSounds`, models in `src/audio/car_sound_model.*`). Other
-cars have, besides their tyres, only their engine and, for the nearest two,
+cars have, besides their tires, only their engine and, for the nearest two,
 their wind unit (§8).
 
 ### §7.1 Channel gains
@@ -548,7 +561,7 @@ their wind unit (§8).
 Every race sound is scaled by a gain for its channel and the camera view
 (`race::sfx_gain`). Views: 0 in-car (followed car), 1 in-car (other car),
 2 chase (followed), 3 chase (other), 4 replays and the TV camera (the
-followed car's extra sounds and, for every car, the tyre loops, §7.6). For
+followed car's extra sounds and, for every car, the tire loops, §7.6). For
 these sounds the cockpit takes precedence: a cockpit camera in a replay
 still uses view 0 or 1.
 
@@ -560,7 +573,7 @@ still uses view 0 or 1.
 | blow-off | 0.2 | 0 | 0 | 0 | 0 |
 | whine | 0.8 | 0 | 0.3 | 0 | 0.2 |
 | clash | 0.3 | 0.3 | 0.5 | 0 | 0.5 |
-| kerb rumble | 1.4 | 0.2 | 1.0 | 0.2 | 0.2 |
+| curb rumble | 1.4 | 0.2 | 1.0 | 0.2 | 0.2 |
 | in-car | 0.6 | 0 | 0 | 0 | 0 |
 | wind | 0 | 0.3 | 1.4 | 0.3 | 0.8 |
 | road roar | 0.9 | 0.3 | 0.6 | 0.3 | 0.9 |
@@ -600,11 +613,11 @@ Its channel gain is non-zero only in your own cockpit.
 
 The `turbine2` loop, only for cars with a **non-stock gearbox** (byte +0x10
 of the gear part record non-zero; for GT-mode garage cars, the fitted racing
-gearbox) and only while the clutch is engaged (clutch above 0.01). With
-$\tau$ the engine torque (N m), $r_g$ the current gear's ratio (the reverse
-ratio in reverse, 0 in neutral), $r_1$ first gear's ratio, and $\omega$ the
-driven axle's wheel speed (rad/s: front for FF, the four-wheel mean for 4WD,
-rear otherwise):
+gearbox) and only while the clutch is not open (locked, slipping or
+shifting; physics §2.4). With $\tau$ the torque through the clutch (N m, its
+size), $r_g$ the current gear's ratio (the reverse ratio's size in reverse),
+$r_1$ first gear's ratio, and $\omega$ the driven axle's wheel speed (rad/s:
+front for FF, the four-wheel mean for 4WD, rear otherwise):
 
 $$\text{gain} = 0.3 + 0.7\cdot\frac{\min(|\tau|, 490)\cdot r_g}{490\cdot r_1},\qquad
 \text{pitch} = 0.3 + 3.2\cdot\frac{|\omega|}{1047.2}$$
@@ -613,13 +626,14 @@ $$\text{gain} = 0.3 + 0.7\cdot\frac{\min(|\tau|, 490)\cdot r_g}{490\cdot r_1},\q
 
 ### §7.5 Turbo spool and blow-off
 
-For turbo cars, `car_sound::Turbo` runs after every physics step with the
-car's own turbo state (`CarExtraSounds::step_inputs`): the **processed
-throttle** (`VehicleTelemetry::throttle_processed`: after the pedal
-shaping, traction control and the shift cut, so 0 through an upshift; not
-the pad's), the turbo load of the previous step $\lambda$
-(`VehicleTelemetry::turbo_load`), the engine torque $\tau$ and the two
-stages' lag states (`turbo_lag`; physics §2.3):
+For turbo cars (`CarFacts::turbo`: the engine has boost), `car_sound::Turbo`
+runs after every race step with the car's own turbo state from the race's
+telemetry (`CarExtraSounds::step_inputs`): the **processed throttle**
+(`VehicleTelemetry::throttle_processed`: after the pedal shaping, traction
+control and the shift cut, so 0 through an upshift; not the pad's), the
+turbo load of the previous step $\lambda$ (`VehicleTelemetry::turbo_load`),
+the torque through the clutch $\tau$ (its size) and the two stages' lag
+states (`turbo_lag`; physics §2.3):
 
 - **Spool level.** While $\lambda > 0.75$ and $\tau > 0$: level
   $\mathrm{clamp}(\lfloor 128 v^2\rfloor, 1, 127)$ with
@@ -638,25 +652,27 @@ stages' lag states (`turbo_lag`; physics §2.3):
 
 Because the processed throttle drops to 0 in a shift, every upshift made
 with the load above 0.8 fires the blow-off, even with the pedal held flat
-(`sound_turbo_blow_off_on_upshift`: 4 upshifts, 4 blow-offs in the synthetic
-turbo car, up to about 0.044 of the region's level in the cockpit, above the
-0.01 threshold of §5.3; the pad's throttle held at 1 would fire none).
+(`sound_turbo_blow_off_on_upshift`: the R34 `r34_gtr_v_99` at full
+throttle on the machine test's straight makes 3 upshifts and 3 blow-offs, up
+to about 0.056 of the region's level in the cockpit, above the 0.01
+threshold of §5.3; the pad's throttle held at 1 fires none).
 
-### §7.6 Tyres
+### §7.6 Tires
 
 Every car (the followed cars and every other car of the field) runs its
-tyre loops after every physics step (`RaceScreen::update_tyre_sounds`). Each
+tire loops after every race step (`RaceScreen::update_tyre_sounds`, which
+also plays the followed cars' collision one-shots, §7.7). Each
 **wheel** has its own voice for each of six loops (`race::TyreLoop`), played
 on the loop's effect's first region as a looping effect (§5.4); a loop keys
 on only while it is audible. The surface under the wheel (the material,
 remapped on wet triangles: materials 0 and 7 become 12, 1 becomes 13, 9
-becomes 14; `sim::model::surface_index`, names from `docs/dev/TRACK.md`)
+becomes 14; `sim::surface_index`, names from `docs/dev/TRACK.md`)
 selects the loops that sound:
 
 | Surface | Loops |
 |---|---|
 | 0 tarmac, 7 paving, 8 loose, 9 rough | squeal `on_skill` and road roar `on_road` |
-| 1 kerb, 13 wet kerb | kerb rumble `rumble` |
+| 1 curb, 13 wet curb | curb rumble `rumble` |
 | 2 grass, 3 gravel, 4 sand | slide `off_skill` |
 | 5 dirt | `off_roadnoiz` |
 | 6, 12, 14 (wet) | `rain_noiz` |
@@ -664,22 +680,20 @@ selects the loops that sound:
 The wheel's other loops are silent, and no loop sounds on the other
 surfaces.
 
-**Slip loops** (squeal, kerb rumble, slide, dirt, rain): volume = the
+**Slip loops** (squeal, curb rumble, slide, dirt, rain): volume = the
 loop's channel gain (§7.1) $\times$ the wheel's **slip intensity** $S$, not
 clamped (a big slide goes past 1); pitch = Doppler $\times$ the wheel's
-**skid pitch** $P$. $S$ and $P$ are the physics' own per-wheel values
-(`VehicleTelemetry::smoke`, `skid_pitch`); their curves by surface class,
-with the kerbs' load and rim-speed terms, are in physics §8.3. An airborne
-wheel keeps its last $S$ and $P$ for 5 more steps, then $S$ is 0 and $P$ is 1. For a car
-without simulation telemetry the engine evaluates the same functions
-(`sim::model::slip_intensity`, `skid_pitch`) from the wheel's state, with
-the car's speed $v$ times $\sin(\min(|\text{slip angle}|, 1.5))$ as the
-lateral speed and the ramp $\min(1, 0.02\,v)$ (`CarSfx::estimate_wheel`);
-its $S$ is 0 once the wheel has been off the ground for 6 steps.
+**skid pitch** $P$. $S$ and $P$ are the race step's own per-wheel values
+from the race's telemetry (`VehicleTelemetry::smoke`, `skid_pitch`); their
+curves by surface class, with the curbs' load and rim-speed terms, are in
+physics §8.3 and §8.3c. A wheel that leaves the ground keeps $S$ and $P$
+following its motion for 5 steps; from its 6th step in the air $S$ is 0 and
+$P$ is 1. A car without race telemetry plays no tire loops
+(`sound_car_sfx_per_wheel_voices`).
 
 **Road roar** (`race::road_noise`) sounds on surfaces 0, 7, 8 and 9 while
 the wheel is on the ground and for 5 steps after it leaves it. With the rim
-speed $w = |\omega|\cdot\text{radius}$ (m/s) and the tyre width $W$ (m):
+speed $w = |\omega|\cdot\text{radius}$ (m/s) and the tire width $W$ (m):
 
 $$\text{volume} = \min\!\big(0.3,\ 2.55\,(w/100)^2\cdot\mathrm{ramp}(W;\ 0.135\mapsto 0.5,\ 0.355\mapsto 1.0)\big)$$
 $$\text{pitch} = \mathrm{ramp}(w;\ 8.333\mapsto 0.5,\ 41.667\mapsto 1.0)\quad\text{(30 to 150 km/h)}$$
@@ -713,26 +727,28 @@ of 1; player 2's wheels have no Doppler.
 ### §7.7 Collisions
 
 Only the followed cars' collisions are heard (not other cars' contacts with
-each other), and player 1's are not heard in replays. Each physics step,
-its strongest impact decides:
+each other), and player 1's are not heard in replays. The inputs are the
+race step's collision hits on the car (physics §5.3): for walls $j$ is the
+sum of the step's wall impulses, for cars the largest car impulse (N s).
+Each race step, the stronger of the two decides:
 
 - wall: strength $\min(|j|/50000, 1)$, effect `clash`;
 - car: strength $\min(|j|/7500, 1)$, effect `clash2` (car wins a tie);
 - strengths below 0.2 are ignored.
 
-($j$ is the impulse, N s.) The one-shot plays centred at volume
+The one-shot plays centered at volume
 $\min(1,\ G_{clash}\cdot\text{strength}\cdot 0.6\cdot 32/\max(d, 0.25))$, with
 $d$ the camera-to-car distance. It is keyed again on every step with such
 a hit; there is no cooldown. A wall hit becomes audible from
 $|j| = 10\,000$ N s. In the cockpit $d$ is
-about a metre, so any audible hit plays at full volume. The `clash3`
+about a meter, so any audible hit plays at full volume. The `clash3`
 (objects) effect is not played.
 
 ### §7.8 Countdown
 
 At a standing start `count_d` plays at 3, 2 and 1 seconds before the signal
 and `count_s` at the signal; at a rolling start only `count_s`, at the
-hand-over to the player; at a flying start (time trials, flying licence
+hand-over to the player; at a flying start (time trials, flying license
 tests, free runs) only `count_s`, when the car crosses the line that ends
 the computer's run-up. Not in replays (nor, for a flying start, in demos
 and attract runs). The countdown plays even when the
@@ -760,16 +776,16 @@ race SE option is off.
 - placement and surround cue as §6.5, from the car's offset along the
   camera's axes; rpm and throttle are the car's own.
 
-Other cars have their tyre loops (§7.6, every car, not only the nearest
+Other cars have their tire loops (§7.6, every car, not only the nearest
 five) but no turbo, whine, in-car or collision sounds (their channel gains
-in the other-car views are zero or they are not modelled). Online, remote
+in the other-car views are zero or they are not modeled). Online, remote
 players' cars are field cars and are heard the same way, without the extra
 sounds (`docs/dev/ONLINE.md`).
 
 ## §9 Course ambience
 
 Each course file may carry a `CRSS` section (75 of the 80 US course files;
-not the four `L_circle*` licence layouts nor `L_slalom80r4`), a set of **emitters** on five channels
+not the four `L_circle*` license layouts nor `L_slalom80r4`), a set of **emitters** on five channels
 (`CourseAmbience`, `src/audio/course_ambience.*`):
 
 | Channel | Loop (`gt3se02.ins`) |
@@ -838,19 +854,19 @@ region with the right gain, with the same priority rule.
 
 ## §10 When race sounds play
 
-- **Race SE** (`[options] race_se`) switches the engines, tyres, collisions
+- **Race SE** (`[options] race_se`) switches the engines, tires, collisions
   and extra sounds of live runs; **Replay SE** (`replay_se`, also in REPLAY
   OPTIONS) does the same for replays, demos and attract runs. The countdown
   and the course ambience are not switched by them.
-- The replay that runs behind a quick menu (the menu backdrop) is silent: no engines, tyres, extra sounds or ambience, whatever
+- The replay that runs behind a quick menu (the menu backdrop) is silent: no engines, tires, extra sounds or ambience, whatever
   the options.
 - Opening the pause window or a quick menu, the end of a replay or demo,
   and leaving the race **silence** every race sound at once (`RaceScreen::silence`): engine
-  notes, other cars, every car's tyre loops, extra loops, one-shots,
+  notes, other cars, every car's tire loops, extra loops, one-shots,
   ambience. They key on again when the race updates resume.
 - Engine notes, the wind, in-car, whine and turbo loops, the blow-off and
   the course ambience are computed once per displayed frame from the
-  interpolated car state; every car's tyre loops, the collision effects, the
+  interpolated car state; every car's tire loops, the collision effects, the
   countdown, the reverb depth and the turbo model's step run with each
   physics step (60 Hz).
 
@@ -861,7 +877,7 @@ region with the right gain, with the same priority rule.
   throttle, but this is the engine's inference.
 - **Other cars' engines** are voiced only for the nearest five (§8); with
   every car voiced the voice allocator would have to drop the quiet ones.
-  Their tyre loops play for every car and rely on the stealing priorities
+  Their tire loops play for every car and rely on the stealing priorities
   (§7.6) instead.
 - `body_noiz` and `clash3` are not played.
 - The view labels (§6.4, §7.1) are this engine's reading of when each

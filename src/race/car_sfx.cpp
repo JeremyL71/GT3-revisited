@@ -1,7 +1,6 @@
 #include "race/car_sfx.h"
 
 #include "base/log.h"
-#include "sim/models.h"
 
 #include <algorithm>
 #include <cmath>
@@ -101,18 +100,6 @@ Placement place_voice(float x, float z, float vol) {
     return p;
 }
 
-WheelSound CarSfx::estimate_wheel(const sim::WheelState& w, const sim::VehicleSetup::Wheel& setup, float speed) {
-    WheelSound ws;
-    ws.surface = sim::model::surface_index(w.surface);
-    ws.rim_speed = std::fabs(w.angular_velocity) * setup.radius;
-    ws.tyre_width = setup.width;
-    float lat = speed * std::sin(std::min(std::fabs(w.slip_angle), 1.5f));
-    float ramp = std::min(1.0f, 0.02f * speed);
-    ws.smoke = sim::model::slip_intensity(ws.surface, lat, w.slip_ratio, ws.rim_speed, w.load, ramp);
-    ws.pitch = sim::model::skid_pitch(ws.surface, lat, w.slip_ratio, ws.rim_speed, ramp);
-    return ws;
-}
-
 bool CarSfx::bind(const std::vector<std::shared_ptr<const sound::InstBank>>& banks,
                   const std::vector<sound::SoundEffect>& index) {
     bound_ = true;
@@ -128,25 +115,19 @@ bool CarSfx::bind(const std::vector<std::shared_ptr<const sound::InstBank>>& ban
 }
 
 void CarSfx::update(RaceSfx& sfx, VoiceMixer& mixer, const Step& st) {
-    if (!st.state || !st.setup) return;
+    if (!st.state || !st.setup || !st.telemetry) return;
     const sim::VehicleState& s = *st.state;
     if (!bound_ && sfx.loaded()) bind(sfx.banks(), sfx.index());
-    const float speed = s.speed_kmh / 3.6f;
     for (size_t w = 0; w < 4; ++w) {
         const sim::WheelState& wh = s.wheels[w];
         // The road roar's grace: sounding on the ground and for 5 steps after leaving it.
         airborne_[w] = wh.grounded || wh.load > 0 ? 6 : std::max(0, airborne_[w] - 1);
         WheelSound ws;
-        if (st.telemetry) {
-            ws.surface = sim::model::surface_index(wh.surface);
-            ws.smoke = st.telemetry->smoke[w];
-            ws.pitch = st.telemetry->skid_pitch[w];
-            ws.rim_speed = std::fabs(wh.angular_velocity) * st.setup->wheels[w].radius;
-            ws.tyre_width = st.setup->wheels[w].width;
-        } else {
-            ws = estimate_wheel(wh, st.setup->wheels[w], speed);
-            if (airborne_[w] == 0) ws.smoke = 0;
-        }
+        ws.surface = sim::surface_index(wh.surface);
+        ws.smoke = st.telemetry->smoke[w];
+        ws.pitch = st.telemetry->skid_pitch[w];
+        ws.rim_speed = std::fabs(wh.angular_velocity) * st.setup->wheels[w].radius;
+        ws.tyre_width = st.setup->wheels[w].width;
         ws.contact = airborne_[w] > 0;
         wheels_[w] = ws;
         // Every loop of the wheel is its own voice at the wheel, seen from the camera.
@@ -197,10 +178,9 @@ bool CarExtraSounds::load(Vfs& vfs) {
     return true;
 }
 
-CarExtraSounds::Step CarExtraSounds::step_inputs(const sim::Vehicle& v) {
-    const sim::VehicleTelemetry& t = v.telemetry();
+CarExtraSounds::Step CarExtraSounds::step_inputs(const sim::VehicleTelemetry& t, bool turbo) {
     Step st;
-    st.turbo = v.spec().engine.turbo.on;
+    st.turbo = turbo;
     st.throttle = t.throttle_processed;
     st.load = t.turbo_load;
     st.torque = t.engine_torque;

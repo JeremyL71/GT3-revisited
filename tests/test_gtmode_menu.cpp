@@ -3,6 +3,9 @@
 
 #include "test_framework.h"
 
+#include "disc/region.h"
+#include "formats/db/gt_db.h"
+#include "formats/text/mltx.h"
 #include "game/gt_mode_menu.h"
 #include "game/gt_save.h"
 #include "menu/flow/game_flow.h"
@@ -15,7 +18,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
 #include <tuple>
+#include <vector>
 
 using namespace gt3r;
 using namespace gt3r::menu::flow;
@@ -152,7 +159,7 @@ TEST(gtmode_menu_disc_buy_and_race) {
     CHECK(r.has_value());
     if (!r) return;
     CHECK(r->mode == "go_race" && r->race_code == "Gsunday_e_0001" && r->event == "Gsunday_e_0001");
-    CHECK(r->car_spec != nullptr && r->car == car);
+    CHECK(r->car_parts.has_value() && r->car == car);
     CHECK(r->opponents.size() == 5);
     CHECK(s->gt().state().day == day + 1);
     // Win it.
@@ -643,6 +650,597 @@ TEST(gtmode_menu_disc_wheel_shop_highlights) {
     CHECK(makers == 9 && makers_ok == makers);
 }
 
+// The dealer's list (gt_mode §7): the focused car's price as "Cr. 785,000", or "----" for a car
+// whose not-for-sale flag (car +0xF0 bit 0) is set. The Nissan dealer lists the Pennzoil Nismo
+// GT-R (785,000 Cr.), then the Z Concept, the NISMO GT-R LM road car and the R390 GT1, the last
+// three not for sale. Any region's disc, in each of its languages; x100 in Japanese (gt_mode §2).
+TEST(gtmode_menu_disc_dealer_list_not_for_sale) {
+    Disc* disc = test::any_region_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::install_gt_mode_menu();
+    Vfs vfs(&disc->volume());
+    const RegionData rd = vfs.region();
+    for (Language lang : rd.languages()) {
+        // A fresh GT-mode module per language: it keeps the game data it loaded first.
+        game::reset_gt_mode_menu_for_tests();
+        vfs.set_language(lang);
+        GameFlow f(vfs_reader(vfs), text::language_code(lang));
+        f.start();
+        settle(f);
+        game::GtModeSession* s = game::gt_mode_session();
+        CHECK(s != nullptr);
+        if (!s) break;
+        const game::GtMode& gt = s->gt();
+        const s64 k = lang == Language::JP ? 100 : 1;
+        CHECK(gt.data().money_scale == int(k));
+        choose(f, "gt_mode");
+        settle(f);
+        choose(f, "cd_cd");
+        choose(f, "jp");
+        choose(f, "dealer5");
+        CHECK(f.controller()->page_name() == "cd/cd_jpn_nissan");
+        // Each car's layer holds its price widget ("<car>_price"): the focused car's is drawn.
+        std::map<std::string, std::string> price;
+        int not_for_sale = 0, for_sale = 0;
+        for (int i = 0; i < int(f.controller()->items().size()); ++i) {
+            const std::string car = f.controller()->items()[size_t(i)].flow->name;
+            CHECK(f.controller()->set_focus(car));
+            for (int t = 0; t < 30; ++t) f.tick(0); // (the layers switch on the next frames)
+            std::vector<std::string> drawn;
+            for (const menu::ElementDraw& d : f.draw_list())
+                if (d.element && d.element->widget_class && *d.element->widget_class == "goods_car_price" && d.text) {
+                    CHECK(d.element->name == car + "_price");
+                    drawn.push_back(*d.text);
+                }
+            CHECK(drawn.size() == 1);
+            if (drawn.size() != 1) continue;
+            price[car] = drawn[0];
+            if (gt.car_flags(car) & 1) {
+                ++not_for_sale;
+                CHECK(drawn[0] == "----");
+            } else {
+                ++for_sale;
+                CHECK(drawn[0] == "Cr. " + game::format_credits(gt.car_price(car)));
+            }
+        }
+        CHECK(not_for_sale == 3 && for_sale == 14);
+        CHECK(price["penzoil_gtr_99"] == (k == 100 ? "Cr. 78,500,000" : "Cr. 785,000"));
+        CHECK(price["z_detroitver_01"] == "----" && gt.car_price("z_detroitver_01") == 300000 * k);
+        CHECK(price["nismo_gtr_lm_00"] == "----" && price["r390_race_98"] == "----");
+        CHECK(price["s14_ks_aero_96"] == (k == 100 ? "Cr. 2,395,000" : "Cr. 23,950"));
+        // The Z Concept's own page: no price either, and no sale.
+        choose(f, "z_detroitver_01");
+        CHECK(f.controller()->page_name() == "cd/cd_jpn_nissan_car" && s->focus_car == "z_detroitver_01");
+        CHECK(widget_text(f, "car_buy_price") == "----");
+        s->gt().state().credits = 10000000 * k;
+        choose(f, "buy");
+        CHECK(f.controller()->page_name() == "00cmn/not_for_buy" && s->gt().state().garage.empty());
+    }
+    game::reset_gt_mode_menu_for_tests();
+}
+
+// The wheel inventory (gt_mode §7): 200 slots, one of them the stock-wheel placeholder every new
+// game starts with, so 199 wheels can be bought. With no slot free the shop adds nothing and
+// charges nothing, and its "fit it?" still puts the wheel on the ride car, for free and outside
+// the inventory. Every disc's shop sells 179 wheels: the test buys them all but two, fills the
+// inventory up to 198 bought wheels directly (more than the shop offers), then through the shop's
+// pages buys the 199th (charged the game config's wheel price) and tries a 200th, answering yes
+// to fitting it, with the same outcome as GT3's shop on a full inventory. Any region's disc; x100
+// in Japanese (gt_mode §2).
+TEST(gtmode_menu_disc_wheel_inventory_full) {
+    Disc* disc = test::any_region_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::reset_gt_mode_menu_for_tests();
+    game::install_gt_mode_menu();
+    Vfs vfs(&disc->volume());
+    const Language lang = vfs.region().default_language();
+    vfs.set_language(lang);
+    GameFlow f(vfs_reader(vfs), text::language_code(lang));
+    f.start();
+    settle(f);
+    game::GtModeSession* s = game::gt_mode_session();
+    CHECK(s != nullptr);
+    if (!s) return;
+    game::GtMode& gt = s->gt();
+    const s64 k = lang == Language::JP ? 100 : 1;
+    const s64 price = gt.data().wheel_price();
+    CHECK(price == 500 * k);
+    CHECK(gt.state().wheels.empty()); // a new game: only the placeholder
+    gt.state().credits = 1000000 * k;
+    CHECK(gt.buy_car("r34_gtr_v_99") == 0 && !(gt.car_flags("r34_gtr_v_99") & 4));
+    choose(f, "gt_mode");
+    settle(f);
+    choose(f, "at_at");
+    choose(f, "sl");
+    CHECK(f.controller()->page_name() == "at/ws/ws");
+    // The shop's wheels, maker by maker ("<wheel>_link" items).
+    std::vector<std::string> shop;
+    const int makers = int(f.controller()->items().size());
+    for (int m = 0; m < makers; ++m) {
+        f.controller()->set_focus(m);
+        press(f, MenuKey::Confirm);
+        for (const MenuController::ItemState& it : f.controller()->items())
+            if (it.flow->action == "set_focus_wheel_code")
+                shop.push_back(it.flow->name.substr(0, it.flow->name.rfind('_')));
+        press(f, MenuKey::Cancel);
+    }
+    std::sort(shop.begin(), shop.end());
+    CHECK(makers == 9 && shop.size() == 179 && std::unique(shop.begin(), shop.end()) == shop.end());
+    if (shop.size() < 2) return;
+    // The first maker's first two wheels are kept for the shop's pages.
+    f.controller()->set_focus(0);
+    press(f, MenuKey::Confirm);
+    const std::string page = f.controller()->page_name();
+    std::vector<std::string> keep;
+    for (const MenuController::ItemState& it : f.controller()->items())
+        if (it.flow->action == "set_focus_wheel_code" && keep.size() < 2) keep.push_back(it.flow->name);
+    CHECK(keep.size() == 2);
+    if (keep.size() != 2) return;
+    s64 credits = gt.state().credits;
+    for (const std::string& w : shop) {
+        if (w + "_link" == keep[0] || w + "_link" == keep[1]) continue;
+        CHECK(gt.buy_wheel(w) && gt.state().credits == credits - price);
+        credits = gt.state().credits;
+    }
+    CHECK(gt.state().wheels.size() == 177);
+    for (int i = 0; gt.state().wheels.size() < 198; ++i)
+        gt.state().wheels.push_back("extra_wheel_" + std::to_string(i));
+    // The 199th: bought and charged.
+    choose(f, keep[0].c_str());
+    CHECK(f.controller()->page_name() == "00cmn/ws_buy_sure");
+    choose(f, "yes1");
+    CHECK(gt.state().wheels.size() == 199 && gt.state().wheels.back() + "_link" == keep[0]);
+    CHECK(gt.state().credits == credits - price);
+    CHECK(f.controller()->page_name() == "00cmn/ws_fit_sure");
+    choose(f, "no1");
+    CHECK(f.controller()->page_name() == page);
+    // The 200th: no slot is free. The shop asks as usual, then adds nothing and charges nothing.
+    credits = gt.state().credits;
+    choose(f, keep[1].c_str());
+    CHECK(f.controller()->page_name() == "00cmn/ws_buy_sure");
+    choose(f, "yes1");
+    CHECK(gt.state().wheels.size() == 199 && gt.state().credits == credits);
+    CHECK(gt.state().wheels.back() + "_link" == keep[0]);
+    const std::string last = keep[1].substr(0, keep[1].rfind('_'));
+    CHECK(gt.can_buy_wheel(last) == game::Check::Ok && !gt.buy_wheel(last) && gt.state().credits == credits);
+    // "Fit it?" yes: the ride car wears the wheel, which the inventory does not hold; nothing is
+    // charged.
+    CHECK(f.controller()->page_name() == "00cmn/ws_fit_sure");
+    choose(f, "yes1");
+    CHECK(f.controller()->page_name() == page);
+    CHECK(gt.state().ride_car()->wheel == last && gt.state().credits == credits);
+    CHECK(gt.state().wheels.size() == 199 &&
+          std::find(gt.state().wheels.begin(), gt.state().wheels.end(), last) == gt.state().wheels.end());
+    // The garage's car page shows the car on it.
+    std::string shown, wheel;
+    int paint = -1;
+    CHECK(game::car_for_widget("hm/hm_car", "car_render_garage", shown, paint, &wheel) && wheel == last);
+    // Saves keep it: the native save, and the PS2 game file (the car's wheel by id, after the 0x130
+    // bytes of the game's figures; 200 wheel entries, the placeholder included).
+    const game::GameState native = game::load_from_text(game::save_to_text(gt.state()));
+    CHECK(native.garage.size() == 1 && native.garage[0].wheel == last && native.wheels == gt.state().wheels);
+    const Bytes file = game::export_ps2_save(gt.state(), gt.data());
+    Bytes payload(file.begin() + 0x40, file.begin() + 0x40 + rd32(file, 4));
+    for (u8& b : payload) b = u8(~b);
+    CHECK(rd32(payload, 0x34) == 200 && rd64(payload, 0x130 + 0xE8) == db::id_hash(last));
+    const game::GameState ps2 = game::import_ps2_save(file, gt.data());
+    CHECK(ps2.garage.size() == 1 && ps2.garage[0].wheel == last && ps2.wheels == gt.state().wheels);
+    // Once changed, it cannot be put back: the garage offers only the inventory's wheels.
+    CHECK(gt.fit_wheel(gt.state().ride, "") && !gt.fit_wheel(gt.state().ride, last));
+    game::reset_gt_mode_menu_for_tests();
+}
+
+// The garage's wheel list (gt_mode §7): Garage > car > Wheel shows one button per entry of the
+// wheel inventory in a row centred in the page's "menu_wheel" window, 4 units apart: the
+// stock-wheel button first with the page's "default_wheel" tile, then the bought wheels in the
+// order they were bought, each with its own tile in the page's 60 x 60 "wheel" frame. The "mark"
+// frame is over the entry the car wears and the cursor starts there (on the stock-wheel button
+// for a car on its own wheels; no mark and the first button for a wheel the inventory does not
+// hold). Left / Right move the cursor (held at the ends) and the car shows the wheel under it;
+// "Equip this wheel?" yes puts it on the car, the stock-wheel button the car's own wheels. The
+// scroll bar shows only while the row is longer than the window. None of the page's tiles named
+// after car models is drawn. The wheel shop's brand pages start on the wheel the ride car wears.
+// Any region's disc.
+TEST(gtmode_menu_disc_garage_wheel_list) {
+    Disc* disc = test::any_region_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::reset_gt_mode_menu_for_tests();
+    game::install_gt_mode_menu();
+    Vfs vfs(&disc->volume());
+    const Language lang = vfs.region().default_language();
+    vfs.set_language(lang);
+    GameFlow f(vfs_reader(vfs), text::language_code(lang));
+    f.start();
+    settle(f);
+    game::GtModeSession* s = game::gt_mode_session();
+    CHECK(s != nullptr);
+    if (!s) return;
+    game::GtMode& gt = s->gt();
+    gt.state().credits = 100000000;
+    CHECK(gt.buy_car("r34_gtr_v_99") == 0);
+    const std::vector<std::string> bought = {"bbw005_g", "duw001_g", "bbw004_g"};
+    for (const std::string& w : bought) CHECK(gt.buy_wheel(w));
+    const game::GarageCar& car = gt.state().garage[0];
+    choose(f, "gt_mode");
+    settle(f);
+    choose(f, "hm_hm");
+    choose(f, "gr");
+    choose(f, "car1");
+    CHECK(f.controller()->page_name() == "hm/hm_car");
+    choose(f, "wheel");
+    CHECK(f.controller()->page_name() == "hm/hm_wheel");
+    const menu::Page& lay = f.controller()->page().layout();
+    const menu::Element* win = nullptr;
+    for (const menu::Layer& l : lay.layers)
+        for (const menu::Element& e : l.widgets)
+            if (e.name == "menu_wheel") win = &e;
+    CHECK(win != nullptr);
+    if (!win) return;
+    // The drawn tiles (52 x 52, inside the window), frames and marks, left to right.
+    struct Drawn {
+        std::string name;
+        SDL_FRect box;
+    };
+    auto drawn = [&](auto pick) {
+        std::vector<Drawn> out;
+        for (const menu::ElementDraw& d : f.draw_list())
+            if (d.element && d.has_box && pick(*d.element)) out.push_back({d.element->name, d.box});
+        std::sort(out.begin(), out.end(), [](const Drawn& a, const Drawn& b) { return a.box.x < b.box.x; });
+        return out;
+    };
+    auto tiles = [&] { return drawn([](const menu::Element& e) { return e.w == 52 && e.h == 52; }); };
+    // The buttons' frames, one per button (the focused one: its highlight with the plain look over it).
+    auto frames = [&] {
+        std::vector<Drawn> all = drawn([](const menu::Element& e) { return e.name == "wheel" || e.name == "wheel1"; });
+        all.erase(std::unique(all.begin(), all.end(), [](const Drawn& a, const Drawn& b) { return a.box.x == b.box.x; }),
+                  all.end());
+        return all;
+    };
+    auto marks = [&] { return drawn([](const menu::Element& e) { return e.name == "mark"; }); };
+    auto focused_frame = [&] {
+        for (const Drawn& d : drawn([](const menu::Element& e) { return e.name == "wheel1"; })) return d.box.x;
+        return -1.0f;
+    };
+    auto preview = [&] {
+        std::string c, w = "?";
+        int paint = -1;
+        game::car_for_widget(f.controller()->page_name(), "car_render_wheel", c, paint, &w);
+        return w;
+    };
+    auto settle_scroll = [&] {
+        for (int i = 0; i < 60; ++i) f.tick(0);
+    };
+    settle_scroll();
+    // A car on its own wheels: the stock-wheel button is marked and has the cursor.
+    {
+        const std::vector<Drawn> t = tiles(), fr = frames(), m = marks();
+        CHECK(t.size() == 4 && fr.size() == 4 && m.size() == 1);
+        if (t.size() == 4 && fr.size() == 4 && m.size() == 1) {
+            CHECK(t[0].name == "default_wheel" && t[1].name == bought[0] && t[2].name == bought[1] &&
+                  t[3].name == bought[2]);
+            const float total = 4 * 60 + 3 * 4, left = win->x + (win->w - total) * 0.5f;
+            for (int i = 0; i < 4; ++i) {
+                CHECK(std::fabs(fr[size_t(i)].box.x - (left + 64.0f * float(i))) < 0.01f);
+                CHECK(std::fabs(t[size_t(i)].box.x - (fr[size_t(i)].box.x + 4)) < 0.01f);
+                CHECK(std::fabs(fr[size_t(i)].box.y - (win->y + 6)) < 0.01f);
+            }
+            CHECK(std::fabs(m[0].box.x - fr[0].box.x) < 0.01f && std::fabs(focused_frame() - fr[0].box.x) < 0.01f);
+        }
+        CHECK(s->wheel_cursor == 0 && preview().empty());
+        // No scroll bar while the row fits.
+        bool bar_drawn = false;
+        for (const menu::ElementDraw& d : f.draw_list())
+            bar_drawn = bar_drawn || (d.element && (d.element->name == "scroll_bar" || d.element->name == "pinch"));
+        CHECK(!bar_drawn);
+    }
+    // Right twice: the second bought wheel under the cursor, on the car; at the end it stays.
+    press(f, MenuKey::Right);
+    press(f, MenuKey::Right);
+    settle_scroll();
+    CHECK(s->wheel_cursor == 2 && preview() == bought[1]);
+    {
+        const std::vector<Drawn> fr = frames(), m = marks();
+        CHECK(fr.size() == 4 && m.size() == 1);
+        if (fr.size() == 4 && m.size() == 1)
+            CHECK(std::fabs(focused_frame() - fr[2].box.x) < 0.01f && std::fabs(m[0].box.x - fr[0].box.x) < 0.01f);
+    }
+    for (int i = 0; i < 4; ++i) press(f, MenuKey::Right);
+    CHECK(s->wheel_cursor == 3);
+    press(f, MenuKey::Left);
+    CHECK(s->wheel_cursor == 2);
+    // Equip it.
+    press(f, MenuKey::Confirm);
+    settle(f);
+    CHECK(f.controller()->page_name() == "hm/hm_change_wheel_sure");
+    choose(f, "yes1");
+    CHECK(car.wheel == bought[1] && f.controller()->page_name() == "hm/hm_wheel_changed");
+    choose(f, "buy3");
+    CHECK(f.controller()->page_name() == "hm/hm_car");
+    // Back on the page: the cursor and the mark on the wheel the car wears.
+    choose(f, "wheel");
+    settle_scroll();
+    CHECK(s->wheel_cursor == 2);
+    {
+        const std::vector<Drawn> fr = frames(), m = marks();
+        if (fr.size() == 4 && m.size() == 1) CHECK(std::fabs(m[0].box.x - fr[2].box.x) < 0.01f);
+        else CHECK(false);
+    }
+    // The stock-wheel button puts the car back on its own wheels.
+    press(f, MenuKey::Left);
+    press(f, MenuKey::Left);
+    press(f, MenuKey::Confirm);
+    settle(f);
+    choose(f, "yes1");
+    CHECK(car.wheel.empty());
+    choose(f, "buy3");
+    // A row longer than the window (13 buttons, 828 units): left-aligned near the start, the
+    // cursor's button centred in the middle, right-aligned at the end; the scroll bar and its
+    // pinch at bar x - offset x bar w / row w, window w x bar w / row w wide (GT3's ScrollBar).
+    for (const char* w : {"bbw006_s", "bbw007_s", "bbw008_s", "bbw009_s", "bbw010_s", "bbw011_s", "bbw012_s",
+                          "bbw013_s", "duw001_s"})
+        CHECK(gt.buy_wheel(w));
+    choose(f, "wheel");
+    settle_scroll();
+    {
+        const menu::Element* sbar = nullptr;
+        for (const menu::Layer& l : lay.layers)
+            for (const menu::Element& e : l.widgets)
+                if (e.name == "scroll_bar") sbar = &e;
+        CHECK(sbar != nullptr && int(gt.state().wheels.size()) + 1 == 13);
+        const float total = 13 * 60 + 12 * 4;
+        auto row_at = [&](int cursor, float off) {
+            while (s->wheel_cursor < cursor) press(f, MenuKey::Right);
+            settle_scroll();
+            const std::vector<Drawn> fr = frames(), p = drawn([](const menu::Element& e) { return e.name == "pinch"; });
+            int tracks = 0; // (the track is drawn where the layout puts it, without a box)
+            for (const menu::ElementDraw& d : f.draw_list()) tracks += d.element == sbar;
+            return s->wheel_cursor == cursor && !fr.empty() && sbar && tracks == 1 && p.size() == 1 &&
+                   std::fabs(focused_frame() - (win->x + off + 64.0f * float(cursor))) < 0.01f &&
+                   std::fabs(p[0].box.x - (sbar->x - off * sbar->w / total)) < 0.01f &&
+                   std::fabs(p[0].box.w - win->w * sbar->w / total) < 0.01f;
+        };
+        CHECK(row_at(0, 0));
+        CHECK(row_at(6, win->w * 0.5f - (6 * 64 + 30)));
+        CHECK(row_at(12, win->w - total));
+    }
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->page_name() == "hm/hm_car");
+    // A wheel the inventory does not hold (fitted by the shop with no slot free): no mark, the
+    // cursor on the first button.
+    gt.state().garage[0].wheel = "enw010_s";
+    choose(f, "wheel");
+    settle_scroll();
+    CHECK(s->wheel_cursor == 0 && marks().empty());
+    // Only the default_wheel and the bought wheels' tiles: none named after a car model.
+    for (const Drawn& t : tiles())
+        CHECK(t.name == "default_wheel" ||
+              std::find(gt.state().wheels.begin(), gt.state().wheels.end(), t.name) != gt.state().wheels.end());
+    // The wheel shop: a brand page opens on the wheel the ride car wears, another on its first.
+    gt.state().garage[0].wheel = bought[0];
+    press(f, MenuKey::Cancel);
+    press(f, MenuKey::Cancel);
+    press(f, MenuKey::Cancel);
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->page_name() == "map");
+    choose(f, "at_at");
+    choose(f, "sl");
+    CHECK(f.controller()->page_name() == "at/ws/ws");
+    choose(f, "ts");
+    CHECK(f.controller()->page_name() == "at/ws/ws_bbs" && f.controller()->focused() &&
+          f.controller()->focused()->flow->name == bought[0] + "_link");
+    // Its tiles: GT3's button row, 52-unit tiles 4 apart (56 from tile to tile), placed for the
+    // focused tile (14 tiles, 780 units in the 600-unit window: tile 5 starts at 280, under half
+    // the window, so the row is left-aligned).
+    {
+        const menu::Element* shop_win = nullptr;
+        for (const menu::Layer& l : f.controller()->page().layout().layers)
+            for (const menu::Element& e : l.widgets)
+                if (e.name == "menu_wheel_shop") shop_win = &e;
+        std::vector<float> xs;
+        for (const MenuController::ItemState& it : f.controller()->items()) {
+            const std::string code = it.flow->name.substr(0, it.flow->name.rfind('_'));
+            for (const Drawn& d : drawn([&](const menu::Element& e) { return e.name == code; })) xs.push_back(d.box.x);
+        }
+        CHECK(shop_win && f.controller()->focus() == 5 && xs.size() >= 10);
+        for (size_t i = 0; shop_win && i < xs.size(); ++i) CHECK(std::fabs(xs[i] - (shop_win->x + 56.0f * float(i))) < 0.01f);
+    }
+    press(f, MenuKey::Cancel);
+    choose(f, "hm");
+    CHECK(f.controller()->page_name() == "at/ws/ws_bridgestone" && f.controller()->focus() == 0);
+    game::reset_gt_mode_menu_for_tests();
+}
+
+// The code-drawn vertical lists on the disc's pages as GT3's vertical button list (menus §4.6,
+// §9.7; gt_mode §5, §8, §17.2, §19):
+// the garage and trade lists (the 24-unit "car1" rows 28 apart in the 304-unit window), Cars
+// Permitted (the 20-unit rows 24 apart in 232) and the records (the 56-unit bars 60 apart in
+// 356: a licence test's six places fill it). From the window's top; a list that fits stays
+// there with no scroll bar, track included; a longer one keeps the cursor row centred, held at
+// the window's top and bottom near the ends, its offset easing 30 % a frame, and its scroll
+// bar's pinch is window h x bar h / list h high, at bar top - offset x bar h / list h
+// (top-down).
+TEST(gtmode_menu_disc_vertical_lists) {
+    Disc* disc = test::any_region_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::reset_gt_mode_menu_for_tests();
+    game::install_gt_mode_menu();
+    Vfs vfs(&disc->volume());
+    const Language lang = vfs.region().default_language();
+    vfs.set_language(lang);
+    GameFlow f(vfs_reader(vfs), text::language_code(lang));
+    f.start();
+    settle(f);
+    game::GtModeSession* s = game::gt_mode_session();
+    CHECK(s != nullptr);
+    if (!s) return;
+    game::GtMode& gt = s->gt();
+    gt.state().credits = 1000000000;
+    for (int i = 0; i < 3; ++i) CHECK(gt.buy_car("r34_gtr_v_99") == 0);
+    auto near = [](float a, float b) { return std::fabs(a - b) < 0.01f; };
+    auto widget = [&](const char* name) -> const menu::Element* {
+        for (const menu::Layer& l : f.controller()->page().layout().layers)
+            for (const menu::Element& e : l.widgets)
+                if (e.name == name) return &e;
+        return nullptr;
+    };
+    auto named = [&](const char* name) {
+        std::vector<menu::ElementDraw> out;
+        for (const menu::ElementDraw& d : f.draw_list())
+            if (d.element && d.element->name == name) out.push_back(d);
+        return out;
+    };
+    // The list's rows (code-drawn, clipped to the window) and the cursor row's top edge (y up).
+    auto rows = [&](const char* tmpl, const char* focus) {
+        std::vector<menu::ElementDraw> out;
+        for (const menu::ElementDraw& d : f.draw_list())
+            if (d.element && d.has_clip && (d.element->name == tmpl || d.element->name == focus)) out.push_back(d);
+        std::sort(out.begin(), out.end(), [](const menu::ElementDraw& a, const menu::ElementDraw& b) { return a.box.y > b.box.y; });
+        return out;
+    };
+    auto cursor_top = [&](const char* tmpl, const char* focus) {
+        for (const menu::ElementDraw& d : rows(tmpl, focus))
+            if (d.element->name == focus) return d.box.y + d.box.h;
+        return -1000.0f;
+    };
+    auto settle_list = [&] {
+        for (int i = 0; i < 60; ++i) f.tick(0);
+    };
+    // The cursor row `c` at offset `off` (rows `step` apart) and the scroll bar: none while
+    // `total` fits it, else the track and the pinch.
+    auto at = [&](const char* tmpl, const char* focus, const menu::Element* win, float step, int c, float off,
+                  float total) {
+        const menu::Element* bar = widget("scroll_bar");
+        auto p = named("pinch");
+        const float top = win->y + win->h;
+        bool ok = bar && near(cursor_top(tmpl, focus), top - off - step * float(c));
+        if (total <= bar->h) return ok && named("scroll_bar").empty() && p.empty();
+        const float ph = win->h * bar->h / total;
+        return ok && named("scroll_bar").size() == 1 && p.size() == 1 &&
+               near(p[0].box.x, bar->x) && near(p[0].box.w, bar->w) && near(p[0].box.h, ph) &&
+               near(p[0].box.y + ph, bar->y + bar->h + off * bar->h / total);
+    };
+
+    // The garage: three cars at the window's top, 28 apart.
+    choose(f, "gt_mode");
+    settle(f);
+    choose(f, "hm_hm");
+    choose(f, "gr");
+    CHECK(f.controller()->page_name() == "hm/hm_gr");
+    const menu::Element* win = widget("menu_garage");
+    CHECK(win && near(win->h, 304) && f.controller()->items()[0].element->h == 24);
+    if (!win) return;
+    {
+        auto r = rows("car1", "car_a1");
+        CHECK(r.size() == 3);
+        for (size_t i = 0; i < r.size(); ++i) CHECK(near(r[i].box.y + 24, win->y + win->h - 28.0f * float(i)));
+        CHECK(at("car1", "car_a1", win, 28, 0, 0, 3 * 28 - 4));
+    }
+    // Twenty: 556 units. The top, the cursor row centred (row 10: 152 - (280 + 12)), the bottom
+    // (304 - 556); one frame of easing.
+    press(f, MenuKey::Cancel);
+    for (int i = 0; i < 17; ++i) CHECK(gt.buy_car("r34_gtr_v_99") == 0);
+    choose(f, "gr");
+    win = widget("menu_garage");
+    CHECK(f.controller()->page_name() == "hm/hm_gr" && win && gt.state().garage.size() == 20);
+    if (!win) return;
+    const float total = 20 * 28 - 4;
+    CHECK(at("car1", "car_a1", win, 28, 0, 0, total));
+    s->garage_cursor = 10;
+    settle_list();
+    CHECK(at("car1", "car_a1", win, 28, 10, -140, total));
+    s->garage_cursor = 11;
+    f.tick(0);
+    CHECK(at("car1", "car_a1", win, 28, 11, -140 - 28 * 0.3f, total));
+    for (int i = 0; i < 12; ++i) press(f, MenuKey::Down);
+    settle_list();
+    CHECK(s->garage_cursor == 19 && at("car1", "car_a1", win, 28, 19, 304 - total, total));
+    // The trade page (a friend's garage of four): the same list in its own window.
+    s->guest = std::make_unique<game::GtMode>(gt.data_ptr());
+    s->guest->state().credits = 1000000000;
+    for (int i = 0; i < 4; ++i) CHECK(s->guest->buy_car("r34_gtr_v_99") == 0);
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->open("hm/hm_gr_trade"));
+    settle(f);
+    const menu::Element* twin = widget("menu_garage_trade");
+    CHECK(f.controller()->page_name() == "hm/hm_gr_trade" && s->trade && twin);
+    if (twin) CHECK(rows("car1", "car_a1").size() == 4 && at("car1", "car_a1", twin, 28, 0, 0, 4 * 28 - 4));
+    s->trade = false;
+    s->guest.reset();
+    press(f, MenuKey::Cancel);
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->page_name() == "map");
+
+    // Cars Permitted: the 80's sports list (longer than the 232-unit window).
+    const std::vector<std::string> names = game::permitted_car_names(gt, "G_80sports_e_0001");
+    CHECK(names.size() >= 10);
+    choose(f, "r_r");
+    choose(f, "beginner");
+    choose(f, "G_80sports_e_0001");
+    choose(f, "G_80sports_e_0001_info");
+    choose(f, "car_regulation");
+    CHECK(f.controller()->page_name() == "00cmn/car_reguration");
+    const menu::Element* rwin = widget("menu_regulated_car");
+    CHECK(rwin && near(rwin->h, 232) && f.controller()->items()[0].element->h == 20);
+    if (rwin && names.size() >= 10) {
+        const float rtotal = float(names.size()) * 24 - 4;
+        CHECK(at("link_menu", "active_menu", rwin, 24, 0, 0, rtotal));
+        auto r = rows("link_menu", "active_menu");
+        CHECK(r.size() >= 2 && near(r[0].box.y - r[1].box.y, 24));
+        const int n = int(names.size());
+        for (int i = 1; i < n; ++i) press(f, MenuKey::Down);
+        settle_list();
+        CHECK(s->regulated_cursor == n - 1 && at("link_menu", "active_menu", rwin, 24, n - 1, 232 - rtotal, rtotal));
+    }
+    press(f, MenuKey::Cancel);
+
+    // The records: twelve places (716 units, so the list scrolls) and a licence test's six.
+    CHECK(game::begin_records("mt:M400"));
+    GameFlow rec(vfs_reader(vfs), text::language_code(lang));
+    rec.start("records", "records_free_tt");
+    settle(rec);
+    CHECK(rec.controller() && rec.controller()->page_name() == "records_free_tt");
+    auto bars = [&] {
+        std::vector<float> out; // the bars' top edges, top to bottom; the cursor's first
+        float cursor = -1000;
+        for (const menu::ElementDraw& d : rec.draw_list())
+            if (d.element && d.has_clip && (d.element->name == "record_bar" || d.element->name == "record_bar1")) {
+                out.push_back(d.box.y + d.box.h);
+                if (d.element->name == "record_bar1") cursor = d.box.y + d.box.h;
+            }
+        std::sort(out.rbegin(), out.rend());
+        out.insert(out.begin(), cursor);
+        return out;
+    };
+    {
+        std::vector<float> b = bars(); // window 4..360
+        CHECK(b.size() == 7 && near(b[0], 360));
+        for (size_t i = 1; i < b.size(); ++i) CHECK(near(b[i], 360 - 60.0f * float(i - 1)));
+    }
+    for (int i = 0; i < 12; ++i) press(rec, MenuKey::Down);
+    for (int i = 0; i < 60; ++i) rec.tick(0);
+    {
+        std::vector<float> b = bars(); // the last place at the window's bottom: offset 356 - 716
+        CHECK(s->records_cursor == 11 && b.size() == 7 && near(b[0], 4 + 56) && near(b.back(), 4 + 56));
+    }
+    CHECK(game::begin_records("lic:L0B0001"));
+    GameFlow lic(vfs_reader(vfs), text::language_code(lang));
+    lic.start("records", "records_free_tt");
+    settle(lic);
+    int places = 0;
+    for (const menu::ElementDraw& d : lic.draw_list())
+        places += d.element && d.has_clip && (d.element->name == "record_bar" || d.element->name == "record_bar1");
+    CHECK(places == 6);
+    game::reset_gt_mode_menu_for_tests();
+}
+
 // The car wash and the oil change on the disc's pages (gt_mode §13.2): after the button's confirm
 // feedback their progress popup ("Washing . . .", "Changing oil . . .") holds the controls, with
 // no "Complete" button and no key doing anything, until the wash (the car spun for 181 frames)
@@ -892,7 +1490,7 @@ TEST(gtmode_menu_disc_license_run_name_entry) {
 TEST(gtmode_menu_disc_record_name_entry) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
-    const std::string path = (std::filesystem::temp_directory_path() / "gt3r_test_record_name.sav").string();
+    const std::string path = test::temp_path("record_name.sav").string();
     std::remove(path.c_str());
     set_env("GT3R_GTMODE_SAVE", path.c_str());
     set_env("GT3R_GTMODE_NOSAVE", "0");
@@ -929,7 +1527,7 @@ TEST(gtmode_menu_disc_record_name_entry) {
     // A new 0-400 m record: the name entry page.
     CHECK(f.control() == "name_entry" && f.controller()->page_name() == "name_entry");
     MenuController* c = f.controller();
-    // One key cursor over the whole grid (FreeButton rows), the column kept across rows.
+    // One key cursor over the whole grid (free button rows), the column kept across rows.
     {
         auto highlighted = [&] {
             int n = 0;
@@ -1124,7 +1722,8 @@ TEST(gtmode_menu_disc_arcade_progression) {
     CHECK(skip_race_prizes(f).size() == 1);
     CHECK(f.controller()->page_name() == "ar/top");
     const game::ArcadeProgress& a = s->gt().state().arcade;
-    CHECK(a.best[size_t(3 * game::kArcadeCourses)] == 0 && a.awards == 0x8000 && a.course_level == 0);
+    CHECK(a.best[size_t(3 * s->gt().arcade_course_count())] == 0 && s->gt().arcade_course_count() == 34 &&
+          a.awards == 0x8000 && a.course_level == 0);
     // Clear Status: a Pro win has no mark; an Easy win shows the Easy mark.
     s->gt().arcade_single_race("AECT0001", "super", 0);
     choose(f, "item5");
@@ -1417,8 +2016,8 @@ TEST(gtmode_menu_disc_arcade_two_player) {
 
 // The save page (save_page.h) over a fake library: no slot choice and no "working" /
 // "Complete" windows; the operation menu, one confirm for delete / overwrite, the name
-// entry for new saves and renames, the file dialog for imports, exports and guest
-// garages, rows scrolling past twelve files, the error window.
+// entry for new saves and renames, the export's format window, the file dialog for
+// imports, exports and guest garages, rows scrolling past twelve files, the error window.
 TEST(save_page_flow) {
     struct Fake {
         std::string id, name;
@@ -1456,8 +2055,12 @@ TEST(save_page_flow) {
     };
     std::optional<std::string> dialog_answer;
     std::vector<int> dialogs;
+    std::string dialog_name;
     FileDialogs d;
-    d.show = [&](FileDialogs::Kind k, const std::string&) { dialogs.push_back(int(k)); };
+    d.show = [&](FileDialogs::Kind k, const std::string& name) {
+        dialogs.push_back(int(k));
+        dialog_name = name;
+    };
     d.poll = [&]() { return std::exchange(dialog_answer, std::nullopt); };
     set_file_dialogs(d);
     std::vector<std::string> snd;
@@ -1533,18 +2136,41 @@ TEST(save_page_flow) {
     press(q, MenuKey::Confirm);
     CHECK(q.phase() == SavePage::Phase::Confirm);
     CHECK(press(q, MenuKey::Confirm) == 1 && std::get<1>(ran.back()) == "b");
-    // Export: the save dialog with the file's name, then back to the list.
+    // Export: the format window (.psu first; Cancel back to the operation menu), then the save
+    // dialog starting on the file's name with the format's extension (cancelled: back to the
+    // formats); the format chosen runs whatever the file is called; then back to the list.
     q.open(SavePage::Mode::Files, b);
     q.tick(0, snd);
     CHECK(q.files().size() == 2 && q.files(1).size() == 1);
     press(q, MenuKey::Confirm);
     for (int i = 0; i < 3; ++i) press(q, MenuKey::Down);
+    const size_t dialogs_before = dialogs.size();
+    press(q, MenuKey::Confirm);
+    CHECK(q.phase() == SavePage::Phase::Format && q.format() == 0 && dialogs.size() == dialogs_before);
+    press(q, MenuKey::Cancel);
+    CHECK(q.phase() == SavePage::Phase::Operation && q.op() == 2); // (Edit file name, Copy, Export)
+    press(q, MenuKey::Confirm);
+    press(q, MenuKey::Up); // stays on the first
+    for (int i = 0; i < 3; ++i) press(q, MenuKey::Down);
+    CHECK(q.phase() == SavePage::Phase::Format && q.format() == SavePage::kExportFormatCount - 1);
     press(q, MenuKey::Confirm);
     CHECK(q.phase() == SavePage::Phase::Dialog && dialogs.back() == int(FileDialogs::Kind::ExportPs2));
-    dialog_answer = "/x/out.ps2";
+    CHECK(dialog_name == "A.raw");
+    dialog_answer = "";
     q.tick(0, snd);
-    CHECK(std::get<0>(ran.back()) == SavePage::OpExport && std::get<2>(ran.back()) == "/x/out.ps2");
+    CHECK(q.phase() == SavePage::Phase::Format && q.format() == 2);
+    press(q, MenuKey::Up);
+    press(q, MenuKey::Confirm);
+    CHECK(dialog_name == "A.ps2");
+    dialog_answer = "content://docs/document/42";
+    q.tick(0, snd);
+    CHECK(std::get<0>(ran.back()) == SavePage::OpExportCard && std::get<1>(ran.back()) == "a");
+    CHECK(std::get<2>(ran.back()) == "content://docs/document/42");
+    CHECK(q.phase() == SavePage::Phase::Done && q.done_text() == "Exported as 42"); // (no FileDialogs::name)
+    press(q, MenuKey::Confirm);
     CHECK(q.phase() == SavePage::Phase::List);
+    for (const SavePage::ExportFormat& e : SavePage::kExportFormats)
+        CHECK(e.op != SavePage::OpExport && e.ext[0] == '.' && std::strlen(e.label) <= 15); // (the button)
     // A failing operation: the error window, OK back to the list.
     fail = SavePage::WriteError;
     press(q, MenuKey::Confirm);
@@ -1586,6 +2212,107 @@ TEST(save_page_flow) {
     m.tick(0, snd);
     press(m, MenuKey::Confirm);
     CHECK(m.files(1).empty() && m.ops().back() == SavePage::OpDelete);
+}
+
+// The save page while a file dialog is open: either key (the waiting window's CANCEL) stops
+// waiting, back to the formats (export) or the list (import), and gives the dialog up; its
+// answer coming later never runs. A dialog that never answers can be left. An export ends
+// on "Exported as" with the file written (a name without an extension gets the format's).
+TEST(save_page_dialog_cancel) {
+    std::vector<std::tuple<int, std::string, std::string>> ran; // op, file id, arg
+    SavePage::Backend b;
+    b.list = [](SavePage::Mode) {
+        SavePage::File g;
+        g.id = "a";
+        g.name = "A";
+        return std::vector<SavePage::File>{g};
+    };
+    b.run = [&](SavePage::Mode, SavePage::Op op, const SavePage::File& f, const std::string& arg) {
+        ran.emplace_back(int(op), f.id, arg);
+        return 0;
+    };
+    // A fake platform: an answer set by the test waits until polled (or until cancel drops it,
+    // as the app's does; `keep_late` leaves it, as a dialog would that cannot be told).
+    std::optional<std::string> answer;
+    int shown = 0, cancelled = 0;
+    bool keep_late = false;
+    FileDialogs d;
+    d.show = [&](FileDialogs::Kind, const std::string&) { ++shown; };
+    d.poll = [&]() { return std::exchange(answer, std::nullopt); };
+    d.cancel = [&]() {
+        ++cancelled;
+        if (!keep_late) answer.reset();
+    };
+    set_file_dialogs(d);
+    std::vector<std::string> snd;
+    auto press = [&](SavePage& p, MenuKey k) {
+        int r = p.tick(key_bit(k), snd);
+        return r ? r : p.tick(0, snd);
+    };
+    SavePage p;
+    p.open(SavePage::Mode::Files, b);
+    p.tick(0, snd);
+    // Export -> the formats -> the dialog; Cancel goes back to the formats and gives it up.
+    press(p, MenuKey::Confirm);
+    for (size_t i = 1; i < p.ops().size(); ++i) press(p, MenuKey::Down);
+    press(p, MenuKey::Confirm);
+    press(p, MenuKey::Down); // PS2 card (.ps2)
+    press(p, MenuKey::Confirm);
+    CHECK(p.phase() == SavePage::Phase::Dialog && shown == 1);
+    for (int i = 0; i < 600; ++i) p.tick(0, snd); // no answer: still waiting
+    CHECK(p.phase() == SavePage::Phase::Dialog);
+    snd.clear();
+    press(p, MenuKey::Cancel);
+    CHECK(p.phase() == SavePage::Phase::Format && p.format() == 1 && cancelled == 1 && snd == std::vector<std::string>{"cancel"});
+    // A late answer of the dialog given up runs nothing, now or when the next one opens.
+    keep_late = true;
+    answer = "/x/late.ps2";
+    for (int i = 0; i < 10; ++i) p.tick(0, snd);
+    CHECK(ran.empty() && p.phase() == SavePage::Phase::Format);
+    press(p, MenuKey::Confirm);
+    CHECK(p.phase() == SavePage::Phase::Dialog && shown == 2);
+    p.tick(0, snd);
+    CHECK(ran.empty() && p.phase() == SavePage::Phase::Dialog);
+    press(p, MenuKey::Confirm); // Confirm is the window's CANCEL too
+    CHECK(p.phase() == SavePage::Phase::Format && cancelled == 2 && ran.empty());
+    keep_late = false;
+    // Answered: written under the format's extension, then "Exported as" until either key.
+    press(p, MenuKey::Confirm);
+    answer = "/x/dir.v2/My export";
+    p.tick(0, snd);
+    CHECK(std::get<0>(ran.back()) == SavePage::OpExportCard && std::get<2>(ran.back()) == "/x/dir.v2/My export");
+    CHECK(p.phase() == SavePage::Phase::Done && p.done_text() == "Exported as My export.ps2");
+    press(p, MenuKey::Cancel);
+    CHECK(p.phase() == SavePage::Phase::List);
+    CHECK(SavePage::export_path("/x/a.b/save", SavePage::OpExportRaw) == "/x/a.b/save.raw");
+    CHECK(SavePage::export_path("/x/save.bin", SavePage::OpExportPsu) == "/x/save.bin");
+    CHECK(SavePage::export_path("content://d/7", SavePage::OpExportPsu) == "content://d/7");
+    // Import: a dialog that never answers is left with Cancel (back to the list); a late
+    // answer imports nothing.
+    ran.clear();
+    press(p, MenuKey::Right);
+    CHECK(p.panel() == 1);
+    press(p, MenuKey::Confirm);
+    CHECK(p.phase() == SavePage::Phase::Dialog && shown == 4);
+    for (int i = 0; i < 600; ++i) p.tick(0, snd);
+    press(p, MenuKey::Cancel);
+    CHECK(p.phase() == SavePage::Phase::List && p.panel() == 1 && cancelled == 3);
+    keep_late = true;
+    answer = "/x/late.sav";
+    for (int i = 0; i < 10; ++i) p.tick(0, snd);
+    CHECK(ran.empty() && p.phase() == SavePage::Phase::List);
+    CHECK(press(p, MenuKey::Cancel) == -1); // and the page can be left
+    // Without poll() a dialog cannot be waited for: straight back.
+    FileDialogs show_only;
+    show_only.show = d.show;
+    set_file_dialogs(show_only);
+    p.open(SavePage::Mode::Files, b);
+    p.tick(0, snd);
+    press(p, MenuKey::Right);
+    press(p, MenuKey::Confirm);
+    p.tick(0, snd);
+    CHECK(p.phase() == SavePage::Phase::List);
+    set_file_dialogs({});
 }
 
 // Settings files on the save page: the car's files (Load), "New Save" first (Save) and the
@@ -1652,13 +2379,137 @@ TEST(options_values_and_previews) {
     CHECK(option_value(&cfg, "menu_se") == "on"); // invalid -> default
 }
 
+// The save page in the real menus (title File Operation, the disc's art) over a fake library
+// and fake file dialogs: Export to PS2 -> a format -> the dialog cancelled, and Import ->
+// cancelled; the page still takes the keys afterwards and can be left.
+TEST(gtmode_menu_disc_save_page_dialogs) {
+    Disc* disc = test::test_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    set_env("GT3R_GTMODE_SAVE", "/nonexistent-gt3r-test/gtmode.sav");
+    set_env("GT3R_GTMODE_NOSAVE", "1");
+    game::install_gt_mode_menu();
+    const GtModeHooks installed = gt_mode_hooks();
+    GtModeHooks h = installed;
+    std::vector<std::tuple<int, std::string, std::string>> ran; // op, file id, arg
+    h.save_list = [](SavePage::Mode) {
+        std::vector<SavePage::File> out;
+        for (const char* n : {"A", "B"}) {
+            SavePage::File g;
+            g.id = n;
+            g.name = n;
+            out.push_back(g);
+        }
+        return out;
+    };
+    h.save_run = [&](SavePage::Mode, SavePage::Op op, const SavePage::File& f, const std::string& arg) {
+        ran.emplace_back(int(op), f.id, arg);
+        return 0;
+    };
+    set_gt_mode_hooks(h);
+    std::optional<std::string> answer;
+    int shown = 0;
+    FileDialogs d;
+    d.show = [&](FileDialogs::Kind, const std::string&) { ++shown; };
+    d.poll = [&]() { return std::exchange(answer, std::nullopt); };
+    set_file_dialogs(d);
+    Vfs vfs(&disc->volume());
+    GameFlow f(vfs_reader(vfs), "US");
+    f.start();
+    settle(f);
+    choose(f, "file_operation");
+    settle(f);
+    const SavePage* p = f.save_page();
+    CHECK(p && p->mode() == SavePage::Mode::Files && p->files().size() == 2);
+    if (!p) return;
+    // Export: Confirm, Down x2 (Edit file name, Copy, Delete, Export), Confirm -> the formats.
+    press(f, MenuKey::Confirm);
+    CHECK(p->phase() == SavePage::Phase::Operation && p->ops().back() == SavePage::OpExport);
+    for (size_t i = 1; i < p->ops().size(); ++i) press(f, MenuKey::Down);
+    press(f, MenuKey::Confirm);
+    CHECK(p->phase() == SavePage::Phase::Format);
+    press(f, MenuKey::Confirm);
+    CHECK(p->phase() == SavePage::Phase::Dialog && shown == 1);
+    for (int i = 0; i < 30; ++i) f.tick(0);
+    answer = "";
+    f.tick(0);
+    CHECK(p->phase() == SavePage::Phase::Format && ran.empty());
+    // The keys still work: Down, Confirm (the dialog again), Cancel back to the list.
+    press(f, MenuKey::Down);
+    CHECK(p->format() == 1);
+    press(f, MenuKey::Confirm);
+    CHECK(p->phase() == SavePage::Phase::Dialog && shown == 2);
+    answer = "";
+    f.tick(0);
+    press(f, MenuKey::Cancel);
+    CHECK(p->phase() == SavePage::Phase::Operation);
+    press(f, MenuKey::Cancel);
+    CHECK(p->phase() == SavePage::Phase::List);
+    // Import: Right to the right panel, Confirm, the dialog cancelled -> the list, keys work.
+    press(f, MenuKey::Right);
+    press(f, MenuKey::Right);
+    CHECK(p->panel() == 1);
+    press(f, MenuKey::Confirm);
+    CHECK(p->phase() == SavePage::Phase::Dialog && shown == 3);
+    answer = "";
+    f.tick(0);
+    CHECK(p->phase() == SavePage::Phase::List);
+    press(f, MenuKey::Left);
+    CHECK(p->panel() == 0);
+
+    // The same by mouse / touch, on the disc's art: icons 64 x 64 at a 70 pitch in the left
+    // view (28, 174, 284 x 214); the operation / format window (256 x 140) kept in that view
+    // at (28, 248), its buttons (128 x 26) at x 144 from y 352 down by 32; the waiting and
+    // "Exported" windows' button at (270, 184, 100 x 26).
+    auto tap = [&](float x, float y) {
+        const bool used = f.tap(x, y);
+        f.tick(0);
+        f.tick(0);
+        return used;
+    };
+    auto drawn = [&](const char* text) {
+        for (const menu::ElementDraw& e : f.draw_list())
+            if (e.text && *e.text == text) return true;
+        return false;
+    };
+    CHECK(tap(66, 350) && p->cursor() == 0 && p->phase() == SavePage::Phase::List);  // A: focused
+    CHECK(tap(136, 350) && p->cursor() == 1 && p->phase() == SavePage::Phase::List); // B: focused
+    CHECK(tap(136, 350) && p->phase() == SavePage::Phase::Operation);               // B again: its menu
+    CHECK(tap(208, 269) && p->op() == 3 && p->phase() == SavePage::Phase::Operation); // Export to PS2
+    CHECK(tap(208, 269) && p->phase() == SavePage::Phase::Format);
+    CHECK(f.hover(208, 301) && p->format() == 2); // a mouse over Raw save
+    CHECK(tap(208, 301) && p->phase() == SavePage::Phase::Dialog && shown == 4);
+    CHECK(drawn("Waiting for the file window...") && drawn("CANCEL"));
+    CHECK(!tap(500, 100) && p->phase() == SavePage::Phase::Dialog); // (only its button)
+    CHECK(tap(320, 197) && p->phase() == SavePage::Phase::Format);  // CANCEL
+    CHECK(tap(500, 100) && p->phase() == SavePage::Phase::Operation); // outside the window: back
+    CHECK(tap(500, 100) && p->phase() == SavePage::Phase::List);
+    // Exported: the window says where; a tap closes it.
+    press(f, MenuKey::Confirm);
+    tap(208, 269);
+    tap(208, 269);
+    tap(208, 301);
+    CHECK(tap(208, 301) && p->phase() == SavePage::Phase::Dialog && shown == 5);
+    answer = "/x/out";
+    f.tick(0);
+    CHECK(p->phase() == SavePage::Phase::Done && std::get<0>(ran.back()) == SavePage::OpExportRaw);
+    CHECK(drawn("Exported as out.raw") && drawn("OK"));
+    CHECK(tap(500, 100) && p->phase() == SavePage::Phase::List);
+    // The pointer's back (a right click) leaves the page.
+    f.back();
+    for (int i = 0; i < 120 && f.save_page(); ++i) f.tick(0);
+    settle(f);
+    CHECK(!f.save_page() && f.control() == "gt_mode");
+    set_gt_mode_hooks(installed);
+    set_file_dialogs({});
+}
+
 // License B end to end through the menus: the license page raises the GameRequest, the
 // race's judged result (gold) comes back, GT mode records the medal, writes the save, the
 // B page shows the cup; test 8 opens after tests 1-7; all 8 -> the license card.
 TEST(gtmode_menu_disc_license_b_progress) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
-    const std::string path = (std::filesystem::temp_directory_path() / "gt3r_test_license_b.sav").string();
+    const std::string path = test::temp_path("license_b.sav").string();
     std::remove(path.c_str());
     set_env("GT3R_GTMODE_SAVE", path.c_str());
     set_env("GT3R_GTMODE_NOSAVE", "0");
@@ -1783,8 +2634,8 @@ TEST(gtmode_menu_disc_arcade_garage_cars) {
     r.car = "hg0";
     r.car2 = "hg1";
     h.arcade_prepare(r);
-    CHECK(r.car == g0->car && r.car_spec != nullptr);
-    CHECK(r.car2 == g1->car && r.car2_spec != nullptr && !r.car2_model.empty() && r.car2_color == g1->color);
+    CHECK(r.car == g0->car && r.car_parts.has_value());
+    CHECK(r.car2 == g1->car && r.car2_parts.has_value() && !r.car2_model.empty() && r.car2_color == g1->color);
     CHECK(!r.racing_gearbox && !r.racing_gearbox2); // stock gearboxes: no whine
     // Player 2's garage car with a non-stock transmission gets the gear whine as player 1's does.
     {

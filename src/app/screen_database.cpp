@@ -1,15 +1,18 @@
-// Car database browser: GT3's car catalogue (database/paramdb_us.db), with
+// Car database browser: GT3's car catalogue (the disc region's database/paramdb*.db), with
 // specs, the engine torque curve, upgrade parts and the race events.
 
 #include "app/app.h"
 #include "app/screen_registry.h"
 #include "formats/text/charset.h"
 #include "game/data/car_database.h"
+#include "game/gt_mode.h"
+#include "menu/flow/menu_set.h"
 #include "vfs/vfs.h"
 
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <memory>
 
 namespace gt3r {
 
@@ -48,10 +51,11 @@ public:
             app.pop();
             return;
         }
+        if (!gt_) return; // no data: only the error page
         if (m.pressed(PadButton::Square)) {
             mode_ = mode_ == Mode::Cars ? Mode::Events : Mode::Cars;
         }
-        int n = mode_ == Mode::Cars ? int(order_.size()) : int(db_.events().size());
+        int n = mode_ == Mode::Cars ? int(order_.size()) : int(db().events().size());
         int& sel = mode_ == Mode::Cars ? car_sel_ : event_sel_;
         if (n) {
             int step = m.held(PadButton::R1) || m.held(PadButton::L1) ? 10 : 1;
@@ -65,7 +69,7 @@ public:
     }
 
     void render(App&, Ui& ui) override {
-        if (!error_.empty()) {
+        if (!error_.empty() || !gt_) {
             ui.header("CAR DATABASE", "");
             ui.text_center(150, error_, colors::kBad);
             ui.footer("Triangle: back");
@@ -91,13 +95,17 @@ private:
             } catch (const std::exception&) {
             }
         }
-        if (!db_.load(*app.vfs())) {
-            error_ = db_.error();
+        // The GT Mode data (the region's database and game config): prices and prizes as the
+        // game shows them, through the same rules as the dealers and races (GtMode).
+        auto data = std::make_shared<game::GtData>();
+        if (!data->load(menu::flow::vfs_reader(*app.vfs()))) {
+            error_ = data->error();
             return;
         }
-        for (size_t i = 0; i < db_.cars().size(); ++i) {
-            const data::Car& c = db_.cars()[i];
-            names_.push_back(ascii(c.name));
+        gt_ = std::make_unique<game::GtMode>(data);
+        for (size_t i = 0; i < db().cars().size(); ++i) {
+            const data::Car& c = db().cars()[i];
+            names_.push_back(ascii(c.latin_name)); // this screen's font has no kana
             if (c.label.rfind("sample", 0) != 0) order_.push_back(i); // skip placeholder rows
         }
         sort();
@@ -122,10 +130,10 @@ private:
     void sort() {
         size_t keep = order_.empty() ? 0 : order_[std::min<size_t>(car_sel_, order_.size() - 1)];
         std::stable_sort(order_.begin(), order_.end(), [&](size_t a, size_t b) {
-            const data::Car& x = db_.cars()[a];
-            const data::Car& y = db_.cars()[b];
+            const data::Car& x = db().cars()[a];
+            const data::Car& y = db().cars()[b];
             if (sort_by_power_) {
-                auto ex = db_.engine(x.parts[6]), ey = db_.engine(y.parts[6]);
+                auto ex = db().engine(x.parts[6]), ey = db().engine(y.parts[6]);
                 return (ex ? ex->power_ps : 0) > (ey ? ey->power_ps : 0);
             }
             if (x.maker != y.maker) return x.maker < y.maker;
@@ -141,18 +149,18 @@ private:
         int first = ui.list_window(n, car_sel_, kRows);
         for (int i = 0; i < kRows && first + i < n; ++i) {
             int idx = first + i;
-            const data::Car& c = db_.cars()[order_[idx]];
+            const data::Car& c = db().cars()[order_[idx]];
             float y = 26 + i * 12.0f;
             if (idx == car_sel_) ui.fill(4, y - 2, 236, 12, colors::kHighlight);
             ui.text(8, y, clip(ascii(c.maker), 8), colors::kDim);
             ui.text(80, y, clip(names_[order_[idx]], 20), idx == car_sel_ ? colors::kAccent : colors::kText);
         }
         if (n == 0) return;
-        const data::Car& c = db_.cars()[order_[car_sel_]];
+        const data::Car& c = db().cars()[order_[car_sel_]];
         float x = 250;
         ui.fill(x - 6, 22, Ui::kWidth - x, Ui::kHeight - 46, colors::kPanel);
         ui.text(x, 26, clip(names_[order_[car_sel_]], 48), colors::kAccent);
-        auto s = db_.summarize(c);
+        auto s = db().summarize(c);
         ui.text(x, 38, fmt("%s  %u  %s  model %s", clip(ascii(c.maker), 14).c_str(), s.year, c.label.c_str(),
                            s.model.c_str()),
                 colors::kDim);
@@ -171,7 +179,8 @@ private:
             ui.text(x + 104, y, v);
             y += 12;
         };
-        row("Price", s.price ? fmt("%u Cr", s.price) : "not for sale");
+        const std::string price = game::format_credits(gt_->car_price(c.label)) + " Cr";
+        row("Price", gt_->car_flags(c.label) & 1 ? price + " (not for sale)" : price);
         row("Engine", fmt("%s %s %s", s.displacement.c_str(), s.layout.c_str(), s.aspiration.c_str()));
         row("Max power", fmt("%u PS @ %s", s.power_ps, s.power_rpm.c_str()));
         row("Max torque", fmt("%.1f kgf-m @ %s", s.torque_kgfm, s.torque_rpm.c_str()));
@@ -180,7 +189,7 @@ private:
         if (s.weight_kg) row("Power/weight", fmt("%.2f kg/PS", s.power_ps ? double(s.weight_kg) / s.power_ps : 0.0));
         row("Dimensions", fmt("%u x %u x %u mm", s.length_mm, s.width_mm, s.height_mm));
         row("Wheelbase", fmt("%u mm", s.wheelbase_mm));
-        if (auto b = db_.body(c.parts[5])) row("Tread F/R", fmt("%u / %u mm", b->front_tread_mm, b->rear_tread_mm));
+        if (auto b = db().body(c.parts[5])) row("Tread F/R", fmt("%u / %u mm", b->front_tread_mm, b->rear_tread_mm));
         row("Gearbox", fmt("%u-speed, final %.3f", s.gears, s.final_drive));
         std::string ratios;
         for (float r : s.ratios) ratios += fmt("%.3f ", r);
@@ -193,7 +202,7 @@ private:
         std::string line;
         for (u64 id : c.parts) {
             if (!id) continue;
-            std::string l = db_.label(id);
+            std::string l = db().label(id);
             if (l.size() < 3 || l[2] != '_') continue;
             std::string p = l.substr(0, 2);
             if (line.size() + p.size() + 1 > 46) {
@@ -207,7 +216,7 @@ private:
     }
 
     void render_curve(Ui& ui, float x, const data::Car& c) {
-        auto e = db_.engine(c.parts[6]);
+        auto e = db().engine(c.parts[6]);
         if (!e || e->rpm.empty()) {
             ui.text(x, 60, "No engine data", colors::kBad);
             return;
@@ -248,10 +257,10 @@ private:
             TableId::Lightweight,
         };
         for (TableId t : kTables) {
-            auto parts = db_.parts_for(t, c.label);
+            auto parts = db().parts_for(t, c.label);
             std::string line;
             for (const auto& p : parts)
-                if (p.stage) line += fmt("%u:%u ", p.stage, p.price);
+                if (p.stage) line += fmt("%u:%s ", p.stage, game::format_credits(gt_->part_price(p.price)).c_str());
             if (line.empty()) continue;
             ui.text(x, y, data::table_name(t), colors::kDim);
             ui.text(x + 136, y, clip(line, 30));
@@ -261,7 +270,7 @@ private:
     }
 
     void render_events(Ui& ui) {
-        const auto& ev = db_.events();
+        const auto& ev = db().events();
         ui.header("RACE EVENTS", fmt("%zu events", ev.size()));
         int n = int(ev.size());
         int first = ui.list_window(n, event_sel_, kRows);
@@ -278,7 +287,7 @@ private:
         ui.text(x, y, e.label, colors::kAccent);
         y += 14;
         std::string course = e.course;
-        for (const auto& c : db_.courses())
+        for (const auto& c : db().courses())
             if (c.label == e.course && !c.name.empty()) course = ascii(c.name) + " (" + e.course + ")";
         auto row = [&](const char* k, const std::string& v) {
             ui.text(x, y, k, colors::kDim);
@@ -290,16 +299,17 @@ private:
         row("Laps", fmt("%u", e.laps));
         row("Regulation", e.regulation.empty() ? "-" : e.regulation);
         std::string prize;
-        for (size_t place = 0; place < 4; ++place)
-            if (u32 cr = e.prize_credits(place)) prize += fmt("%zu: %u  ", place + 1, cr);
+        if (std::optional<game::EventRules> r = gt_->rules(e.label))
+            for (size_t place = 0; place < r->prize.size(); ++place)
+                if (r->prize[place]) prize += fmt("%zu: %s  ", place + 1, game::format_credits(r->prize[place]).c_str());
         row("Prize (Cr)", prize.empty() ? "-" : prize);
         ui.text(x, y + 4, fmt("Entries (%zu)", e.entries.size()), colors::kDim);
         y += 16;
         for (size_t i = 0; i < e.entries.size() && y < Ui::kHeight - 40; ++i) {
-            const data::CarVariant* v = db_.variant(e.entries[i]);
+            const data::CarVariant* v = db().variant(e.entries[i]);
             std::string name = e.entries[i];
             if (v) {
-                if (const data::Car* c = db_.car(v->car)) name = ascii(c->name) + "  [" + e.entries[i] + "]";
+                if (const data::Car* c = db().car(v->car)) name = ascii(c->latin_name) + "  [" + e.entries[i] + "]";
             }
             ui.text(x, y, clip(name, 46));
             y += 11;
@@ -307,7 +317,9 @@ private:
         ui.footer("Up/Down: event  Square: cars  Triangle: back   (prize/laps fields partly inferred)");
     }
 
-    CarDatabase db_;
+    const CarDatabase& db() const { return gt_->db(); }
+
+    std::unique_ptr<game::GtMode> gt_;
     text::JisTable jis_;
     std::vector<size_t> order_;
     std::vector<std::string> names_;

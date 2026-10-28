@@ -156,7 +156,7 @@ Render-state ops that matter for cars (each sets GS drawing state):
 | 1A / 1B | TEST.ATE on / off | on for body passes, off for reflection passes |
 | 1C a, r | TEST.ATST = a, AREF = r | (6 GREATER, 0x20) by default; (6, 0) or (5 GEQUAL, 0) before some passes |
 | 1D / 1E | TEST.DATE on / off | on for reflection passes |
-| 20 m, f | ALPHA = m (A\|B<<2\|C<<4\|D<<6), FIX = f | 0x44 = (Cs-Cd)·As+Cd for glass/decals, 0x58 = Cs·Ad+Cd for reflections |
+| 20 m, f | ALPHA = m (A\|B<<2\|C<<4\|D<<6), FIX = f | 0x44 = (Cs-Cd)·As+Cd for glass/decals, 0x58 = Cs·Ad+Cd for reflections and specular overlays |
 | 24 v | FRAME.FBMSK = v | 0xFF000000 = colour only (glass, decals keep the reflectivity alpha), 0xFFFFFFFF = depth only, 0 = all |
 | 17 / 18 | depth test on / off (17 only when depth testing is enabled globally) | |
 | 19 f | TEST.ZTST from f: 0 NEVER, 1 ALWAYS, 2 GREATER, 3 GEQUAL | not used by ml0002 (nor Laguna Seca's scenery) |
@@ -279,6 +279,17 @@ head-on), K = 1 − (a per-car value, meaning open). The result is an 8-bit GS
 colour (≤ 255, i.e. ≤ 255/128 of the texel after MODULATE). Blend ALPHA 0x58 (Cs·Ad + Cd) with the fog colour set to black; Ad is
 the frame alpha the body pass wrote (texel alpha × lit alpha). Later reflection
 chunks use the destination-alpha test so overlaps are not added twice.
+
+Specular overlays: blended (PRIM.ABE) packets that are not reflection passes but
+are drawn with ALPHA 0x58 add the same way, Cs·Ad + Cd over the body pass below.
+Besides the chunk kind 4 glints, ten models (day / eve / night: 787B, Calsonic
+Skyline, Escudo Pikes Peak, Castrol Mugen NSX, S2000 LM, Nismo GT-R LM road car,
+Cobra, both Griffith 500s, MR-S S Edition) have kind 1 lit textured overlays with a
+specular-only material (Ma = Md = 0, Ms 1, the MR-S 0.1-0.5; shininess 16 / 20) on
+the same vertices as a body pass: headlamp lenses, grille mesh, deck panels. Lit by
+the specular term alone they are black away from the highlight, so drawn with
+normal blending they would black out the part; added, they only put the highlight
+on it.
 
 ### VIF packets
 
@@ -461,8 +472,8 @@ second key frame by the fraction. The game's car code sets the values every fram
 Car models' +0x3C animators (type 7, mostly without targets) are never advanced by the game.
 
 Ours: `gtm1::RunParams::callback` (op 0x06 ids 1-5), `gtm1::MorphDraws` (`Options::morphs`,
-`CarModelOptions::morphs`: the draws left out of the body), `model::flap_step` and
-`sim::WheelState::flap` / `VehicleState::steer`, `race::car_callback_values` and
+`CarModelOptions::morphs`: the draws left out of the body), the race's flap pendulums
+(physics §8.8) as `sim::WheelState::flap` / `VehicleState::steer`, `race::car_callback_values` and
 `race::CarVisual`'s morph models (one per drawing of the car, rebuilt when the values change).
 
 ## Open questions

@@ -16,8 +16,8 @@ std::vector<std::string> RaceScreen::pause_items() const {
 }
 
 // GT3's pause window for this run (presentation §E): time trials,
-// licence tests and machine tests have RETRY (RacePauseWithRetry), races / free runs /
-// 2P do not (RacePause), replays have REPLAY OPTIONS (ReplayPause).
+// licence tests and machine tests have RETRY (race pause with retry), races / free runs /
+// 2P do not (race pause), replays have REPLAY OPTIONS (replay pause).
 PauseMenu::Kind RaceScreen::pause_kind() const {
     if (replaying_ || (theater_ && demo_)) return PauseMenu::Kind::Replay;
     bool machine = from_menu_ && launch_.request.mode == "go_machine_test";
@@ -29,7 +29,7 @@ void RaceScreen::open_pause(App& app) {
     paused_ = true;
     pause_sel_ = 0;
     pause_more_ = false;
-    if (!pause_loaded_) pause_loaded_ = true, pause_menu_.load(*app.vfs(), app.renderer(), hud_.fonts());
+    if (!pause_loaded_) pause_loaded_ = true, pause_menu_.load(*app.vfs(), app.renderer(), hud_.fonts(), lang_);
     // A run that set a record keeps RETRY greyed out until the next run (presentation §E3).
     pause_menu_.set_retry_enabled(!retry_locked_);
     pause_menu_.open(pause_kind());
@@ -74,12 +74,14 @@ void RaceScreen::update_pause(App& app, double dt) {
             break;
         case PauseMenu::Result::Retry: // the run again from its start (presentation §E retry)
             paused_ = false;
+            // GT3 tears the race down and sets it up again: the paused music stops (music §2.4) and
+            // the new run starts its own cues (resumed, a fail jingle played over the whole retry).
             if (online_) toast("Online races cannot be restarted");
-            else restart();
+            else music_.stop(app.audio()), restart();
             break;
         case PauseMenu::Result::ReplayOptions: // GT3's REPLAY OPTIONS panel (replay_panel1/2.pmb)
             if (!replay_opts_loaded_)
-                replay_opts_loaded_ = true, replay_opts_.load(*app.vfs(), app.renderer(), hud_.fonts());
+                replay_opts_loaded_ = true, replay_opts_.load(*app.vfs(), app.renderer(), hud_.fonts(), lang_);
             replay_opts_.open(replay_settings_, two_player_);
             replay_opts_open_ = true;
             replay_opts_acc_ = 0;
@@ -103,6 +105,8 @@ void RaceScreen::update_pause(App& app, double dt) {
     }
     if (!m.pressed(PadButton::Cross)) return;
     const std::string& it = items[size_t(pause_sel_)];
+    // A run started over from here ends the paused run's music, as RETRY does (above).
+    if (it == "Restart" || it == "Restart replay" || it == "Stop replay (drive)") music_.stop(app.audio());
     if (it == "Resume" || it == "Resume replay") {
         if (!(replaying_ && player_.done())) paused_ = false;
     } else if (it == "Restart") {

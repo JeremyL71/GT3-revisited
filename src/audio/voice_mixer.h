@@ -15,9 +15,14 @@
 //
 // Thread safety: every public method may be called from any thread. The
 // game thread issues key-on/off and parameter changes; the audio thread
-// calls mix(). One mutex guards the voice table; calls are short. The tick
-// hook runs on the mixing thread without the lock held, so it may call any
-// method; it is how the sequencer gets sample-exact timing.
+// calls mix(). One mutex guards the voice table; calls are short. mix()
+// renders each block from a copy of the table without the lock (a block can
+// take milliseconds on a phone), then takes the rendered voices back and
+// replays, in order, the changes made meanwhile: they land after the block,
+// as they would have had they waited for it (a key-on meanwhile picks its
+// voice from the table as it was before the block). The tick hook runs on the
+// mixing thread without the lock held, so it may call any method; it is how
+// the sequencer gets sample-exact timing.
 
 #include "audio/spu_reverb.h"
 #include "base/bytes.h"
@@ -28,6 +33,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 namespace gt3r {
 
@@ -146,22 +152,47 @@ private:
         u32 env_counter = 0;
         u64 age = 0;
     };
+    // A change to the voice table or the reverb, kept while a block renders.
+    struct Change {
+        enum class Kind : u8 { KeyOn, KeyOff, Stop, StopAll, Pitch, Volume, Priority, Reverb, ReverbDepth };
+        Change(Kind k, VoiceId v = {}, int n = 0, s16 left = 0, s16 right = 0) : kind(k), id(v), value(n), l(left), r(right) {}
+        Kind kind;
+        VoiceId id;
+        int value;   // pitch, priority, reverb mode
+        s16 l, r;    // volume, reverb depth
+        Voice voice; // KeyOn: the voice as keyed on (at id's index)
+    };
+    // What a block renders with besides the voices, as it was when the block began.
+    struct BlockParams {
+        s32 master = 0;
+        bool gauss = true;
+        std::array<s32, 2> bus_gain{};
+    };
 
     Voice* find(VoiceId v);
     const Voice* find(VoiceId v) const;
-    void render(s16* out, size_t frames);
+    void change(Change c); // (mutex_ held)
+    void apply(const Change& c);
+    void render_block(s16* out, size_t frames);
+    void render(s16* out, size_t frames, const BlockParams& p);
     static s32 next_sample(Voice& v);
     static void step_envelope(Voice& v);
     static bool env_tick(Voice& v, int rate, int rate_mask, bool exponential, bool decrease);
 
     mutable std::mutex mutex_;
     std::array<Voice, kVoices> voices_;
+    std::array<Voice, kVoices> block_;   // the block being rendered (mixing thread, without mutex_)
+    bool rendering_ = false;             // a block renders: block_ and reverb_ are the mixing thread's
+    std::vector<Change> changes_;        // made while it renders, replayed after it
+    std::mutex mix_mutex_;               // one mix() at a time
     u64 clock_ = 0;
     float master_ = kOutputTrim;
     std::array<s32, 2> bus_gain_{1 << 16, 1 << 16}; // per VoiceBus, 16.16 fixed point
     Interpolation interp_ = Interpolation::Gaussian;
     std::atomic<bool> surround_cue_{false};
     SpuReverb reverb_;
+    int reverb_mode_ = SpuReverb::Off; // as last set (reverb_ takes it after a rendering block)
+    s16 reverb_depth_ = 0;
 
     std::mutex hook_mutex_; // guards hook_ and the tick counters
     std::function<void()> hook_;

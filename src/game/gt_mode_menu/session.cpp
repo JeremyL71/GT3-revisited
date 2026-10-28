@@ -7,6 +7,7 @@
 #include "base/file.h"
 #include "base/log.h"
 #include "game/gt_save.h"
+#include "vfs/vfs.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -69,9 +70,10 @@ bool ensure_gt_mode_session(const std::function<std::optional<Bytes>(const std::
 
 SaveLibrary& save_library() {
     MenuState& ms = menu_state();
-    // Made again when GT3R_GTMODE_SAVE changes (tests).
+    // The disc region's library; made again when GT3R_GTMODE_SAVE changes (tests).
     const char* env = std::getenv("GT3R_GTMODE_SAVE");
-    const std::string want = env ? env : "";
+    const Region region = region_data(ms.reader).region;
+    const std::string want = std::string(region_key(region)) + "|" + (env ? env : "");
     if (ms.library && want != ms.library_env) ms.library.reset();
     ms.library_env = want;
     if (!ms.library) {
@@ -81,9 +83,14 @@ SaveLibrary& save_library() {
             dir = sl == std::string::npos ? std::string(".") : dir.substr(0, sl);
             ms.library = std::make_unique<SaveLibrary>(dir, false);
         } else {
-            ms.library = std::make_unique<SaveLibrary>(SaveLibrary::user_dir());
-            if (saving_enabled())
+            ms.library = std::make_unique<SaveLibrary>(SaveLibrary::user_dir(region));
+            if (saving_enabled() && region == Region::America) // earlier versions played NTSC-U data only
                 if (int n = ms.library->migrate(SaveLibrary::legacy_path()); n > 0)
+                    LOG_INFO("gt mode: %d save(s) copied into %s", n, ms.library->dir().c_str());
+            // Versions up to 0.3 kept a PAL disc's games in saves/ too (on the NTSC-U data set,
+            // which the PAL set extends): the PAL library starts with copies of them, once.
+            if (saving_enabled() && region == Region::Europe)
+                if (int n = ms.library->copy_library(SaveLibrary::user_dir(Region::America)); n > 0)
                     LOG_INFO("gt mode: %d save(s) copied into %s", n, ms.library->dir().c_str());
         }
     }
@@ -98,7 +105,9 @@ std::string current_save_path() {
         if (f.state) return f.path;
     // Nothing in the library yet: an earlier version's save when it was not migrated
     // (writes disabled), else the new game's file.
-    if (!saving_enabled() && host_path_exists(SaveLibrary::legacy_path())) return SaveLibrary::legacy_path();
+    if (!saving_enabled() && region_data(menu_state().reader).region == Region::America &&
+        host_path_exists(SaveLibrary::legacy_path()))
+        return SaveLibrary::legacy_path();
     return lib.dir() + "gtmode.sav";
 }
 
@@ -157,6 +166,7 @@ bool begin_records(const std::string& key) {
     GtModeSession* s = S();
     if (!s) return false;
     s->records_key = key;
+    s->records_cursor = 0; // (the first place)
     return true;
 }
 

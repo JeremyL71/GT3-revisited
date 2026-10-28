@@ -82,38 +82,156 @@ size_t AnalyzerTrack::index_at_distance(float d) const {
     return std::min(size_t(it - trace.dist.begin()), trace.size() ? trace.size() - 1 : 0);
 }
 
-AnalyzerLap analyzer_lap(const Replay& r) {
-    if (r.best_lap < 0 || r.best_lap_end <= r.best_lap_begin) return {0, r.ticks(), true};
-    return {r.best_lap_begin, std::min(r.best_lap_end, r.ticks()), false};
+u32 AnalyzerTrack::frame_at_distance(float d, u32 begin) const {
+    const size_t i = index_at_distance(d);
+    if (frames.empty()) return begin + u32(i);
+    return i == 0 ? lap_begin : frames[i - 1]; // (bin i starts where bin i - 1 ends)
 }
 
-LapSampler::LapSampler(double hz, float lap_length, bool whole) : lap_length_(lap_length), whole_(whole) { t_.hz = hz; }
+float AnalyzerTrack::distance_at_frame(u32 f, u32 begin) const {
+    if (!valid()) return 0;
+    if (frames.empty()) return trace.dist[std::min<size_t>(f > begin ? f - begin : 0, trace.size() - 1)];
+    const size_t i = size_t(std::lower_bound(frames.begin(), frames.end(), f) - frames.begin());
+    return trace.dist[std::min(i, trace.size() - 1)];
+}
 
-void LapSampler::add(const sim::VehicleState& s, const sim::ControlInputs& in, float d) {
-    const float L = lap_length_;
-    // A lap starts on the line: a first sample just short of it counts from -0.
-    if (prev_ < 0 && !whole_ && L > 0 && d > L * 0.5f) base_ = -L;
-    // Unwrapped distance from the lap's first sample (the line for a lap).
-    if (prev_ >= 0 && L > 0) {
-        if (d < prev_ - L * 0.5f) base_ += L;
-        else if (d > prev_ + L * 0.5f) base_ -= L;
+namespace {
+
+using ee::F;
+const F kZero = F::raw(0), kHalf = F::raw(0x3F000000), kOne = F::raw(0x3F800000);
+constexpr size_t kMaxBins = 0x4000;
+
+// The area under the line from (d0, v0) to (d1, v1) over [lo, hi]: 0 when the segment misses it, else the segment
+// cut to it (the line's values at the cuts) as a trapezoid.
+F bin_area(F d0, F d1, F v0, F v1, F lo, F hi) {
+    if (d1 < lo || hi < d0) return kZero;
+    if (d0 < lo || hi < d1) {
+        const F f1 = v1 * d0;
+        const F f3 = (v0 * d1) - f1;
+        const F inv = kOne / (d1 - d0);
+        const F dv = v1 - v0;
+        if (d0 < lo) v0 = ((dv * lo) + f3) * inv, d0 = lo;
+        if (hi < d1) v1 = ((dv * hi) + f3) * inv, d1 = hi;
     }
-    prev_ = d;
-    float u = d + base_;
-    if (t_.trace.dist.empty() && whole_) base_ -= u, u = 0;
-    LapTrace& tr = t_.trace;
-    tr.dist.push_back(std::max(0.0f, u));
-    tr.speed_kmh.push_back(s.speed_kmh);
-    tr.throttle.push_back(in.throttle);
-    tr.brake.push_back(in.brake);
-    tr.x.push_back(s.position.x);
-    tr.z.push_back(s.position.z);
-    t_.ghost.add(s);
+    return ((v0 + v1) * (d1 - d0)) * kHalf;
 }
 
-AnalyzerTrack LapSampler::take(double lap_time) {
-    t_.trace.time = lap_time >= 0 ? lap_time : double(t_.trace.size()) / t_.hz;
-    return std::exchange(t_, {});
+// The value at `at` of the line through (d0, x0) and (d1, x1).
+F line_at(F d0, F d1, F x0, F x1, F at) {
+    const F a = x0 * d1, b = x1 * d0;
+    const F inv = kOne / (d1 - d0);
+    const F c = a - b;
+    return (((x1 - x0) * at) + c) * inv;
+}
+
+// At t = 0: a drawn coordinate between the last two steps (the race-flow accumulator's share of the last).
+F drawn(F prev, F cur, F flow) {
+    const F f = kZero + flow;
+    return (prev * f) + (cur * (kOne - f));
+}
+
+} // namespace
+
+LoggerBinner::LoggerBinner(F lap) : lap_(lap) {
+    w_ = ee::max(lap / F::raw(0x467FFC00), kHalf); // 16383
+    inv_w_ = kOne / w_;
+}
+
+void LoggerBinner::add(const sim::exact::Car& c, double time, u32 frame) {
+    if (bins_.size() >= kMaxBins) return;
+    const std::array<F, 3> v{c.speed_abs, c.throttle_pedal, c.brake_pedal};
+    const F x = drawn(c.draw_pos_prev.x, c.draw_pos.x, c.flow), z = drawn(c.draw_pos_prev.z, c.draw_pos.z, c.flow);
+    F d = c.f3e4 + ee::int_to_f(s32(c.laps) - 1) * lap_;
+    auto store = [&] {
+        if (!started_ && !(d < kZero)) { // (ours: where the lap starts)
+            const double dd = double(d.host()) - double(d_.host());
+            start_t_ = first_ || dd <= 0 ? time : t_ + (0.0 - double(d_.host())) / dd * (time - t_);
+            start_frame_ = frame, started_ = true;
+        }
+        first_ = false;
+        d_ = d, v_ = v, x_ = x, z_ = z, t_ = time;
+    };
+    if (first_) {
+        if (kZero < d) d = kZero;
+        edge_ = d;
+        return store();
+    }
+    if (d <= edge_) {
+        d = edge_;
+        return store();
+    }
+    edge_ = d;
+    F lo = ee::int_to_f(s32(bins_.size())) * w_;
+    F hi = lo + w_;
+    for (size_t k = 0; k < 3; ++k) acc_[k] = acc_[k] + bin_area(d_, d, v_[k], v[k], lo, hi);
+    const u8 gear = u8(c.gear & 7);
+    while (hi <= d) {
+        F s = acc_[0], a = acc_[1], b = acc_[2];
+        const F k255 = F::raw(0x437F0000);
+        a = a * k255, b = b * k255;
+        s = s * F::raw(0x42200000); // 40
+        a = a * inv_w_, b = b * inv_w_, s = s * inv_w_;
+        a = a + kHalf, b = b + kHalf, s = s + kHalf;
+        const F px = line_at(d_, d, x_, x, hi), pz = line_at(d_, d, z_, z, hi);
+        LoggerBin bin;
+        s = ee::min(s, F::raw(0x45FFF800)); // 8191
+        bin.word = u16(gear | u32(ee::to_int(s)) << 3);
+        bin.throttle = u8(ee::to_int(ee::min(a, k255)));
+        bin.brake = u8(ee::to_int(ee::min(b, k255)));
+        bin.x = s16(ee::to_int(px)), bin.z = s16(ee::to_int(pz));
+        const double dd = double(d.host()) - double(d_.host());
+        bin.time = dd > 0 ? t_ + (double(hi.host()) - double(d_.host())) / dd * (time - t_) : time;
+        bin.frame = frame;
+        bins_.push_back(bin);
+        if (bins_.size() >= kMaxBins) return; // (the last step's values are not kept then)
+        hi = hi + w_, lo = lo + w_;
+        for (size_t k = 0; k < 3; ++k) acc_[k] = bin_area(d_, d, v_[k], v[k], lo, hi);
+    }
+    store();
+}
+
+void LoggerBinner::finish() {
+    if (bins_.empty()) return;
+    u32 ps = bins_[0].word >> 3, pt = bins_[0].throttle, pb = bins_[0].brake; // the bin before's, as they were
+    for (size_t i = 1; i + 1 < bins_.size(); ++i) {
+        LoggerBin& b = bins_[i];
+        const LoggerBin& n = bins_[i + 1];
+        const u32 s = b.word >> 3, t = b.throttle, r = b.brake;
+        b.word = u16((((ps + 2 * s + (n.word >> 3)) >> 2) << 3) | (b.word & 7));
+        b.throttle = u8((pt + 2 * t + n.throttle) >> 2);
+        b.brake = u8((pb + 2 * r + n.brake) >> 2);
+        ps = s, pt = t, pb = r;
+    }
+}
+
+AnalyzerTrack logger_track(const LoggerBinner& bins, const std::map<s32, sim::exact::Snapshot>* table, double hz) {
+    AnalyzerTrack t;
+    t.hz = hz;
+    const float w = bins.width().host();
+    LapTrace& tr = t.trace;
+    for (size_t k = 0; k < bins.bins().size(); ++k) {
+        const LoggerBin& b = bins.bins()[k];
+        tr.dist.push_back(float(k) * w);
+        tr.speed_kmh.push_back(b.speed() * 3.6f);
+        tr.throttle.push_back(float(b.throttle) / 255.0f);
+        tr.brake.push_back(float(b.brake) / 255.0f);
+        tr.x.push_back(float(b.x)), tr.z.push_back(float(b.z));
+        t.times.push_back(std::max(0.0, b.time - bins.start_time()));
+        t.frames.push_back(b.frame);
+    }
+    t.lap_begin = bins.start_frame();
+    t.lap_end = t.frames.empty() ? t.lap_begin : t.frames.back();
+    // The logger's entries end at its marks and at the lap: their times count from the lap's start (ms).
+    double last = 0;
+    if (table)
+        for (const auto& [k, e] : *table) {
+            if (k < 0 || e.time == 0 || e.time == sim::exact::kNoTime) continue; // (an entry not ended)
+            const double at = double(e.time) / 1000.0;
+            t.sector_times.push_back(at - last);
+            last = at;
+        }
+    tr.time = !t.sector_times.empty() ? last : t.times.empty() ? -1.0 : t.times.back();
+    return t;
 }
 
 std::optional<LoggerMap> LoggerMap::parse(ByteSpan d) {
@@ -391,8 +509,11 @@ void Analyzer::draw(SDL_Renderer* r, const SDL_FRect& dst) {
         const float unit = imperial ? 1.0f / 1.609344f : 1.0f;
         char buf[32];
         std::snprintf(buf, sizeof buf, "%d %s", int(std::lround(tr.trace.speed_kmh[i] * unit)), imperial ? "mph" : "km/h");
-        const double st = tr.time_at(i1) - tr.time_at(i0);
-        const float sd = tr.trace.dist[i1] - tr.trace.dist[i0];
+        // The sector's time: the data logger's for the whole sector where the track has its table, else the samples' to the
+        // cursor.
+        const bool logged = size_t(sec) < tr.sector_times.size();
+        const double st = logged ? tr.sector_times[size_t(sec)] : tr.time_at(i1) - tr.time_at(i0);
+        const float sd = logged ? s1 - s0 : tr.trace.dist[i1] - tr.trace.dist[i0];
         std::string avg = "---";
         if (st > 0.05) {
             std::snprintf(buf + 16, 16, "%d", int(std::lround(sd / st * 3.6 * unit)));

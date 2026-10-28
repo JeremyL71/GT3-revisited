@@ -12,6 +12,8 @@
 #include "formats/ps2/memcard.h"
 #include "vfs/vfs.h"
 
+#include <zlib.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -61,12 +63,19 @@ void drive(GtMode& gt, int i, float metres) {
 // --- Logic (no disc) ----------------------------------------------------------------
 
 TEST(gtmode_display_power_rule) {
-    // The menus truncate after the unit conversion (NTSC-U: HP = PS x 0.98619), never round.
-    CHECK(display_power(329.6f, true) == 325);  // a tuned R34's 329.6 PS shows "325HP"
-    CHECK(display_power(329.6f, false) == 329); // and "329PS" in PS
-    CHECK(display_power(280.0f, true) == 276);
-    CHECK(display_power(275.99f, false) == 275);
-    CHECK(std::string(power_unit(true)) == "HP" && std::string(power_unit(false)) == "PS");
+    // The menus truncate after the unit conversion (HP, BHP, CV = PS x 0.98619), never round.
+    const Units us = language_units(Language::US), jp = language_units(Language::JP);
+    CHECK(display_power(329.6f, us) == 325); // a tuned R34's 329.6 PS shows "325HP"
+    CHECK(display_power(329.6f, jp) == 329); // and "329PS" in PS
+    CHECK(display_power(280.0f, us) == 276);
+    CHECK(display_power(275.99f, jp) == 275);
+    CHECK(std::string(power_unit(us)) == "HP" && std::string(power_unit(jp)) == "PS");
+    // British English, Italian and Spanish show BHP, French CV, German PS (the same figures).
+    CHECK(std::string(power_unit(language_units(Language::BR))) == "BHP" &&
+          display_power(329.6f, language_units(Language::BR)) == 325);
+    CHECK(std::string(power_unit(language_units(Language::FR))) == "CV" &&
+          std::string(power_unit(language_units(Language::GR))) == "PS" &&
+          std::string(power_unit(language_units(Language::IT))) == "BHP");
 }
 
 TEST(gtmode_power_peak_sweep) {
@@ -126,6 +135,8 @@ TEST(gtmode_format_credits) {
     CHECK(format_credits(18000) == "18,000");
     CHECK(format_credits(1500000) == "1,500,000");
     CHECK(format_credits(-2500) == "-2,500");
+    CHECK(format_credits(-100) == "-,100"); // the original groups the printed text, sign included
+    CHECK(credits_text(18000) == "Cr. 18,000" && prize_remain_text("Prize", 991) == "Prize Cr. 991");
     CHECK(format_time_ms(62400) == "1'02.400");
 }
 
@@ -139,6 +150,8 @@ TEST(gtmode_record_dates) {
     const u32 y2028 = 7 * 1461 * 86400; // 2028-01-01, a leap year read with the common months
     CHECK(record_date_text(y2028 + 58 * 86400) == "28/02/28" && record_date_text(y2028 + 59 * 86400) == "01/03/28");
     CHECK(record_date_text(y2028 + 365 * 86400) == "32/12/28");
+    // Japanese: year / month / day.
+    CHECK(record_date_text(0x3264FD64, Language::JP) == "26/10/16" && record_date_text(0, Language::JP) == "--/--/--");
     CHECK(record_date_text(y2028 + 366 * 86400) == "01/01/29");
     // The clock: after the reference stamp, never 0.
     CHECK(record_stamp_now() > 0x3264FD64);
@@ -238,6 +251,15 @@ TEST(gtmode_ps2_replay_pad_fields) {
     CHECK(f == 1.0f);
     p = ps2_replay_pad(o);
     CHECK(p.level == 0.4f && p.music_cuts == 1.0f);
+}
+
+// The export format by file name: .psu, a card image (.ps2 / .mcd), the raw data file (.raw).
+TEST(gtmode_ps2_export_format) {
+    CHECK(ps2_export_format("/a/b/GAME.psu") == Ps2Export::Psu && ps2_export_format("plain") == Ps2Export::Psu);
+    CHECK(ps2_export_format("card.PS2") == Ps2Export::Card && ps2_export_format("x.mcd") == Ps2Export::Card);
+    CHECK(ps2_export_format("edited.raw") == Ps2Export::Raw);
+    CHECK(ps2_export_format("C:\\saves\\GT3.RAW") == Ps2Export::Raw);
+    CHECK(ps2_export_format("x.raw.psu") == Ps2Export::Psu && ps2_export_format("raw") == Ps2Export::Psu);
 }
 
 TEST(gtmode_save_text_roundtrip) {
@@ -547,6 +569,12 @@ TEST(gtmode_disc_constants) {
     CHECK(data->race_codes.size() == 364);
     GtMode gt(data);
     CHECK(gt.state().credits == 18000 && gt.state().day == 1 && gt.state().garage.empty() && gt.state().ride == -1);
+    CHECK(gt.arcade_course_count() == 34);
+    // The garage list's price column: what the car sells for, "-" for one that cannot be sold.
+    gt.state().credits = 1000000;
+    CHECK(gt.buy_car("r34_gtr_v_99") == 0 && gt.sort_value(gt.state().garage[0], 4) == "13,995");
+    CHECK(gt.car_flags("stratos_00") & 2);
+    CHECK(gt.add_prize_car("stratos_00", -1, "test") == 0 && gt.sort_value(gt.state().garage[0], 4) == "-");
 }
 
 TEST(gtmode_disc_catalog) {
@@ -976,6 +1004,40 @@ TEST(gtmode_disc_ps2_new_game_layout) {
     CHECK(load_from_text(save_to_text(s)).ps2_options == s.ps2_options);
 }
 
+// Each release's save: its own directory name, GAMEDATA minor version and language word
+// (+0xC8; NTSC-J never writes it). The NTSC-U disc's files stand in for the other releases'.
+TEST(gtmode_disc_ps2_save_by_region) {
+    NEED_DATA();
+    CHECK(std::string(ps2_game_dir(Region::America)) == "BASCUS-97102GAMEDATA" &&
+          std::string(ps2_game_dir(Region::Europe)) == "BESCES-50294GAMEDATA" &&
+          std::string(ps2_game_dir(Region::Japan)) == "BISCPS-15009GAMEDATA");
+    const Volume& vol = test::test_disc()->volume();
+    auto reader = [&vol](std::string region, std::string lang) -> GtData::Reader {
+        return [&vol, region, lang](const std::string& p) -> std::optional<Bytes> {
+            if (p == Vfs::kRegionFile) return Bytes(region.begin(), region.end());
+            if (p == Vfs::kLanguageFile) return Bytes(lang.begin(), lang.end());
+            const Volume::Entry* e = vol.find(p == "gameconf/product_eu.gcf" ? "gameconf/product.gcf" : p);
+            if (!e) return std::nullopt;
+            return vol.read(*e);
+        };
+    };
+    GtMode us(data);
+    Bytes file = export_ps2_save(us.state(), *data);
+    CHECK(rd16(file, 8) == 1 && rd32(ps2_payload(file), 0xC8) == 1);
+    auto eu = std::make_shared<GtData>();
+    CHECK(eu->load(reader("eu", "FR")) && eu->region == Region::Europe && eu->language == Language::FR);
+    Bytes efile = export_ps2_save(us.state(), *eu);
+    CHECK(rd16(efile, 8) == 2 && rd32(ps2_payload(efile), 0xC8) == 3);
+    auto jp = std::make_shared<GtData>();
+    CHECK(jp->load(reader("jp", "JP")) && jp->money_scale == 100);
+    Bytes jfile = export_ps2_save(us.state(), *jp);
+    CHECK(rd16(jfile, 8) == 0 && rd32(ps2_payload(jfile), 0xC8) == 0);
+    // Every release reads any 7.x game file; the directory names keep them apart on a card.
+    CHECK(import_ps2_save(efile, *data).credits == us.state().credits);
+    std::vector<Ps2SaveFile> files = export_ps2_save_files(us.state(), eu, reader("eu", "FR"));
+    CHECK(std::any_of(files.begin(), files.end(), [](const Ps2SaveFile& f) { return f.name == "BESCES-50294GAMEDATA"; }));
+}
+
 TEST(gtmode_disc_ps2_rankings_and_options) {
     NEED_DATA();
     GtMode gt(data);
@@ -1084,10 +1146,8 @@ TEST(gtmode_disc_ps2_save_containers) {
     CHECK(std::memcmp(&th[0x28], "MY GAME", 8) == 0);
 
     namespace fs = std::filesystem;
-    const fs::path dir = fs::temp_directory_path() / "gt3r_test_ps2_containers";
-    fs::remove_all(dir);
-    fs::create_directories(dir);
-    for (const char* out : {"card", "game.psu", "game.ps2"}) {
+    const fs::path dir = test::temp_dir("ps2_containers");
+    for (const char* out : {"card", "game.psu", "game.ps2", "game.raw"}) {
         const std::string path = (dir / out).string();
         export_ps2_save_path(gt.state(), data, read, path);
         GameState s = import_ps2_save_path(path, *data);
@@ -1097,6 +1157,83 @@ TEST(gtmode_disc_ps2_save_containers) {
     for (const fs::path& p : {dir / "card" / kPs2GameDir, dir / "card" / kPs2GameDir / kPs2GameDir})
         CHECK(import_ps2_save_path(p.string(), *data).garage.size() == 1);
     CHECK(read_host_file((dir / "card" / kPs2GameDir / "icon.sys").string())->size() == 964);
+    // The .raw is that data file alone.
+    const fs::path folder_file = dir / "card" / kPs2GameDir / kPs2GameDir;
+    CHECK(read_host_file((dir / "game.raw").string()) == read_host_file(folder_file.string()));
+    CHECK(export_ps2_save_container(gt.state(), data, read, Ps2Export::Raw) == export_ps2_save(gt.state(), *data));
+    fs::remove_all(dir);
+}
+
+// The raw save (.raw, the data file alone) as a PS2 save editor (GT3SaveEditor) leaves it:
+// values changed in place, a car deleted (the records after it move up, the payload size
+// at +4 and the car count follow, the padding stays) and the CRC-32 recomputed. It imports
+// from the .raw, and from the .psu it came from with the edited file put back padded with
+// zeros to the old length (as a players' .psu extract / repack script does).
+TEST(gtmode_disc_ps2_raw_save_edited) {
+    NEED_DATA();
+    Disc* disc = test::test_disc();
+    const Volume& vol = disc->volume();
+    GtData::Reader read = [&](const std::string& path) -> std::optional<Bytes> {
+        const Volume::Entry* e = vol.find(path);
+        if (!e) return std::nullopt;
+        return vol.read(*e);
+    };
+    GtMode gt(data);
+    gt.state().credits = 1000000;
+    std::string cheapest;
+    for (const DealerCar& d : data->catalog.dealers)
+        if (!(gt.car_flags(d.car) & 1) && (cheapest.empty() || gt.car_price(d.car) < gt.car_price(cheapest)))
+            cheapest = d.car;
+    CHECK(gt.buy_car("r34_gtr_v_99") >= 0 && gt.buy_car(cheapest) >= 0 && gt.state().garage.size() == 2);
+    const Bytes original = export_ps2_save(gt.state(), *data);
+    Bytes raw = original;
+    auto wr32 = [&](size_t o, u32 v) { std::memcpy(&raw[o], &v, 4); };
+    // Credits (payload +0x10, inverted) to 99,999,999.
+    const u64 credits = ~u64(99999999);
+    std::memcpy(&raw[0x40 + 0x10], &credits, 8);
+    // Delete the first car record (payload +0x130, 0x204 bytes each; the garage list's first).
+    const std::string kept = gt.state().garage[1].car;
+    const size_t car = 0x40 + 0x130;
+    raw.erase(raw.begin() + ptrdiff_t(car), raw.begin() + ptrdiff_t(car + 0x204));
+    wr32(4, rd32(raw, 4) - 0x204);
+    wr32(0x40 + 0x30, ~u32(1));
+    wr32(0x0C, u32(::crc32(0, &raw[0x40], uInt(rd32(raw, 4)))));
+    CHECK(raw.size() == original.size() - 0x204 && raw.size() > 0x40 + rd32(raw, 4));
+
+    namespace fs = std::filesystem;
+    const fs::path dir = test::temp_dir("ps2_raw_edited");
+    auto check = [&](const GameState& s) {
+        CHECK(s.credits == 99999999 && s.garage.size() == 1 && s.garage[0].car == kept);
+    };
+    const std::string raw_path = (dir / "gtmode.raw").string(), named = (dir / kPs2GameDir).string();
+    const std::string misnamed = (dir / "gtmode.psu").string(); // (by its contents)
+    CHECK(write_host_file(raw_path, raw) && write_host_file(named, raw) && write_host_file(misnamed, raw));
+    check(import_ps2_save_path(raw_path, *data));
+    check(import_ps2_save_path(named, *data));
+    check(import_ps2_save_path(misnamed, *data));
+    // Back in its .psu, zero-padded to the old length.
+    ps2::McDir psu_dir;
+    psu_dir.name = kPs2GameDir;
+    for (Ps2SaveFile& f : export_ps2_save_files(gt.state(), data, read)) psu_dir.files.push_back({f.name, f.data});
+    for (ps2::McFile& f : psu_dir.files)
+        if (f.name == kPs2GameDir) {
+            CHECK(f.data == original);
+            f.data = raw;
+            f.data.resize(original.size(), 0);
+        }
+    const std::string psu = (dir / "gtmode-edited.psu").string();
+    CHECK(write_host_file(psu, ps2::write_psu(psu_dir)));
+    check(import_ps2_save_path(psu, *data));
+    // A damaged edit (CRC not updated) is refused.
+    raw[0x40 + 0x10] ^= 1;
+    CHECK(write_host_file(raw_path, raw));
+    bool refused = false;
+    try {
+        import_ps2_save_path(raw_path, *data);
+    } catch (const FormatError&) {
+        refused = true;
+    }
+    CHECK(refused);
     fs::remove_all(dir);
 }
 
@@ -1424,7 +1561,7 @@ TEST(gtmode_disc_garage_power) {
     CHECK(gt.buy_part(81) && gt.fit_part(81));
     PowerPeak tuned = gt.power_peak(*gt.state().ride_car());
     CHECK(tuned.ps > stock.ps * 1.2f);
-    CHECK(gt.power_text(tuned.ps) == std::to_string(display_power(tuned.ps, data->imperial)) + (data->imperial ? "HP" : "PS"));
+    CHECK(gt.power_text(tuned.ps) == std::to_string(display_power(tuned.ps, data->units)) + power_unit(data->units));
     CHECK(gt.sort_value(*gt.state().ride_car(), 6) == gt.power_text(tuned.ps, " "));
 }
 

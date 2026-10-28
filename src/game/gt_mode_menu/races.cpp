@@ -6,6 +6,7 @@
 #include "game/gt_mode_menu/internal.h"
 
 #include "base/log.h"
+#include "game/language_rules.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -39,9 +40,8 @@ void fill_car(GameRequest& r, const GtMode& gt) { gt_menu::fill_car(r, gt, gt.st
 
 void fill_car(GameRequest& r, const GtMode& gt, const GarageCar* c) {
     if (!c) return;
-    std::string err;
-    if (auto spec = gt.car_spec(*c, &err)) r.car_spec = std::make_shared<const sim::CarSpec>(std::move(*spec));
-    else LOG_WARN("gt mode: car spec of %s: %s", c->car.c_str(), err.c_str());
+    r.car_parts = c->parts;
+    r.car_settings = c->settings;
     r.car = c->car;
     r.car_model = gt.model_of(*c);
     r.car_color = c->color;
@@ -85,7 +85,9 @@ void prepare_request(GameRequest& r) {
         fill_condition(r, gt, gt.state().ride_car());
     } else if (r.mode == "go_license") {
         r.event = r.race_code;
-        if (auto rules = gt.rules(r.race_code); rules && !rules->entries.empty()) r.car = rules->entries[0];
+        // The test's car in the game's language (gt_mode §21, docs/dev/GT_MODE.md "Language").
+        if (const data::Event* ev = gt.db().event(r.race_code))
+            r.car = license_car(gt.db(), *ev, gt.data().language).entry;
     } else if (r.mode == "go_machine_test") {
         r.event = r.race_code;
         fill_car(r, gt);
@@ -199,7 +201,7 @@ std::vector<std::string> on_result(const GameResult& r) {
             log.push_back("prize car: " + car_name(gt, c.car));
             Show sh{"car_get", "car_get", {}, prize_reason(c.origin), c.car, c.color, {}, "", -1, "", 0, "", true, {}};
             if (const PrizeSet* ps = gt.data().prize_set(c.origin))
-                for (const PrizeCar& pc : ps->cars) sh.candidates.push_back(pc.car);
+                for (const PrizeCar& pc : ps->cars) sh.candidates.push_back(gt.data().prize_candidate(pc).car);
             ms.shows.push_back(std::move(sh));
         }
     // A prize car that did not fit in the garage: "Garage is full" (as the original).

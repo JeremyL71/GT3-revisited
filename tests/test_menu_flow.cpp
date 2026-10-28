@@ -5,8 +5,11 @@
 
 #include "menu_flow_synth.h"
 
+#include "disc/region.h"
+#include "disc/volume.h"
 #include "formats/menu/mbl.h"
 #include "formats/menu/pmb.h"
+#include "formats/text/mltx.h"
 #include "menu/flow/game_flow.h"
 #include "menu/flow/menu_controller.h"
 #include "menu/flow/menu_set.h"
@@ -343,6 +346,18 @@ TEST(menu_flow_initial_focus_rule) {
     CHECK(c.page_name() == "list" && c.focus() == 2);
 }
 
+// Items control code leaves out get no button; the ones after them close up.
+TEST(menu_flow_listed_items) {
+    MenuSet set(map_reader(synthetic_files()), "test", "US");
+    MenuController c(set);
+    c.listed = [](const std::string& page, const MblItem& it) { return page != "top" || it.name != "item2"; };
+    c.open("top");
+    CHECK(c.items().size() == 2 && c.items()[0].flow->name == "item1" && c.items()[1].flow->name == "item3");
+    settle(c);
+    press(c, MenuKey::Down);
+    CHECK(c.focus() == 1 && c.focused() && c.focused()->flow->name == "item3");
+}
+
 TEST(menu_flow_disabled_and_fade) {
     MenuSet set(map_reader(synthetic_files()), "test", "US");
     MenuController c(set);
@@ -674,6 +689,112 @@ TEST(menu_flow_disc_race_page_hooks) {
 // of tiles in its window: the focused tile is inside the window, and a pointer over a
 // tile focuses it (VR / mouse). England and Germany name their window "menu_dealer";
 // the Toyota list keeps four of its cars parked below the screen instead of to the right.
+// A horizontal selector's row and scroll bar (menus §4.6; GT3's button list and ScrollBar): the
+// buttons 4 units apart, centred while the row fits the window; the scroll bar draws nothing,
+// track included, while the row is no longer than the bar, else the track and the hidden
+// "pinch" at x = bar x - offset x bar w / row w, width = window w x bar w / row w (offset: the
+// row's start from the window's left edge). The row's offset eases 30 % a frame towards the
+// focused button's.
+TEST(menu_flow_horizontal_scroll_bar) {
+    auto page = [](const char* name, int n) {
+        SynPage p{name, {}, {}};
+        for (int i = 0; i < n; ++i) {
+            SynElement e = el(("b" + std::to_string(i)).c_str(), 700, 300, 51, 27, 39);
+            e.has_alt = true;
+            p.items.push_back(e);
+        }
+        SynElement win = el("menu", 20, 116, 600, 28, 32), bar = el("scroll_bar", 20, 111, 600, 4, 32, 0xFF494949);
+        win.widget = true;
+        bar.widget = true;
+        bar.widget_class = "scroll_bar";
+        p.layers = {{"defaultLayer", {win, bar}}, {"hidden", {el("pinch", 20, 111, 8, 4, 32, 0xFFCCCCCC)}}};
+        return p;
+    };
+    auto flow = [](const char* name, int n) {
+        SynFlowPage f{name, 1, 0x101, "", "", "", {}};
+        for (int i = 0; i < n; ++i) f.items.push_back(SynItem{"b" + std::to_string(i), "", "", "", "", -1, 2, {}});
+        return f;
+    };
+    std::map<std::string, Bytes> files;
+    files["menu/row.mbl"] = write_mbl({flow("long", 20), flow("short", 3)});
+    files["menu/US/row1.pmb"] = write_pmb({page("long", 20), page("short", 3)});
+    MenuSet set(map_reader(files), "row", "US");
+    auto drawn = [](const MenuController& c, const char* name) {
+        std::vector<ElementDraw> out;
+        for (const ElementDraw& d : c.draw_list())
+            if (d.element && d.element->name == name) out.push_back(d);
+        return out;
+    };
+    auto near = [](float a, float b) { return std::fabs(a - b) < 0.001f; };
+    SDL_FRect box;
+    {
+        // Three buttons (161 units) fit the 600-unit window: centred, no scroll bar at all.
+        MenuController c(set);
+        CHECK(c.open("short"));
+        settle(c);
+        CHECK(c.item_box(0, box) && near(box.x, 20 + (600 - 161) * 0.5f) && c.item_box(1, box) &&
+              near(box.x, 20 + (600 - 161) * 0.5f + 55));
+        CHECK(drawn(c, "scroll_bar").empty() && drawn(c, "pinch").empty());
+    }
+    MenuController c(set);
+    CHECK(c.open("long"));
+    settle(c);
+    // Twenty buttons: 20 x 51 + 19 x 4 = 1096 units.
+    const float total = 1096, frac = 600.0f / total;
+    auto pinch_at = [&](float off) {
+        auto p = drawn(c, "pinch");
+        return drawn(c, "scroll_bar").size() == 1 && p.size() == 1 && p[0].has_box &&
+               near(p[0].box.x, 20 - off * frac) && near(p[0].box.w, 600 * frac) && near(p[0].box.h, 4);
+    };
+    // At the start the row is left-aligned (offset 0), at the end right-aligned (600 - 1096),
+    // in the middle the focused button is centred (button 10: 300 - (550 + 25.5)).
+    CHECK(c.item_box(0, box) && near(box.x, 20) && pinch_at(0));
+    c.set_focus(19);
+    CHECK(c.item_box(19, box) && near(box.x + box.w, 620) && pinch_at(600 - total));
+    c.set_focus(10);
+    CHECK(c.item_box(10, box) && near(box.x, 20 + 300 - 25.5f) && pinch_at(-275.5f));
+    // A move: the offset eases 30 % a frame from -275.5 towards button 11's -330.5.
+    press(c, MenuKey::Right);
+    CHECK(c.focus() == 11 && c.item_box(0, box) && near(box.x, 20 - 292.0f) && pinch_at(-292.0f));
+    for (int i = 0; i < 120; ++i) c.tick(0);
+    CHECK(c.item_box(0, box) && near(box.x, 20 - 330.5f) && pinch_at(-330.5f));
+}
+
+// A vertical button list (menus §4.6; GT3's button list, used by the code-drawn garage, Cars
+// Permitted and records lists): the buttons 4 units apart from the top; a list that fits the
+// window stays at its top (not centred, as a fitting row is); a longer one is held at the
+// window's top while the focused button starts less than half a window down the list, at its
+// bottom while less than half a window follows the focused button, else the focused button is
+// centred. Its offset eases 30 % a frame (ease_scroll).
+TEST(menu_flow_column_layout) {
+    auto near = [](float a, float b) { return std::fabs(a - b) < 0.001f; };
+    std::vector<float> y, x;
+    float total = 0;
+    // Two 20-unit rows in a 300-unit window: 44 units, at the top for either focus.
+    CHECK(near(column_layout({20, 20}, 0, 300, y, total), 0) && near(total, 44) && y.size() == 2 && near(y[1], 24));
+    CHECK(near(column_layout({20, 20}, 1, 300, y, total), 0));
+    // (A row of the same buttons is centred.)
+    CHECK(near(row_layout({20, 20}, 0, 300, x, total), (300 - 44) * 0.5f));
+    // Twelve rows (284 units) still fit; a list exactly as long as the window too.
+    CHECK(near(column_layout(std::vector<float>(12, 20), 11, 300, y, total), 0) && near(total, 284));
+    CHECK(near(column_layout(std::vector<float>(6, 56), 5, 356, y, total), 0) && near(total, 356));
+    // Twenty rows: 476 units, rows 24 apart.
+    const std::vector<float> h(20, 20);
+    CHECK(near(column_layout(h, 0, 300, y, total), 0) && near(total, 476) && near(y[19], 456));
+    // Row 6 starts at 144 (under half the window): the top; row 7 at 168: centred (150 - 178).
+    CHECK(near(column_layout(h, 6, 300, y, total), 0));
+    CHECK(near(column_layout(h, 7, 300, y, total), -28));
+    CHECK(near(column_layout(h, 10, 300, y, total), 150 - 250));
+    // Row 13: 144 units follow it (under half the window): the bottom (300 - 476); so the last.
+    CHECK(near(column_layout(h, 12, 300, y, total), 150 - 298));
+    CHECK(near(column_layout(h, 13, 300, y, total), 300 - 476));
+    CHECK(near(column_layout(h, 19, 300, y, total), 300 - 476));
+    // The easing: 30 % of the way a frame.
+    CHECK(near(ease_scroll(0, -28), -8.4f) && near(ease_scroll(-8.4f, -28), -14.28f));
+    // No rows.
+    CHECK(near(column_layout({}, 0, 300, y, total), 0) && y.empty() && near(total, 0));
+}
+
 TEST(menu_flow_disc_dealer_strips) {
     Disc* disc = test::test_disc();
     if (!disc) SKIP("needs GT3R_DISC");
@@ -707,6 +828,125 @@ TEST(menu_flow_disc_dealer_strips) {
     CHECK(pages >= 40);
     CHECK(strips == pages);
     CHECK(hovered == pages);
+}
+
+// The GT Mode league pages (the only horizontal selectors with a scroll bar): 20, 23 and 22 event
+// tiles, longer than the 600-unit bar, so the track and the pinch show: at the start (row
+// left-aligned), in the middle (the focused tile centred) and at the end (right-aligned), the
+// pinch at bar x - offset x bar w / row w, as wide as window w x bar w / row w (menus §4.6).
+TEST(menu_flow_disc_league_scroll_bars) {
+    Disc* disc = test::any_region_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    Vfs vfs(&disc->volume());
+    const Language lang = vfs.region().default_language();
+    vfs.set_language(lang);
+    MenuSet set(vfs_reader(vfs), "gt_mode", text::language_code(lang));
+    auto near = [](float a, float b) { return std::fabs(a - b) < 0.01f; };
+    int checked = 0;
+    for (const char* name : {"r/beginner/beginner", "r/amateur/amateur", "r/pro/pro"}) {
+        MenuController c(set);
+        CHECK(c.open(name));
+        for (int i = 0; i < 200 && c.busy(); ++i) c.tick(0);
+        const Element *win = nullptr, *bar = nullptr;
+        for (const Layer& l : c.page().layout().layers)
+            for (const Element& e : l.widgets) {
+                if (e.name == "menu") win = &e;
+                if (e.name == "scroll_bar") bar = &e;
+            }
+        CHECK(win && bar);
+        if (!win || !bar) continue;
+        // The row: the tiles' widths, 4 units apart.
+        const int n = int(c.items().size());
+        std::vector<float> left;
+        float total = 0;
+        for (int i = 0; i < n; ++i) {
+            left.push_back(total);
+            total += c.items()[size_t(i)].element->w + (i + 1 < n ? 4.0f : 0.0f);
+        }
+        CHECK(total > bar->w);
+        auto check_at = [&](int focus) {
+            c.set_focus(focus);
+            c.tick(0);
+            const float fw = c.items()[size_t(focus)].element->w, right = total - left[size_t(focus)] - fw;
+            float off = win->w * 0.5f - (left[size_t(focus)] + fw * 0.5f);
+            if (left[size_t(focus)] < win->w * 0.5f) off = 0;
+            else if (right < win->w * 0.5f) off = win->w - total;
+            SDL_FRect box;
+            bool ok = c.item_box(focus, box) && near(box.x, win->x + off + left[size_t(focus)]);
+            int tracks = 0, pinches = 0;
+            for (const ElementDraw& d : c.draw_list()) {
+                if (d.element == bar) ++tracks;
+                if (d.element && d.element->name == "pinch") {
+                    ++pinches;
+                    ok = ok && near(d.box.x, bar->x - off * bar->w / total) && near(d.box.w, win->w * bar->w / total);
+                }
+            }
+            return ok && tracks == 1 && pinches == 1;
+        };
+        CHECK(check_at(0) && check_at(n / 2) && check_at(n - 1));
+        ++checked;
+    }
+    CHECK(checked == 3);
+}
+
+// Every horizontal selector of every menu set on the disc (league and series pages, dealer
+// strips, quick menus, ...): with each item focused in turn the focused item lies inside the
+// window once the row has eased there; a page with a scroll bar draws its track and pinch only
+// when the row is longer than the bar, the pinch inside the bar (menus §4.6).
+TEST(menu_flow_disc_horizontal_selectors) {
+    Disc* disc = test::any_region_disc();
+    if (!disc) SKIP("needs GT3R_DISC");
+    Vfs vfs(&disc->volume());
+    const Language lang = vfs.region().default_language();
+    vfs.set_language(lang);
+    int pages = 0, ok_pages = 0, bars = 0;
+    for (const Volume::Entry& entry : disc->volume().entries()) {
+        const std::string path = entry.path;
+        if (path.rfind("menu/", 0) != 0 || path.find('/', 5) != std::string::npos || path.size() < 9 ||
+            path.compare(path.size() - 4, 4, ".mbl") != 0)
+            continue;
+        const std::string name = path.substr(5, path.size() - 9);
+        MenuSet set(vfs_reader(vfs), name, text::language_code(lang));
+        for (const MblPage& mp : set.flow().pages) {
+            if (!(mp.flags42 & page_flag::kHorizontal)) continue;
+            MenuController c(set);
+            if (!c.open(mp.name)) continue;
+            for (int i = 0; i < 200 && c.busy(); ++i) c.tick(0);
+            SDL_FRect box, clip;
+            if (c.items().empty() || !c.item_box(0, box, &clip) || clip.w >= 640) continue; // not a selector
+            ++pages;
+            const Element* bar = nullptr;
+            for (const Layer& l : c.page().layout().layers)
+                for (const Element& e : l.widgets)
+                    if (e.name == "scroll_bar") bar = &e;
+            float total = 0;
+            for (size_t i = 0; i < c.items().size(); ++i) total += c.items()[i].element->w + (i ? 4.0f : 0.0f);
+            bool ok = true;
+            for (int i = 0; i < int(c.items().size()); ++i) {
+                c.set_focus(i);
+                for (int k = 0; k < 40; ++k) c.tick(0);
+                ok = ok && c.focus() == i && c.item_box(i, box, &clip) && box.x >= clip.x - 0.01f &&
+                     box.x + box.w <= clip.x + clip.w + 0.01f;
+                if (bar) {
+                    int tracks = 0, pinches = 0;
+                    for (const ElementDraw& d : c.draw_list()) {
+                        tracks += d.element == bar;
+                        if (d.element && d.element->name == "pinch") {
+                            ++pinches;
+                            ok = ok && d.box.x >= bar->x - 0.01f && d.box.x + d.box.w <= bar->x + bar->w + 0.01f;
+                        }
+                    }
+                    const int want = total > bar->w ? 1 : 0;
+                    ok = ok && tracks == want && pinches == want;
+                }
+            }
+            bars += bar != nullptr;
+            if (ok) ++ok_pages;
+            else std::printf("  %s:%s: focused item outside its window or a wrong scroll bar\n", name.c_str(), mp.name.c_str());
+        }
+    }
+    std::printf("  %d horizontal selectors (%d with a scroll bar), %d ok\n", pages, bars, ok_pages);
+    CHECK(pages >= 45 && bars >= 3 && ok_pages == pages);
 }
 
 namespace {
@@ -777,4 +1017,75 @@ TEST(menu_flow_disc_title_to_time_trial) {
     flow_press(f, MenuKey::Cancel);
     flow_settle(f);
     CHECK(f.controller()->page_name() == "root" && f.controller()->focus() == 1);
+}
+
+// Options, Key Configuration (ours): the page and its view on the top page show a Controller
+// Settings button in place of the original's DualShock 2 table; Confirm or a tap on it asks the
+// screen for our controller settings, once; Cancel still leaves the page.
+TEST(menu_flow_key_config_button) {
+    auto text = [](const char* name, float y, const char* t) {
+        SynElement e = el(name, 216, y, 200, 24, 40);
+        e.text = t;
+        return e;
+    };
+    auto widget = [](const char* cls) {
+        SynElement e = el(cls, 460, 464, 32, 32, 22);
+        e.widget = true;
+        e.widget_class = cls;
+        return e;
+    };
+    // The key page's elements, as on the disc (menu/<lang>/option1.pmb).
+    auto table = [&](const char* cls) {
+        return std::vector<SynElement>{el("bace_7", 64, 28, 512, 324, 8), el("bace1_7", 64, 256, 512, 22, 11),
+                                       text("item2_7", 256, "Steering"), text("p3", 292, "1P"),
+                                       el("title1_7", 64, 352, 512, 16, 2), widget(cls)};
+    };
+    const SynLayer hidden{"hidden", {text("default_item", 30, "Default")}};
+    SynElement icon = el("item5", 240, 376, 52, 52, 5);
+    icon.has_alt = true;
+    SynPage key{"key/key", {}, {{"defaultLayer", table("key_config_1")}, hidden}};
+    SynPage top{"option", {icon}, {{"defaultLayer", {el("bg", 0, 0, 640, 448, 0)}}, hidden, {"m5", table("key_config_1_display")}}};
+    SynItem item5{"item5", "m5", "", "", "key/key", 1, 0, {}};
+    std::map<std::string, Bytes> files;
+    files["menu/option.mbl"] = write_mbl({{"key/key", 1, 0x123, "", "option", "", {}}, {"option", 1, 0x123, "", "", "", {item5}}});
+    files["menu/US/option1.pmb"] = write_pmb({key, top});
+
+    IniDocument cfg;
+    GameFlow f(map_reader(files), "US");
+    f.set_options(&cfg, [] {});
+    f.debug_open("option", "option");
+    flow_settle(f);
+    auto drawn = [&](const char* name) {
+        for (const ElementDraw& d : f.draw_list())
+            if (d.element && d.element->name == name) return true;
+        return false;
+    };
+    auto button = [&] {
+        for (const ElementDraw& d : f.draw_list())
+            if (d.text && *d.text == "Controller Settings") return true;
+        return false;
+    };
+    // The top page's view: the button, not the table (the panel and title stay).
+    CHECK(f.controller()->page_name() == "option");
+    CHECK(button() && drawn("bace_7") && drawn("title1_7"));
+    CHECK(!drawn("bace1_7") && !drawn("item2_7") && !drawn("p3"));
+    flow_press(f, MenuKey::Confirm);
+    CHECK(f.controller()->page_name() == "key/key");
+    CHECK(!f.take_controller_settings());
+    CHECK(button() && drawn("bace_7") && drawn("title1_7"));
+    CHECK(!drawn("bace1_7") && !drawn("item2_7") && !drawn("p3"));
+    // Confirm: the button, once.
+    flow_press(f, MenuKey::Confirm);
+    CHECK(f.take_controller_settings());
+    CHECK(!f.take_controller_settings());
+    CHECK(f.controller()->page_name() == "key/key");
+    // A tap on it (the middle of the panel) does the same; elsewhere nothing.
+    CHECK(!f.tap(320, 300));
+    CHECK(f.tap(320, 190));
+    f.tick(0);
+    CHECK(f.take_controller_settings());
+    // Cancel leaves the page as before.
+    flow_press(f, MenuKey::Cancel);
+    CHECK(f.controller()->page_name() == "option");
+    CHECK(!f.take_controller_settings());
 }

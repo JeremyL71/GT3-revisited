@@ -1,6 +1,7 @@
 #pragma once
 
 #include "base/file.h"
+#include "disc/region.h"
 
 #include <functional>
 #include <map>
@@ -36,10 +37,14 @@ public:
         u32 size = 0;        // logical (uncompressed) size
         u32 stored_size = 0; // bytes on disc
         bool compressed = false;
+        u8 part = 0; // which of the set's volumes holds it (add_part)
     };
 
     // `base_offset` is the byte offset of GT3.VOL within `file`.
     Volume(File& file, u64 base_offset, u64 length);
+    // Another volume of the set in the same file (a disc whose files are spread over several *.VOL files): its entries
+    // join this one's, a path already here staying this one's.
+    void add_part(u64 base_offset, u64 length);
 
     const std::vector<Entry>& entries() const { return entries_; }
     const Entry* find(const std::string& path) const;
@@ -58,15 +63,22 @@ public:
     // table from the program; the engine never executes it.
     void set_program_reader(std::function<Bytes()> f) { program_reader_ = std::move(f); }
     std::optional<Bytes> read_program() const;
+    // The release's data set (disc/region.h), set by the owner (Disc: from its program).
+    void set_region(Region r) { region_ = r; }
+    Region region() const { return region_; }
 
 private:
-    void walk(ByteSpan toc, u32 node, const std::string& prefix, int depth);
+    void walk(ByteSpan toc, u32 node, const std::string& prefix, int depth, u8 part);
+    void read_toc(u8 part);
     std::function<Bytes()> program_reader_;
+    Region region_ = Region::America;
     static std::string node_name(ByteSpan toc, u32 offset);
 
     File& file_;
-    u64 base_;
-    u64 length_;
+    struct Part {
+        u64 base, length;
+    };
+    std::vector<Part> parts_;
     std::vector<Entry> entries_;
     std::map<std::string, size_t> index_;
 };

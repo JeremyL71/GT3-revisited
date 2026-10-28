@@ -15,8 +15,10 @@
 //
 // Earlier versions kept one save, <user data>/gtmode.sav, and a second "memory card
 // slot" next to it, gtmode_2.sav: migrate() copies them into the library the first time
-// it is created (the originals stay where they are).
+// it is created (the originals stay where they are). Versions up to 0.3 kept every disc's
+// games in saves/: the PAL library copies them in when it is first used (copy_library).
 
+#include "disc/region.h"
 #include "game/gt_mode.h"
 
 #include <optional>
@@ -38,9 +40,11 @@ public:
     // `dir`: the library folder (created on the first write). `tracked`: whether the
     // current save is remembered in current.txt (off for GT3R_GTMODE_SAVE).
     explicit SaveLibrary(std::string dir, bool tracked = true);
-    // <user data>/saves/ (the user data folder: SDL_GetPrefPath, or the executable's
-    // folder in portable mode).
-    static std::string user_dir();
+    // The library of a region's games (each release keeps its own, as on the PS2's memory
+    // cards): <user data>/saves/ for NTSC-U, <user data>/saves/<region key>/ for the
+    // others (the user data folder: SDL_GetPrefPath, or the executable's folder in
+    // portable mode).
+    static std::string user_dir(Region region = Region::America);
     // The single save of earlier versions: <user data>/gtmode.sav.
     static std::string legacy_path();
 
@@ -49,6 +53,12 @@ public:
     // and its second slot (<legacy stem>_2.sav) are copied in (the first one becomes the
     // current save). Returns the number of saves copied.
     int migrate(const std::string& legacy);
+    // First run of a region's library: when the folder does not exist yet it is created and
+    // every *.sav of the library `from` (its subfolders not included) is copied in, and its
+    // current save stays the current one; the originals stay where they are. Versions up to
+    // 0.3 kept every disc's games in saves/ (all on the NTSC-U data set, also from a PAL disc),
+    // so a PAL library starts with them. Returns the number of saves copied.
+    int copy_library(const std::string& from);
 
     // Every *.sav in the folder, newest first.
     std::vector<SaveInfo> list() const;

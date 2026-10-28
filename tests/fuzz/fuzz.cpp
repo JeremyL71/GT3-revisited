@@ -153,7 +153,9 @@ std::vector<Target> targets() {
          [] {
              net::CarSnapshot s;
              s.tick = 77;
-             s.state.position = {1, 2, 3};
+             s.motion.pos = {0x3F800000u, 0x40000000u, 0x40400000u};
+             s.inputs[0] = {0x1F, 2, 1, -300, 4096, 0, 0, 0};
+             s.inputs[2] = {0x1F, 2, 0, 0, 0, 0, 4096, 4096};
              s.input_count = 3;
              net::Writer w;
              net::write_snapshot(w, s);
@@ -169,7 +171,13 @@ std::vector<Target> targets() {
              m.kind = game::OnlineCar::Kind::Mod;
              m.car = "x";
              m.package = std::string(64, 'b');
-             return std::vector<Bytes>{game::encode_online_car(g), game::encode_online_car(m)};
+             game::OnlineCar a;
+             a.kind = game::OnlineCar::Kind::Arcade;
+             a.car = "nsx_s_zero_97";
+             a.arcade = "nsx_s_zero_97_290";
+             a.digest.emplace(); // the trailing spec digest
+             a.digest->fill(0x5A);
+             return std::vector<Bytes>{game::encode_online_car(g), game::encode_online_car(m), game::encode_online_car(a)};
          }},
         {"rendezvous",
          [](ByteSpan d) {

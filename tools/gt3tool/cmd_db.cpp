@@ -117,7 +117,7 @@ std::string fmt(const char* f, double v) {
 }
 
 int cmd_db(Disc& disc, const Args& a) {
-    std::string out = a[0], suffix = a.size() > 1 ? (a[1] == "jp" ? "" : a[1]) : "_us";
+    std::string out = a[0], suffix = a.size() > 1 ? (a[1] == "jp" ? "" : a[1]) : std::string(RegionData{disc.info().region}.db_suffix());
     CarDatabase d;
     if (!d.load(disc.volume(), suffix)) {
         std::fprintf(stderr, "error: %s\n", d.error().c_str());
@@ -182,13 +182,15 @@ int cmd_db(Disc& disc, const Args& a) {
                 << int(e->unknown_46) << "," << e->sound_id << "," << fmt("%.1f", e->curve_peak_ps()) << "," << curve << "\n";
     }
 
+    // Prizes as stored: hundreds of credits for places 1..6 (+0x1D4; the game also scales them
+    // x100 in Japanese).
     events << "label,course,regulation,race_mode,laps,cars,prize1,prize2,prize3,prize4,prize5,prize6,entries\n";
     for (const data::Event& e : d.events()) {
         std::string entries;
         for (const auto& x : e.entries) entries += (entries.empty() ? "" : " ") + x;
         events << e.label << "," << e.course << "," << e.regulation << "," << e.race_mode << "," << int(e.laps)
                << "," << int(e.cars_in_race);
-        for (u16 p : e.prize) events << "," << p;
+        for (size_t k = 0; k < 6; ++k) events << "," << rd16(e.bytes, 0x1D4 + 2 * k);
         events << "," << entries << "\n";
     }
     std::ostringstream courses;
@@ -206,7 +208,7 @@ int cmd_db(Disc& disc, const Args& a) {
 
 int cmd_car(Disc& disc, const Args& a) {
     CarDatabase d;
-    if (!d.load(disc.volume(), a.size() > 1 ? (a[1] == "jp" ? "" : a[1]) : "_us")) {
+    if (!d.load(disc.volume(), a.size() > 1 ? (a[1] == "jp" ? "" : a[1]) : std::string(RegionData{disc.info().region}.db_suffix()))) {
         std::fprintf(stderr, "error: %s\n", d.error().c_str());
         return 1;
     }

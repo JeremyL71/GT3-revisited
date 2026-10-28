@@ -12,7 +12,7 @@
 //   Triangle         reverse (pressure)
 //   left stick X     steering (D-pad Left/Right also steers, ramped)
 //   R2 / L2          shift up / down (edge-triggered, manual gearbox)
-//   (the race screen: R1 change view, L1 look back (held), Select respawn, Start pause)
+//   (the race screen: R1 change view, L1 look back (held), Start pause)
 //
 // Reverse (GT3's "back" action, a pressure input like the throttle): while its value is at
 // least the throttle's, the car requests reverse gear and the value drives it (the throttle in
@@ -63,17 +63,16 @@ private:
     bool reverse_ = false;
 };
 
-// Rumble requests derived from what the car is doing. Feed it every tick;
+// The controller's motors in a race, driven as GT3 drives a DualShock 2 (physics §1.2, phase 12's
+// pad vibration): each race step's vibration level (VehicleTelemetry::pad_rumble, 0..127) goes to
+// the large motor as it is, the small motor never runs, and a car the pad does not drive
+// (VehicleTelemetry::pad_output) sends nothing, so its motors stop. Ours: the adaptive triggers
+// (ABS chatter, wheelspin buzz), which a DualShock 2 does not have. Feed it after every step;
 // read rumble()/triggers() and pass them to InputManager.
 class RumbleModel {
 public:
-    struct Events {
-        bool kerb = false;          // a wheel is on a kerb / rumble strip
-        bool offroad = false;       // on grass/gravel/dirt
-        float impact = 0;           // collision delta-v this tick (m/s), 0 = none
-    };
-
-    void update(const sim::VehicleState& s, const Events& ev, const sim::ControlInputs& in, double dt);
+    // The step's car state, its telemetry (null: none, the motors stop) and its inputs.
+    void update(const sim::VehicleState& s, const sim::VehicleTelemetry* t, const sim::ControlInputs& in, double dt);
     void reset();
 
     PadRumble rumble() const { return rumble_; }
@@ -83,7 +82,6 @@ public:
 private:
     PadRumble rumble_;
     float trig_l_ = 0, trig_r_ = 0;
-    float impact_timer_ = 0, impact_level_ = 0;
     double clock_ = 0;
 };
 

@@ -24,21 +24,7 @@ bool pool_entry_available(const data::CarDatabase& db, const std::string& label)
     if (const ByteSpan* r = db.record(data::TableId::CarVariant, id); r && r->size() >= 0x10) id = rd64(*r, 8);
     const ByteSpan* car = db.record(data::TableId::Car, id);
     if (!car || car->size() <= 0xF7) return false;
-    // Region byte: 0 everywhere; 1/2 only / not EU (region 2); 3/4 only / not US (1);
-    // 5/6 only / not outside JP and US; 7/8 only / not JP (0); larger values everywhere.
-    const int region = db.region();
-    const bool jp = region == 0, us = region == 1, eu = region == 2, other = !jp && !us;
-    switch ((*car)[0xF7]) {
-    case 1: return eu;
-    case 2: return !eu;
-    case 3: return us;
-    case 4: return !us;
-    case 5: return other;
-    case 6: return !other;
-    case 7: return jp;
-    case 8: return !jp;
-    default: return true;
-    }
+    return data::car_region_offered((*car)[0xF7], db.language());
 }
 
 std::vector<int> draw_pool(GameRandom& rng, const std::vector<bool>& unavailable, int draws) {

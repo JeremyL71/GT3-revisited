@@ -4,8 +4,11 @@
 //   gt3tool <iso> modcar <file.ini | mod dir | mods dir> ...
 //
 // For each car: load errors and warnings, the resulting catalogue figures and
-// physics spec, then a straight-line run on a flat plane (0-60 mph, 0-100
-// km/h, quarter mile, top speed) next to the [reference] figures in the file.
+// spec, then test drives on the game's own physics (the exact core) on the
+// machine tests' course: a standing start at full throttle down the straight
+// (0-60 mph, 0-100 km/h, quarter mile), a 60-0 mph stop and a lift-off from
+// 100 km/h, and GT3's top-speed test (the race's AI at the wheel), next to the
+// [reference] figures in the file.
 
 #include "tool.h"
 
@@ -14,8 +17,12 @@
 #include "game/data/car_database.h"
 #include "game/data/mod_cars.h"
 #include "game/gt_mode.h"
+#include "disc/core_image.h"
+#include "race/backend.h"
+#include "race/exact_field.h"
 #include "sim/car_spec.h"
-#include "sim/vehicle.h"
+#include "sim/exact/race.h"
+#include "vfs/vfs.h"
 
 #include <SDL3/SDL_filesystem.h>
 
@@ -23,18 +30,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 
 namespace gt3r::tool {
 
 namespace {
 
-struct Flat : sim::TrackQuery {
-    sim::SurfaceHit probe(float, float, float y_max) const override {
-        sim::SurfaceHit h;
-        h.hit = y_max >= 0;
-        return h;
-    }
-};
+namespace ex = sim::exact;
 
 std::vector<std::string> list_dir(const std::string& dir) {
     std::vector<std::string> out;
@@ -72,139 +74,150 @@ void collect(const std::string& path, std::vector<std::string>& out) {
     }
 }
 
-struct Run {
-    double t_roll = -1, t60 = -1, t100 = -1, t400 = -1, trap_kmh = 0, top_kmh = 0, t_top = 0;
-    double spin_kmh = 0, spin_at_kmh = 0; // peak driven-wheel rim speed over road speed before 60 mph (TCS on)
+// The machine tests' course (event M1000's) and the race set-up the drives share.
+struct TestCourse {
+    data::CarDatabase* db = nullptr;
+    std::shared_ptr<const ex::ProgramData> data;
+    std::unique_ptr<Vfs> vfs;
+    std::string course;
+    Bytes file;
+    std::unique_ptr<race::RaceTrack> track;
+    std::string error;
+
+    bool load(Disc& disc, data::CarDatabase& database) {
+        db = &database;
+        try {
+            std::optional<Bytes> core = disc.volume().read_program();
+            if (!core) throw FormatError("no game program on the disc");
+            data = std::make_shared<const ex::ProgramData>(ex::ProgramData::load(CoreImage::decode(*core)));
+            const data::Event* ev = db->event("M1000");
+            if (!ev) throw FormatError("no machine test event M1000");
+            course = ev->course;
+            vfs = std::make_unique<Vfs>(&disc.volume());
+            const std::string path = course_file_path(*vfs, course);
+            std::optional<Bytes> f = path.empty() ? std::nullopt : vfs->read(path);
+            if (!f) throw FormatError("no course file for " + course);
+            file = *f;
+            track = race::make_track(*vfs, file, course);
+        } catch (const std::exception& e) {
+            error = e.what();
+            return false;
+        }
+        return true;
+    }
+
+    // A run of machine test `event` with `car`: the pad's frames from the screen-style inputs given each step, or the race's
+    // AI at the wheel (config 3).
+    std::unique_ptr<race::RaceField> run(const std::string& event, const std::string& car, bool ai, std::string& err) const {
+        race::FieldConfig cfg;
+        cfg.event = event;
+        cfg.max_opponents = 0;
+        cfg.exact.data = data;
+        cfg.exact.course_file = file;
+        cfg.exact.course = course;
+        cfg.exact.kind = ex::Conductor::MachineTest;
+        cfg.exact.config = ai ? 3 : 0;
+        cfg.exact.player.car = {car};
+        return race::make_exact_field(*track, *db, cfg, &err);
+    }
 };
 
-Run straight_line(const sim::CarSpec& spec) {
-    auto car = sim::Vehicle::create(spec);
-    Flat g;
-    car->reset({}, {});
+constexpr double kStep = 1.0 / sim::kDefaultTickHz;
+
+struct Run {
+    double t_roll = -1, t60 = -1, t100 = -1, t400 = -1, trap_kmh = 0;
+    double spin_kmh = 0, spin_at_kmh = 0; // peak driven-wheel rim speed over road speed before 60 mph
+    std::string error;
+};
+
+// A standing start at full throttle down the straight (automatic gearbox, wheel straight), timed from GO.
+Run straight_line(const TestCourse& tc, const std::string& car) {
+    Run r;
+    std::unique_ptr<race::RaceField> f = tc.run("M1000", car, false, r.error);
+    if (!f) return r;
+    race::RaceVehicle& v = f->player();
     sim::ControlInputs in;
     in.throttle = 1;
-    Run r;
-    const double h = 1.0 / sim::kDefaultTickHz;
-    sim::Vec3 start = car->state().position;
-    float best = 0;
-    for (int i = 0; i < int(120 / h); ++i) {
-        car->step(in, g, h);
-        double t = (i + 1) * h;
-        float kmh = car->state().speed_kmh;
-        if (r.t_roll < 0 && (car->state().position - start).length() >= 0.3048f) r.t_roll = t;
+    in.controller_kind = 2;
+    std::optional<sim::Vec3> start;
+    for (int i = 0; i < int(90 / kStep) && r.t400 < 0; ++i) {
+        v.step(in, kStep);
+        const double t = f->race_time();
+        if (t <= 0) continue; // (the start's hold)
+        if (!start) start = v.state().position;
+        const float kmh = v.state().speed_kmh;
+        const float dist = (v.state().position - *start).length();
+        if (r.t_roll < 0 && dist >= 0.3048f) r.t_roll = t;
         if (r.t60 < 0)
             for (int w = 0; w < 4; ++w)
-                if (double d = car->state().wheels[w].angular_velocity * car->setup().wheels[w].radius * 3.6f - kmh; d > r.spin_kmh)
+                if (double d = v.state().wheels[size_t(w)].angular_velocity * v.setup().wheels[size_t(w)].radius * 3.6f - kmh;
+                    d > r.spin_kmh)
                     r.spin_kmh = d, r.spin_at_kmh = kmh;
         if (r.t60 < 0 && kmh >= 96.56f) r.t60 = t;
         if (r.t100 < 0 && kmh >= 100) r.t100 = t;
-        if (r.t400 < 0 && (car->state().position - start).length() >= 402.34f) r.t400 = t, r.trap_kmh = kmh;
-        if (kmh > best + 0.05f) best = kmh, r.t_top = t;
-        if (t - r.t_top > 10 && r.t400 > 0) break; // no longer gaining
+        if (r.t400 < 0 && dist >= 402.34f) r.t400 = t, r.trap_kmh = kmh;
     }
-    r.top_kmh = best;
     return r;
 }
 
-// Lift-off from 100 km/h on the flat: average deceleration 100->50 and 50->10
-// km/h (g), and where the car ends up after 25 s.
+// GT3's top-speed test (MMAX) with the race's AI at the wheel: the run's highest speed (km/h) up to its split line.
+double top_speed_kmh(const TestCourse& tc, const std::string& car, std::string& err) {
+    std::unique_ptr<race::RaceField> f = tc.run("MMAX", car, true, err);
+    if (!f) return -1;
+    const ex::ExactRace* race = race::exact_race_of(*f);
+    for (int i = 0; i < int(240 / kStep) && race->cars()[0].finished == 0; ++i) f->player().step({}, kStep);
+    return race->cars()[0].max_speed.host() * 3.6;
+}
+
+// Full throttle to 100 km/h down the straight, then `then` (the brake, or a lift-off) until the car stops or 25 s pass.
+template <class Each>
+void from_100(const TestCourse& tc, const std::string& car, float brake, Each&& each, std::string& err) {
+    std::unique_ptr<race::RaceField> f = tc.run("M1000", car, false, err);
+    if (!f) return;
+    race::RaceVehicle& v = f->player();
+    sim::ControlInputs in;
+    in.throttle = 1;
+    in.controller_kind = 2;
+    for (int i = 0; i < int(60 / kStep) && (f->race_time() <= 0 || v.state().speed_kmh < 100); ++i) v.step(in, kStep);
+    in.throttle = 0, in.brake = brake;
+    double t = 0;
+    for (int i = 0; i < int(25 / kStep); ++i) {
+        const sim::Vec3 p0 = v.state().position;
+        v.step(in, kStep);
+        t += kStep;
+        if (!each(t, v.state().speed_kmh, (v.state().position - p0).length())) break;
+    }
+}
+
+// 60-0 mph stop with full brakes, feet.
+double brake_60_0_ft(const TestCourse& tc, const std::string& car, std::string& err) {
+    double dist = 0;
+    bool started = false;
+    from_100(tc, car, 1.0f, [&](double, float kmh, float step_m) {
+        if (started) dist += step_m;
+        if (!started && kmh <= 96.56f) started = true;
+        return kmh >= 0.5f;
+    }, err);
+    return dist * 3.28084;
+}
+
+// Lift-off from 100 km/h: average deceleration 100->50 and 50->10 km/h (g), and the speed after 25 s.
 struct Coast {
     double g_high = 0, g_low = 0, end_kmh = 0;
 };
 
-Coast coast_down(const sim::CarSpec& spec) {
-    auto car = sim::Vehicle::create(spec);
-    Flat g;
-    car->reset({}, {});
-    sim::ControlInputs in;
-    in.throttle = 1;
-    const double h = 1.0 / sim::kDefaultTickHz;
-    for (int i = 0; i < int(60 / h) && car->state().speed_kmh < 100; ++i) car->step(in, g, h);
-    in.throttle = 0;
+Coast coast_down(const TestCourse& tc, const std::string& car, std::string& err) {
     Coast c;
-    double t = 0, t50 = -1, t10 = -1;
-    for (int i = 0; i < int(25 / h); ++i) {
-        car->step(in, g, h);
-        t += h;
-        float v = car->state().speed_kmh;
-        if (t50 < 0 && v <= 50) t50 = t;
-        if (t10 < 0 && v <= 10) t10 = t;
-        if (std::getenv("GT3R_MODCAR_DEBUG") && i % 30 == 0) {
-            const auto& tl = car->telemetry();
-            std::printf("     t %.1f  %.1f km/h  motor %.0f rpm  T %.0f N*m  clutch %.2f locked %d  gear %d\n", t, v,
-                        car->state().engine_rpm, tl.engine_torque, tl.clutch, int(tl.clutch_locked), car->state().gear);
-        }
-    }
+    double t50 = -1, t10 = -1;
+    from_100(tc, car, 0.0f, [&](double t, float kmh, float) {
+        if (t50 < 0 && kmh <= 50) t50 = t;
+        if (t10 < 0 && kmh <= 10) t10 = t;
+        c.end_kmh = kmh;
+        return true;
+    }, err);
     if (t50 > 0) c.g_high = 50 / 3.6 / t50 / 9.81;
     if (t10 > 0 && t50 > 0) c.g_low = 40 / 3.6 / (t10 - t50) / 9.81;
-    c.end_kmh = car->state().speed_kmh;
     return c;
-}
-
-// Skidpad, like Car and Driver's 300-ft circle: a controller holds the circle's curvature with
-// the road-wheel angle while the speed ramps up slowly; the result is the highest lateral
-// acceleration held for a second.
-double skidpad_g(const sim::CarSpec& spec, double radius = 45.72) {
-    auto car = sim::Vehicle::create(spec);
-    Flat g;
-    car->reset({}, {});
-    const double h = 1.0 / sim::kDefaultTickHz;
-    sim::ControlInputs in;
-    double steer = 0, thr_i = 0.2, best = 0, held = 0, held_acc = 0;
-    int held_n = 0;
-    double v_target = 30 / 3.6;
-    for (int i = 0; i < int(240 / h); ++i) {
-        const auto& st = car->state();
-        double v = std::hypot(st.velocity.x, st.velocity.z);
-        double r = st.angular_velocity.y;
-        double k = v > 1 ? std::fabs(r) / v : 0;
-        if (v > 3) steer = std::clamp(steer + 0.6 * (1 / radius - k) * h * 60 * 0.02, 0.0, 0.6);
-        else steer = 0.05;
-        double e = v_target - v;
-        thr_i = std::clamp(thr_i + 0.15 * e * h, 0.0, 1.0);
-        in.throttle = float(std::clamp(thr_i + 0.4 * e, 0.0, 1.0));
-        in.brake = 0;
-        in.steer_angle = float(steer);
-        car->step(in, g, h);
-        if (i * h > 6) v_target += 1.0 / 3.6 * h; // +1 km/h per second once settled
-        bool on_circle = v > 5 && std::fabs(k * radius - 1) < 0.04;
-        double a = v * std::fabs(r) / 9.81;
-        if (on_circle) {
-            held += h, held_acc += a, ++held_n;
-            if (held >= 1.0) {
-                best = std::max(best, held_acc / held_n);
-                held = 0, held_acc = 0, held_n = 0;
-            }
-        } else {
-            held = 0, held_acc = 0, held_n = 0;
-            if (i * h > 20 && steer >= 0.59) break; // out of lock: past the limit
-        }
-        if (v_target - v > 4 && i * h > 20) break; // can no longer hold the speed on the circle
-    }
-    return best;
-}
-
-// 60-0 mph stop with full brakes (ABS), feet.
-double brake_60_0_ft(const sim::CarSpec& spec) {
-    auto car = sim::Vehicle::create(spec);
-    Flat g;
-    car->reset({}, {});
-    const double h = 1.0 / sim::kDefaultTickHz;
-    sim::ControlInputs in;
-    in.throttle = 1;
-    for (int i = 0; i < int(60 / h) && car->state().speed_kmh < 100; ++i) car->step(in, g, h);
-    in.throttle = 0;
-    in.brake = 1;
-    double dist = 0;
-    bool started = false;
-    for (int i = 0; i < int(20 / h); ++i) {
-        float v = car->state().speed_kmh;
-        if (!started && v <= 96.56f) started = true;
-        car->step(in, g, h);
-        if (started) dist += car->state().speed_kmh / 3.6 * h;
-        if (car->state().speed_kmh < 0.5) break;
-    }
-    return dist * 3.28084;
 }
 
 std::string secs(double t) {
@@ -243,6 +256,8 @@ int cmd_modcar(Disc& disc, const Args& a) {
         std::fprintf(stderr, "error: %s\n", db.error().c_str());
         return 1;
     }
+    TestCourse tc;
+    if (!tc.load(disc, db)) std::fprintf(stderr, "warning: no test drives (%s)\n", tc.error.c_str());
     int bad = 0;
     for (const std::string& f : files) {
         std::printf("== %s\n", f.c_str());
@@ -253,26 +268,16 @@ int cmd_modcar(Disc& disc, const Args& a) {
                 std::printf("   error: %s\n", serr.c_str());
                 continue;
             }
-            if (std::getenv("GT3R_MODCAR_DEBUG")) { // at rest: where the car frame and wheels sit
-            auto car = sim::Vehicle::create(*spec);
-            Flat g;
-            car->reset({}, {});
-            sim::ControlInputs idle;
-            for (int i = 0; i < 180; ++i) car->step(idle, g, 1.0 / 60);
-            const auto& st = car->state();
-            const auto& su = car->setup();
-            std::printf("   at rest: origin y %.4f, body lift (ride height) %.3f, wheel FL hub %.3f (rest %.3f, susp %.4f static %.4f), tyre r %.3f\n",
-                        st.position.y, su.wheels[0].ride_height, st.position.y + su.wheels[0].rest_center.y + (st.wheels[0].suspension - su.wheels[0].static_suspension),
-                        su.wheels[0].rest_center.y, st.wheels[0].suspension, su.wheels[0].static_suspension, spec->axle[0].tire_radius);
-        }
-        Run r = straight_line(*spec);
             std::printf("   %s: %.0f kg, %.0f kW, %.2f kg/PS\n", spec->name.c_str(), spec->mass, spec->peak_power_kw(),
                         (spec->mass - 120) / std::max(1.0f, spec->peak_power_kw() * 1.35962f));
+            if (!tc.track) continue;
+            Run r = straight_line(tc, f.substr(5));
+            std::string err;
             std::printf("   0-60 mph  %s s, %s s with a 1 ft rollout\n", secs(r.t60).c_str(), secs(r.t60 - r.t_roll).c_str());
             std::printf("   1/4 mile  %s s @ %.0f mph\n", secs(r.t400).c_str(), r.trap_kmh / 1.609344);
-            std::printf("   top speed %.0f km/h\n", r.top_kmh);
-            std::printf("   skidpad   %.2f g (300 ft)\n", skidpad_g(*spec));
-            std::printf("   60-0 mph  %.0f ft\n", brake_60_0_ft(*spec));
+            std::printf("   top speed %.0f km/h\n", top_speed_kmh(tc, f.substr(5), err));
+            std::printf("   60-0 mph  %.0f ft\n", brake_60_0_ft(tc, f.substr(5), err));
+            if (!r.error.empty() || !err.empty()) std::printf("   error: %s\n", (r.error.empty() ? err : r.error).c_str());
             continue;
         }
         auto bytes = read_host_file(f);
@@ -308,13 +313,20 @@ int cmd_modcar(Disc& disc, const Args& a) {
         }
         float total = spec->gearbox.ratios.empty() ? 0 : spec->gearbox.ratios[0] * spec->gearbox.final_drive;
         std::printf("   spec: %.0f kg, %s, peak %.0f N*m, %.0f kW @ %.0f rpm, limit %.0f rpm, %zu gear(s), 1st x final %.2f, "
-                    "tyres r %.3f/%.3f m, CdA %.2f m^2\n",
+                    "tyres r %.3f/%.3f m, drag %.3f N/(m/s)^2\n",
                     spec->mass, spec->engine.electric ? "electric" : "engine", spec->peak_torque(), spec->peak_power_kw(),
                     spec->peak_power_rpm(), spec->engine.rev_limit_rpm, spec->gearbox.ratios.size(), total,
-                    spec->axle[0].tire_radius, spec->axle[1].tire_radius, spec->aero.drag_area);
+                    spec->axle[0].tire_radius, spec->axle[1].tire_radius, spec->aero.c_drag);
         if (spec->engine.electric)
-            std::printf("   regen: %.0f N*m, %.0f kW\n", spec->engine.regen_torque, spec->engine.regen_power / 1000);
-        Run r = straight_line(*spec);
+            std::printf("   electric: the test drives run on its donor's engine (%s) until the game's physics has the EV drive\n",
+                        def->donor.c_str());
+        if (!tc.track) continue;
+        Run r = straight_line(tc, def->label);
+        if (!r.error.empty()) {
+            std::printf("   error: test drive: %s\n", r.error.c_str());
+            ++bad;
+            continue;
+        }
         IniDocument ini = IniDocument::parse(text);
         auto ref = [&](const char* k) {
             auto v = ini.get("reference", k);
@@ -325,14 +337,16 @@ int cmd_modcar(Disc& disc, const Args& a) {
         };
         std::printf("   0-60 mph  %s s, %s s with a 1 ft rollout like US magazine tests%s\n", secs(r.t60).c_str(),
                     secs(r.t60 - r.t_roll).c_str(), ref("zero_to_60_s").c_str());
-        std::printf("   launch    wheelspin peaks %.0f km/h over road speed at %.0f km/h (TCS on)\n", r.spin_kmh, r.spin_at_kmh);
+        std::printf("   launch    wheelspin peaks %.0f km/h over road speed at %.0f km/h\n", r.spin_kmh, r.spin_at_kmh);
         std::printf("   0-100 km/h%s s%s\n", secs(r.t100).c_str(), ref("zero_to_100_s").c_str());
         std::printf("   1/4 mile  %s s @ %.0f mph (rollout %s s)%s\n", secs(r.t400).c_str(), r.trap_kmh / 1.609344,
                     secs(r.t400 - r.t_roll).c_str(), ref("quarter_mile_s").c_str());
-        std::printf("   top speed %.0f km/h (%.0f mph)%s\n", r.top_kmh, r.top_kmh / 1.609344, ref("top_speed_kmh").c_str());
-        std::printf("   skidpad   %.2f g (300 ft)%s\n", skidpad_g(*spec), ref("skidpad_g").c_str());
-        std::printf("   60-0 mph  %.0f ft%s\n", brake_60_0_ft(*spec), ref("brake_60_0_ft").c_str());
-        Coast cd = coast_down(*spec);
+        std::string drive_err;
+        const double top = top_speed_kmh(tc, def->label, drive_err);
+        std::printf("   top speed %.0f km/h (%.0f mph), GT3's top-speed test%s\n", top, top / 1.609344, ref("top_speed_kmh").c_str());
+        std::printf("   60-0 mph  %.0f ft%s\n", brake_60_0_ft(tc, def->label, drive_err), ref("brake_60_0_ft").c_str());
+        Coast cd = coast_down(tc, def->label, drive_err);
+        if (!drive_err.empty()) std::printf("   error: test drive: %s\n", drive_err.c_str());
         std::printf("   lift-off  %.2f g (100-50 km/h), %.2f g (50-10), %.1f km/h after 25 s\n", cd.g_high, cd.g_low, cd.end_kmh);
     }
     for (const std::string& e : db.mod_car_errors()) std::printf("error: %s\n", e.c_str());

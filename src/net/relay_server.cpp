@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <queue>
 #include <random>
 
@@ -100,10 +102,40 @@ bool RelayServer::trusted(const Address& a) const {
     return (std::memcmp(ip, kMapped, 12) == 0 && ip[12] == 127) || std::memcmp(ip, kV6Loopback, 16) == 0;
 }
 
+// Unless --log-ips, the log never holds an IP: within a UTC day one source (IPv6: /64) always
+// gets the same tag, so lobbies and joins can still be counted per player; a new day (or a
+// restart) draws a new key, so tags cannot be matched across days or reversed by hashing every
+// address.
+std::string RelayServer::ip_tag(const Address& a) {
+    long long day = (long long)(std::time(nullptr) / 86400);
+    if (day != tag_day_) {
+        for (int i = 0; i < 16; i += 8) {
+            u64 v = random();
+            std::memcpy(tag_key_ + i, &v, 8);
+        }
+        tag_day_ = day;
+        log("ip tags: new key (tags do not match earlier ones)");
+    }
+    std::string k = ip_key(a);
+    u64 h = siphash24(tag_key_, ByteSpan(reinterpret_cast<const u8*>(k.data()), k.size()));
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%08x", unsigned(h >> 32));
+    return buf;
+}
+
 std::string RelayServer::ip_of(const Address& a) {
     std::string s = a.to_string();
     size_t c = s.rfind(':');
     return c == std::string::npos ? s : s.substr(0, c);
+}
+
+std::string RelayServer::who(const Address& a) {
+    std::string s = log_ips_ ? ip_of(a) : ip_tag(a);
+    if (country_) {
+        std::string c = country_(a);
+        s += " (" + (c.empty() ? std::string("??") : c) + ")";
+    }
+    return s;
 }
 
 RelayServer::IpSlot& RelayServer::slot(const Address& a) {
@@ -290,7 +322,7 @@ void RelayServer::handle_control(const Address& from, Rv type, Reader& r, const 
         sessions_[code] = s;
         by_token_[token] = code;
         ++sessions_per_ip_[key];
-        log("session " + code + " registered by " + ip_of(from));
+        log("session " + code + " registered by " + who(from));
         return registered(from, code);
     }
     case Rv::Keepalive:
@@ -378,7 +410,7 @@ void RelayServer::handle_control(const Address& from, Rv type, Reader& r, const 
         put_u64(in, nonce);
         put_endpoints(in, client_eps);
         send(s.host, in);
-        log("join " + code + " from " + ip_of(from));
+        log("join " + code + " from " + who(from));
         return;
     }
     case Rv::Bind: {

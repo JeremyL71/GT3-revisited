@@ -32,10 +32,4 @@ std::optional<ArcadeCar> arcade_car(const data::CarDatabase& db, const std::stri
     return std::nullopt;
 }
 
-int driver_param_set(const data::CarDatabase& db, const std::string& course) {
-    for (const data::Course& c : db.courses())
-        if (c.label == course) return c.surface == 1 || c.surface == 2 ? int(c.surface) : 0;
-    return 0;
-}
-
 } // namespace gt3r::race

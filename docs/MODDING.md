@@ -5,10 +5,43 @@ Every asset the engine loads goes through a layered virtual filesystem
 GT3.VOL**. A mod can therefore replace any file, or add new ones, without
 touching the disc image.
 
+## Installing mods
+
+On the **Mods** screen:
+
+- **Install from .zip** (Start) picks a .zip with the system's file picker and
+  installs every mod in it. On a computer you can also drop the .zip onto the
+  window while the Mods screen is open.
+- **Open folder** (Select) shows the mods folder in the file manager. On
+  Android the folder is in the app's private storage, so it opens in the
+  **Files** app, where **GT3 Revisited** is listed with the other places
+  (Internal storage, Downloads). Unzipped mod folders can be copied into
+  `mods/` there.
+- Cross turns the selected mod on or off. **Remove** (Square) deletes its
+  folder after asking.
+- The list is read again when you come back to the game from another app.
+
+What a .zip may hold:
+
+- One mod or several. A mod is a folder with a `mod.ini`. A .zip without any
+  `mod.ini` is one mod when its top level, or its only top folder, has
+  `files/`, `cars/` or `makers/`.
+- Each mod installs as `mods/<its folder's name>/`. A mod whose `mod.ini` is
+  at the top of the .zip is named after the .zip file.
+- Anything beside the mods (a README at the top, `__MACOSX/`) is left out.
+- A mod already installed under the same name is replaced, after asking: its
+  folder is deleted first, with any changes made to it.
+- Standard (Deflate) or uncompressed .zip files only. Password-protected
+  archives, other compression methods and paths leading out of the folder
+  (`..`, absolute paths) are refused, and nothing changes until the whole
+  archive has unpacked.
+
+To share a mod, zip its folder (`my_mod/` with its `mod.ini` inside).
+
 ## Layout
 
-Mods live in the user data folder (shown on the Mods screen, or press
-Start there to open it):
+Mods live in `mods/` in the user data folder (the Mods screen shows where;
+**Open folder** opens it):
 
 ```
 mods/
@@ -132,8 +165,7 @@ gears = 9.04                   ; electric: the single reduction; engine: up to 7
 [tires]
 front = 255/35R21              ; or `size = ...` for both axles
 rear = 275/35R21               ; width and aspect in steps of 5 (as the disc stores them)
-grip_pct = 98                  ; optional: the street compounds' grip, % (fit the real
-                               ; tyre's skidpad: `gt3tool modcar` reports it vs [reference] skidpad_g)
+grip_pct = 98                  ; optional: the street compounds' grip, %
 
 [sound]                        ; electric: the synthesised motor
 whine_order = 1.15             ; pitch multiplier
@@ -156,16 +188,18 @@ level = 0                      ; arcade unlock level (0 = always open)
 zero_to_60_s = 3.3             ; magazine tests (1 ft rollout)
 quarter_mile_s = 11.5
 top_speed_kmh = 250
-skidpad_g = 0.88               ; 300 ft skidpad (also: zero_to_100_s, brake_60_0_ft)
+skidpad_g = 0.88               ; 300 ft skidpad, kept for reference (also: zero_to_100_s, brake_60_0_ft)
 
 [raw.chassis]                  ; advanced: bytes of the car's own record in any table
 0x1D = 120                     ; 0x30:u16 = 1000, 0x44:f32 = 2.1 (docs/formats/database.md)
 ```
 
 In arcade mode, a mod car appears at the end of its class's car list. It is
-drawn in the turning showroom, with its own specs and its `[paints]` colours,
+drawn in the turning showroom, with its own specs and its `[paints]` colors,
 and races against that class's opponents. The icon strip shows its
-`[dealer] thumb`.
+`[dealer] thumb`. It races on the same stock settings (gearing, output,
+suspension) in arcade mode, quick races and `gt3tool modcar` as when it is
+bought new in GT Mode.
 
 Mods load in priority order. A later mod's car replaces an earlier one with the
 same label, but a mod car can never replace a disc car. The Mods screen lists
@@ -174,7 +208,15 @@ each mod's cars, along with the reason any of them failed to load.
 ### Dealers and makers
 
 A car for sale appears at its maker's dealer in GT Mode, at its `price` in
-credits:
+credits. The price is stored like the disc's own car prices, so it follows the
+game's money rules: the US and European versions show it as written, the
+Japanese version shows every price, prize and starting balance 100 times
+larger, a mod car's too (`price = 57490` costs 5,749,000 Cr. there). Write the
+price you want a US or European player to pay. Without a `price` the car costs
+what its donor costs on the player's disc. Selling a car pays a quarter of its
+price, as for any car.
+
+Where the car is sold:
 
 - If a disc dealer already sells cars from that maker (FORD, CHEVROLET...), the
   car joins that dealer's page.
@@ -210,6 +252,11 @@ GT3R_VIEWER="find=mod:my_car,clean=1,key=1,yaw=3.95,pitch=0.16,zoom=1.15" GT3R_V
 GT3 has no electric cars, so `type = electric` switches on a few additions. Disc
 cars never use them.
 
+**For now an electric car races with its donor car's engine, gearbox and
+drivetrain** (the stock ones): the race runs GT3's own physics, which has no
+electric drive yet. The mods screen and the log say so, and the car still
+sounds like its motor. The drive described below returns when the race has it.
+
 - **Drive:** the motor drives the wheels directly through a single reduction.
   There is no idle, no clutch slip and no gear changes, and full torque is
   available from standstill. The default curve holds constant torque up to the
@@ -234,11 +281,13 @@ gt3tool modcar game.iso mods/my_cars
 ```
 
 The command loads each file and reports errors and warnings. It then prints the
-resulting specs and drives the car on a flat plane. It reports 0-60 mph (standing
-start and with a 1 ft rollout, like US magazine tests), 0-100 km/h, the quarter
-mile, top speed, skidpad grip, 60-0 mph braking and lift-off deceleration, each
-next to your `[reference]` figures. `disc:<label>` arguments run disc cars
-through the same test for comparison. Fit `power_kw` to the quarter-mile trap
+resulting specs and test-drives the car on the game's own physics, on the
+machine tests' course: 0-60 mph (standing start and with a 1 ft rollout, like
+US magazine tests), 0-100 km/h, the quarter mile, top speed (GT3's top-speed
+test, driven by the race's AI), 60-0 mph braking and lift-off deceleration,
+each next to your `[reference]` figures. An electric car is driven on its
+donor's engine (above). `disc:<label>` arguments run disc cars through the same
+test for comparison. Fit `power_kw` to the quarter-mile trap
 speed (top end) first, then `output_pct` to 0-60. GT3's physics loses a little
 at speed (the disc Viper
 traps ~5 mph under its magazine tests), so the curve power often ends up

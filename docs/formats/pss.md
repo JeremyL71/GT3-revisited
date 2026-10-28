@@ -4,7 +4,9 @@ Decoder: `src/formats/pss.*` (demuxer), `src/video/` (MPEG-2 video, playback).
 Tools: `gt3tool video-info | video-frames | video-yuv | video-psnr | video-wav | video-ads | video-survey`.
 
 GT3.VOL holds 51 `.pss` files (about 1.4 GB, all stored uncompressed) under
-`stream/`, plus `stream/course.ipic` (not a movie; see the end).
+`stream/`, plus `stream/course.ipic` (not a movie; see the end). The values
+below are the NTSC-U disc's; the other releases differ as listed under
+"Regional releases".
 
 ## Container
 
@@ -49,7 +51,7 @@ then GOPs of 18 pictures (`I B B P B B P ...`, M=3).
 |---|---|
 | Profile/level | Main@Main (0x48), `progressive_sequence` 1, 4:2:0 |
 | Size | 640×448 (50 files), 320×112 (`menu_bg2.pss`) |
-| Frame rate | 30 fps (code 5) for most; 29.97 (code 4) for `opening.pss` |
+| Frame rate | 30 fps (code 5) or 29.97 (code 4: `opening.pss`, the endings, `title_full.pss`, ...) |
 | Bit rate | 9 Mbit/s (3 Mbit/s for `menu_bg2`), VBV 1835008 bits |
 | Pictures | frame pictures only, `frame_pred_frame_dct` 1, `progressive_frame` 1 |
 | Coding | `q_scale_type` 1 (non-linear), `intra_vlc_format` 1, zigzag scan, no concealment vectors |
@@ -68,6 +70,25 @@ dual-prime prediction, no field pictures.
 Coverage: all 51 files decode with zero slice errors, frame counts identical
 to FFmpeg (39,307 frames total). See `docs/dev/MOVIES.md` for the accuracy
 comparison.
+
+## Regional releases
+
+| | NTSC-U | NTSC-J | PAL |
+|---|---|---|---|
+| Files | 51 | 51 | 49 (no `arcade_full`, `level_full`, which the game does not play) |
+| Size | 640×448 | 640×448 | 640×512 |
+| Frame rate | 30 or 29.97 fps (the opening, endings and title 29.97) | 30 fps | 25 fps (code 3) for all |
+| Field-split | 2 × 640×224, 1/60 s apart | as NTSC-U | 2 × 640×256, 1/50 s apart, same order |
+| `menu_bg2.pss` | 320×112, 360 pictures | as NTSC-U | 320×112, 300 pictures (the same 12 s) |
+| Audio | 44100 Hz | 48000 Hz, tracks of their own (opening 184.5 s) | 44100 Hz (opening 216.8 s; endings as long as NTSC-U's) |
+| `course.ipic` | 42 stills, 640×448 | none | 42 stills, 640×512 |
+
+PAL's opening runs 219.2 s of pictures (5,479) against its 216.8 s of audio;
+the endings have 232.7 s and 90.6 s of audio over 224.3 s and 91.2 s of
+pictures, as on NTSC-U (the picture stays on its last frame while the music
+ends). All 49 PAL movies decode with zero slice
+errors (31,955 pictures). The MPEG headers do not tell the TV system (both
+releases mark the pictures square-pixel and NTSC); the frame rate does.
 
 ## `stream/course.ipic` ✅ (`src/video/ipu.*`)
 

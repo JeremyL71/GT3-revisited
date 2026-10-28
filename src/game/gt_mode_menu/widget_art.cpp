@@ -434,11 +434,9 @@ bool car_for_widget(const std::string& page, const std::string& cls, std::string
         // Wheel shop: the wheel being looked at goes on the car (a preview).
         if (starts(page, "at/ws/ws_") && cls == "car_render_wheel_shop")
             if (GtModeSession* ss = S(); ss && !ss->focus_wheel_preview.empty()) *wheel = ss->focus_wheel_preview;
-        // Garage wheel change page: the inventory wheel under the cursor.
-        if (page == "hm/hm_wheel") {
-            const auto& w = st.wheels;
-            *wheel = s->wheel_cursor >= 0 && s->wheel_cursor < int(w.size()) ? w[size_t(s->wheel_cursor)] : "";
-        }
+        // The garage's wheel list: the entry under the cursor, the car's own wheels for the
+        // stock-wheel button.
+        if (page == "hm/hm_wheel") *wheel = wheel_list_entry(st, s->wheel_cursor);
     }
     return true;
 }

@@ -136,6 +136,13 @@ const GameState* snapshot_save();
 // the save library and the snapshot), so the next GT-mode menus start as on a fresh launch,
 // e.g. with another disc or a synthetic data set. Hooks stay installed.
 void reset_gt_mode_menu_for_tests();
+// The disc closes (App::close_disc): forgets the same, so the next disc loads its own data,
+// reader and region's save library.
+void close_gt_mode();
+// The mods changed (App::rescan_mods): the next GT-mode start loads the disc data again, and
+// the dealers their mod cars, with the mods as they are now. A running session keeps the
+// data it has.
+void reload_gt_mode_data();
 
 class GtModeSession {
 public:
@@ -163,7 +170,12 @@ public:
     int regulated_cursor = 0;  // 00cmn/car_reguration: the permitted-car list cursor
     std::string focus_wheel;   // wheel shop (set_focus_wheel_code)
     std::string focus_wheel_preview; // wheel shop: the wheel under the cursor (shown on the car)
-    int wheel_cursor = 0;      // hm/hm_wheel: wheel inventory cursor (-1 = stock)
+    // hm/hm_wheel, the garage's wheel list: the focused button (0 = the stock-wheel placeholder,
+    // k = GameState::wheels[k - 1]) and the row's offset in its window, easing towards the
+    // focused button's (none yet: placed at once).
+    int wheel_cursor = 0;
+    float wheel_row_off = 0;
+    bool wheel_row_set = false;
     std::string race_code;     // set_race_code*
     bool champ = false;        // set_race_code_champ
     std::string last_page;
@@ -173,6 +185,7 @@ public:
     std::map<std::string, int> setting_entry;       // slider positions when the page opened (pinch_prev)
     bool setting_committed = false;                 // a commit hides pinch_prev until the page is rebuilt
     std::string records_key;                        // records menu: the ranking shown
+    int records_cursor = 0;                         // records menu: the place under the cursor
     menu::flow::TextBox name_box;                   // record name entry: the name and its cursor
     // Guest garage (a friend's save loaded for Trade and the arcade guest class) and
     // whether the garage pages show it (the trade session).

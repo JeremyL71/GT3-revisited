@@ -9,7 +9,6 @@
 #include "race/replay_cameras.h"
 #include "render/math3d.h"
 #include "sim/sim_types.h"
-#include "sim/vehicle.h"
 
 #include <SDL3/SDL_events.h>
 
@@ -61,7 +60,7 @@ public:
     void set_car_points(const render::Vec3& p0, const render::Vec3& p1) { point_[0] = p0, point_[1] = p1; }
     // L1 held: look back (heading + pi, pitch negated); no mirror while held.
     void set_look_back(bool on) { look_back_ = on; }
-    // GT3's pre-race shot (StartingCamera, cameras/start.cam): while `on`, the camera follows the
+    // GT3's pre-race shot (starting camera, cameras/start.cam): while `on`, the camera follows the
     // file's record 0 in the car's frame as t goes 0 -> 1 (eye, target and zoom curves).
     void set_intro(bool on, float t) { intro_ = on, intro_t_ = t; }
     // cameras/start.cam's record (without it: a straight move from 30 m ahead to the front corner).
@@ -124,7 +123,7 @@ private:
     render::Vec3 point_[2] = {{0, -0.8f, 0}, {0, -1.5f, -6.0f}};
     bool look_back_ = false;
     bool mirror_ = true;
-    // In-car vibration (GT3's OnBoardCamera shakers): random kicks scaled by the tyres' slip,
+    // In-car vibration (GT3's on-board camera shakers): random kicks scaled by the tyres' slip,
     // through a lag, stepped at 60 Hz; see update().
     struct Shaker {
         float v = 0, x = 0, u_prev = 0;

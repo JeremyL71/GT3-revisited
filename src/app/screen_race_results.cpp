@@ -25,10 +25,12 @@ std::string RaceScreen::car_display_name(const std::string& label, bool full) co
     if (car.empty())
         for (const data::CarVariant& v : db_.arcade_cars())
             if (v.label == label) car = v.car;
+    // (The Latin-letter names: the text is cut to ASCII.)
     const data::Car* c = db_.car(car);
-    if (!c || c->name.empty()) return ascii(label);
-    std::string n = c->name;
-    if (full && !c->name_alt.empty() && c->name_alt.find_first_not_of(' ') != std::string::npos) n += " " + c->name_alt;
+    if (!c || c->latin_name.empty()) return ascii(label);
+    std::string n = c->latin_name;
+    const std::string& alt = c->latin_name_alt;
+    if (full && !alt.empty() && alt.find_first_not_of(' ') != std::string::npos) n += " " + alt;
     return ascii(n);
 }
 
@@ -92,7 +94,7 @@ menu::flow::GameResult RaceScreen::build_result() const {
     r.lap_times = lap_times_;
     r.best_lap = track_ ? track_->best_lap_time() : -1;
     // The engine condition the live runs leave (physics §10.3), for the garage car.
-    if (has_condition_ && vehicle_ && vehicle_->sim_vehicle()) {
+    if (has_condition_ && vehicle_ && vehicle_->facts()) {
         const sim::EngineCondition c = live_condition();
         r.car_condition = true;
         r.car_odometer = c.odometer;
@@ -217,7 +219,8 @@ int RaceScreen::presented_medal() const {
     return license_.state() == LicenseRun::State::Finished && shown_medal_ >= 0 ? shown_medal_ : -1;
 }
 
-// A race display string in the disc's text table (text/realtime.dat, US), or `fallback`.
+// A race display string in the disc's text table (text/realtime.dat) in the game's language
+// (else US English), or `fallback`.
 std::string RaceScreen::race_text(const char* key, const char* fallback) {
     if (!race_strings_tried_ && app_ && app_->vfs()) {
         race_strings_tried_ = true;
@@ -230,8 +233,12 @@ std::string RaceScreen::race_text(const char* key, const char* fallback) {
     if (race_strings_) {
         int i = race_strings_->find(key);
         if (i >= 0) {
-            std::string v = race_strings_->utf8(size_t(i), text::Language::US, nullptr);
-            if (!v.empty()) return v;
+            const text::Language own = text::language_from_code(lang_).value_or(text::Language::US);
+            for (text::Language l : {own, text::Language::US}) {
+                if (int(l) >= race_strings_->language_count()) continue;
+                std::string v = race_strings_->utf8(size_t(i), l, nullptr);
+                if (!v.empty()) return v;
+            }
         }
     }
     return fallback;

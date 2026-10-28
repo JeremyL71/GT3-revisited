@@ -13,7 +13,6 @@
 #include "audio/surround_cue.h"
 #include "race/race_sfx.h"
 #include "sim/sim_types.h"
-#include "sim/vehicle.h"
 
 #include <array>
 #include <memory>
@@ -52,10 +51,10 @@ const char* tyre_loop_effect(TyreLoop loop);
 
 // One wheel's inputs to its tyre loops after a physics step.
 struct WheelSound {
-    int surface = 0;         // tyre surface index (sim::model::surface_index, wet remap included)
+    int surface = 0;         // tyre surface index (sim::surface_index, wet remap included)
     bool contact = true;     // false once the wheel has been off the ground for 6 steps (road roar)
     float smoke = 0;         // slip intensity, unclamped (VehicleTelemetry::smoke, physics §8.3)
-    float pitch = 1;         // skid pitch (VehicleTelemetry::skid_pitch, physics §8.3)
+    float pitch = 1;         // skid pitch (VehicleTelemetry::skid_pitch, physics §8.3c)
     float rim_speed = 0;     // |w| r, m/s (road roar)
     float tyre_width = 0.2f; // m (road roar)
 };
@@ -78,12 +77,12 @@ Placement place_voice(float x, float z, float vol);
 
 class CarSfx {
 public:
-    // One physics step of a car: its state and (when it has one) the simulation's telemetry,
-    // the view's gains, and the listener (camera position and axes) the wheels are placed from.
+    // One race step of a car: its state and telemetry (no sound without them), the view's gains, and the listener (camera
+    // position and axes) the wheels are placed from.
     struct Step {
         const sim::VehicleState* state = nullptr;
         const sim::VehicleSetup* setup = nullptr;
-        const sim::VehicleTelemetry* telemetry = nullptr; // null: estimated from the state
+        const sim::VehicleTelemetry* telemetry = nullptr;
         SoundView view = SoundView::ChaseTarget;
         sim::Vec3 eye, right{1, 0, 0}, forward{0, 0, 1};
         float doppler = 1;
@@ -105,10 +104,6 @@ public:
 
     const std::array<WheelSound, 4>& wheels() const { return wheels_; }
     const Voice& voice(int wheel, TyreLoop loop) const { return out_[size_t(wheel)][size_t(loop)]; }
-
-    // A wheel's inputs from its state alone (cars without telemetry): slip intensity and skid
-    // pitch with the car's speed x sin(slip angle) standing in for the wheel's lateral speed.
-    static WheelSound estimate_wheel(const sim::WheelState& w, const sim::VehicleSetup::Wheel& setup, float speed);
 
 private:
     bool bound_ = false;
@@ -150,7 +145,7 @@ public:
     // The turbo model's inputs after a physics step of `v` (sound §7.5): the processed
     // throttle (after TCS and the shift cut, so 0 through an upshift), the turbo load,
     // the engine torque and the stage lag states.
-    static Step step_inputs(const sim::Vehicle& v);
+    static Step step_inputs(const sim::VehicleTelemetry& t, bool turbo);
     void step(const Step& s);
     void update(RaceSfx& sfx, VoiceMixer& mixer, const Frame& f);
     void stop(RaceSfx& sfx, VoiceMixer& mixer);

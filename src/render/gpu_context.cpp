@@ -1,13 +1,18 @@
 #include "render/gpu_context.h"
 
 #include "base/log.h"
+#include "platform/render_scale.h"
 #include "render/shaders/generated/model_frag.h"
 #include "render/shaders/generated/model_vert.h"
 #include "scene/model.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#ifdef __ANDROID__
+#include <sys/prctl.h>
+#endif
 
 #define GT3R_HAVE_GPU_RENDERER SDL_VERSION_ATLEAST(3, 4, 0)
 
@@ -79,6 +84,12 @@ bool GpuContext::init(SDL_Window* window, const GpuOptions& options) {
         LOG_WARN("No SDL_GPU device: %s", SDL_GetError());
         return false;
     }
+    const SDL_PropertiesID device_props = SDL_GetGPUDeviceProperties(device_);
+    const char* gpu_name = SDL_GetStringProperty(device_props, SDL_PROP_GPU_DEVICE_NAME_STRING, "");
+    const char* driver = SDL_GetStringProperty(device_props, SDL_PROP_GPU_DEVICE_DRIVER_INFO_STRING, nullptr);
+    if (!driver) driver = SDL_GetStringProperty(device_props, SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING, "");
+    LOG_INFO("3D renderer: GPU %s%s%s", gpu_name, *driver ? ", driver " : "", driver);
+    one_compile_thread_ = mali_bifrost(gpu_name);
     // The 2D renderer claims the window and owns the swapchain (a headset: offscreen, it draws
     // into the session's canvases and the headset sets the pace).
     SDL_Window* target = window;
@@ -104,33 +115,16 @@ bool GpuContext::init(SDL_Window* window, const GpuOptions& options) {
         }
     set_msaa(options.msaa);
     set_render_scale(options.render_scale);
-
-    for (int i = 0; i < 8; ++i) {
-        const bool no_mips = (i & 4) != 0; // the base level only (GS MXL 0)
-        SDL_GPUSamplerCreateInfo si{};
-        si.min_filter = SDL_GPU_FILTER_LINEAR;
-        si.mag_filter = SDL_GPU_FILTER_LINEAR;
-        si.mipmap_mode = no_mips ? SDL_GPU_SAMPLERMIPMAPMODE_NEAREST : SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
-        si.address_mode_u = (i & 1) ? SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE : SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
-        si.address_mode_v = (i & 2) ? SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE : SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
-        si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
-        si.max_lod = no_mips ? 0.0f : 1000.0f;
-        si.enable_anisotropy = anisotropy_ && !no_mips;
-        si.max_anisotropy = anisotropy_ && !no_mips ? 4.0f : 1.0f;
-        samplers_[i] = SDL_CreateGPUSampler(device_, &si);
-        if (!samplers_[i]) {
-            LOG_WARN("Sampler creation failed: %s", SDL_GetError());
-            return false;
-        }
-    }
+    aniso_level_ = std::clamp(options.anisotropy, 1, 16);
+    if (!create_samplers()) return false;
 
     Uploader up(device_);
     const u32 white = 0xFFFFFFFFu;
     white_ = up.texture_rgba(1, 1, &white, false);
     if (!white_ || !up.submit()) return false;
 
-    LOG_INFO("3D renderer: SDL_GPU %s, MSAA %dx, depth format %d, render scale %.2f", driver_name(), msaa(),
-             int(depth_format_), double(render_scale_));
+    LOG_INFO("3D renderer: SDL_GPU %s, MSAA %dx, anisotropy %dx, depth format %d, render scale %.2f", driver_name(),
+             msaa(), anisotropy(), int(depth_format_), double(render_scale_));
     return true;
 #else
     (void)window;
@@ -143,8 +137,7 @@ GpuContext::~GpuContext() {
     if (device_) {
         SDL_WaitForGPUIdle(device_);
         release_pipelines();
-        for (SDL_GPUSampler* s : samplers_)
-            if (s) SDL_ReleaseGPUSampler(device_, s);
+        release_samplers();
         if (white_) SDL_ReleaseGPUTexture(device_, white_);
         for (auto& [t, shared] : shared_textures_) SDL_ReleaseGPUTexture(device_, t);
         if (vs_) SDL_ReleaseGPUShader(device_, vs_);
@@ -180,12 +173,71 @@ SDL_GPUShader* GpuContext::make_shader(bool vertex) {
     return s;
 }
 
+// Eight samplers: the clamp_u / clamp_v combinations, each with mipmaps (trilinear, anisotropic
+// at aniso_level_) or without (the base level only, GS MXL 0).
+bool GpuContext::create_samplers() {
+    for (int i = 0; i < 8; ++i) {
+        const bool no_mips = (i & 4) != 0;
+        const bool aniso = anisotropy_ && !no_mips && aniso_level_ > 1;
+        SDL_GPUSamplerCreateInfo si{};
+        si.min_filter = SDL_GPU_FILTER_LINEAR;
+        si.mag_filter = SDL_GPU_FILTER_LINEAR;
+        si.mipmap_mode = no_mips ? SDL_GPU_SAMPLERMIPMAPMODE_NEAREST : SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+        si.address_mode_u = (i & 1) ? SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE : SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+        si.address_mode_v = (i & 2) ? SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE : SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+        si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+        si.max_lod = no_mips ? 0.0f : 1000.0f;
+        si.enable_anisotropy = aniso;
+        si.max_anisotropy = aniso ? float(aniso_level_) : 1.0f;
+        samplers_[i] = SDL_CreateGPUSampler(device_, &si);
+        if (!samplers_[i]) {
+            LOG_WARN("Sampler creation failed: %s", SDL_GetError());
+            return false;
+        }
+    }
+    return true;
+}
+
+void GpuContext::release_samplers() {
+    for (SDL_GPUSampler*& s : samplers_) {
+        if (s) SDL_ReleaseGPUSampler(device_, s);
+        s = nullptr;
+    }
+}
+
+void GpuContext::set_anisotropy(int level) {
+    level = level >= 16 ? 16 : level >= 8 ? 8 : level >= 4 ? 4 : level >= 2 ? 2 : 1;
+    if (level == aniso_level_) return;
+    const int before = aniso_level_;
+    aniso_level_ = level;
+    if (!anisotropy_) return; // remembered; the samplers have none
+    SDL_WaitForGPUIdle(device_);
+    release_samplers();
+    if (!create_samplers()) { // keep drawing with the previous level
+        release_samplers();
+        aniso_level_ = before;
+        create_samplers();
+    }
+}
+
 void GpuContext::set_render_scale(float s) {
-    render_scale_ = std::isfinite(s) ? std::clamp(s, 0.5f, 1.0f) : 1.0f;
+    render_scale_ = std::isfinite(s) ? std::clamp(s, 0.5f, platform::kMaxRenderScale) : 1.0f;
 }
 
 void GpuContext::set_render_ceiling(float s) {
-    render_ceiling_ = std::isfinite(s) ? std::clamp(s, 0.0f, 1.0f) : 0.0f;
+    render_ceiling_ = std::isfinite(s) ? std::clamp(s, 0.0f, platform::kMaxRenderScale) : 0.0f;
+}
+
+bool GpuContext::msaa_supported(SDL_GPUSampleCount c) const {
+    return SDL_GPUTextureSupportsSampleCount(device_, kColorFormat, c) &&
+           SDL_GPUTextureSupportsSampleCount(device_, depth_format_, c);
+}
+
+std::vector<int> GpuContext::msaa_levels() const {
+    std::vector<int> levels{1};
+    for (SDL_GPUSampleCount c : {SDL_GPU_SAMPLECOUNT_2, SDL_GPU_SAMPLECOUNT_4, SDL_GPU_SAMPLECOUNT_8})
+        if (msaa_supported(c)) levels.push_back(1 << int(c));
+    return levels;
 }
 
 void GpuContext::set_msaa(int samples) {
@@ -193,9 +245,11 @@ void GpuContext::set_msaa(int samples) {
                               : samples >= 4 ? SDL_GPU_SAMPLECOUNT_4
                               : samples >= 2 ? SDL_GPU_SAMPLECOUNT_2
                                              : SDL_GPU_SAMPLECOUNT_1;
-    while (want != SDL_GPU_SAMPLECOUNT_1 && !(SDL_GPUTextureSupportsSampleCount(device_, kColorFormat, want) &&
-                                              SDL_GPUTextureSupportsSampleCount(device_, depth_format_, want)))
-        want = SDL_GPUSampleCount(int(want) - 1);
+    // The nearest count the GPU offers: a missing 2x becomes 4x (Mali GPUs offer 1x, 4x and 8x
+    // only, and 4x cost a Galaxy A15 about 5 points of dynamic resolution), others the next lower.
+    if (want == SDL_GPU_SAMPLECOUNT_2 && !msaa_supported(want) && msaa_supported(SDL_GPU_SAMPLECOUNT_4))
+        want = SDL_GPU_SAMPLECOUNT_4;
+    while (want != SDL_GPU_SAMPLECOUNT_1 && !msaa_supported(want)) want = SDL_GPUSampleCount(int(want) - 1);
     if (want != samples_) {
         SDL_WaitForGPUIdle(device_);
         release_pipelines();
@@ -216,15 +270,14 @@ void GpuContext::release_pipelines() {
     pipelines_.clear();
 }
 
-void GpuContext::warm_pipelines() {
-    stop_warming();
-    warm_ = true;
-    // The combinations five courses and the menus drew with: opaque and alpha blending with
-    // every cull, depth write and frame-alpha mode; the other blends without depth or alpha
-    // writes. Then the same for transparent pictures (coverage, no frame alpha): car models on
-    // the race's gap pop-ups and results bar, the online pickers' cars. A pop-up's first car
-    // built three of these mid-race, a 0.5 s stall on a Moto G Power 2024. Others are still
-    // created on first use.
+namespace {
+
+// The combinations five courses and the menus drew with: opaque and alpha blending with every
+// cull, depth write and frame-alpha mode; the other blends without depth or alpha writes. Then
+// the same for transparent pictures (coverage, no frame alpha): car models on the race's gap
+// pop-ups and results bar, the online pickers' cars. A pop-up's first car built three of these
+// mid-race, a 0.5 s stall on a Moto G Power 2024. Others are still created on first use.
+std::vector<PipelineKey> warm_keys() {
     std::vector<PipelineKey> keys;
     for (bool coverage : {false, true}) {
         const std::vector<AlphaWrite> alphas = coverage ? std::vector<AlphaWrite>{AlphaWrite::Keep}
@@ -246,23 +299,59 @@ void GpuContext::warm_pipelines() {
                 keys.push_back(k);
             }
     }
+    return keys;
+}
+
+} // namespace
+
+void GpuContext::warm_pipelines() {
+    stop_warming();
+    warm_ = true;
+    if (one_compile_thread_) { // on the render thread instead: warm_step, finish_warming
+        render_thread_keys_ = warm_keys();
+        render_thread_next_ = 0, render_thread_made_ = 0, render_thread_ns_ = 0;
+        return;
+    }
     warm_stop_ = false;
-    warm_thread_ = std::thread([this, keys] {
+    warm_thread_ = std::thread([this, keys = warm_keys()] {
         const u64 t0 = SDL_GetTicksNS();
         int made = 0;
         for (const PipelineKey& k : keys) {
             if (warm_stop_) return;
-            {
-                std::lock_guard lock(pipelines_mutex_);
-                if (pipelines_.count(k)) continue;
-            }
-            SDL_GPUGraphicsPipeline* p = create_pipeline(k);
-            ++made;
-            std::lock_guard lock(pipelines_mutex_);
-            if (!pipelines_.emplace(k, p).second && p) SDL_ReleaseGPUGraphicsPipeline(device_, p);
+            made += build_pipeline(k);
         }
         LOG_INFO("3D pipelines warmed: %d in %.0f ms", made, double(SDL_GetTicksNS() - t0) / 1e6);
     });
+}
+
+void GpuContext::warm_step() { warm_on_render_thread(false); }
+
+void GpuContext::finish_warming() { warm_on_render_thread(true); }
+
+void GpuContext::warm_on_render_thread(bool all) {
+    if (render_thread_keys_.empty()) return;
+    const u64 t0 = SDL_GetTicksNS();
+    while (render_thread_next_ < render_thread_keys_.size()) {
+        const bool built = build_pipeline(render_thread_keys_[render_thread_next_++]);
+        render_thread_made_ += built;
+        if (built && !all) break; // one compile per frame (those built on first use cost nothing)
+    }
+    render_thread_ns_ += SDL_GetTicksNS() - t0;
+    if (render_thread_next_ < render_thread_keys_.size()) return;
+    LOG_INFO("3D pipelines warmed on the render thread%s: %d in %.0f ms", all ? " (race load)" : "",
+             render_thread_made_, double(render_thread_ns_) / 1e6);
+    render_thread_keys_.clear();
+}
+
+bool GpuContext::build_pipeline(const PipelineKey& key) {
+    {
+        std::lock_guard lock(pipelines_mutex_);
+        if (pipelines_.count(key)) return false;
+    }
+    SDL_GPUGraphicsPipeline* p = create_pipeline(key);
+    std::lock_guard lock(pipelines_mutex_);
+    if (!pipelines_.emplace(key, p).second && p) SDL_ReleaseGPUGraphicsPipeline(device_, p); // built meanwhile
+    return true;
 }
 
 SDL_GPUGraphicsPipeline* GpuContext::pipeline(const PipelineKey& key) {
@@ -399,7 +488,20 @@ SDL_GPUGraphicsPipeline* GpuContext::create_pipeline(const PipelineKey& key) {
     info.target_info.depth_stencil_format = depth_format_;
     info.target_info.has_depth_stencil_target = true;
 
+#ifdef __ANDROID__
+    // Android's crash reports name the crashing thread: while the driver compiles, the thread is
+    // named after the key, in the order of the first-use log (blend, cull, depth write, lines,
+    // coverage, alpha), then the MSAA level, e.g. "pipe100000x4".
+    char thread_name[16] = {}, key_name[16];
+    prctl(PR_GET_NAME, thread_name);
+    std::snprintf(key_name, sizeof key_name, "pipe%d%d%d%d%d%dx%d", int(key.blend), int(key.cull),
+                  int(key.depth_write), int(key.lines), int(key.coverage), int(key.alpha), msaa());
+    prctl(PR_SET_NAME, key_name);
+#endif
     SDL_GPUGraphicsPipeline* p = SDL_CreateGPUGraphicsPipeline(device_, &info);
+#ifdef __ANDROID__
+    prctl(PR_SET_NAME, thread_name);
+#endif
     if (!p) LOG_WARN("Pipeline creation failed: %s", SDL_GetError());
     return p;
 }
@@ -447,6 +549,27 @@ bool GpuContext::take_texture(SDL_GPUTexture* t) {
 
 // ---------------------------------------------------------------------------
 
+bool PendingGpuWork::add(u32 submits, u64 bytes) {
+    submits_ += submits;
+    bytes_ += bytes;
+    if (submits_ < kMaxSubmits && bytes_ < kMaxBytes) return false;
+    frame_presented();
+    return true;
+}
+
+namespace {
+PendingGpuWork& pending_gpu_work() {
+    static PendingGpuWork work;
+    return work;
+}
+} // namespace
+
+void note_gpu_submits(SDL_GPUDevice* device, u32 submits, u64 bytes) {
+    if (pending_gpu_work().add(submits, bytes)) SDL_WaitForGPUIdle(device);
+}
+
+void GpuContext::frame_presented() { pending_gpu_work().frame_presented(); }
+
 Uploader::Uploader(SDL_GPUDevice* device) : device_(device) {}
 
 u32 Uploader::stage(const void* data, u32 size) {
@@ -467,6 +590,19 @@ SDL_GPUBuffer* Uploader::buffer(SDL_GPUBufferUsageFlags usage, const void* data,
     if (!b) return nullptr;
     pending_.push_back({b, nullptr, stage(data, size), size, 0, 0, 0, false});
     return b;
+}
+
+bool mali_bifrost(std::string_view name) {
+    constexpr std::string_view prefix = "Mali-G";
+    if (name.substr(0, prefix.size()) != prefix) return false;
+    int model = 0;
+    size_t i = prefix.size();
+    for (; i < name.size() && i < prefix.size() + 4 && name[i] >= '0' && name[i] <= '9'; ++i)
+        model = model * 10 + (name[i] - '0');
+    if (i == prefix.size() || (i < name.size() && name[i] != ' ')) return false;
+    for (int m : {31, 51, 52, 71, 72, 76})
+        if (model == m) return true;
+    return false;
 }
 
 u32 mip_levels(u32 w, u32 h) {
@@ -506,7 +642,9 @@ SDL_GPUTexture* Uploader::texture_rgba(u32 w, u32 h, const u32* rgba, bool mipma
     ti.layer_count_or_depth = 1;
     ti.num_levels = mipmaps ? mip_levels(w, h) : 1;
     SDL_GPUTexture* tex = SDL_CreateGPUTexture(device_, &ti);
-    if (tex) update_rgba(tex, w, h, rgba, mipmaps, false);
+    if (!tex) return nullptr;
+    note_gpu_submits(device_, 1); // Vulkan: a submit that sets the texture's layout
+    update_rgba(tex, w, h, rgba, mipmaps, false);
     return tex;
 }
 
@@ -561,6 +699,7 @@ bool Uploader::submit() {
         }
     }
     if (t) SDL_ReleaseGPUTransferBuffer(device_, t); // deferred until the GPU is done
+    if (ok) note_gpu_submits(device_, 1, staging_.size());
     pending_.clear();
     staging_ = {};
     return ok;

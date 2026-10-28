@@ -28,7 +28,8 @@ std::string save_to_text(const GameState& s);
 GameState load_from_text(const std::string& text);
 
 // The user data folder (with a trailing separator): SDL_GetPrefPath, or the executable's
-// folder in portable mode (portable.ini beside it); the app keeps mods and config there.
+// folder in portable mode (portable.ini beside it), or GT3R_DATA_DIR when set; the app keeps
+// mods, config, saves and replays there.
 std::string user_data_dir();
 bool write_save(const std::string& path, const GameState& s, std::string* error = nullptr);
 // nullopt when there is no save at `path` or it cannot be read (damaged, or from a newer
@@ -49,8 +50,10 @@ GameState import_ps2_save(ByteSpan file, const GtData& data);
 Bytes export_ps2_save(const GameState& s, const GtData& data);
 
 // The original's memory-card save directory for the game file (gt_mode §12.2):
-// BASCUS-97102GAMEDATA/ {BASCUS-97102GAMEDATA, icon.sys, icon0.ico, thumbnail}.
+// BASCUS-97102GAMEDATA/ {BASCUS-97102GAMEDATA, icon.sys, icon0.ico, thumbnail}. Each release
+// has its own and reads only that one: BESCES-50294GAMEDATA (PAL), BISCPS-15009GAMEDATA (NTSC-J).
 constexpr const char* kPs2GameDir = "BASCUS-97102GAMEDATA";
+const char* ps2_game_dir(Region r);
 struct Ps2SaveFile {
     std::string name;
     Bytes data;
@@ -63,20 +66,29 @@ std::vector<Ps2SaveFile> export_ps2_save_files(const GameState& s, std::shared_p
                                                const GtData::Reader& read);
 // File-level import / export for players (gt3tool save-import / save-export; the
 // game's file picker). Supported containers: the data file itself
-// (BASCUS-97102GAMEDATA), its save directory, a PCSX2 folder memory card (the
-// folder holding BASCUS-97102GAMEDATA/), an EMS / uLaunchELF .psu and a raw 8 MB card
-// image (PCSX2 .ps2 / .mcd, with or without ECC). Throws FormatError.
+// (BASCUS-97102GAMEDATA, under any name, e.g. a .raw from a save editor), its save
+// directory, a PCSX2 folder memory card (the folder holding BASCUS-97102GAMEDATA/), an
+// EMS / uLaunchELF .psu and a raw 8 MB card image (PCSX2 .ps2 / .mcd, with or without
+// ECC). Throws FormatError.
 GameState import_ps2_save_path(const std::string& path, const GtData& data);
-// `out` ending in .psu: a .psu; in .ps2 / .mcd: a new card image (with ECC) holding
-// only this save; otherwise a folder: <out>/BASCUS-97102GAMEDATA/... (e.g. a PCSX2
-// folder memory card). Throws FormatError.
+
+// The single-file exports: a .psu, a new 8 MB card image with ECC holding only this save,
+// or the data file alone (the "raw" save that PS2 save editors such as GT3SaveEditor
+// open: export_ps2_save, without the icons and thumbnail).
+enum class Ps2Export { Psu, Card, Raw };
+// The format a file name asks for: ".ps2" / ".mcd" a card image, ".raw" the data file,
+// anything else a .psu.
+Ps2Export ps2_export_format(const std::string& name);
+// `out` ending in .psu, .ps2 / .mcd or .raw: that file (ps2_export_format); otherwise a
+// folder: <out>/BASCUS-97102GAMEDATA/... (e.g. a PCSX2 folder memory card). Throws
+// FormatError.
 void export_ps2_save_path(const GameState& s, std::shared_ptr<const GtData> data, const GtData::Reader& read,
                           const std::string& out);
 
-// The same as one file: a .psu (`card` false) or a new 8 MB card image with ECC (true),
-// e.g. for a path from a save dialog that has no extension. Throws FormatError.
+// The same as one file in `format`, e.g. for a path from a save dialog that has no
+// extension. Throws FormatError.
 Bytes export_ps2_save_container(const GameState& s, std::shared_ptr<const GtData> data, const GtData::Reader& read,
-                                bool card);
+                                Ps2Export format);
 
 // The game save's options block (0x888 bytes, gt_mode §12.2) fields of view mode 1's replay pad
 // (presentation §G3): +0x114 the race-sound level of the music's marked sections (Up / Down,

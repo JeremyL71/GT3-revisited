@@ -1,7 +1,7 @@
 #include "sim/car_spec.h"
 
+#include "base/ee_float.h"
 #include "game/data/car_database.h"
-#include "sim/models.h"
 
 #include <algorithm>
 #include <cmath>
@@ -43,121 +43,84 @@ std::vector<float> fill_ratios(std::vector<float> r, int gears) {
     return r;
 }
 
-} // namespace
+constexpr float kRpmToRadS = 0.10471976f; // 2*pi/60
 
-void TireSpec::default_curves() {
-    // [placeholder] shapes; replaced by the database curves in build_car_spec.
-    width = 0;
-    load = {{0.0f, 1.0f, 2.0f, 3.0f}, {1.12f, 1.0f, 0.88f, 0.78f}};
-    slip_a = {{0.0f, 0.04f, 0.08f, 0.14f, 0.25f, 0.5f, 1.5708f}, {0.0f, 0.55f, 0.88f, 1.0f, 0.95f, 0.85f, 0.75f}};
-    slip_b = {{0.0f, 0.1f, 0.3f, 1.5708f}, {0.0f, 0.02f, 0.15f, 0.40f}};
-    limit_d = {{-1.0f, -0.2f, -0.1f, -0.05f, 0.0f, 0.05f, 0.1f, 0.2f, 1.0f},
-               {0.35f, 0.45f, 0.6f, 0.85f, 1.0f, 0.85f, 0.6f, 0.45f, 0.35f}};
-    long_c = {{-1.0f, -0.5f, -0.2f, -0.10f, -0.06f, -0.03f, 0.0f, 0.03f, 0.06f, 0.10f, 0.2f, 0.5f, 1.0f},
-              {0.75f, 0.82f, 0.93f, 1.0f, 0.9f, 0.6f, 0.0f, 0.6f, 0.9f, 1.0f, 0.93f, 0.82f, 0.75f}};
-    opt_drive = -0.10f;
-    opt_brake = 0.10f;
+// Piecewise-linear lookup, clamped to the first / last y outside the axis.
+float table_lookup(const float* x, const float* y, int n, float v) {
+    if (n <= 0) return 0;
+    if (v <= x[0]) return y[0];
+    if (v >= x[n - 1]) return y[n - 1];
+    int i = 1;
+    while (i < n - 1 && v > x[i]) ++i;
+    float span = x[i] - x[i - 1];
+    float t = span > 0 ? (v - x[i - 1]) / span : 1.0f;
+    return y[i - 1] + (y[i] - y[i - 1]) * t;
 }
 
-namespace {
-
-// [physics §6.5] Spec tyre block (0x70 bytes) from a compound record c (table 27)
-// and force-vol record f (table 26), before defaults/zeroing.
-std::array<u8, 0x70> tire_block(const ByteSpan* c, const ByteSpan* f) {
-    std::array<u8, 0x70> B{};
-    auto cb = [&](size_t off) -> u8 { return c && c->size() > off ? (*c)[off] : 0; };
-    auto fb = [&](size_t off) -> u8 { return f && f->size() > off ? (*f)[off] : 0; };
-    B[0x00] = cb(0x08) ? cb(0x08) : 100;
-    B[0x01] = cb(0x09) ? cb(0x09) : 0x2D;
-    B[0x02] = 8;
-    for (int i = 0; i < 8; ++i) {
-        B[size_t(0x03 + i)] = cb(size_t(0x12 + i));
-        B[size_t(0x0B + i)] = cb(size_t(0x1A + i));
-    }
-    B[0x13] = 6;
-    B[0x26] = 6;
-    for (int i = 0; i < 6; ++i) {
-        B[size_t(0x14 + i)] = cb(size_t(0x22 + i));
-        B[size_t(0x1A + i)] = cb(size_t(0x28 + i));
-        B[size_t(0x20 + i)] = cb(size_t(0x2E + i));
-        B[size_t(0x27 + i)] = cb(size_t(0x34 + i));
-        B[size_t(0x2D + i)] = cb(size_t(0x3A + i));
-        B[size_t(0x33 + i)] = cb(size_t(0x40 + i));
-        B[size_t(0x5F + i)] = cb(size_t(0x46 + i));
-        B[size_t(0x65 + i)] = cb(size_t(0x4C + i));
-    }
-    B[0x39] = 4;
-    for (int i = 0; i < 4; ++i) {
-        B[size_t(0x3A + i)] = cb(size_t(0x0A + i));
-        B[size_t(0x3E + i)] = cb(size_t(0x0E + i));
-    }
-    // force-vol +0x08..+0x11 -> surfaces 0..9, +0x12..+0x14 -> surfaces 12..14 (10, 11, 15 = 0)
-    for (int sidx = 0; sidx < 10; ++sidx) B[size_t(0x4B + sidx)] = fb(size_t(0x08 + sidx));
-    for (int k = 0; k < 3; ++k) B[size_t(0x4B + 12 + k)] = fb(size_t(0x12 + k));
-    B[0x5E] = 6;
-    B[0x6B] = cb(0x52);
-    return B;
+// [physics §2.1] Full-throttle torque (N*m) at `rpm` on the curve.
+float curve_torque(const EngineSpec& e, float rpm) {
+    return table_lookup(e.curve_rpm.data(), e.curve_torque.data(), int(std::min(e.curve_rpm.size(), e.curve_torque.size())),
+                        rpm);
 }
 
-// [physics §6.5] Runtime record from a finished block (after defaults/zeroing).
-TireSpec tire_record(std::array<u8, 0x70> B, float width) {
-    // The game zeroes the first point of each curve.
-    for (size_t o : {0x03, 0x0B, 0x14, 0x1A, 0x27, 0x2D, 0x3A, 0x5F, 0x65}) B[o] = 0;
-    B[0x20] = B[0x33];
-    TireSpec t;
-    t.width = width;
-    t.mu = B[0x00] * 0.01f;
-    t.wear_rate = B[0x6B] * 0.01f; // [physics §8.2] compound wear rate
-    for (int s = 0; s < 16; ++s) {
-        u8 pct = B[size_t(0x4B + s)];
-        t.surface_mu[size_t(s)] = pct ? t.mu * pct * 0.01f : t.mu;
+// [physics §2.3] One turbo stage's boost at rpm n (shape type 0): below the knee A (1 - ((N - n)/N)^2), from N to 3N
+// A - 0.25 A ((n - N)/N)^2, above 3N 0; the uncapped boost 1 + both stages.
+float turbo_stage(const TurboSpec::Stage& st, float n) {
+    if (!st.active || st.knee_rpm <= 0) return 0;
+    float N = st.knee_rpm, A = st.peak;
+    if (n < N) {
+        float u = (N - n) / N;
+        return A * (1 - u * u);
     }
-    t.surface_mu[11] = std::min(1.0f, 1.25f / t.mu);
-    float th = std::min((B[0x01] ? B[0x01] : 90) * model::kPiF / 180.0f, model::kPiF / 2);
-    for (int i = 0; i < 8; ++i) {
-        t.slip_a.x.push_back(B[size_t(0x03 + i)] * th / 255.0f);
-        t.slip_a.y.push_back(B[size_t(0x0B + i)] / 200.0f);
+    if (n <= 3 * N) {
+        float u = (n - N) / N;
+        return A - 0.25f * A * u * u;
     }
-    bool b_empty = true;
-    for (int j = 1; j < 6; ++j) b_empty = b_empty && B[size_t(0x5F + j)] == 0;
-    if (b_empty) {
-        TireSpec d;
-        d.default_curves();
-        t.slip_b = d.slip_b; // [placeholder] the static default curve bytes are not in the spec
-    } else {
-        for (int j = 0; j < 6; ++j) {
-            t.slip_b.x.push_back(B[size_t(0x5F + j)] * (model::kPiF / 2) / 255.0f);
-            t.slip_b.y.push_back(B[size_t(0x65 + j)] / 200.0f);
+    return 0;
+}
+float turbo_boost_raw(const TurboSpec& t, float n0, float n1) {
+    return 1 + turbo_stage(t.stage[0], n0) + turbo_stage(t.stage[1], n1);
+}
+
+// [physics §2.1] The curve from raw spec values: torque points (0.01 kgf*m), rpm axis (x100 rpm), output factor (1000 =
+// x1), high-rpm factor (per mille) and low-rpm factor (percent); with a turbo, each point is multiplied by min(B, cap) / B,
+// B = the uncapped boost at that rpm with both stages at the axis rpm. Writes rpm / N*m pairs; returns the point count.
+int build_torque_curve(const u16* torque, const u8* rpm_x100, int n, u16 out_factor, u16 hi_permille, u8 lo_percent,
+                       float* out_rpm, float* out_nm, const TurboSpec* turbo) {
+    n = std::clamp(n, 0, 16);
+    if (n == 0) return 0;
+    float f_out = out_factor ? out_factor * 1e-5f : 0.01f;
+    float s_lo = lo_percent ? lo_percent * 0.01f : 1.0f;
+    float s_hi = hi_permille ? hi_permille * 0.001f : 1.0f;
+    float w0 = rpm_x100[0] * 100.0f, w1 = rpm_x100[n - 1] * 100.0f;
+    for (int i = 0; i < n; ++i) {
+        float w = rpm_x100[i] * 100.0f;
+        float t = w1 > w0 ? (w - w0) / (w1 - w0) : 0.0f;
+        out_rpm[i] = w;
+        out_nm[i] = torque[i] * 9.8f * f_out * (s_lo + (s_hi - s_lo) * t);
+        if (turbo && turbo->on) {
+            float b = turbo_boost_raw(*turbo, w, w);
+            if (b > 0) out_nm[i] *= std::min(b, turbo->cap) / b;
         }
     }
-    for (int i = 5; i >= 0; --i) {
-        t.long_c.x.push_back(-B[size_t(0x14 + i)] / 255.0f);
-        t.long_c.y.push_back(B[size_t(0x1A + i)] / 200.0f);
-        t.limit_d.y.push_back(B[size_t(0x20 + i)] / 200.0f);
-    }
-    for (int j = 1; j < 6; ++j) {
-        t.long_c.x.push_back(B[size_t(0x27 + j)] / 255.0f);
-        t.long_c.y.push_back(B[size_t(0x2D + j)] / 200.0f);
-        t.limit_d.y.push_back(B[size_t(0x33 + j)] / 200.0f);
-    }
-    t.limit_d.x = t.long_c.x;
-    // Optimum slips: first maximum of C going outwards from 0 on each side.
-    auto first_max = [&](int from, int step, int end) {
-        int best = from;
-        for (int i = from + step; i != end; i += step) {
-            if (t.long_c.y[size_t(i)] > t.long_c.y[size_t(best)]) best = i;
-            else break;
-        }
-        return t.long_c.x[size_t(best)];
-    };
-    t.opt_drive = first_max(5, -1, -1);
-    t.opt_brake = first_max(5, 1, 11);
-    for (int j = 0; j < 4; ++j) {
-        t.load.x.push_back(B[size_t(0x3A + j)] * 196.0f);
-        t.load.y.push_back(B[size_t(0x3E + j)] / 200.0f);
-    }
-    return t;
+    return n;
 }
+
+// Gear x final drive (-1 = reverse, 0 = neutral -> 0).
+float total_ratio(const GearboxSpec& g, int gear) {
+    if (gear < 0) return -g.reverse * g.final_drive;
+    if (gear == 0 || gear > int(g.ratios.size())) return 0;
+    return g.ratios[size_t(gear - 1)] * g.final_drive;
+}
+
+// [physics §3.5] The rolling-resistance speed curve RR(|v|); tarmac's coefficient (surface 0) is 0.1.
+float rolling_curve(float speed) {
+    // speed axis in exact km/h / 3.6 (0, 4, 20, 58, 116, 200, 308, 400 km/h)
+    static const float x[] = {0, 4 / 3.6f, 20 / 3.6f, 58 / 3.6f, 116 / 3.6f, 200 / 3.6f, 308 / 3.6f, 400 / 3.6f};
+    static const float y[] = {0, 0, 0.010f, 0.015f, 0.032f, 0.072f, 0.144f, 0.255f};
+    return table_lookup(x, y, 8, std::fabs(speed));
+}
+constexpr float kTarmacRolling = 0.10f;
 
 } // namespace
 
@@ -170,7 +133,7 @@ float CarSpec::peak_torque() const {
 float CarSpec::peak_power_rpm() const {
     float best = 0, best_rpm = engine.rev_limit_rpm;
     for (float rpm = engine.idle_rpm; rpm <= engine.rev_limit_rpm; rpm += 50) {
-        float p = model::curve_torque(engine, rpm) * rpm;
+        float p = curve_torque(engine, rpm) * rpm;
         if (p > best) {
             best = p;
             best_rpm = rpm;
@@ -181,7 +144,7 @@ float CarSpec::peak_power_rpm() const {
 
 float CarSpec::peak_power_kw() const {
     float rpm = peak_power_rpm();
-    return model::curve_torque(engine, rpm) * rpm * model::kRpmToRadS * 0.001f;
+    return curve_torque(engine, rpm) * rpm * kRpmToRadS * 0.001f;
 }
 
 float showroom_top_speed(const CarSpec& c) {
@@ -190,122 +153,63 @@ float showroom_top_speed(const CarSpec& c) {
     float r = 0;
     int driven_axles = 0;
     for (int a = 0; a < 2; ++a)
-        if (c.drivetrain.drive == Drive::AWD || (a == 0) == (c.drivetrain.drive == Drive::FF)) {
+        if (c.drive == Drive::AWD || (a == 0) == (c.drive == Drive::FF)) {
             r += c.axle[size_t(a)].tire_radius;
             ++driven_axles;
         }
     r = std::max(r / float(std::max(driven_axles, 1)), 0.05f);
-    auto per_metre = [&](int gear) { return model::total_ratio(c.gearbox, gear) / r; }; // engine rad/s per m/s
+    auto per_metre = [&](int gear) { return total_ratio(c.gearbox, gear) / r; }; // engine rad/s per m/s
     // The start value: the rev limit in top gear.
-    float top = c.engine.rev_limit_rpm * model::kRpmToRadS / per_metre(n);
+    float top = c.engine.rev_limit_rpm * kRpmToRadS / per_metre(n);
     const int kmh_max = int(top * 3.6f), step = kmh_max / 500 + 1;
     // The aero coefficients as built (air density 1.2; the showroom's global holds 0.8
     // until a race has been set up, but the reference screens match 1.2).
     const float drag = c.aero.c_drag, down = c.aero.c_front + c.aero.c_rear;
-    const float weight = c.mass * 9.8f, rr = model::surface_rolling(0);
+    const float weight = c.mass * 9.8f, rr = kTarmacRolling;
     const float up = c.engine.upshift_rpm > 0 ? c.engine.upshift_rpm : c.engine.rev_limit_rpm - 500;
     int gear = 1;
     for (int kmh = 0; kmh < kmh_max; kmh += step) {
         const float v = float(kmh) / 3.6f, w = v * per_metre(gear);
-        const float drive = model::curve_torque(c.engine, w / model::kRpmToRadS) * per_metre(gear);
-        const float resist = model::rolling_curve(v) * rr * (weight + down * v * v) + drag * v * v;
+        const float drive = curve_torque(c.engine, w / kRpmToRadS) * per_metre(gear);
+        const float resist = rolling_curve(v) * rr * (weight + down * v * v) + drag * v * v;
         if (resist < drive) top = v;
-        if (gear < n && up < float(int(w * 60.0f / model::kTwoPiF))) ++gear;
+        if (gear < n && up < float(int(w * 60.0f / 6.2831853f))) ++gear;
     }
     return top;
 }
 
-void CarSpec::finalize() {
-    float g = model::kGravity;
-    mass = std::max(mass, 300.0f);
-    front_weight = std::clamp(front_weight, 0.3f, 0.7f);
-    float share[2] = {front_weight, 1 - front_weight};
-    float total_brake = brake_decel * mass * g; // N at the ground
-    for (int a = 0; a < 2; ++a) {
-        AxleSpec& ax = axle[size_t(a)];
-        float corner = mass * share[a] * 0.5f;
-        if (ax.spring_rate <= 0) {
-            float w = 2 * model::kPiF * ax.ride_frequency;
-            ax.spring_rate = corner * w * w;
-        }
-        if (ax.damper <= 0) ax.damper = 2 * ax.damping_ratio * std::sqrt(ax.spring_rate * corner);
-        if (ax.arb_rate <= 0) ax.arb_rate = ax.spring_rate * (a == 0 ? 0.9f : 0.5f);
-        float sag = corner * g / ax.spring_rate;
-        ax.rest_length = std::max(ax.rest_length, sag + ax.travel + 0.03f);
-        if (ax.max_brake_torque <= 0) {
-            float bal = a == 0 ? brake_balance : 1 - brake_balance;
-            ax.max_brake_torque = total_brake * bal * 0.5f * ax.tire_radius;
-        }
-        if (ax.wheel_inertia <= 0) ax.wheel_inertia = 1.2f;
-        TireSpec& t = tire[size_t(a)];
-        if (t.slip_a.x.empty()) t.default_curves();
-        t.fz_ref = corner * g;
-        for (TireSpec& r : tire_slots[size_t(a)]) {
-            if (r.slip_a.x.empty()) r = t;
-            r.fz_ref = corner * g;
-        }
+void generate_gear_ratios(int n, int rev_byte, int final_word, int rim, int wc, int ac, int slider, s16 out[8], int drive,
+                          int awd_system) {
+    using ee::F;
+    static const u8 kSteps[3][6] = {{155, 165, 188, 190, 190, 200}, {165, 175, 190, 192, 190, 200},
+                                    {170, 180, 192, 194, 190, 200}};
+    const u8* b = kSteps[std::clamp(n, 5, 7) - 5];
+    const F k_rpm = F::raw(0x3DD67750); // 0.10472
+    const F k_kmh = F::raw(0x3E8E38E4); // 0.277778
+    const F t = ee::int_to_f(10 * slider - 150) / F(250.0f);
+    const F v = ee::int_to_f(10 * slider) * k_kmh;
+    const F rpm = ee::int_to_f(100 * rev_byte);
+    const F fd = F(float(double(final_word) * 0.001)); // double, then rounded to float
+    // Driven tyre [physics §6.7]: front for FF and for AWD system 0, rear otherwise. A
+    // width code 0 gives no sidewall on the front path and 10 mm on the rear one.
+    const bool front = drive == 1 || (drive == 2 && awd_system == 0);
+    const F c_mm = F::raw(0x3A83126F), c_in = F::raw(0x3CD013A9), c_sw = F::raw(0x3D4CCCCD);
+    const F W = ee::int_to_f(wc ? 5 * wc : (front ? 0 : 10)) * c_mm; // rear path: width 0 -> 10 mm
+    const F R = ee::int_to_f(rim) * c_in * F(0.5f) + W * ee::int_to_f(ac) * c_sw;
+    F r = rpm * k_rpm * R / v / fd;
+    auto q = [&](int hi, int lo) {
+        const F a = F(200.0f) / ee::int_to_f(b[lo]), c = F(200.0f) / ee::int_to_f(b[hi]);
+        return a + t * (c - a);
+    };
+    F q1 = q(0, 1), q2 = q(2, 3), q3 = q(4, 5);
+    for (int i = std::min(n, 7); i >= 1; --i) {
+        if (i == 1) r = r * q3;
+        // The float-to-int conversion truncates and saturates; the store keeps the low 16 bits.
+        out[i] = s16(u16(u32(ee::to_int(r * F(1000.0f)))));
+        r = r * q1;
+        q1 = q1 * q2;
     }
-    if (aids.handbrake_torque <= 0) aids.handbrake_torque = 1.5f * axle[1].max_brake_torque;
-    if (gearbox.ratios.empty()) gearbox.ratios = {3.2f, 2.0f, 1.4f, 1.05f, 0.82f};
-    if (gearbox.final_drive <= 0) gearbox.final_drive = 4.0f;
-    if (gearbox.reverse <= 0) gearbox.reverse = 3.3f;
-    if (engine.curve_rpm.empty()) {
-        engine.curve_rpm = {1000, 3000, 5000, 7000};
-        engine.curve_torque = {150, 220, 240, 200};
-    }
-    engine.idle_rpm = engine.electric ? 0.0f : std::clamp(engine.idle_rpm, 500.0f, 2500.0f);
-    if (engine.rev_limit_rpm < engine.idle_rpm + 1500) engine.rev_limit_rpm = engine.curve_rpm.back();
-    float peak = peak_torque();
-    if (drivetrain.clutch_max_torque <= 0) drivetrain.clutch_max_torque = 1.6f * peak;
-    if (drivetrain.launch_rpm <= 0 && !engine.electric)
-        drivetrain.launch_rpm = std::min(0.5f * (engine.idle_rpm + peak_power_rpm()), engine.rev_limit_rpm * 0.7f);
-    for (AxleSpec& ax : axle) ax.toe = model::toe_angle(ax.toe_byte, ax.tire_radius);
-    model::ackermann_ratios(wheelbase, 0.5f * axle[0].track, steering.ack_inner, steering.ack_outer);
-    if (front_extent <= 0.3f) front_extent = length * 0.5f;
-    if (rear_extent <= 0.3f) rear_extent = length * 0.5f;
-    if (cg_height <= 0) cg_height = std::max(0.35f, height * 0.37f);
-    if (aero.c_drag <= 0) aero.c_drag = 0.5f * aero.air_density * aero.drag_area;
-    if (yaw_inertia <= 0) yaw_inertia = 6000; // [physics §6.4] default
-}
-
-CarSpec CarSpec::test_car(Drive drive) {
-    CarSpec s;
-    s.label = "test_car";
-    s.name = "Test car (R34 GT-R-like)";
-    s.mass = 1680; // 1560 kg + 120 kg [physics §6.4]
-    s.front_weight = 0.55f;
-    s.wheelbase = 2.665f;
-    s.length = 4.6f;
-    s.width = 1.785f;
-    s.height = 1.36f;
-    s.cg_height = 0.50f;
-    s.power_ps = 280;
-    for (int a = 0; a < 2; ++a) {
-        s.axle[size_t(a)].track = a == 0 ? 1.48f : 1.49f;
-        s.axle[size_t(a)].tire_width = 0.245f;
-        s.axle[size_t(a)].tire_radius = 0.0254f * 18 * 0.5f + 0.245f * 0.40f;
-        s.tire[size_t(a)].mu = 1.0f;
-        s.tire[size_t(a)].compound = "normal";
-    }
-    // Roughly an RB26DETT as the game rates it (~330 PS at the crank).
-    s.engine.curve_rpm = {1000, 2000, 3000, 4000, 4400, 5000, 6000, 6800, 7500, 8000};
-    s.engine.curve_torque = {170, 250, 330, 385, 392, 380, 360, 345, 300, 260};
-    s.engine.idle_rpm = 1000;
-    s.engine.rev_limit_rpm = 8000;
-    s.yaw_inertia = 9500;
-    s.steering.max_angle = 0.61f;
-    s.gearbox.ratios = {3.827f, 2.360f, 1.685f, 1.312f, 1.000f, 0.793f};
-    s.gearbox.final_drive = 3.545f;
-    s.gearbox.reverse = 3.28f;
-    s.drivetrain.drive = drive;
-    s.drivetrain.front_share = drive == Drive::AWD ? 0.35f : 0;
-    if (drive == Drive::AWD) { // [placeholder] a 50:50 coupled AWD (physics §2.7 system 1, L3)
-        s.drivetrain.awd_system = 1;
-        s.drivetrain.awd_share_byte = 50;
-    }
-    s.aero.drag_area = 0.34f * s.width * s.height * 0.85f;
-    s.finalize();
-    return s;
+    out[0] = s16((3 * int(out[1]) + int(out[2])) / 4);
 }
 
 std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::string& label, std::string* error) {
@@ -331,12 +235,6 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     return std::nullopt;
 }
 
-namespace {
-int interp_setting(int steps, int mn, int mx, int set) { // [physics §6.1]
-    return steps < 2 ? mn : mn + (mx - mn) * (set - 1) / (steps - 1);
-}
-} // namespace
-
 bool apply_gear_slider(const data::CarDatabase& db, const std::array<u64, 27>& parts, CarSettings& c) {
     const ByteSpan* g = part_record(db, parts, kGear);
     const ByteSpan* er = part_record(db, parts, kEngine);
@@ -357,7 +255,7 @@ bool apply_gear_slider(const data::CarDatabase& db, const std::array<u64, 27>& p
         }
     int n = (*g)[0x11];
     s16 out[8] = {};
-    model::generate_gear_ratios(n, rev, c.final_drive, rim, wc, ac, c.gear_slider, out, drive, sys);
+    generate_gear_ratios(n, rev, c.final_drive, rim, wc, ac, c.gear_slider, out, drive, sys);
     for (int i = 0; i <= std::min(n, 7); ++i) c.gears[size_t(i)] = out[i];
     return true;
 }
@@ -415,7 +313,7 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
 
     CarSpec s;
     s.label = car_label;
-    s.name = car->name;
+    s.name = car->latin_name; // the app's own screens draw it (Car::latin_name)
 
     // --- chassis / body ---
     auto ch = db.chassis(parts[kChassis]);
@@ -426,18 +324,11 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     const ByteSpan* lw = part_record(db, parts, kLightweight);
     if (lw && lw->size() >= 0x14 && rd16(*lw, 0x12)) weight = weight * rd16(*lw, 0x12) / 1000;
     if (body && body->weight_permille) weight = weight * body->weight_permille / 1000;
-    s.mass = float(weight + 120);
-    s.front_weight = ch->front_weight_pct > 0 ? ch->front_weight_pct * 0.01f : 0.55f;
+    s.mass = std::max(float(weight + 120), 300.0f);
+    s.front_weight = std::clamp(ch->front_weight_pct > 0 ? ch->front_weight_pct * 0.01f : 0.55f, 0.3f, 0.7f);
     s.wheelbase = ch->wheelbase_mm * 0.001f;
     if (ch->length_mm) s.length = ch->length_mm * 0.001f;
     if (ch->height_mm) s.height = ch->height_mm * 0.001f;
-    // Yaw inertia parameter: chassis +0x1C x lightweight(+0x11 %) x body(+0x38 %), x100.
-    {
-        int yi = ch->unknown_1c;
-        if (lw && lw->size() > 0x11 && (*lw)[0x11]) yi = yi * (*lw)[0x11] / 100;
-        if (body && body->inertia_pct) yi = yi * body->inertia_pct / 100;
-        s.yaw_inertia = yi ? float(yi * 100) : 6000.0f;
-    }
     if (body) {
         if (body->width_mm) s.width = body->width_mm * 0.001f;
         const ByteSpan* br = part_record(db, parts, kBody);
@@ -445,8 +336,6 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         int off_r = br && br->size() > 0x3E ? int(static_cast<signed char>((*br)[0x3E])) : 0;
         if (body->front_tread_mm) s.axle[0].track = (body->front_tread_mm - 2 * off_f) * 0.001f;
         if (body->rear_tread_mm) s.axle[1].track = (body->rear_tread_mm - 2 * off_r) * 0.001f;
-    }
-    if (body) {
         // [physics §6.2] collision extents (body f32 +0x20 / +0x24, mm, truncated).
         // Extents default to length / 2 in integer mm; width/height are the collision
         // extents = body f32 +0x28 / +0x2C.
@@ -457,84 +346,12 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         if (int(body->inertia[2]) > 0) s.width = float(int(body->inertia[2])) * 0.001f;
         if (int(body->inertia[3]) > 0) s.height = float(int(body->inertia[3])) * 0.001f;
     }
-    // Steering lock [physics §6.4]: steer record +0x11 degrees.
-    if (const ByteSpan* st = part_record(db, parts, kSteer); st && st->size() > 0x11 && (*st)[0x11])
-        s.steering.max_angle = (*st)[0x11] * model::kPiF / 180.0f;
-    // Suspension [physics §4.2 / physics §6.2 / physics §6.6]: stock settings -> spec bytes -> axle blocks.
-    if (const ByteSpan* su = part_record(db, parts, kSuspension); su && su->size() >= 0x7C) {
-        auto B = [&](size_t o) -> int { return (*su)[o]; };
-        auto interp = interp_setting;
-        const auto& dm = set.damper;
-        for (int a = 0; a < 2; ++a) {
-            SuspensionSpec& p = s.axle[size_t(a)].susp;
-            int spring = set.spring[size_t(a)], c = set.motion_ratio[size_t(a)];
-            if (!spring || !c) continue;
-            int arb = a ? interp(B(0x4B), B(0x4C), B(0x4D), set.arb[1]) : interp(B(0x47), B(0x48), B(0x49), set.arb[0]);
-            int b2 = B(a ? 0x2A : 0x29), b3 = B(a ? 0x5D : 0x5C), b13 = B(a ? 0x7B : 0x7A), g1 = B(a ? 0x79 : 0x78);
-            int v_b1 = B(size_t(a ? 0x74 : 0x70)), v_b2 = B(size_t(a ? 0x75 : 0x71));
-            int v_r1 = B(size_t(a ? 0x76 : 0x72)), v_r2 = B(size_t(a ? 0x77 : 0x73));
-            int f_b1, f_b2, f_r1, f_r2;
-            if (a == 0) { // the front second-stage dampers reuse the first-stage indices
-                f_b1 = interp(B(0x2B), B(0x2C), B(0x2D), dm[0]);
-                f_b2 = interp(B(0x2B), B(0x2F), B(0x30), dm[1]);
-                f_r1 = interp(B(0x32), B(0x33), B(0x34), dm[0]);
-                f_r2 = interp(B(0x32), B(0x36), B(0x37), dm[1]);
-            } else {
-                f_b1 = interp(B(0x39), B(0x3A), B(0x3B), dm[4]);
-                f_b2 = interp(B(0x39), B(0x3D), B(0x3E), dm[5]);
-                f_r1 = interp(B(0x40), B(0x41), B(0x42), dm[6]);
-                f_r2 = interp(B(0x40), B(0x44), B(0x45), dm[7]);
-            }
-            float sc = 100.0f / float(c);
-            p.k = spring * 980.0f * float(c) / 100.0f;
-            p.arb_gain = arb * 98.0f;
-            p.k2 = b2 * 98000.0f;
-            p.unsprung = b3 * 0.25f;
-            p.bump_damping = b13 * 98.0f;
-            p.bump = model::fit_damper(v_b1 * 0.01f * sc, f_b1 * 49.0f, v_b2 * 0.01f * sc, f_b2 * 49.0f);
-            p.rebound = model::fit_damper(v_r1 * 0.01f * sc, f_r1 * 49.0f, v_r2 * 0.01f * sc, f_r2 * 49.0f);
-            // [physics §4.2/physics §6] q = the front ride height for BOTH blocks: the rear block reads the front byte again, not
-            // the rear one (verified on the rear bump-stop limit of 4 cars whose rear ride height differs)
-            p.ride_height = set.ride_height[0] * 0.001f;
-            p.bump_room = B(size_t(0x1D + a)) * 0.001f;
-            p.droop = B(size_t(0x1F + a)) * 0.001f;
-            p.knee_gap = g1 * 0.001f;
-            p.valid = p.k > 0;
-            if (p.valid) s.axle[size_t(a)].spring_rate = p.k;
-            // [physics §4.2] CoG-height parameter X = 0.5 (chassis +0x1D x 0.001 + front ride height).
-            if (p.valid && a == 0) s.cg_height = 0.5f * (ch->unknown_1d * 0.001f + p.ride_height);
-        }
-    }
-    // [physics §3.1/4.4] axle factor, camber offset and toe from the settings.
-    for (int a = 0; a < 2; ++a) {
-        const ByteSpan* cr = part_record(db, parts, kChassis);
-        int b = cr && cr->size() > 0x1E ? (((*cr)[size_t(a ? 0x1E : 0x12)] + 124) & 0xFF) : 100;
-        s.axle[size_t(a)].axle_factor = (b + 900) * 0.001f;
-        s.axle[size_t(a)].camber_offset = -set.camber[size_t(a)] * 0.1f * model::kPiF / 180.0f;
-        s.axle[size_t(a)].toe_byte = set.toe[size_t(a)] ? set.toe[size_t(a)] : 128;
-    }
-    // Camber curves [physics §3.1/6.4]: suspension +0x60.. angle codes, +0x64.. multiplier codes (front), +0x68/+0x6C rear.
-    if (const ByteSpan* su = part_record(db, parts, kSuspension); su && su->size() >= 0x70) {
-        for (int a = 0; a < 2; ++a) {
-            std::vector<std::pair<float, float>> pts;
-            for (int i = 0; i < 4; ++i) {
-                u8 ac = (*su)[size_t(0x60 + 8 * a + i)], mc = (*su)[size_t(0x64 + 8 * a + i)];
-                pts.push_back({(128.0f - ac) * 0.0698132f / 32.0f, mc / 200.0f});
-            }
-            std::sort(pts.begin(), pts.end());
-            bool valid = true;
-            for (auto& p : pts) valid = valid && p.second > 0.2f;
-            if (!valid) continue;
-            Curve c;
-            for (auto& p : pts) {
-                c.x.push_back(p.first);
-                c.y.push_back(p.second);
-            }
-            s.axle[size_t(a)].camber = c;
-        }
-    }
-    if (!s.axle[0].susp.valid) s.cg_height = 0; // derived from height in finalize()
-    s.aero.drag_area = 0.33f * s.width * s.height * 0.85f;
+    if (s.front_extent <= 0.3f) s.front_extent = s.length * 0.5f;
+    if (s.rear_extent <= 0.3f) s.rear_extent = s.length * 0.5f;
+    // [physics §4.2] The stock ride height q: the front setting for both axles, when the suspension has a spring.
+    if (const ByteSpan* su = part_record(db, parts, kSuspension); su && su->size() >= 0x7C)
+        if (set.spring[0] && set.motion_ratio[0])
+            for (AxleSpec& a : s.axle) a.ride_height = set.ride_height[0] * 0.001f;
 
     // --- tyres ---
     const int tire_slot[2] = {kFrontTire, kRearTire};
@@ -549,31 +366,6 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
                 s.axle[size_t(a)].tire_radius = rim_in * 0.0254f * 0.5f + width_mm * 0.001f * aspect * 0.01f;
             }
         }
-        // [physics §6.5] three records per axle from compounds/force-vols 0..2.
-        std::array<std::array<u8, 0x70>, 3> blocks;
-        const ByteSpan* tr = part_record(db, parts, tire_slot[a]);
-        for (int k = 0; k < 3; ++k) {
-            const ByteSpan* c = tr && tr->size() >= size_t(0x28 + 8 * k) ? db.record(data::TableId::TireCompound, rd64(*tr, size_t(0x20 + 8 * k))) : nullptr;
-            const ByteSpan* f = tr && tr->size() >= size_t(0x48 + 8 * k) ? db.record(data::TableId::TireForceVol, rd64(*tr, size_t(0x40 + 8 * k))) : nullptr;
-            blocks[size_t(k)] = tire_block(c, f);
-        }
-        auto& b0 = blocks[0];
-        if (!b0[0x57]) b0[0x57] = b0[0x4B];
-        if (!b0[0x58]) b0[0x58] = b0[0x4C];
-        if (!b0[0x59]) b0[0x59] = b0[0x54];
-        for (int k = 1; k < 3; ++k)
-            for (size_t o = 0x4B; o <= 0x5A; ++o)
-                if (!blocks[size_t(k)][o]) blocks[size_t(k)][o] = b0[o];
-        for (int k = 0; k < 3; ++k) {
-            TireSpec rec = tire_record(blocks[size_t(k)], s.axle[size_t(a)].tire_width);
-            rec.compound = t->compound[size_t(k)];
-            s.tire_slots[size_t(a)][size_t(k)] = rec;
-        }
-        s.tire[size_t(a)] = s.tire_slots[size_t(a)][0];
-    }
-    for (int a = 0; a < 2; ++a) {
-        float r = s.axle[size_t(a)].tire_radius;
-        s.axle[size_t(a)].wheel_inertia = std::clamp(12.0f * r * r * 1.0f + 0.3f, 0.6f, 3.0f); // [placeholder]
     }
 
     // --- engine ---
@@ -626,11 +418,10 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     };
     for (int slot : {kPortPolish, kEngineBalance, kDisplacement, kComputer, kNaTune, kTurbo, kPortPolish, kMuffler, kIntercooler})
         engine_part(slot);
-    s.engine.launch_rpm = (*er)[0x43] ? (*er)[0x43] * 10.0f : 2500.0f; // [physics §2.4]
-    s.engine.upshift_rpm = limit2 * 100.0f;                            // [physics §2.6] UP
+    s.engine.upshift_rpm = limit2 * 100.0f; // [physics §2.6] UP
     float rpm[16], nm[16];
-    n = model::build_torque_curve(torque, axis, n, u16((*er)[0x42] * 10), u16(std::min<u32>(hi, 65535)),
-                                  u8(std::min<u32>(lo, 255)), rpm, nm, &s.engine.turbo);
+    n = build_torque_curve(torque, axis, n, u16((*er)[0x42] * 10), u16(std::min<u32>(hi, 65535)), u8(std::min<u32>(lo, 255)),
+                           rpm, nm, &s.engine.turbo);
     for (int i = 0; i < n; ++i) {
         if (!s.engine.curve_rpm.empty() && rpm[i] <= s.engine.curve_rpm.back()) continue; // padding
         s.engine.curve_rpm.push_back(rpm[i]);
@@ -640,14 +431,12 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
     // [physics §2.1] rev limit = +0x45 x100 (last axis point if 0), at least +0x46 x100 + 200; idle = +0x44 x10.
     float lim = limit > 0 ? limit * 100.0f : s.engine.curve_rpm.back();
     s.engine.rev_limit_rpm = std::max(lim, limit2 * 100.0f + 200.0f);
-    s.engine.idle_rpm = idle ? idle * 10.0f : 900.0f;
+    s.engine.idle_rpm = std::clamp(idle ? idle * 10.0f : 900.0f, 500.0f, 2500.0f);
     if (const data::ModCar* mc = db.mod_car(car_label); mc && mc->electric) {
         s.engine.electric = true;
         s.engine.idle_rpm = 0;
-        s.engine.launch_rpm = 0;
-        s.engine.regen_torque = mc->regen_torque_nm;
-        s.engine.regen_power = mc->regen_kw * 1000.0f;
     }
+    if (s.engine.rev_limit_rpm < s.engine.idle_rpm + 1500) s.engine.rev_limit_rpm = s.engine.curve_rpm.back();
 
     // --- gearbox ---
     if (auto ge = db.gearbox(parts[kGear])) {
@@ -657,76 +446,15 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         s.gearbox.ratios = fill_ratios(ratios, ge->gears ? ge->gears : 5);
         if (set.final_drive > 0) s.gearbox.final_drive = set.final_drive * 0.001f;
         if (set.gears[0] != 0) s.gearbox.reverse = std::fabs(set.gears[0] * 0.001f);
-        if (ge->adjustable) {
-            // [physics §6.7] computed gearbox: the game regenerates from the slider.
-            CarSettings g = set;
-            if (apply_gear_slider(db, parts, g)) {
-                int gear_count = ge->gears;
-                s.gearbox.ratios.clear();
-                for (int i = 1; i <= std::min(gear_count, 7); ++i) s.gearbox.ratios.push_back(g.gears[size_t(i)] * 0.001f);
-                s.gearbox.reverse = g.gears[0] * 0.001f;
-            }
-        }
+        // A computed gearbox's words are the settings' as the race reads them [physics §6.7]: generated by stock_settings
+        // and by the settings pages' slider (apply_gear_slider), never here.
     }
+    if (s.gearbox.ratios.empty()) s.gearbox.ratios = {3.2f, 2.0f, 1.4f, 1.05f, 0.82f};
+    if (s.gearbox.final_drive <= 0) s.gearbox.final_drive = 4.0f;
+    if (s.gearbox.reverse <= 0) s.gearbox.reverse = 3.3f;
 
     // --- drivetrain ---
-    if (auto dt = db.drivetrain(parts[kDrivetrain])) {
-        s.drivetrain.drive = dt->drive_type <= 4 ? Drive(dt->drive_type) : Drive::FR;
-        int f = dt->front_torque[2]; // B4 = drivetrain +0x13 (the game does not read setting 0x118)
-        if (s.drivetrain.drive == Drive::AWD) s.drivetrain.front_share = (f > 0 && f < 100) ? f * 0.01f : 0.4f;
-        s.drivetrain.awd_system = dt->awd_system;
-        s.drivetrain.awd_coupling = f * 0.01f;
-        s.drivetrain.awd_share_byte = f;
-        // [physics §2.2/2.4/6.2] engine inertia (+0x20 x flywheel +0x12 % x clutch +0x12 %) and
-        // friction (+0x16 x flywheel/clutch/shaft +0x11 %), integer percent maths.
-        const ByteSpan* fw = part_record(db, parts, kFlywheel);
-        const ByteSpan* cl = part_record(db, parts, kClutch);
-        const ByteSpan* ps = part_record(db, parts, kPropShaft);
-        u32 inertia = dt->params[5], fric = dt->params[0];
-        if (u8 p = byte_at(fw, 0x12)) inertia = inertia * p / 100;
-        if (u8 p = byte_at(cl, 0x12)) inertia = inertia * p / 100;
-        for (const ByteSpan* r : {fw, cl, ps})
-            if (u8 p = byte_at(r, 0x11)) fric = fric * p / 100;
-        if (inertia) s.engine.inertia = inertia * 0.001f;
-        // [physics §2.7/6.2] axle inertia words: 0xD2/0xD4 = +0x18/+0x1A x flywheel(+0x13/+0x14)% x
-        // clutch(+0x13/+0x14)% x prop(+0x12/+0x13)%; 0xCE/0xD0 = +0x1C/+0x1E x prop(+0x14/+0x15)%.
-        for (int a = 0; a < 2; ++a) {
-            u32 spin = dt->params[size_t(1 + a)], shaft = dt->params[size_t(3 + a)];
-            if (u8 p = byte_at(fw, size_t(0x13 + a))) spin = spin * p / 100;
-            if (u8 p = byte_at(cl, size_t(0x13 + a))) spin = spin * p / 100;
-            if (u8 p = byte_at(ps, size_t(0x12 + a))) spin = spin * p / 100;
-            if (u8 p = byte_at(ps, size_t(0x14 + a))) shaft = shaft * p / 100;
-            s.axle[size_t(a)].spin_inertia = float(u16(spin)) * 0.01f;
-            s.axle[size_t(a)].shaft_inertia = float(u16(shaft)) * 0.01f;
-        }
-        // k_f = u16 +0x16 x 0.98 / omega_last (last rpm-axis point in rad/s): engine braking at the
-        // top of the curve = u16 x 0.98 N*m [physics §2.2, verified against the original game].
-        if (fric && !s.engine.curve_rpm.empty())
-            s.engine.friction_coeff = fric * 0.98f / (s.engine.curve_rpm.back() * model::kRpmToRadS);
-    }
-
-    // --- differentials [physics §2.7]: LSD type +0x11 / +0x1B, front initial/accel/decel
-    // +0x12/+0x15/+0x18, rear +0x1C/+0x1F/+0x22.
-    if (const ByteSpan* ls = part_record(db, parts, kLsd); ls && ls->size() > 0x22) {
-        for (int a = 0; a < 2; ++a) {
-            // The byte is the ASCII letter (f, h, m, n, v, y on disc); type = its index in "frnmhvyt".
-            static const char kTypes[] = "frnmhvyt";
-            const char* hit = std::strchr(kTypes, char((*ls)[size_t(a ? 0x1B : 0x11)]));
-            if (!hit || !*hit) continue;
-            int type = int(hit - kTypes);
-            s.drivetrain.lsd_type[size_t(a)] = type;
-            s.drivetrain.lsd_initial[size_t(a)] = set.lsd[size_t(0 + a)]; // setting 0x194/0x198
-            s.drivetrain.lsd_accel[size_t(a)] = set.lsd[size_t(2 + a)];   // 0x19C/0x1A0
-            s.drivetrain.lsd_decel[size_t(a)] = set.lsd[size_t(4 + a)];   // 0x1A4/0x1A8
-        }
-    }
-
-    // --- brakes [physics §4.5]: front/rear torque per wheel, handbrake ---
-    if (const ByteSpan* br = part_record(db, parts, kBrake); br && br->size() > 0x13) {
-        if ((*br)[0x11]) s.axle[0].max_brake_torque = (*br)[0x11] * 98.0f;
-        if ((*br)[0x12]) s.axle[1].max_brake_torque = (*br)[0x12] * 98.0f;
-        s.aids.handbrake_torque = (*br)[0x13] * 98.0f;
-    }
+    if (auto dt = db.drivetrain(parts[kDrivetrain])) s.drive = dt->drive_type <= 4 ? Drive(dt->drive_type) : Drive::FR;
 
     // --- aero [physics §4.7]: A from body f32 +0x44 (m^2), Cd = body +0x39 %, rho = 1.2 ---
     if (body) {
@@ -735,72 +463,14 @@ std::optional<CarSpec> build_car_spec(const data::CarDatabase& db, const std::st
         int a16 = int(body->unknown_44 * 10000.0f);
         float area = a16 > 1000 ? a16 / 10000.0f : s.width * s.height;
         float cd = br && br->size() > 0x39 && (*br)[0x39] ? (*br)[0x39] * 0.01f : 0.33f;
-        s.aero.air_density = 1.2f;
-        s.aero.drag_area = area * cd;
         float af = 0.5f * 1.2f * area;
         // Stock downforce settings [physics §6.6]: body +0x13 front, +0x3C rear (percent of A_f).
         s.aero.c_front = af * set.downforce_front * 0.01f; // setting 0x124
         s.aero.c_rear = af * set.downforce_rear * 0.01f;   // setting 0x128
         s.aero.c_drag = af * cd + 0.1f * (s.aero.c_front + s.aero.c_rear);
     }
-
-    // --- steering [physics §4.4/6.4]: pad curve B, steer +0x1E.. (6 x km/h, 6 x 0.2 deg) ---
-    if (const ByteSpan* st = part_record(db, parts, kSteer); st && st->size() > 0x29) {
-        Curve c;
-        for (int i = 0; i < 6; ++i) {
-            c.x.push_back((*st)[size_t(0x1E + i)] / 3.6f);
-            c.y.push_back((*st)[size_t(0x24 + i)] * 0.2f * model::kPiF / 180.0f);
-        }
-        bool ok = c.y[0] > 0;
-        for (int i = 1; i < 6; ++i) ok = ok && c.x[size_t(i)] >= c.x[size_t(i - 1)];
-        if (ok) s.steering.pad_curve = c;
-    }
-
-    // --- aids ---
-    // [physics §4.6/6.2/6.6] TCS: level = interp(TCSC +0x15, +0x16 / steps +0x12 /
-    // index +0x11); gain = +0x13 (x 0.1, 0 when the level is 100);
-    // lateral a = +0x14 (x 0.1), b = +0x17 (x 0.01).
-    if (const ByteSpan* tc = db.record(data::TableId::Tcsc, parts[25]); tc && tc->size() > 0x17) {
-        int steps = (*tc)[0x12], mn = (*tc)[0x15], mx = (*tc)[0x16], idx = set.tcs;
-        int lvl = steps < 2 ? mn : mn + (mx - mn) * (idx - 1) / (steps - 1);
-        s.aids.tcs = lvl != 0 && lvl != 100;
-        s.aids.tcs_level = lvl * 0.01f;
-        s.aids.tcs_scale = (lvl == 0 || lvl == 100) ? 1.0f : lvl * 0.01f;
-        s.aids.tcs_gain = lvl == 100 ? 0.0f : (*tc)[0x13] * 0.1f;
-        s.aids.tcs_lat_a = (*tc)[0x14] * 0.1f;
-        s.aids.tcs_lat_b = (*tc)[0x17] * 0.01f;
-    } else {
-        s.aids.tcs = false;
-    }
-    // [physics §4.6/6.2/6.6] ASCC channels (indices default +0x12, +0x1B, +0x21, +0x26).
-    if (const ByteSpan* as = db.record(data::TableId::Ascc, parts[24]); as && as->size() > 0x26) {
-        auto A = [&](size_t o) -> int { return (*as)[o]; };
-        auto interp = interp_setting;
-        s.aids.ascc_flags = u8((A(0x17) & 3) | (A(0x16) & 3) << 2 | (A(0x1D) & 3) << 4 | (A(0x1C) & 3) << 6);
-        s.aids.ascc_a_gain = interp(A(0x11), A(0x14), A(0x15), set.ascc[0]) * 0.01f;
-        s.aids.ascc_a_thr = A(0x13) * 0.01f;
-        s.aids.ascc_d_gain = interp(A(0x18), A(0x19), A(0x1A), set.ascc[1]) * 0.01f;
-        s.aids.ascc_c_gain = interp(A(0x1E), A(0x1F), A(0x20), set.ascc[2]) * 0.01f;
-        s.aids.ascc_c_thr = A(0x22) * 0.01f;
-        s.aids.ascc_e_gain = interp(A(0x23), A(0x24), A(0x25), set.ascc[3]) * 0.01f;
-    }
-    // ABS gain G = brake-controller setting x 0.1 (index = +0x14) [physics §4.5/6.6].
-    if (const ByteSpan* bc = part_record(db, parts, 1); bc && bc->size() > 0x17) {
-        // front = interp(+0x12, +0x13 / steps +0x11 / front index), rear = interp(+0x16, +0x17 / +0x15 / rear).
-        s.aids.abs_gain = interp_setting((*bc)[0x11], (*bc)[0x12], (*bc)[0x13], set.brake_front) * 0.1f;
-        s.aids.abs_gain_rear = interp_setting((*bc)[0x15], (*bc)[0x16], (*bc)[0x17], set.brake_rear) * 0.1f;
-    }
-
-    s.finalize();
+    if (s.aero.c_drag <= 0) s.aero.c_drag = 0.5f * 1.225f * (0.33f * s.width * s.height * 0.85f); // no body record
     return s;
-}
-
-void apply_aid_options(AidsSpec& aids, bool asm_on, bool tcs_on) {
-    if (!asm_on) {
-        aids.ascc_flags = 0;
-        aids.ascc_a_gain = aids.ascc_c_gain = aids.ascc_d_gain = aids.ascc_e_gain = 0;
-    }
-    if (!tcs_on) aids.tcs_gain = 0;
 }
 
 } // namespace gt3r::sim

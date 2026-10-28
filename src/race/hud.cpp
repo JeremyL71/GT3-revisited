@@ -167,10 +167,10 @@ const HudRow* Hud::event_row(HudMode m, u8 items, int view) {
     return (items & kItemTimes) ? hud_row(m, HudPart::Events, -1, view) : nullptr;
 }
 
-void Hud::load(const Vfs& vfs, SDL_Renderer* r) {
+void Hud::load(const Vfs& vfs, SDL_Renderer* r, const std::string& language) {
     fonts_ok_ = fonts_.load(vfs, r);
-    for (const char* lang : {"US", "UK", "JP"}) {
-        std::optional<Bytes> data = vfs.read(std::string("race/") + lang + "/display.imgs");
+    for (const std::string& lang : {language, std::string("US"), std::string("UK"), std::string("JP")}) {
+        std::optional<Bytes> data = vfs.read("race/" + lang + "/display.imgs");
         if (!data || !menu::Imgs::is_imgs(*data)) continue;
         try {
             menu::Imgs imgs = menu::Imgs::parse(*data);

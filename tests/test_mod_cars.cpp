@@ -9,8 +9,9 @@
 #include "formats/sound/spu.h"
 #include "game/data/car_database.h"
 #include "game/data/mod_cars.h"
+#include "exact_drive.h"
+#include "race/exact_setup.h"
 #include "sim/car_spec.h"
-#include "sim/vehicle.h"
 
 #include <cmath>
 #include <vector>
@@ -20,13 +21,21 @@ using namespace gt3r::test;
 
 namespace {
 
-struct Flat : sim::TrackQuery {
-    sim::SurfaceHit probe(float, float, float y_max) const override {
-        sim::SurfaceHit h;
-        h.hit = y_max >= 0;
-        return h;
+// Full throttle down the machine tests' straight: the speed (km/h) at each of `at` seconds after GO; empty when the race
+// cannot be set up.
+std::vector<float> straight_kmh(Disc& disc, const data::CarDatabase& db, const std::string& car, const std::vector<double>& at) {
+    StraightRun run = straight_run(disc, db, car);
+    if (!run.field) return {};
+    sim::ControlInputs in;
+    in.throttle = 1;
+    in.controller_kind = 2;
+    std::vector<float> out;
+    for (int i = 0; i < 60 * 120 && out.size() < at.size(); ++i) {
+        run.step(in);
+        if (run.field->race_time() >= at[out.size()]) out.push_back(run.field->player().state().speed_kmh);
     }
-};
+    return out;
+}
 
 const char* kMinimal = R"(
 ; a comment
@@ -163,43 +172,6 @@ TEST(body_fit_maps_axles) {
     CHECK(m.meshes[1].vertices[0].pos[2] == -1.3f); // wheels untouched
 }
 
-TEST(electric_vehicle_launch) {
-    // An R34-like test car turned into a single-speed EV: pulls away from rest
-    // with no clutch slip and no idle, and regen slows it on lift-off.
-    sim::CarSpec s = sim::CarSpec::test_car(sim::Drive::AWD);
-    s.engine.electric = true;
-    s.engine.curve_rpm = {0, 5000, 10000, 16000};
-    s.engine.curve_torque = {280, 280, 200, 120}; // within the tyres' grip: no traction control on this car
-    s.engine.rev_limit_rpm = 16000;
-    s.engine.inertia = 0.06f;
-    s.engine.regen_torque = 150;
-    s.engine.regen_power = 100000;
-    s.gearbox.ratios = {1.0f};
-    s.gearbox.final_drive = 9.0f;
-    s.gearbox.reverse = 1.0f;
-    s.finalize();
-    CHECK(s.engine.idle_rpm == 0);
-    auto car = sim::Vehicle::create(s);
-    Flat g;
-    car->reset({}, {});
-    sim::ControlInputs in;
-    in.throttle = 1;
-    const double h = 1.0 / 60;
-    for (int i = 0; i < 60; ++i) car->step(in, g, h);
-    float v1 = car->state().speed_kmh;
-    CHECK(v1 > 15); // moving after 1 s
-    CHECK(car->state().gear == 1);
-    // Motor speed follows the wheels through the reduction (direct drive).
-    float wheel_rpm = v1 / 3.6f / s.axle[1].tire_radius * 60 / (2 * 3.14159265f);
-    CHECK(std::fabs(car->state().engine_rpm - wheel_rpm * 9.0f) < 0.1f * wheel_rpm * 9.0f + 50);
-    for (int i = 0; i < 240; ++i) car->step(in, g, h);
-    float v5 = car->state().speed_kmh;
-    CHECK(v5 > 70);
-    in.throttle = 0;
-    for (int i = 0; i < 60; ++i) car->step(in, g, h);
-    CHECK(car->state().speed_kmh < v5 - 8); // regen: > ~0.2 g including drag
-}
-
 TEST(modcar_disc_end_to_end) {
     Disc* disc = test_disc();
     if (!disc) SKIP("GT3R_DISC not set");
@@ -226,6 +198,19 @@ TEST(modcar_disc_end_to_end) {
     CHECK(!db.parts_for(data::TableId::FrontTire, "test_ev").empty());
     CHECK(db.parts_for(data::TableId::TurbineKit, "test_ev").empty());
     CHECK(db.mod_car("test_ev") && db.mod_car("test_ev")->fit.active());
+    // The game's physics has no EV drive yet: an electric mod car races on its donor's engine, engine parts, driveline and
+    // gearbox (and their settings), on its own body and tyres.
+    using T = data::TableId;
+    std::optional<sim::exact::Equipment> ev = race::exact_equipment(db, {"test_ev"});
+    std::optional<sim::exact::Equipment> donor = race::exact_equipment(db, {"legacy_gtb_96"});
+    CHECK(ev && donor);
+    if (ev && donor) {
+        for (T t : {T::Engine, T::Drivetrain, T::Gear}) CHECK(ev->part[size_t(t)] == donor->part[size_t(t)]);
+        CHECK(ev->word(0x110) == donor->word(0x110) && ev->word(0xF4) == donor->word(0xF4)); // final drive, first gear
+        CHECK(ev->part[size_t(T::FrontTire)] != donor->part[size_t(T::FrontTire)]);
+    }
+    const std::vector<float> v = straight_kmh(*disc, db, "test_ev", {6.0});
+    CHECK(v.size() == 1 && v[0] > 60); // (it drives, on the donor's engine)
     // A second definition with a disc car's label is refused.
     def->label = "legacy_gtb_96";
     CHECK(!data::add_mod_car(db, *def, &err));
@@ -383,18 +368,126 @@ TEST(example_mod_car) {
     auto ws = wheel_spec_for_car(db, label);
     CHECK(ws.has_value() && std::fabs(ws->radius[0] - 0.384f) < 0.01f && std::fabs(ws->radius[1] - 0.384f) < 0.01f);
 
-    // It drives: full throttle on a flat plane passes 100 km/h in under 8 s and keeps pulling.
+    // It drives on the game's physics: full throttle down the machine tests' straight passes 100 km/h in under 8 s and keeps
+    // pulling.
     auto spec = sim::build_car_spec(db, label, &err);
     CHECK(spec.has_value());
-    if (!spec) return;
-    auto car = sim::Vehicle::create(*spec);
-    Flat g;
-    car->reset({}, {});
-    sim::ControlInputs in;
-    in.throttle = 1;
-    const double h = 1.0 / sim::kDefaultTickHz;
-    for (int i = 0; i < int(8 / h); ++i) car->step(in, g, h);
-    CHECK(car->state().speed_kmh > 100);
-    for (int i = 0; i < int(12 / h); ++i) car->step(in, g, h);
-    CHECK(car->state().speed_kmh > 180 && car->state().speed_kmh < 290);
+    const std::vector<float> v = straight_kmh(*disc, db, label, {8.0, 20.0});
+    CHECK(v.size() == 2);
+    if (v.size() < 2) return;
+    std::printf("    %s: %.0f km/h at 8 s, %.0f km/h at 20 s\n", label.c_str(), v[0], v[1]);
+    CHECK(v[0] > 100);
+    CHECK(v[1] > 180 && v[1] < 290);
+}
+
+// --- a mod car races the same from its arcade record as from its own parts ----------
+// Arcade mode, quick races and gt3tool modcar find a mod car's label among the arcade cars first (table 35, arcade_equipment);
+// a GT Mode garage car races on its parts and settings. The arcade record holds the car's stock settings, not the donor's
+// arcade tune, so the mod's own final drive, output factor and suspension reach the race either way.
+
+#include "sim/exact/car_fields.h"
+
+namespace {
+
+const char* kArcadeTuned = R"(
+[car]
+label = test_arcade_tuned
+name = Arcade Tuned
+donor = rx8_01            ; its arcade record has its own ride height and springs
+[body]
+weight_kg = 1350
+ride_height_mm = 130
+[powertrain]
+type = engine
+curve = 2000:180 5000:220 8000:200
+max_rpm = 8500
+output_pct = 112
+[drivetrain]
+gears = 3.20 2.10 1.50 1.15 0.95 0.80
+final_drive = 4.30
+)";
+
+const char* kArcadeNone = R"(
+[car]
+label = test_arcade_none
+name = Arcade None
+donor = legacy_gtb_96     ; no arcade record of its own
+[powertrain]
+type = engine
+output_pct = 105          ; on the donor's curve
+max_rpm = 7200
+[drivetrain]
+final_drive = 4.10
+)";
+
+u16 rec16(const data::CarDatabase& db, data::TableId t, const std::string& label, size_t o) {
+    const ByteSpan* r = db.record(t, label);
+    return r && r->size() >= o + 2 ? u16((*r)[o] | (*r)[o + 1] << 8) : 0;
+}
+
+} // namespace
+
+TEST(mod_car_arcade_matches_garage) {
+    Disc* disc = test_disc();
+    if (!disc) SKIP("GT3R_DISC not set");
+    std::optional<Bytes> core = disc->volume().read_program();
+    CHECK(core.has_value());
+    if (!core) return;
+    namespace ex = sim::exact;
+    using T = data::TableId;
+    const ex::ProgramData d = ex::ProgramData::load(CoreImage::decode(*core));
+    data::CarDatabase db;
+    CHECK(db.load(disc->volume()));
+    const std::string coupe = "gt3r_concept_coupe_24";
+    data::load_mod_car_files(db, {std::string(GT3R_SOURCE_DIR) + "/examples/mods/example_coupe/cars/" + coupe + ".ini"}, "example_coupe");
+    std::string err;
+    for (const char* text : {kArcadeTuned, kArcadeNone, kMinimal}) {
+        auto def = data::parse_mod_car(text, &err);
+        CHECK(def && data::add_mod_car(db, *def, &err));
+    }
+    db.rebuild();
+    CHECK(db.mod_car_errors().empty());
+
+    // The mods' own final drive (x 1000) and output factor.
+    const std::pair<std::string, std::pair<int, int>> cars[] = {
+        {coupe, {3910, 118}}, {"test_arcade_tuned", {4300, 112}}, {"test_arcade_none", {4100, 105}}, {"test_ev", {0, 0}}};
+    for (const auto& [label, want] : cars) {
+        const data::Car* c = db.car(label);
+        CHECK(c != nullptr);
+        if (!c) continue;
+        bool arcade = false;
+        for (const data::CarVariant& v : db.arcade_cars()) arcade = arcade || v.label == label;
+        CHECK(arcade); // (so the label alone races its arcade record)
+        const std::optional<ex::Equipment> by_label = race::exact_equipment(db, {label});
+        const std::optional<ex::Equipment> by_parts = race::exact_equipment(db, {label, c->parts});
+        const std::optional<ex::Equipment> garage = race::exact_equipment(db, {label, c->parts, sim::stock_settings(db, label, c->parts)});
+        CHECK(by_label && by_parts && garage);
+        if (!by_label || !by_parts || !garage) continue;
+        CHECK(by_label->car == by_parts->car && by_label->part == by_parts->part);
+        for (size_t k = 0; k < by_label->setting.size(); ++k)
+            if (by_label->setting[k] != by_parts->setting[k] || by_label->setting[k] != garage->setting[k]) {
+                std::printf("    %s: EQ +0x%zX arcade %d, stock %d, garage %d\n", label.c_str(), 0xF0 + 4 * k, by_label->setting[k],
+                            by_parts->setting[k], garage->setting[k]);
+                CHECK(false);
+            }
+        ex::ConvertInputs in;
+        in.base = ex::kParams;
+        const ex::ParamImage p = ex::race_params(db, d, *by_label, 0, true, true, in);
+        CHECK(p == ex::race_params(db, d, *by_parts, 0, true, true, in));
+        CHECK(p == ex::race_params(db, d, *garage, 0, true, true, in));
+        if (want.first) {
+            CHECK(by_label->word(0x110) == want.first);
+            const ByteSpan* en = db.record(T::Engine, c->parts[6]);
+            CHECK(en && en->size() > 0x42 && (*en)[0x42] == want.second);
+            // Every gearbox the shop sells for it shares the stock final drive, as on the disc.
+            for (const data::PartInfo& g : db.parts_for(T::Gear, label)) {
+                CHECK(rec16(db, T::Gear, g.label, 0x22) == want.first);
+                CHECK(rec16(db, T::Gear, g.label, 0x26) <= want.first && rec16(db, T::Gear, g.label, 0x24) >= want.first);
+            }
+        }
+    }
+    // Without a curve the rev limit applies to the donor's.
+    const data::Car* none = db.car("test_arcade_none");
+    const ByteSpan* en = none ? db.record(T::Engine, none->parts[6]) : nullptr;
+    CHECK(en && en->size() > 0x45 && (*en)[0x45] == 72);
 }

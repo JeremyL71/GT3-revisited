@@ -1,72 +1,144 @@
 #pragma once
 
-// A race with opponents: the player's car and the AI cars in one sim::World
-// (car-to-car contact, slipstream, per-car time scale), the AI driven by
-// ai::AiDriver with the event's parameters and rubber band (see docs/dev/AI.md).
+// A race as the race screen runs it: RaceField, over GT3's own race step (race/exact_field.h: the exact core's cars, AI and
+// race flow). The player's car is exposed as a RaceVehicle: stepping it steps the whole race, so the race screen's
+// fixed-tick loop, replays and HUD read every car the same way. Every race (with opponents, a split-screen battle, an
+// online race, and the solo modes: time trial, licence test, machine test, free run, free practice) is one.
 //
-// The player's car is exposed as a RaceVehicle: stepping it steps the whole
-// field (AI inputs first, then World::step), so the race screen's fixed-tick
-// loop, replays and HUD work unchanged. Everything is deterministic (AI and
-// World), so a replay of the player's inputs reproduces the whole race.
-//
-// Start: cars are held until the start signal (race_time < 0 during the
-// countdown); the player sits on the last grid slot behind the opponents.
+// Start: the race's own start (its countdown and holds; race_time < 0 during the countdown).
 
 #include "race/backend.h"
 #include "race/net_race.h"
-#include "sim/models.h"
+#include "sim/car_spec.h"
+#include "sim/program.h"
 
+#include <array>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gt3r::data {
 struct Event;
 } // namespace gt3r::data
+namespace gt3r::sim::exact {
+class ProgramData;
+enum class Conductor : u8;
+struct RaceRecord;
+struct SoloRecorders;
+struct Snapshot;
+} // namespace gt3r::sim::exact
 
 namespace gt3r::race {
 
+// A car as the game picks it, for the exact core's equipment (exact_setup.h): a label (a database car, table 30; a variant,
+// 31; an arcade car, 35), optionally with its own parts and settings (a GT-mode garage car, a demonstration's car record)
+// or an arcade car's tyre stage.
+struct ExactCarSource {
+    ExactCarSource() = default;
+    ExactCarSource(std::string l, std::optional<std::array<u64, 27>> p = std::nullopt, std::optional<sim::CarSettings> s = std::nullopt,
+                   int stage = -1)
+        : label(std::move(l)), parts(std::move(p)), settings(std::move(s)), tire_stage(stage) {}
+    std::string label;
+    std::optional<std::array<u64, 27>> parts;  // the car's fitted parts (data::Car::parts order)
+    std::optional<sim::CarSettings> settings;  // with the parts: its settings (none: the parts' stock settings)
+    int tire_stage = -1;                       // an arcade car's tyres (10 racing, 11 drift, 12 dirt, + 13 wet)
+};
+
+// A human's race entry for the exact core: the car and what GT3's race information holds of the player (entry + 0x20E4 ..).
+struct ExactHuman {
+    ExactCarSource car;
+    int pedal_style = 0;               // 0 the automatic gearbox, 1 the manual one (a pad) [physics §2.6]
+    bool wheel = false;                // a steering wheel (the pad read's wheel path, steering-wheel type 1)
+    // [race] analog_response = original: the race pad read as GT3 reads it (its pressure scales reach full throttle at
+    // 18 % of a DualShock 2's pressure range, brake 33 %, handbrake 10 %; its stick curve has a dead band over the inner
+    // 29 %). Default (linear): the same frames with every analog axis linear in the race pad's, so the steering,
+    // throttle, brake and handbrake after phase 3's shaping follow the input.
+    bool original_response = false;
+    bool asm_on = true, tcs_on = true; // the Options' ASM / TCS (entry + 0x20F0 / + 0x20F4)
+    sim::EngineCondition condition;    // the run's start
+    float dirt = 0;                    // the car's dirt (condition word 3)
+};
+
+// A race on the exact core (exact_field.h): GT3's own race step, cars and race flow.
+struct ExactFieldOptions {
+    std::shared_ptr<const sim::exact::ProgramData> data;
+    // Whose rules the race follows (sim/program.h): unset, the disc's own release's (`data`'s behaviour, the races the player
+    // drives); online races and the game's demos (attract, quick-menu demonstration, licence demonstrations) NTSC-U's, on a copy
+    // of `data` with that behaviour. Every race steps 60 times a second (tick_hz).
+    std::optional<sim::Program> rules;
+    Bytes course_file;          // the course file (its road, AI lines, driver sets, Env0)
+    std::string course;         // its label (the course record's category)
+    sim::exact::Conductor kind{}; // the race mode (SinglePlayer, Battle2P, ...)
+    u8 config = 0;              // the race-flow byte (the race's play kind): 0 live, 2 the attract demo (every car a CPU car),
+                                // 3 the AI drives the players' cars (the pad decoded)
+    int laps = 0;               // the race's laps (0: the event's time limit)
+    ExactHuman player, second;
+    // A replay: the race as recorded (sim/exact/race_record.h), built from its setup and stepped from its frames and changes
+    // (the cars, grid, laps and words above are not used; the players' pads and inputs are ignored).
+    std::shared_ptr<const sim::exact::RaceRecord> playback;
+    // A whole-run ghost (time trial, licence test, machine test): car 0 of that run's record, as GT3 races it: a car of this
+    // race after the players (its entry the run's car 0's; the solo conductors' entry set-up flags it a ghost), its device
+    // playing the run's recording (RaceRecord::run_recording: every frame but the last, then empty ones). The screen draws it
+    // from the race (exact_ghost).
+    std::shared_ptr<const sim::exact::RaceRecord> ghost;
+    // The solo modes (kind TimeTrial, License, MachineTest, FreeRun, FreePractice: the player alone, no opponents) and the race
+    // information's words they read: the session's best sector times and lap (race info + 0x8AC .. + 0x8BC, ms; 0x157529FF
+    // none: the visit's, the screen carries them from run to run), the licence test's judging times (gold, silver, bronze;
+    // ms), a licence test that is not judged (+0x80), the speed display's unit (0 km/h, 1 mph).
+    std::array<u32, 5> session{0x157529FF, 0x157529FF, 0x157529FF, 0x157529FF, 0x157529FF};
+    std::array<u32, 3> licence_times{};
+    bool unjudged = false;
+    u8 speed_unit = 0;
+    // The free run's ghost car without a whole-run ghost (car 1, the player's car once more: the start flags it a ghost),
+    // driven by the race's recorders (sim::exact::SoloRecorders: its lap recordings, best lap and the ghost's playback);
+    // `ghost_shown`: the race object's ghost switch (+0x217A4: the ghost car is drawn, translucent); `ghost_option`: the Options
+    // menu's Ghost (on: a lap better than the ghost's becomes the ghost at once).
+    bool free_run_ghost = true, ghost_shown = true, ghost_option = true;
+    // The visit's free run recorders (GT3's free run keeps its race object, and with it its best lap's store and the ghost's
+    // playback, from run to run until the player leaves): the race starts from them and, when the field is done, leaves them
+    // as its run left them (the screen holds them for the visit). Null: the race's own, empty at its start.
+    std::shared_ptr<sim::exact::SoloRecorders> free_run;
+    // The data logger (race info + 0x70 / + 0x74): the race plays its run for the logger (the marks are timed; the cars drawn
+    // as the logger draws them) and, with `logger_record`, records each recorded car's table at the course's logger marks
+    // (exact_logger_tables: the Analyzer's pass over a replay). A replay's own words are kept otherwise.
+    bool logger = false, logger_record = false;
+    // The Analyzer's race (a replay's, `playback` its track A; the time trial, licence test and machine test): GT3's logger
+    // race (the solo race's devices, both playing): car 0 plays track A's recording, car 1, a ghost car with track B's
+    // car, plays `analysis_b`'s (none: no car 1); `logger_tables` (optional) the tables of a pass over it, which the race's
+    // jumps (exact_logger_jump) restore from.
+    std::shared_ptr<const sim::exact::RaceRecord> analysis_b;
+    bool analysis = false;
+    std::shared_ptr<const std::vector<std::map<s32, sim::exact::Snapshot>>> logger_tables;
+};
+// The solo conductors: the time trial, licence test, machine test, free run and free practice (the player alone).
+bool exact_solo_kind(sim::exact::Conductor k);
+
 struct FieldConfig {
-    std::string player;                 // car (or variant) label of the player
-    std::shared_ptr<const sim::CarSpec> player_spec; // when set, used instead of `player`
+    // The race on the exact core: the program, rules, course, mode, players and solo words (make_exact_field).
+    ExactFieldOptions exact;
     std::string event;                  // event label (opponents, AI parameters, rubber band); may be empty
-    std::vector<std::string> opponents; // car variant labels; empty = the event's entries
+    std::vector<std::string> opponents; // car (variant) labels; empty = the event's entries
     int max_opponents = 5;
-    // Second human (2P battle): car label or spec; empty = none.
-    std::string second_player;
-    std::shared_ptr<const sim::CarSpec> second_spec;
-    double countdown = 3.0;             // seconds before the start signal (0 = rolling start: no hold)
-    // Course category (course table 34 +8: 0 tarmac, 1 wet Route 5, 2 dirt): the CPU drivers' built-in
-    // parameter set where the course file has no set for a car's driveline class (ai §9.1); the
-    // event's per-class overrides come on top.
-    int course_category = 0;
-    // 2P battle options (the original's options record, docs/dev/RACE.md "Options"):
-    // boost = catch-up for the trailing player as a time-step scale 1 + A x (gap - start) /
-    // (full - start) (full A from `full` m or a lap down), A = 0 = off (low 0.15 / 20 / 1000,
-    // high 0.20 / 10 / 200); handicap metres (> 0: player 2 starts back, < 0: player 1), both
-    // cars placed on the line before the start: the leader 10 m back, the other max(|h|, 20) m.
-    float boost_amount = 0, boost_start = 0, boost_full = 1;
-    float handicap_m = 0;
     // GT-mode grid: opponents ranked by power-to-weight (kg per PS, lightest per PS on pole);
     // otherwise they take the slots in the given order (arcade: the random draw).
     bool grid_by_power = false;
-    // Time-limited race (endurance events with 0 laps, event +0x1E4 minutes): a car finishes at
-    // its first line crossing at or after it (finishes_at_line).
-    double time_limit = 0;
-    // Non-original fail-safe ([race] respawn): put a CPU car that is lost or has made no
-    // progress for 12 s back on the track. The original never respawns a car.
-    bool cpu_respawn = true;
-    // Rolling start: every opponent starts moving at this speed (km/h); 0 = from rest.
-    float start_kmh = 0;
-    // Tyre wear of the race (model::wear_params of event +0x1BD..+0x1C3); off by default.
-    sim::model::WearParams wear;
-    // Online battle (docs/dev/ONLINE.md): the other players' cars. They take the opponent
-    // indices 0..n-1 (no AI): never stepped here, posed from the network before each step
-    // (set_remote_pose) and collided as sim::World kinematic cars. `slot` is the grid slot.
+    // The split-screen battle's options (its Options page, docs/dev/RACE.md "Options"): the catch-up for the
+    // trailing player (0 off, 1 low, 2 high), the handicap in metres (> 0: player 2 starts back, < 0: player 1), tyre damage.
+    int battle_catchup = 0;
+    float handicap_m = 0;
+    bool battle_wear = false;
+    // Online battle (docs/dev/ONLINE.md): the other players' cars, on their grid slots, posed from the network before each
+    // step (RaceField::set_remote_pose), never stepped here.
     struct Remote {
         std::string car; // car label
         int slot = 0;
-        std::shared_ptr<const sim::CarSpec> spec; // their car as raced (garage parts); null = the stock car
+        // The car as raced (a garage car's parts and settings, an arcade car's tyres; empty label: `car`) and its engine
+        // condition.
+        ExactCarSource source;
+        sim::EngineCondition condition;
     };
     std::vector<Remote> remote;
     int player_slot = -1; // the local player's grid slot (-1: behind the opponents)
@@ -90,23 +162,15 @@ struct EventStart {
     bool flying() const { return type == 3 && initial_kmh > 0; }
 };
 EventStart event_start(const data::Event& ev);
-// Rolling start: the computer drives the player's car for this long after the start
-// (300 frames), every car starting at kRollingKmh.
+// Rolling start: the computer drives the player's car for this long after the start (300 frames).
 constexpr double kRollingAutoDrive = 5.0;
-constexpr float kRollingKmh = 80.0f;
-
-// Grid slot point -> car position: the slot marks the nose, so the car is moved back
-// along its heading by its front extent (physics §9.2).
-sim::Vec3 grid_back(const sim::Vec3& slot, const sim::Quat& heading, const sim::VehicleSetup& setup);
-// The same from a car spec (builds the vehicle's setup).
-sim::Vec3 grid_back(const sim::Vec3& slot, const sim::Quat& heading, const sim::CarSpec& spec);
 
 // kg per PS of a car spec (GT mode's grid order: lowest on pole).
 float power_to_weight(const sim::CarSpec& spec);
 
 class RaceField {
 public:
-    // nullptr with *error set when the track runtime is unavailable or no car could be built.
+    // nullptr with *error set when the race cannot be set up (make_exact_field).
     static std::unique_ptr<RaceField> create(const RaceTrack& track, const data::CarDatabase& db,
                                              const FieldConfig& cfg, std::string* error = nullptr);
     virtual ~RaceField() = default;
@@ -144,11 +208,17 @@ public:
     virtual const sim::VehicleState& second_prev_state() const = 0;
     virtual const sim::VehicleSetup& second_setup() const = 0;
     virtual TrackPose second_grid() const = 0;
-    virtual void reset_second(const TrackPose& p) = 0;
-    virtual float second_impact() const = 0;
     virtual float second_boost() const = 0;
-    virtual const sim::Vehicle* second_vehicle() const = 0;
-    virtual const sim::Vehicle* opponent_vehicle(int i) const = 0;
+    // The last step's telemetry and the make-up of player 2's car and of opponent i (null / nullopt: none).
+    virtual const sim::VehicleTelemetry* second_telemetry() const = 0;
+    virtual const sim::VehicleTelemetry* opponent_telemetry(int i) const = 0;
+    virtual std::optional<CarFacts> second_facts() const = 0;
+    virtual std::optional<CarFacts> opponent_facts(int i) const = 0;
+    // Player 2's race pad for the next step (RaceVehicle::set_pad).
+    virtual void set_second_pad(const PadState* pad) { (void)pad; }
+    // How often the race steps (the one place the screen takes the rate from: 60 for every race a player drives; a
+    // disc's own demo on a PAL disc runs at 50).
+    virtual double tick_hz() const { return sim::kDefaultTickHz; }
     // The brake pedal the car was given on the last tick (lamp state).
     virtual float opponent_brake(int i) const = 0;
     // Strongest car-car impulse on opponent i in the last step (N s), for its clash sound.
@@ -183,6 +253,7 @@ public:
     };
     virtual const std::vector<CarCrossing>& last_crossings() const = 0;
     // Opponents that entered the pit lane since the last call ("%s Pitting in...").
+    // (-1 / -2: player 1's / 2's car, from a field that drives the players' pit lane itself.)
     virtual std::vector<int> take_pit_entries() = 0;
     virtual bool opponent_in_pits(int i) const = 0;
     virtual std::vector<Standing> standings() const = 0;
@@ -218,11 +289,6 @@ public:
 // Ranking: more laps completed first; at equal laps two running cars by race distance, a
 // running car ahead of a finished one, two finished cars by finish time.
 bool ranks_ahead(const RaceField::Standing& a, const RaceField::Standing& b);
-// Whether a car finishes at a line crossing (cars are judged in race order, the leader
-// first): it has completed the race's laps (race_laps > 0), the car ranked first has
-// finished, or the crossing is at or after the time limit (seconds, 0 = none). There is no
-// other finish: a car that stops short never finishes.
-bool finishes_at_line(int laps_completed, int race_laps, bool leader_finished, double race_time, double time_limit);
 // The game's lap counter of a car: 0 before its first crossing of the start line, then the lap
 // it is on (1 during lap 1). The replay cameras' lap variant comes from it (presentation §H6).
 constexpr int lap_counter(bool started, int completed) { return started ? completed + 1 : 0; }

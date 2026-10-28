@@ -19,8 +19,9 @@ namespace {
 
 // The GT-mode control is opened: the disc data and the current save of the save library (a new
 // game when there is none), the original's boot-time memory-card load.
-void attach(const menu::flow::FileReader& read) {
+void attach(const menu::flow::FileReader& read, const std::string& lang) {
     menu_state().reader = read;
+    menu_state().lang = lang;
     std::string why;
     bool loaded = false;
     if (!start_session(read, &why, &loaded)) {
@@ -67,6 +68,8 @@ void install_gt_mode_menu() {
     };
     h.intercept = intercept;
     h.enabled = enabled;
+    h.listed = listed;
+    h.initial_item = initial_item;
     h.widget_text = widget_text;
     h.hide_art = hide_art;
     h.on_frame = on_frame;

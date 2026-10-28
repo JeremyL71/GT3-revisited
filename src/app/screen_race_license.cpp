@@ -1,8 +1,9 @@
-// Licence tests and demonstrations: the test's judge (LicenseRun) every tick, the medal,
+// Licence tests and demonstrations: the test's rules and its result as the race flow judges it (LicenseRun), the medal,
 // and the disc's demonstration runs (quick menu DEMO, the licence menu's preview box).
 // (Race screen code map: docs/dev/RACE.md.)
 
 #include "app/screen_race_impl.h"
+#include "game/language_rules.h"
 
 namespace gt3r::race_screen {
 
@@ -16,11 +17,11 @@ void RaceScreen::start_demo() {
     if (!track_ || !vehicle_) return;
     pre_demo_run_ = finished_recording();
     quick_ = false;
+    demo_ = true; // (before the race is built: the exact core plays the demonstration's record, with NTSC-U's rules)
     restart();
-    demo_ = true;
-    demo_tick_ = 0;
-    if (disc_demo_) demo_judge_.begin(license_.rules());
-    demo_off_ = false;
+    demo_tick_ = 0, demo_logged_ = false;
+    // Without the disc's demonstration: the race's own AI drives the player's car.
+    if (vehicle_ && !disc_demo_) vehicle_->ai_take_over();
     drive_camera_ = camera_.mode() == CameraMode::Tv ? drive_camera_ : camera_.mode();
     camera_.set_mode(CameraMode::Tv);
     restart_director();
@@ -41,11 +42,10 @@ void RaceScreen::start_preview() {
     }
     if (!disc_demo_) return;
     pre_demo_run_ = finished_recording();
+    demo_ = true, preview_ = true; // (before the race is built, as start_demo)
     restart();
-    demo_ = true, preview_ = true, quick_ = true;
-    demo_tick_ = 0;
-    demo_judge_.begin(license_.rules());
-    demo_off_ = false;
+    quick_ = true;
+    demo_tick_ = 0, demo_logged_ = false;
     drive_camera_ = camera_.mode() == CameraMode::Tv ? drive_camera_ : camera_.mode();
     camera_.set_mode(CameraMode::Tv);
     restart_director();
@@ -100,10 +100,19 @@ void RaceScreen::begin_license() {
     if (!demo_code.empty() && !disc_demo_tried_ && app_ && app_->vfs()) { // the disc's demonstration run
         disc_demo_tried_ = true;
         std::string err;
-        if (std::optional<Bytes> b = app_->vfs()->read("demo/" + demo_code)) disc_demo_ = DemoReplay::parse(*b, &err);
+        // The language's demonstration (docs/dev/GT_MODE.md "Language": S-1's in British English).
+        const Vfs& vfs = *app_->vfs();
+        const std::string path =
+            game::demo_replay_path(demo_code, vfs.language(), [&](const std::string& p) { return vfs.exists(p); });
+        if (std::optional<Bytes> b = vfs.read(path)) disc_demo_ = DemoReplay::parse(*b, &err);
         if (disc_demo_) LOG_INFO("Demo %s: %zu frames, %.3f s", demo_code.c_str(), disc_demo_->size(),
                                  disc_demo_->time_ms / 1000.0);
         else LOG_WARN("Demo %s: no demo run (%s)", demo_code.c_str(), err.c_str());
+        // The race GT3's replay playback builds from the save, played like a replay.
+        const data::Event* dev = db_.event(demo_code);
+        if (disc_demo_ && dev && load_program_data(*app_))
+            if (std::optional<sim::exact::RaceRecord> r = race::demo_record(*disc_demo_, *dev, db_, exact_data_->fingerprint(), 180, &err))
+                demo_record_ = std::make_shared<const sim::exact::RaceRecord>(std::move(*r));
     }
     if (license_event_.empty()) return;
     const data::Event* ev = db_.event(license_event_);
@@ -112,58 +121,30 @@ void RaceScreen::begin_license() {
     LicenseRun::Rules r;
     r.kind = license_times_.kind;
     r.laps = std::max<int>(1, ev->laps);
-    if (const track::Track* t = track_ ? track_->runtime() : nullptr) r.goal_m = t->road().start_distance;
     r.standing = !tt_start_.flying();
     license_.begin(r);
-    license_progress_ = 0;
-    license_dist_valid_ = false;
 }
 
-void RaceScreen::update_license(const sim::VehicleState& s, double dt) {
-    LicenseRun::Step st;
-    st.started = track_->lap_started();
-    st.dt = dt;
-    st.elapsed = st.started ? track_->current_lap_time(race_time_) : 0;
-    float prog = st.started && track_->laps_completed() == 0 ? track_->lap_progress() * track_->length() : license_progress_;
-    st.progress_prev = license_progress_;
-    st.progress = prog;
-    license_progress_ = prog;
-    st.laps_completed = track_->laps_completed();
-    for (double t : lap_times_) st.laps_time += t;
-    st.speed_mps = s.speed_kmh / 3.6f;
-    // The original's clock: ticks since GO completed before this one (its stop check runs
-    // before the clock's per-tick advance); the body's 3-D speed.
-    st.clock_ticks = tt_hold_ > 0 ? -1 : std::llround(race_time_ * 60.0) - 1;
-    st.speed3d_mps = std::sqrt(s.velocity.x * s.velocity.x + s.velocity.y * s.velocity.y + s.velocity.z * s.velocity.z);
-    // Unwrapped distance from the line (negative behind it) for the progress events.
-    st.lap_length = track_->length();
-    st.dist = track_->race_distance();
-    st.dist_prev = license_dist_valid_ ? license_dist_ : st.dist;
-    license_dist_ = st.dist, license_dist_valid_ = tt_hold_ <= 0;
-    st.wall_dv = vehicle_->last_impact(); // speed change this step (no other cars here)
-    st.pylon = pylon_hit_; // any touch fails (the licence test's failure check, failure bit 0)
-    for (int i = 0; i < 4; ++i) st.grounded[i] = s.wheels[size_t(i)].grounded, st.surface[i] = s.wheels[size_t(i)].surface;
-    if (preset_.lic_finish > 0 && st.started && st.elapsed >= preset_.lic_finish) license_.force_finish(st.elapsed);
-    LicenseRun::State r = license_.step(st);
-    if (r == LicenseRun::State::Running) return;
+// The licence run is over (finished with `time` and `medal`, -1 none, or failed): the result, the medal's model, GT mode's
+// save.
+void RaceScreen::license_end(LicenseRun::State r, double time, int medal, const std::string& failure) {
+    license_.end(r, time, failure);
     finished_ = true;
     finish_position_ = r == LicenseRun::State::Finished ? 1 : 0;
-    music_license_end_s_ = race_time_, music_license_failed_ = r != LicenseRun::State::Finished; // replay's finish cue
+    music_license_end_s_ = race_time_, music_license_failed_ = race::license_fail_jingle(r, medal); // the replay's end cue
     if (r == LicenseRun::State::Finished) {
-        int medal = license_medal(license_times_, license_.time());
-        LOG_INFO("Licence %s: finished in %.3f s, medal %d", license_event_.c_str(), license_.time(), medal);
-        rank_finish(license_.time(), false, medal >= 0 ? medal + 1 : 0); // a record with a medal locks RETRY (presentation §E3)
+        LOG_INFO("Licence %s: finished in %.3f s, medal %d", license_event_.c_str(), time, medal);
+        rank_finish(time, false, medal >= 0 ? medal + 1 : 0); // a record with a medal locks RETRY (presentation §E3)
         // The session's best judged run is what GT mode records (a retry or a replay
         // afterwards must not lose a medal already earned).
-        // (Not the demonstration: its run is judged through the same code, swapped in.)
         auto rank = [](int m) { return m >= 0 ? m : 3; };
         if (!demo_ && (!best_license_ || rank(medal) < rank(best_license_->medal) ||
-                       (rank(medal) == rank(best_license_->medal) && license_.time() < best_license_->time)))
-            best_license_ = BestLicense{medal, license_.time()};
+                       (rank(medal) == rank(best_license_->medal) && time < best_license_->time)))
+            best_license_ = BestLicense{medal, time};
         // GT mode: the medal goes into the save at once (also kept if the game is closed
         // before returning to the menus).
         if (!demo_ && from_menu_ && launch_.request.mode == "go_license" && !launch_.request.practice && medal >= 0)
-            game::save_license_run(license_event_, medal, license_.time());
+            game::save_license_run(license_event_, medal, time);
         if (preset_.prize >= 0) medal = std::min(preset_.prize, 2); // screenshots: show this medal
         shown_medal_ = medal;
         // The medal model (race/gold|silver|bronze.prm) flies in on the result screen.
@@ -175,7 +156,7 @@ void RaceScreen::update_license(const sim::VehicleState& s, double dt) {
                 if (!prize_->load(*b, kPrm[medal])) prize_.reset();
             }
     }
-    else LOG_INFO("Licence %s: FAIL (%s)", license_event_.c_str(), license_.failure().c_str());
+    else LOG_INFO("Licence %s: FAIL (%s)", license_event_.c_str(), failure.c_str());
 }
 
 } // namespace gt3r::race_screen

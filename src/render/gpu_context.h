@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -62,7 +63,8 @@ struct GpuOptions {
     int msaa = 4;       // 1, 2, 4 or 8; clamped to what the device supports
     bool vsync = true;
     bool debug = false; // backend validation layers
-    float render_scale = 1.0f; // 3D resolution relative to the display (0.5..1); the UI stays native
+    float render_scale = 1.0f; // 3D resolution relative to the display (0.5..4); the UI stays native
+    int anisotropy = 4;        // anisotropic texture filtering: 1 (off), 2, 4, 8 or 16
     // VR builds (GT3R_XR): create the device through the headset's OpenXR runtime when there is
     // one; the 2D renderer then draws offscreen (canvases of xr::Session) instead of the window.
     bool xr = false;
@@ -92,10 +94,19 @@ public:
     SDL_GPUTextureFormat depth_format() const { return depth_format_; }
     SDL_GPUSampleCount sample_count() const { return samples_; }
     int msaa() const { return 1 << int(samples_); }
-    // Changes the MSAA level (rounded down to a supported count); drops cached pipelines.
+    // The MSAA levels the GPU draws the 3D pass with (1 = off), lowest first.
+    std::vector<int> msaa_levels() const;
+    // Changes the MSAA level (the nearest the GPU offers: a missing 2x is 4x, others round down);
+    // drops cached pipelines.
     void set_msaa(int samples);
-    // 3D views render at this fraction of their on-screen pixel size and are
-    // upscaled when composited (cheaper on high-resolution phones/tablets).
+    // Anisotropic filtering of mipmapped textures: 1 (off), 2, 4, 8 or 16 (1 when the GPU has
+    // none). set_anisotropy recreates the samplers.
+    bool anisotropy_supported() const { return anisotropy_; }
+    int anisotropy() const { return anisotropy_ ? aniso_level_ : 1; }
+    void set_anisotropy(int level);
+    // 3D views render at this fraction of their on-screen pixel size and are upscaled when
+    // composited (cheaper on high-resolution phones/tablets); above 1 (supersampling) they
+    // render larger and are scaled down (View3D::draw).
     float render_scale() const { return render_scale_; }
     void set_render_scale(float s);
     // The largest scale the views size their targets for (0: render_scale), so the dynamic scale
@@ -107,7 +118,13 @@ public:
     // Creates the pipelines races and menus draw with on a background thread, ahead of their
     // first use: one takes ~65 ms on a Galaxy A15 (Mali), a stutter the first time each blend /
     // cull / write combination appears in a session.
+    // Mali Bifrost GPUs (mali_bifrost), whose shader compiler crashed in the background warm-up,
+    // build them on the render thread instead: warm_step, one after each presented frame (the
+    // menus lag for a few seconds after start-up, races don't), and finish_warming, the rest at
+    // once in a race's load. Both do nothing on other GPUs.
     void warm_pipelines();
+    void warm_step();
+    void finish_warming();
     // no_mips: the full-size image only (GS MXL 0), linear, no anisotropy.
     SDL_GPUSampler* sampler(bool clamp_u, bool clamp_v, bool no_mips = false) const {
         return samplers_[(clamp_u ? 1 : 0) | (clamp_v ? 2 : 0) | (no_mips ? 4 : 0)];
@@ -126,16 +143,24 @@ public:
     // False when others hold it too: the caller needs a texture of its own.
     bool take_texture(SDL_GPUTexture* texture);
 
+    // After each presented frame: SDL has recycled the finished GPU work (see PendingGpuWork).
+    void frame_presented();
+
 private:
     GpuContext() = default;
     bool init(SDL_Window* window, const GpuOptions& options);
     SDL_GPUShader* make_shader(bool vertex);
+    bool create_samplers();
+    void release_samplers();
     SDL_GPUGraphicsPipeline* create_pipeline(const PipelineKey& key);
+    bool build_pipeline(const PipelineKey& key); // into pipelines_ unless there; true when built
+    void warm_on_render_thread(bool all);         // warm_step (one) / finish_warming (all)
     void stop_warming();
     void release_pipelines();
 
     SDL_GPUDevice* device_ = nullptr;
     bool anisotropy_ = true; // the device was created with anisotropic filtering
+    int aniso_level_ = 4;    // the samplers' anisotropy (when anisotropy_)
 #if GT3R_XR
     bool xr_ = false;
     xr::Session::DeviceRequest xr_request_;
@@ -149,11 +174,17 @@ private:
     SDL_GPUTexture* white_ = nullptr;
     SDL_GPUTextureFormat depth_format_ = SDL_GPU_TEXTUREFORMAT_D16_UNORM;
     SDL_GPUSampleCount samples_ = SDL_GPU_SAMPLECOUNT_1;
+    bool msaa_supported(SDL_GPUSampleCount c) const; // both the color and the depth target
     std::map<PipelineKey, SDL_GPUGraphicsPipeline*> pipelines_;
     std::mutex pipelines_mutex_; // pipelines_ (warm_pipelines' thread adds to it)
     std::thread warm_thread_;
     std::atomic<bool> warm_stop_{false};
     bool warm_ = false; // warm_pipelines was asked for (again after an MSAA change)
+    bool one_compile_thread_ = false; // pipelines only on the render thread (mali_bifrost)
+    std::vector<PipelineKey> render_thread_keys_; // its warm-up still to go through
+    size_t render_thread_next_ = 0;
+    int render_thread_made_ = 0;
+    u64 render_thread_ns_ = 0;
     struct TextureKey {
         u32 width, height;
         u64 hash[2]; // two independent 64-bit hashes of the texels
@@ -167,11 +198,42 @@ private:
     std::map<SDL_GPUTexture*, SharedTexture> shared_textures_;
 };
 
+// A Vulkan device name ("Mali-G52", "Mali-G76 MP12") of Arm's Bifrost generation: G31, G51,
+// G52, G71, G72, G76. A Mali-G52 driver (Android 11, Unisoc T610) crashed in its shader
+// compiler (a null read) building a warm-up pipeline on the second thread, likely because the
+// render thread was compiling its own at the same time, so these build pipelines on the render
+// thread only. A name this misses keeps the warm-up.
+bool mali_bifrost(std::string_view device_name);
+
 // Mip chain of a w x h texture: levels down to 1 x 1, each side halving to no less than 1.
 u32 mip_levels(u32 w, u32 h);
 // The next mip level of RGBA8 texels: max(1, w / 2) x max(1, h / 2), each texel the rounded
 // mean of its 2 x 2 block (what a linear blit of the level above gives).
 std::vector<u32> half_size(const u32* rgba, u32 w, u32 h);
+
+// GPU work submitted since the last presented frame. With a window, SDL's Vulkan backend
+// recycles finished command buffers (their fences, transfer buffers and the resources released
+// meanwhile) only when a frame is presented, and every texture it creates is a submit of its
+// own. A load presents nothing: a 6-car race load kept ~1,800 command buffers and fences in
+// flight at once (RTX 3080), and a Linux NVIDIA laptop failed race loads with vkCreateFence
+// VK_ERROR_OUT_OF_HOST_MEMORY. Past either limit the uploads wait for the GPU, which recycles
+// it all (SDL_WaitForGPUIdle).
+class PendingGpuWork {
+public:
+    static constexpr u32 kMaxSubmits = 128;
+    static constexpr u64 kMaxBytes = 64ull << 20; // staged upload data
+    // True when the caller should wait for the GPU now (the count starts again).
+    bool add(u32 submits, u64 bytes);
+    void frame_presented() { submits_ = 0, bytes_ = 0; }
+
+private:
+    u32 submits_ = 0;
+    u64 bytes_ = 0;
+};
+
+// After submits besides the frame's own (uploads, texture creation): waits for the GPU when
+// the process's PendingGpuWork says so (one GPU device per process).
+void note_gpu_submits(SDL_GPUDevice* device, u32 submits, u64 bytes = 0);
 
 // Batches buffer/texture uploads into one command buffer and one transfer buffer:
 //   Uploader up(device); auto* vb = up.buffer(VERTEX, data, size); ...; up.submit();

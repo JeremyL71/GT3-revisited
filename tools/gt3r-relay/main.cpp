@@ -2,7 +2,7 @@
 // (docs/dev/ONLINE.md "Server"). Session codes, endpoint exchange for UDP hole punching,
 // and a relay for pairs that cannot connect directly. Keeps nothing on disk.
 //
-//   gt3r-relay [--port 47631] [--quiet] [--bench] [limits] [versions]
+//   gt3r-relay [--port 47631] [--quiet] [--log-ips] [--geoip PATH] [--bench] [limits] [versions]
 //
 // Link slots (docs/dev/ONLINE.md "Link slots and the queue"):
 //   --relay-links 300        racing links (relayed player pairs) at once; more lobbies queue
@@ -32,10 +32,15 @@
 //                            gt3r-relay) without dropping anything. tools/gt3r-relay/set-versions.sh
 //                            writes it. A missing file is fine (the flags apply).
 //
-// Logs to stdout (one line per session event with the host's / joining player's IP
-// address and the code, a stats line every minute). Nothing else is kept. Version queries
-// are only counted (in the stats line), never logged.
+// Logs to stdout (one line per session event with the code and a tag for the host's /
+// joining player's IP: a keyed hash, new key each UTC day; a stats line every minute).
+//   --log-ips                log the IPs themselves instead of tags
+//   --geoip PATH             add each player's country: a "first IP,last IP,country" CSV such as
+//                            DB-IP's IP to Country Lite (tools/gt3r-relay/update-geoip.sh fetches
+//                            it); re-read on SIGHUP. Missing: "??" until a reload finds it.
+// Nothing else is kept. Version queries are only counted (in the stats line), never logged.
 
+#include "net/geoip.h"
 #include "net/relay_server.h"
 
 #include <algorithm>
@@ -95,7 +100,7 @@ bool load_versions(const std::string& path, gt3r::net::RelayServer::Versions& v,
 
 int main(int argc, char** argv) {
     unsigned port = gt3r::net::kDefaultRelayPort;
-    bool quiet = false;
+    bool quiet = false, log_ips = false;
     double buffers_kb = 4096; // kernel socket buffers asked for (a burst of 60 Hz traffic)
     gt3r::net::RelayServer::Limits lim;
     struct Flag {
@@ -122,7 +127,7 @@ int main(int argc, char** argv) {
         {"--misses-per-s", &lim.misses_per_s},
     };
     gt3r::net::RelayServer::Versions flag_versions;
-    std::string versions_file;
+    std::string versions_file, geoip_file;
     bool bad_value = false;
     for (int i = 1; i < argc; ++i) {
         bool known = false;
@@ -137,10 +142,12 @@ int main(int argc, char** argv) {
         version_flag("--min-online", flag_versions.min_online);
         if (!known && !std::strcmp(argv[i], "--release-url") && i + 1 < argc) flag_versions.release_url = argv[++i], known = true;
         if (!known && !std::strcmp(argv[i], "--versions-file") && i + 1 < argc) versions_file = argv[++i], known = true;
+        if (!known && !std::strcmp(argv[i], "--geoip") && i + 1 < argc) geoip_file = argv[++i], known = true;
         if (known) continue;
         if (bad_value) break;
         if (!std::strcmp(argv[i], "--port") && i + 1 < argc) port = unsigned(std::atoi(argv[++i])), known = true;
         else if (!std::strcmp(argv[i], "--quiet")) quiet = true, known = true;
+        else if (!std::strcmp(argv[i], "--log-ips")) log_ips = true, known = true;
         else if (!std::strcmp(argv[i], "--bench")) lim.bench = true, known = true;
         for (const Flag& f : flags)
             if (!known && !std::strcmp(argv[i], f.name) && i + 1 < argc) {
@@ -152,7 +159,7 @@ int main(int argc, char** argv) {
             }
         if (!known) {
             std::fprintf(stderr,
-                         "usage: gt3r-relay [--port N] [--quiet] [--bench]\n"
+                         "usage: gt3r-relay [--port N] [--quiet] [--log-ips] [--geoip PATH] [--bench]\n"
                          "  link slots: [--relay-links 300] [--max-queue 100]\n"
                          "  guards:     [--channel-mbit 0.5] [--idle-channel-kbit 256] [--idle-mbit 20]\n"
                          "  limits:     [--max-sessions 4000] [--sessions-per-ip 8] [--max-channels 20000] [--max-pending 8192]\n"
@@ -160,7 +167,8 @@ int main(int argc, char** argv) {
                          "  socket:     [--buffers-kb 4096]\n"
                          "  versions:   [--latest x.y.z] [--min-online x.y.z] [--release-url URL] [--versions-file PATH]\n"
                          "              (URL may hold {asset}: .../releases/latest/download/{asset})\n"
-                         "  (values > 0; --bench lets loopback sources past the per-IP limits, for gt3r-relay-bench)\n");
+                         "  (values > 0; --log-ips logs players' IPs instead of daily tags; --bench lets loopback\n"
+                         "  sources past the per-IP limits, for gt3r-relay-bench)\n");
             return 2;
         }
     }
@@ -184,6 +192,15 @@ int main(int argc, char** argv) {
         srv.set_versions(v);
     }
     if (!quiet) srv.set_log(line);
+    srv.set_log_ips(log_ips);
+    gt3r::net::GeoIp geo;
+    auto load_geo = [&] {
+        if (geoip_file.empty()) return;
+        std::string geo_err;
+        if (geo.load(geoip_file, &geo_err)) line("geoip: " + std::to_string(geo.ranges()) + " ranges from " + geoip_file);
+        else line("geoip: " + geo_err + (geo.ranges() ? " (kept the previous list)" : " (countries show as \"\?\?\")"));
+    };
+    if (!geoip_file.empty()) srv.set_log_country([&geo](const gt3r::net::Address& a) { return geo.country(a); });
     std::string err;
     if (!srv.open(gt3r::u16(port), &err)) {
         std::fprintf(stderr, "gt3r-relay: %s\n", err.c_str());
@@ -200,12 +217,16 @@ int main(int argc, char** argv) {
                   lim.idle_bytes_per_s / kMbit, lim.max_sessions, lim.max_sessions_per_ip, lim.max_channels,
                   lim.ip_msgs_per_s, rcvbuf / 1024, lim.bench ? ", BENCH MODE (loopback skips per-IP limits)" : "");
     line(limits);
+    line(log_ips ? "logging players' IP addresses (--log-ips)"
+                 : "logging players as tags (a keyed hash of the IP, new key each UTC day), not IP addresses");
+    load_geo();
     line(describe(srv.versions()));
     double last_stats = gt3r::net::now_ms();
     while (!g_stop) {
         srv.step(50);
-        if (g_reload) { // SIGHUP: new versions; sessions, channels and reservations stay
+        if (g_reload) { // SIGHUP: new versions and country list; sessions, channels and reservations stay
             g_reload = 0;
+            load_geo();
             gt3r::net::RelayServer::Versions v = flag_versions;
             std::string note;
             if (load_versions(versions_file, v, note)) {

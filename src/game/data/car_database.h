@@ -10,8 +10,8 @@
 // u8 stage at +0x10 (0 = stock), and a u32 price in credits in the last
 // four bytes of the record.
 
+#include "disc/region.h"
 #include "formats/db/gt_db.h"
-#include "disc/disc.h"
 
 #include <array>
 #include <deque>
@@ -72,6 +72,19 @@ enum class TableId : int {
 
 const char* table_name(TableId t);
 
+// Whether a car is offered in the game's language, by its region byte (car +0xF7): 0 in every
+// language; 1 / 2 only / not in British English; 3 / 4 only / not in US English; 5 / 6 only /
+// not in the European languages (BR, FR, GR, IT, SP); 7 / 8 only / not in Japanese; larger
+// values in every language. The Opel / Vauxhall and S2000 / Viper twins use it.
+bool car_region_offered(u8 region_byte, Language lang);
+
+// The car record's name and its second string in a language (database.md "Car"): +0xF2 / +0xF4
+// in Japanese, +0x100 / +0x102 in British English, +0xE4 / +0xE6 in the other languages.
+struct CarNameFields {
+    size_t name = 0xE4, second = 0xE6;
+};
+CarNameFields car_name_fields(Language lang);
+
 // One record of any table, plus the ids resolved for convenience.
 struct RawRecord {
     u64 id = 0;
@@ -83,7 +96,7 @@ struct PartInfo {
     std::string label; // e.g. "tk_r34_gtr_v_99_c"
     std::string car;   // e.g. "r34_gtr_v_99"
     u8 stage = 0;      // 0 = stock, 1.. = sports/semi-racing/racing... (+0x10)
-    u32 price = 0;     // credits (last u32 of the record; +0x14 for tires)
+    u32 price = 0;     // last u32 of the record (+0x14 for tires), in the disc's money units (GtMode::part_price)
 };
 
 // Engine (table 6, 88 bytes). Physics confirmed by the spec builder in
@@ -177,13 +190,20 @@ struct TireCompound { std::string label; ByteSpan bytes; };
 // Car (table 30): default parts + catalogue data.
 struct Car {
     std::string label; // e.g. "r34_gtr_v_99"
-    std::string name;  // paramunistr, e.g. "Skyline GT-R V-spec (R34)"
+    // The names in the game's language (CarDatabase::language(), car_name_fields), as game
+    // text (paramunistr; Japanese names in kana), e.g. "SKYLINE GT-R V-spec(R34)"; and the
+    // second string (mostly blank).
+    std::string name;
     std::string name_alt;
+    // The names for text drawn without the game's fonts (the app's own screens, online car
+    // descriptors): the same as above in every language but Japanese, where they are the
+    // record's +0xE4 / +0xE6 names in Latin letters.
+    std::string latin_name, latin_name_alt;
     std::string maker; // e.g. "NISSAN"
     u16 maker_id = 0;
     u16 year = 0;
-    u32 price = 0; // credits
-    u16 flags = 0; // +0xF0 (non-zero for concept / not-for-sale cars; unconfirmed)
+    u32 price = 0; // +0xEC, in the disc's money units (the game shows x100 in Japanese: game::GtMode::car_price)
+    u8 flags = 0;  // +0xF0: bit 0 not for sale at the dealer, 1 cannot be sold / traded, 2 wheels cannot be changed
     std::array<u64, 27> parts{}; // default part ids at +0x08.., in record order (see kCarPartTables)
     ByteSpan bytes;
 };
@@ -218,11 +238,7 @@ struct Event {
     std::string race_mode;  // e.g. RACE_MODE_SINGLE (racemode.db labels)
     u8 laps = 0;            // +0x199 (the race's lap count; a machine test's type, race::MachineTest)
     u8 cars_in_race = 0;    // +0x1B5 (inferred)
-    // +0x1D0..+0x1DB raw u16s. [0] is always 0 and [1] looks like flags
-    // (0x500/0x600/0x700/0x809); [2..5] are the 1st..4th place prizes in
-    // units of 100 Cr on NTSC-U (e.g. Seattle 100 Miles 1500 = 150,000 Cr).
-    std::array<u16, 6> prize{};
-    u32 prize_credits(size_t place) const { return place < 4 ? u32(prize[2 + place]) * 100 : 0; }
+    // The prizes (+0x1D4) and the GT Mode rules: game::GtMode::rules().
     ByteSpan bytes;
 };
 
@@ -281,18 +297,22 @@ struct ModMaker {
     std::string mod, file;
 };
 
-// The whole database. `suffix` selects the regional set: "_us" (what
-// CORE.GT3 on PBPX-955.03 loads), "_eu" (PAL), or "" (Japanese); by default
-// the one of the open disc (Disc::current_db_suffix).
+// The whole database. `suffix` selects the regional set: "_us" (NTSC-U), "_eu" (PAL) or
+// "" (NTSC-J); by default the set of the disc's region (disc/region.h; through a reader:
+// the region file Vfs::kRegionFile, NTSC-U when the reader has none).
 class CarDatabase {
 public:
     using Reader = std::function<std::optional<Bytes>(const std::string&)>;
-    bool load(const Reader& read, const std::string& suffix = Disc::current_db_suffix());
-    bool load(const Vfs& vfs, const std::string& suffix = Disc::current_db_suffix());
-    bool load(const Volume& vol, const std::string& suffix = Disc::current_db_suffix());
+    bool load(const Reader& read, std::optional<std::string> suffix = std::nullopt);
+    bool load(const Vfs& vfs, std::optional<std::string> suffix = std::nullopt);
+    bool load(const Volume& vol, std::optional<std::string> suffix = std::nullopt);
     const std::string& error() const { return error_; }
-    // The region of the loaded set, as the game's region word: 0 JP (""), 1 US ("_us"), 2 EU ("_eu").
-    int region() const { return region_; }
+    // The player's message for a failed load: "This disc's car database isn't supported yet" when the database is there but
+    // laid out otherwise than GT3's (another game on the engine), else error().
+    std::string player_error() const { return unsupported_ ? "This disc's car database isn't supported yet" : error_; }
+    // The game's language (disc/region.h) through the reader's Vfs::kLanguageFile, else the
+    // set's own (JP for "", US for "_us", BR for "_eu"): the region byte filters compare its index.
+    Language language() const { return language_; }
 
     // Generic access.
     const db::Table& table(TableId t) const { return tables_[size_t(t)]; }
@@ -374,8 +394,9 @@ public:
     void add_mod_car_error(std::string e) { mod_car_errors_.push_back(std::move(e)); }
 
 private:
-    int region_ = 1;
+    Language language_ = Language::US;
     void decode();
+    void us_medal_times(const Reader& read); // a PAL disc: the US database's medal times
     PartInfo part_info(ByteSpan r, bool tire = false) const;
     std::string pu(ByteSpan r, size_t off) const { return unistr_.at(rd16(r, off)); }
     std::string ps(ByteSpan r, size_t off) const { return paramstr_.at(rd16(r, off)); }
@@ -397,6 +418,7 @@ private:
     std::vector<ModMaker> mod_makers_;
     std::vector<std::string> mod_car_errors_;
     std::string error_;
+    bool unsupported_ = false;
 };
 
 } // namespace gt3r::data

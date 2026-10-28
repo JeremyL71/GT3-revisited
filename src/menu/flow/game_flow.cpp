@@ -49,6 +49,18 @@ bool is_code_page(const std::string& p) {
 
 bool is_car_page(const std::string& p) { return p == "ar/select_car" || p == "ar/select_car_2p"; }
 
+// Ours: the Key Configuration page shows a "Controller Settings" button, in the middle of its
+// panel (bace_7: 64, 28, 512 x 324), in place of the original's DualShock 2 table: these
+// elements of the page (layer defaultLayer) and of its view on the top page (layer m5), the
+// action rows, their labels and the 1P / 2P headings, are not drawn.
+constexpr SDL_FRect kControllerSettingsBox{190, 177, 260, 26};
+bool key_config_hidden(const std::string& element) {
+    static const char* const kHidden[] = {"bace1_7", "bace2_7", "bace3_7", "bace4_7", "bace5_7", "item2_7",
+                                          "item3_7", "item4_7", "item5_7", "item6_7", "item7_7", "item8_7",
+                                          "item9_7", "item10_7", "p3",      "p4"};
+    return std::find(std::begin(kHidden), std::end(kHidden), element) != std::end(kHidden);
+}
+
 } // namespace
 
 // Menu BGM by page, as the page build picks it (prefix tests in this
@@ -187,10 +199,12 @@ void GameFlow::open_control(const std::string& set, const std::string& page, int
         const GtModeHooks& h = gt_mode_hooks();
         if (h.attach && !gt_attached_ && set == "gt_mode") {
             gt_attached_ = true;
-            h.attach(reader_);
+            h.attach(reader_, lang_);
         }
         ctl_->intercept = h.intercept;
         ctl_->enabled = h.enabled;
+        ctl_->listed = h.listed;
+        ctl_->initial_item = h.initial_item;
     } else if (set == "arcade") {
         // Arcade pages the game decides on (ar/goodies "Goal", ar/select_ending items).
         const GtModeHooks& h = gt_mode_hooks();
@@ -389,6 +403,12 @@ std::vector<std::string> GameFlow::take_log() { return std::exchange(log_, {}); 
 
 bool GameFlow::tap(float x, float y) {
     if (!ctl_ || switching() || waiting_game_ || ctl_->busy() || ctl_->ignoring_control()) return false;
+    if (control_ == "memorycard" && save_mode_ && !name_mode_ && !theater_mode_) { // the save page (code driven)
+        MenuKeys press = 0;
+        if (!save_page_.tap(ctl_->page(), x, y, press, sounds_)) return false;
+        injected_ |= press;
+        return true;
+    }
     if (SDL_FRect area; music_list_active() && music_list_area(area)) {
         const bool used = music_page_.tap(area, x, y, sounds_);
         if (std::optional<int> p = music_page_.take_preview()) preview_request_ = p;
@@ -400,6 +420,15 @@ bool GameFlow::tap(float x, float y) {
                 if (r == 2) injected_ = key_bit(MenuKey::Confirm);
                 return true;
             }
+    if (key_config_page()) {
+        // Our Controller Settings button: as Confirm (the page has no items).
+        const SDL_FRect& b = kControllerSettingsBox;
+        if (x >= b.x && x < b.x + b.w && y >= b.y - 6 && y < b.y + b.h + 6) {
+            injected_ = key_bit(MenuKey::Confirm);
+            return true;
+        }
+        return false;
+    }
     if (ctl_->tap(x, y)) return true;
     if (!carousel_.entries.empty() && ctl_->items().empty()) {
         if (int k = carousel_icon_at(x, y); k >= 0) {
@@ -415,6 +444,8 @@ bool GameFlow::tap(float x, float y) {
 
 bool GameFlow::hover(float x, float y) {
     if (!ctl_ || switching() || waiting_game_ || ctl_->busy() || ctl_->ignoring_control()) return false;
+    if (control_ == "memorycard" && save_mode_ && !name_mode_ && !theater_mode_)
+        return save_page_.hover(ctl_->page(), x, y, sounds_);
     if (SDL_FRect area; music_list_active() && music_list_area(area)) {
         const bool used = music_page_.hover(area, x, y, sounds_);
         if (std::optional<int> p = music_page_.take_preview()) preview_request_ = p;
@@ -724,6 +755,18 @@ void GameFlow::handle(const MenuEvent& e) {
         }
     } else if (control_ == "arcade") handle_arcade(e);
     else if (control_ == "option") handle_option(e);
+    else if (control_ == "language") handle_language(e);
+}
+
+// The language page: each item ("br", "fr", "it", "gr", "sp") sets its language; an unknown
+// one sets British English.
+void GameFlow::handle_language(const MenuEvent& e) {
+    if (e.kind != MenuEvent::Kind::Finish || e.action != "set_lang") return;
+    std::string code = e.item;
+    for (char& c : code) c = char(std::toupper(static_cast<unsigned char>(c)));
+    if (code != "BR" && code != "FR" && code != "GR" && code != "IT" && code != "SP") code = "BR";
+    language_choice_ = code;
+    exited_ = true;
 }
 
 void GameFlow::handle_gt(const MenuEvent& e) {
@@ -907,18 +950,22 @@ void GameFlow::option_draws(std::vector<ElementDraw>& out) const {
         if (!w.element || w.kind != ElementDraw::Kind::Element) return;
         const Element& e = *w.element;
         const std::string cls = e.widget_class ? *e.widget_class : e.name;
-        if (cls == "key_config_1_display") {
-            // The GT3 race layout (DUALSHOCK 2, 1P); the 2P column stays empty without a second pad.
-            static const std::pair<const char*, const char*> kKeys[] = {
-                {"steering_1", "ana_l_lr"}, {"acceleration_1", "batu"}, {"brake_1", "sikaku"},
-                {"back_1", "sankaku"},      {"side_brake_1", "maru"},   {"shift_up_1", "r2"},
-                {"shift_down_1", "l2"},     {"rear_view_1", "l1"},      {"change_view_1", "r1"}};
-            for (const auto& [slot, icon] : kKeys) {
-                const Element* s = find_element(hidden, slot);
-                const Element* ic = find_element(hidden, icon);
-                if (!s || !ic) continue;
-                put(w, ic, {s->x + (s->w - ic->w) * 0.5f, s->y + (s->h - ic->h) * 0.5f, ic->w, ic->h});
-            }
+        if (cls == "key_config_1" || cls == "key_config_1_display") {
+            // Ours, in place of the DualShock 2 table (key_config_hidden): the Controller Settings
+            // button (Confirm, or a tap), to our settings; on the top page, its view.
+            ElementDraw b;
+            b.kind = ElementDraw::Kind::Fill;
+            b.has_box = true;
+            b.box = kControllerSettingsBox;
+            b.dx = w.dx;
+            b.dy = w.dy;
+            // The colour of the layer's title bar (title1_7): orange on the page, grey in the view.
+            b.fill = cls == "key_config_1" ? SDL_FColor{0.82f, 0.16f, 0.0f, w.alpha}
+                                           : SDL_FColor{0.29f, 0.29f, 0.29f, w.alpha};
+            b.z = w.z + 0.005f; // under its text
+            add.push_back(b);
+            const std::string text = "Controller Settings";
+            put(w, find_element(hidden, "default_item"), kControllerSettingsBox, &text); // white, sw_12
         } else if (cls == "song_edit" || cls == "song_list") {
             // The music list (menus §10.1): the page's own list, or the top page's view of it.
             const MusicListPage& list = cls == "song_edit" && music_page_.is_open() ? music_page_ : music_view_;
@@ -1050,6 +1097,16 @@ void GameFlow::handle_option(const MenuEvent& e) {
         }
     } else if (e.kind == K::Action && e.action != "commit") log("option action: " + e.action);
     else if (e.kind == K::Finish) open_control("option", e.page, e.child);
+    else if (e.kind == K::Confirm && e.page == "key/key") {
+        // The page has no items: Confirm is our Controller Settings button.
+        sounds_.push_back("ok");
+        controller_settings_ = true;
+    }
+}
+
+bool GameFlow::key_config_page() const {
+    return control_ == "option" && ctl_ && ctl_->has_page() && ctl_->depth() == 0 && ctl_->page_name() == "key/key" &&
+           !ctl_->busy();
 }
 
 void GameFlow::handle_arcade(const MenuEvent& e) {
@@ -1549,6 +1606,18 @@ std::vector<ElementDraw> GameFlow::draw_list_impl() const {
         }
     }
     if (control_ == "option") option_draws(out);
+    if (control_ == "option" && ctl_->page()) {
+        // Key Configuration (the page, or its view on the top page): our button only.
+        const bool key_page = ctl_->page_name() == "key/key";
+        const Layer* l = find_layer(ctl_->page().layout(), key_page ? "defaultLayer" : "m5");
+        if (l && !l->elements.empty())
+            out.erase(std::remove_if(out.begin(), out.end(),
+                                     [&](const ElementDraw& d) {
+                                         return d.element && d.element >= &l->elements.front() &&
+                                                d.element <= &l->elements.back() && key_config_hidden(d.element->name);
+                                     }),
+                      out.end());
+    }
     if (control_ == "option")
         // Option previews: only the art of the current values.
         out.erase(std::remove_if(out.begin(), out.end(),
@@ -1780,7 +1849,7 @@ std::vector<ElementDraw> GameFlow::draw_list_impl() const {
                 d.z = slot->z;
                 out.push_back(d);
             }
-        // Car page: the three CircleGauges (riding on the cross with the car's art): a ring
+        // Car page: the three circle gauges (riding on the cross with the car's art): a ring
         // 22..238 degrees in the background colour and the value arc from 230 degrees
         // clockwise, orange up to 80 % and red beyond; each new car sweeps to full (+0.04
         // per frame) and settles back (-0.02 per frame).
@@ -1879,7 +1948,7 @@ std::vector<ElementDraw> GameFlow::draw_list_impl() const {
             }
             put(find_element(hidden, "color_selection"), dx, alpha);
         }
-        // Car pages: the spec ticker (TransitiveEX on "flow_spec"): a new line every second
+        // Car pages: the spec ticker (ticker on "flow_spec"): a new line every second
         // at the element's place, fading in 0.5 s, held 3 s, fading out 0.5 s, drifting up
         // 40 px/s; label above value.
         if ((c.page == "ar/select_car" || c.page == "ar/select_compulsory") && h.arcade_specs)

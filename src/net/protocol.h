@@ -10,12 +10,13 @@
 #include "base/bytes.h"
 #include "sim/sim_types.h"
 
+#include <array>
 #include <string>
 #include <vector>
 
 namespace gt3r::net {
 
-constexpr u16 kProtocolVersion = 3;
+constexpr u16 kProtocolVersion = 4; // 4: races on the exact core (exact car states, pad frames)
 constexpr int kMaxPlayers = 6; // as the original's i.LINK battle
 constexpr size_t kMaxDatagram = 1200;
 
@@ -24,7 +25,8 @@ enum class Msg : u8 {
     Welcome = 2,  // H->C  u8 your id
     Reject = 3,   // H->C  str reason
     Roster = 4,   // H->*  u8 n, {u8 id, str name, str car, u8 paint, u8 flags (1 ready, 2 loaded), u16 ping ms}
-    Settings = 5, // H->*  str course, u8 laps
+    Settings = 5, // H->*  str course, u8 laps, u8 mods, u16 ghost ms, u8 stock only, u16 max PS,
+                  //       u8 class, u8 category, u8 drive, u8 aspiration (net::Settings)
     Car = 6,      // C->H  str car, u8 paint, u8 ready
     Load = 7,     // H->*  str course, u8 laps, u8 n, {u8 id} grid order (pole first)
     Loaded = 8,   // C->H  (the race scene is ready)
@@ -78,33 +80,64 @@ private:
     bool ok_ = true;
 };
 
-// A driver's inputs for one tick, quantised (steer -1..1 in 1/127, pedals in 1/255).
-struct InputFrame {
-    s8 steer = 0;
-    u8 throttle = 0, brake = 0;
-    u8 flags = 0; // 1 handbrake, 2 shift up, 4 shift down, 8 automatic, 16 reverse request, bits 5-6 controller kind
-    bool operator==(const InputFrame&) const = default;
+// A driver's frame for one step as the exact core reads it (sim::exact::PadFrame: the pad read's output), bit for bit.
+struct PadInput {
+    u8 flags = 0;      // analog axes: bit 0 steer, 1 throttle, 2 brake, 3 back, 4 third (bits 0-4 only)
+    u8 kind = 0;       // controller kind (0..15)
+    s8 shift = 0;      // -1, 0, +1
+    s16 steer = 0;     // +-4096 full lock, left positive
+    u16 throttle = 0, brake = 0, back = 0, third = 0;
+    bool operator==(const PadInput&) const = default;
 };
-constexpr int kInputHistory = 6; // inputs of the last ticks in every state (a lost datagram costs none)
+constexpr int kInputHistory = 3; // frames of the last steps in every state (a lost datagram costs none)
 
-// One car's state at the end of a tick, as its owner simulated it. On the wire it is
-// quantised to ~100 bytes (docs/dev/ONLINE.md "State"): position in mm, orientation as
-// "smallest three", velocities in cm/s and mrad/s, wheels in a few bits each. Wheel
-// contact points, loads, speed, the CoG (body_x/z) and race_time are not sent: the
-// receiver derives them from the car's setup and the tick (race::complete_snapshot).
+// What a car's record holds of its motion, as its owner's machine sends it after each step (docs/dev/ONLINE.md "State"):
+// the receiver poses the car in its own race and syncs its prediction from it (race::sync_motion). The physics frame of
+// sim::exact (Z up); `pos` .. `axle_speed` are the record's single floats bit for bit, the rest in fixed units.
+struct CarMotion {
+    std::array<u32, 3> pos{}, vel{};      // F +0x00 CoG, F +0x44C velocity
+    u32 heading = 0, pitch = 0, roll = 0; // F +0x470 / +0x468 / +0x46C
+    u32 yaw_rate = 0;                     // F +0x47C
+    u32 omega = 0;                        // F +0x448 engine speed (rad/s)
+    u32 steer_cmd = 0;                    // F +0x41C the steering command (rad)
+    std::array<u32, 2> axle_speed{};      // F +0x458 (rad/s)
+    s16 pitch_rate = 0, roll_rate = 0;    // F +0x480 / +0x484, 1/1024 rad/s
+    std::array<s16, 4> rim_speed{};       // wheel +0x20, 1/128 m/s
+    std::array<s16, 4> susp{};            // wheel +0x18 the suspension coordinate, 1/65536 m
+    u8 gear = 0, clutch = 0;              // F +0x436 / +0x437
+    bool operator==(const CarMotion&) const = default;
+};
+
+// The owner's race entry as far as its car's physics read it (the race entry's + 0x20E4 .. + 0x20F4; the pedal style can
+// change during the race).
+struct CarEntry {
+    u8 pedal_style = 0; // 0..7: 0 the automatic gearbox, 1 the manual one (a pad), ...
+    u8 wheel_type = 0;  // 0..7: the steering-wheel type
+    bool asm_on = true, tcs_on = true;
+    u8 control = 0;     // 0..3: the car's control source (F +0x3E9: 0 its pad, 1 the AI with the pad decoded, 2 the AI)
+    u8 driver_kind = 0; // 0..15: F +0x534 (1 the AI drives it on, after its finish)
+    bool operator==(const CarEntry&) const = default;
+};
+
+// One car's state at the end of a step, as its owner ran it on the exact core: 90 to 125 bytes on the wire. What the
+// receiver needs besides (the course-frame position and velocity the checks read) it derives (race::complete_snapshot).
 struct CarSnapshot {
     u8 player = 0;
-    u32 tick = 0;          // owner's race tick (sequence; newer replaces older)
-    float race_time = 0;   // owner's race clock after the tick (s; < 0 in the countdown) [derived]
-    sim::VehicleState state;
-    // Collision pose (sim::collide::Body: CoG x/z [derived], heading, yaw rate).
-    float body_x = 0, body_z = 0, heading = 0, yaw_rate = 0;
-    float brake = 0;       // lamps (the brake pedal: inputs[0])
+    u32 tick = 0;          // the owner's race step (sequence; newer replaces older)
+    s32 clock = 0;         // the owner's race time after the step in 1/3000 s (the race clock; negative in the countdown)
+    CarMotion motion;
+    CarEntry entry;
     u8 laps = 0;           // laps completed
+    bool rev_limiter = false;
     bool respawned = false; // the owner put the car back on the track lately (a jump is no teleport)
-    // inputs[0] = this tick's, [1] the tick before, ... (input_count valid).
-    InputFrame inputs[kInputHistory];
+    // inputs[0] = this step's frame, [1] the step before, ... (input_count valid).
+    PadInput inputs[kInputHistory];
     u8 input_count = 0;
+    // Derived by the receiver (race::complete_snapshot), not sent.
+    float race_time = 0;     // clock / 3000 (s)
+    sim::VehicleState state; // the CoG and the velocity in the course frame, the heading's rotation, the speed
+    float body_x = 0, body_z = 0, heading = 0, yaw_rate = 0; // the collision body (course frame)
+    float brake = 0;         // the brake axis, 0..1 (lamps)
 };
 
 // Plausibility checks a player's machine reports about another player's car (the host sees them).
@@ -116,12 +149,6 @@ enum class FlagKind : u8 {
     Motion = 5,     // moves unlike its own car under its own inputs (value: metres)
 };
 const char* flag_text(FlagKind k);
-
-// Quantisation helpers (exposed for tests).
-u32 pack_quat(const sim::Quat& q);   // smallest three, 10 bits each
-sim::Quat unpack_quat(u32 v);
-InputFrame pack_input(const sim::ControlInputs& in, bool reverse = false);
-sim::ControlInputs unpack_input(const InputFrame& f);
 
 void write_snapshot(Writer& w, const CarSnapshot& s);
 bool read_snapshot(Reader& r, CarSnapshot& s);

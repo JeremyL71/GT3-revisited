@@ -4,6 +4,7 @@
 // (Race screen code map: docs/dev/RACE.md.)
 
 #include "app/screen_race_impl.h"
+#include "game/language_rules.h"
 
 namespace gt3r::race_screen {
 
@@ -31,7 +32,6 @@ DebugPreset read_preset() {
         else if (k == "quit") p.quit = std::atof(v.c_str());
         else if (k == "leave") p.leave = std::atof(v.c_str());
         else if (k == "demo_drive") p.demo_drive = v != "0";
-        else if (k == "lic_finish") p.lic_finish = std::atof(v.c_str());
         else if (k == "paint") p.paint = std::atoi(v.c_str());
         else if (k == "hud") p.hud = v != "0";
         else if (k == "perf") p.perf = v != "0";
@@ -62,7 +62,6 @@ DebugPreset read_preset() {
         else if (k == "ritems") p.ritems = std::atoi(v.c_str());
         else if (k == "rcam") p.rcam = std::atoi(v.c_str());
         else if (k == "lcursor") p.lcursor = float(std::atof(v.c_str()));
-        else if (k == "pit") p.pit = v != "0";
         else if (k == "demo") p.demo = v != "0";
         else if (k == "prize") p.prize = std::atoi(v.c_str());
         else if (k == "script") p.script = v;
@@ -70,35 +69,27 @@ DebugPreset read_preset() {
         else if (k == "oyaw") p.oyaw = float(std::atof(v.c_str()));
         else if (k == "opitch") p.opitch = float(std::atof(v.c_str()));
         else if (k == "odist") p.odist = float(std::atof(v.c_str()));
-        else if (k == "at") p.at = float(std::atof(v.c_str()));
-        else if (k == "turn") p.turn = float(std::atof(v.c_str()));
-        else if (k == "atkmh") p.at_kmh = float(std::atof(v.c_str()));
     }
     return p;
 }
 
-std::string course_path(const Vfs& vfs, const std::string& label) {
-    for (const char* region : {"US", "JP", "UK", "EU"}) {
-        std::string p = std::string("courses/") + region + "/" + label;
-        if (vfs.exists(p)) return p;
-    }
-    return {};
-}
+std::string course_path(const Vfs& vfs, const std::string& label) { return course_file_path(vfs, label); }
 
-// Online: our car from its descriptor (a garage car runs with its parts and settings).
+// Online: our car from its descriptor (a garage car runs with its parts and settings, an
+// arcade car with its own parts and arcade tyres for the course).
 void RaceScreen::resolve_online() {
     std::optional<game::OnlineCar> oc = game::decode_online_car(net_.car_info);
     if (!oc) return;
     preset_.car = oc->car;
     preset_.paint = oc->paint;
-    if (oc->kind != game::OnlineCar::Kind::Garage) return;
-    std::string err;
-    if (std::optional<sim::CarSpec> spec = game::online_car_spec(db_, *oc, &err)) {
-        launch_spec_ = std::make_shared<const sim::CarSpec>(std::move(*spec));
+    // The exact core's car: its parts and settings, its arcade tyres, its engine condition.
+    launch_source_ = exact_online_source(db_, *oc, preset_.course, &run_condition_);
+    start_condition_ = run_condition_;
+    using K = game::OnlineCar::Kind;
+    if (oc->kind == K::Arcade) LOG_INFO("Online: arcade car %s, tyre stage %d", oc->arcade.c_str(), launch_source_->tire_stage);
+    if (oc->kind == K::Garage) { // its bought wheels and gearbox (the model, the gearbox whine)
         launch_.request.car_wheel = oc->wheel;
         launch_.request.racing_gearbox = game::online_car_racing_gearbox(db_, *oc);
-    } else {
-        LOG_WARN("Online: garage car %s: %s", oc->car.c_str(), err.c_str());
     }
 }
 
@@ -125,8 +116,12 @@ void RaceScreen::resolve_launch() {
         }
         return {};
     };
+    // A licence test's car and colour in the game's language (gt_mode §21, docs/dev/GT_MODE.md "Language"): entry 0, or
+    // entry 1.
+    const game::LicenseCar license = ev ? game::license_car(db_, *ev, db_.language()) : game::LicenseCar{};
+    const bool license_mode = rq.mode == "go_license";
     std::string car = base_car(launch_.request.car);
-    if (car.empty() && ev && !ev->entries.empty()) car = base_car(ev->entries[0]);
+    if (car.empty() && ev && !ev->entries.empty()) car = base_car(license_mode ? license.entry : ev->entries[0]);
     if (car.empty()) car = "r34_gtr_v_99";
     preset_.course = course;
     preset_.car = car;
@@ -147,12 +142,14 @@ void RaceScreen::resolve_launch() {
     if (ev && (rq.mode == "time_trial" || rq.mode == "go_license" || rq.mode == "go_machine_test"))
         tt_start_ = event_start(*ev);
     if (ev && rq.mode == "go_license") license_event_ = code;
+    // The solo modes' event on the exact core (its configuration, start and judging times).
+    if (ev && (rq.mode == "time_trial" || rq.mode == "go_license" || rq.mode == "go_machine_test" || rq.mode == "free_run" ||
+               rq.mode == "go_free_run"))
+        solo_event_ = code;
     // Licence tests drive the event's entry 0 in the event's slot-0 colour (+0x110, a carcolor id;
-    // 0xFFFFFFFF = none), not a garage paint.
+    // 0xFFFFFFFF = none), not a garage paint (or entry 1 and its colour, game::license_car).
     // (Quick race practice with a car of the player's choice: that car's own paint.)
-    event_paint_id_ = ev && rq.mode == "go_license" && (!rq.practice || rq.car.empty()) && ev->bytes.size() >= 0x114
-                          ? rd32(ev->bytes, 0x110)
-                          : 0xFFFFFFFFu;
+    event_paint_id_ = ev && license_mode && (!rq.practice || rq.car.empty()) ? license.color : 0xFFFFFFFFu;
     // Title-screen attract demo: the event's cars all driven by the computer, TV cameras,
     // no HUD; any button ends it.
     std::string attract_slot0;
@@ -189,48 +186,45 @@ void RaceScreen::resolve_launch() {
     live_condition_ = false;
     car_dirt_ = 0;
     dirt_dims_ = true;
-    if (rq.car_spec)
+    if (rq.car_parts)
         if (game::GtModeSession* gs = game::gt_mode_session())
             if (const game::GarageCar* gc = gs->gt().state().ride_car()) car_dirt_ = gc->cond.dirt;
-    if (rq.car_spec) launch_spec_ = rq.car_spec;
+    if (rq.car_parts) launch_source_ = ExactCarSource{rq.car, rq.car_parts, rq.car_settings};
     // Licence / machine tests: the event's entry-0 car is a variant with its own parts
     // (Quick race practice: only when no other car was chosen).
     else if (ev && !ev->entries.empty() &&
              (rq.mode == "go_license" || rq.mode == "go_machine_test" || !theater_demo_.empty()) &&
-             (!rq.practice || rq.car.empty()))
+             (!rq.practice || rq.car.empty())) {
         // (also the theater's time-trial demonstrations: the event's car with its parts)
-        if (std::optional<sim::CarSpec> vs = sim::build_car_spec(db_, ev->entries[0]))
-            launch_spec_ = std::make_shared<const sim::CarSpec>(std::move(*vs));
+        const std::string& e0 = license_mode ? license.entry : ev->entries[0];
+        launch_source_ = ExactCarSource{e0};
+    }
     // The attract demo's slot 0: the drawn entry with its parts.
-    if (!attract_slot0.empty())
-        if (std::optional<sim::CarSpec> vs = sim::build_car_spec(db_, attract_slot0))
-            launch_spec_ = std::make_shared<const sim::CarSpec>(std::move(*vs));
+    if (!attract_slot0.empty()) launch_source_ = ExactCarSource{attract_slot0};
     // The theater's demonstrations: the car the run was recorded with (the demo's car record,
     // parts and settings): the arcade time trials' dirt tyres (stage 12) differ from the
     // event car's.
     if (!theater_demo_.empty())
-        if (std::optional<Bytes> b = app_->vfs()->read("demo/" + theater_demo_))
+        if (std::optional<Bytes> b = app_->vfs()->read(game::demo_replay_path(
+                theater_demo_, app_->vfs()->language(), [&](const std::string& p) { return app_->vfs()->exists(p); })))
             if (std::optional<DemoReplay> d = DemoReplay::parse(*b); d && !d->car_record.empty()) {
                 std::string dc;
                 std::array<u64, 27> parts{};
                 sim::CarSettings st;
                 int ref_final = 0;
                 game::decode_car_equipments(d->car_record, db_, dc, parts, st, ref_final);
-                std::string err;
-                if (!dc.empty())
-                    if (std::optional<sim::CarSpec> ds = sim::build_car_spec(db_, dc, parts, st, &err))
-                        launch_spec_ = std::make_shared<const sim::CarSpec>(std::move(*ds));
+                if (!dc.empty()) launch_source_ = ExactCarSource{dc, parts, st};
             }
     // Arcade cars (table 35 variants) run with their own parts; the tyres follow the car page's
     // RACING / DRIFT choice: GT3 switches both to the car's stage-10 (racing, "_k") or stage-11
     // (drift, "_l") records; dirt courses force stage 12 ("_m"), the wet Route 5 stage + 13.
-    if (!rq.car_spec && theater_demo_.empty()) {
+    if (!rq.car_parts && theater_demo_.empty()) {
         int tire_mode = 0;
         if constexpr (requires { rq.tire_mode; }) tire_mode = std::max(0, rq.tire_mode);
         std::string err;
         if (std::optional<ArcadeCar> ac = arcade_car(db_, launch_.request.car, tire_mode, preset_.course, &err)) {
-            launch_spec_ = std::make_shared<const sim::CarSpec>(std::move(ac->spec));
             launch_tire_stage_ = ac->stage;
+            launch_source_ = ExactCarSource{ac->label, std::nullopt, std::nullopt, ac->stage};
             LOG_INFO("Race: arcade car %s, tyres stage %d (%s)", ac->label.c_str(), ac->stage,
                      tire_mode == 1 ? "drift" : "racing");
         }
@@ -252,18 +246,17 @@ void RaceScreen::resolve_launch() {
         two_player_ = true;
         if (db_.event(code)) race_event_ = code; // A2P0001: laps
         // Player 2's car page: car, paint, AT/MT and RACING/DRIFT (own pad).
-        launch_spec2_.reset();
         car2_paint_ = -1, manual2_ = -1;
         if constexpr (requires { rq.car2; }) {
             if (!rq.car2.empty()) {
                 std::string c2 = base_car(rq.car2);
                 if (!c2.empty()) preset_.car2 = c2;
                 std::string err2;
-                if (rq.car2_spec) { // a garage car: its fitted parts and settings
-                    launch_spec2_ = rq.car2_spec;
+                if (rq.car2_parts) { // a garage car: its fitted parts and settings
+                    launch_source2_ = ExactCarSource{rq.car2, rq.car2_parts, rq.car2_settings};
                     LOG_INFO("Race: player 2 garage car %s", rq.car2.c_str());
                 } else if (std::optional<ArcadeCar> ac = arcade_car(db_, rq.car2, std::max(0, rq.tire_mode2), course, &err2)) {
-                    launch_spec2_ = std::make_shared<const sim::CarSpec>(std::move(ac->spec));
+                    launch_source2_ = ExactCarSource{ac->label, std::nullopt, std::nullopt, ac->stage};
                     LOG_INFO("Race: player 2 arcade car %s, tyres stage %d", ac->label.c_str(), ac->stage);
                 }
             }

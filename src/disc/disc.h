@@ -1,10 +1,14 @@
 #pragma once
 
 #include "disc/iso9660.h"
+#include "disc/region.h"
 #include "disc/volume.h"
 
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace gt3r {
 
@@ -16,11 +20,15 @@ struct DiscInfo {
     std::string video;    // SYSTEM.CNF VMODE
     std::string volume_id;
     bool verified = false; // serial is in the tested list
-    // The regional data set the program loads (database/paramdb<suffix>.db,
-    // gameconf/product<suffix>.gcf): "_us" (NTSC-U), "_eu" (PAL), "" (NTSC-J).
-    std::string db_suffix = "_us";
+    bool reported = false; // in the list as reported working by players
     std::string description;
+    Region region = Region::America; // the release's data set (disc/region.h)
+    std::string problem; // a problem with the image for the player (incomplete_image), empty when none
 };
+
+// The player's message for an image shorter than its volume says (a dump that stopped early), none when it is whole:
+// "This disc image is incomplete (2.47 of 3.67 GB). Make the image again from your disc."
+std::string incomplete_image(u64 file_bytes, u64 volume_bytes);
 
 // A user-supplied Gran Turismo 3 disc image. Owns the open file and the
 // parsed GT3.VOL archive.
@@ -33,13 +41,15 @@ public:
     Iso9660& iso() { return *iso_; }
     Volume& volume() { return *volume_; }
     Bytes read_core_gt3();
-    // The db_suffix of the disc opened last ("_us" before any).
-    static const std::string& current_db_suffix();
+    // The image's file systems (a dual-layer image: one per layer), and a file in the first that has it.
+    std::vector<Iso9660*> file_systems() const;
+    std::optional<std::pair<Iso9660*, Iso9660::Entry>> find_file(const std::string& path) const;
 
 private:
     Disc() = default;
     std::unique_ptr<File> file_;
-    std::unique_ptr<Iso9660> iso_;
+    std::unique_ptr<Iso9660> iso_;                   // the first layer's file system
+    std::vector<std::unique_ptr<Iso9660>> layers_;  // every layer's but the first
     std::unique_ptr<Volume> volume_;
     DiscInfo info_;
 };

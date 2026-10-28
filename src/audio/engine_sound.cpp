@@ -63,9 +63,9 @@ bool EngineSound::load(Vfs& vfs, int sound_id, int variant, std::string* error) 
     std::shared_ptr<const sound::EngineBank> banks[2];
     std::string paths[2] = {std::string("sound/engine/") + id, "sound/" + variant_dir(variant) + "/" + id};
     for (int i = 0; i < 2; ++i) {
-        auto bytes = vfs.read(paths[i]);
-        if (!bytes) continue; // a car may lack one bank (e.g. engine-only ids)
-        try {
+        try { // (an unreadable file is an error, as a bad one is)
+            auto bytes = vfs.read(paths[i]);
+            if (!bytes) continue; // a car may lack one bank (e.g. engine-only ids)
             banks[i] = std::make_shared<const sound::EngineBank>(sound::EngineBank::parse(*bytes));
         } catch (const std::exception& e) {
             if (error) *error = paths[i] + ": " + e.what();

@@ -68,7 +68,7 @@ titles stored in `bgm/ads.inf`):
 | 0x12 | `kStartLong` | `str01a` "jg11" | standing start with the long hold (start type 2), §2.2 |
 | 0x13 | `kFinish` | `str02a` "jg12" | the finish jingle, §3.1 |
 | 0x14 | `kRace` | `race_a01` .. `race_a25` | the race songs, §2.3; their intros in the Options music list, §4.4 |
-| 0x15 | `kQuickMenu` | `str10a` "shortmenu-2" | pre-race, time trial, licence and machine test quick menus, §3.3 |
+| 0x15 | `kQuickMenu` | `str10a` "shortmenu-2" | pre-race, time trial, license and machine test quick menus, §3.3 |
 | 0x16 | `kResult` | `str05a` "result" | race result quick menus, §3.3 |
 | 0x17 | `kMiniPrize` | `str14a` "jg05" | arcade trophy, GT-mode trophy and consolation prize pages, §4.2 |
 | 0x18 | `kTrophy` | `str12a` "champ-3" | championship trophy presentation, §4.2 |
@@ -76,11 +76,11 @@ titles stored in `bgm/ads.inf`):
 | 0x1A | `kReplayTheater` | `str91a` "Are You Gonna Go My Way" (GT remix) | the Replay Theater page, §4.1 |
 | 0x1B | `kStartShort` | `str03a` "jg04e" | standing start with the short hold (start type 1), §2.2 |
 | 0x1C | `kJg01` | `str04a` "jg01" | no caller known |
-| 0x1D | `kLicenseGold` | `str06a` "jg06" | licence gold medal, §3.2 |
-| 0x1E | `kLicenseSilver` | `str07a` "jg05" | licence silver medal, §3.2 |
-| 0x1F | `kLicenseBronze` | `str08a` "bronze" | licence bronze medal, §3.2 |
-| 0x20 | `kFail` | `str09a` "fail" | licence failed, time trial voided, §3.1 |
-| 0x21 | `kLicenseGet` | `str11a` "champ-2" | licence card presentation, §4.2 |
+| 0x1D | `kLicenseGold` | `str06a` "jg06" | license gold medal, §3.2 |
+| 0x1E | `kLicenseSilver` | `str07a` "jg05" | license silver medal, §3.2 |
+| 0x1F | `kLicenseBronze` | `str08a` "bronze" | license bronze medal, §3.2 |
+| 0x20 | `kFail` | `str09a` "fail" | license failed, time trial voided, §3.1 |
+| 0x21 | `kLicenseGet` | `str11a` "champ-2" | license card presentation, §4.2 |
 | 0x22 | `kDemo` | `demo_a01` | the attract-mode race, §2.3 |
 
 `gt3tool bgm` lists the groups' files, titles and artists from the disc.
@@ -155,13 +155,13 @@ what the test `sound_race_music_cues` exercises.
 | menu music on | the race's music switch and the options' **Menu BGM**: the quick menus' music (§3.3) |
 | replay | a replay of the run: race songs at the replay level (§6) |
 | songs | the race playlist has a song in the list (§2.3) |
-| kind | Race (one-player races and solo runs), TwoPlayer (2P battle), License (a licence test), LicenseReplay (a licence run replayed, or the disc's licence demo), Demo (attract mode and demo races) |
+| kind | Race (one-player races and solo runs), TwoPlayer (2P battle), License (a license test), LicenseReplay (a license run replayed, or the disc's license demo), Demo (attract mode and demo races) |
 | paused | the pause window is open |
 | start type | the event's start type for races; the time trial's start type otherwise |
 | holding | the run is before its start signal: a standing start's hold (race time below zero, or the time-trial hold), a rolling start's 300 frames of computer driving, a flying start's run-up to the line (not Demo); replays re-run it (§2.5) |
 | finished | the player (or, in 2P, either player) has finished; in a replay of a one-player race, the car the cameras follow (§2.5) |
-| failed | licence FAIL, a licence time slower than bronze, or a voided time trial |
-| medal | the licence medal shown, 0 gold, 1 silver, 2 bronze, none |
+| failed | a license run without a medal (FAIL or a time slower than bronze; in a replay, the live run's; in a demo, its judged result), or a voided time trial |
+| medal | the license medal shown, 0 gold, 1 silver, 2 bronze, none |
 | since finish | seconds since the finish |
 | menu | the quick menu on screen: none, Short or Result (§3.3) |
 
@@ -198,18 +198,18 @@ plays a start jingle once (not looping):
 
 No start jingle plays in Demo runs. If the jingle ends before the signal,
 the remaining hold is silent. At the **start signal** the jingle is replaced:
-in races the first race song starts at once; in licence tests (and licence
-replays) the music simply stops, because licence tests have no race music.
+in races the first race song starts at once; in license tests (and license
+replays) the music simply stops, because license tests have no race music.
 It also stops when the race playlist has no song in the list (§2.3).
 
 **Rolling and flying starts** have no jingle; their run-up holds the music
 like a standing start's hold, in silence. A rolling start's signal is the
 hand-over, after the computer has driven the player's car for 300 frames
 (5 s): the first race song starts there. A flying start's signal (time
-trials, flying licence tests, free runs) is the start-line crossing that ends
+trials, flying license tests, free runs) is the start-line crossing that ends
 the computer's run-up, where `count_s` sounds and START shows
 (`RaceScreen::flying_start_signal`): in time trials and free runs the first
-race song starts there; a licence test stays silent. In Demo runs a flying
+race song starts there; a license test stays silent. In Demo runs a flying
 start holds nothing.
 
 **After a quick menu.** A run entered through a quick menu (the pre-race
@@ -233,7 +233,7 @@ and 0.7 in a replay (§6). When a song ends the next one starts the following
 frame, for as long as the race goes on. This applies to Race and TwoPlayer
 runs and their replays.
 
-- Licence tests and licence replays have no race songs.
+- License tests and license replays have no race songs.
 - Demo (attract) runs play the demo track (0x22) once and then stay silent.
 - With no song in the list there are no race songs; the jingles still play.
 
@@ -277,13 +277,13 @@ leaving a race from the pause menu does not leave the next music silent.
 
 ### §2.5 The replay after a run
 
-Every run except a licence test and the free practice before a GT race is
+Every run except a license test and the free practice before a GT race is
 followed by its replay, which plays by itself, whether the run finished,
 failed or was left with the pause menu's EXIT (after the prize page, arcade
 win cup or name entry, if any; their music is §4.2's). Its music:
 
 - **The race-exit transition** that ends the live run (its last frame held,
-  then the grey wash) does not update the music: whatever was sounding (a race
+  then the gray wash) does not update the music: whatever was sounding (a race
   song, the finish jingle) goes on, and after a pause EXIT it stays paused.
 - **The replay re-runs the start sequence.** When it starts, the run's music
   is stopped and its jingle state cleared (`RaceScreen::start_auto_replay`).
@@ -292,7 +292,7 @@ win cup or name entry, if any; their music is §4.2's). Its music:
   start's hold plays the start type's jingle (§2.2); at the replayed start
   signal (the end of the hold, a rolling start's hand-over, a flying start's
   line crossing) the playlist's next song (§2.3) starts, at the replay level
-  0.7 (§6), and songs follow one another as in a live run. A licence run's
+  0.7 (§6), and songs follow one another as in a live run. A license run's
   replay stops the music at the signal, as the live test does.
 - **The finish.** A one-player race's replay re-runs the field, and "jg12"
   (§3.1) plays when the car the cameras follow finishes (`race::FinishCue`):
@@ -309,7 +309,7 @@ win cup or name entry, if any; their music is §4.2's). Its music:
 
 The quick menu's REPLAY item plays the same way, except that closing the menu
 stops its music (§3.3) before the replay's start sequence. After a
-licence run left with EXIT, or after a DEMONSTRATION, REPLAY is disabled
+license run left with EXIT, or after a DEMONSTRATION, REPLAY is disabled
 until the next run and plays nothing.
 
 ## §3 The finish, results and quick menus
@@ -320,12 +320,12 @@ On the frame the run becomes finished:
 
 | Situation | Music |
 |---|---|
-| failed (licence fail or slower than bronze, voided time trial) | 0x20 "fail", once |
-| licence test passed | silence; the medal jingle follows (§3.2) |
+| failed (a license run without a medal, live, replayed or demonstrated; a voided time trial) | 0x20 "fail", once |
+| license test passed with a medal | silence; the medal jingle follows (§3.2) |
 | any race or solo run, whatever the place | 0x13 "jg12", once |
 | 2P battle | "jg12" when the first player finishes (the engine treats the first finisher as the winner) |
 | a one-player race's replay | "jg12" when the car the cameras follow finishes (§2.5) |
-| licence replay / licence demo | "jg12" at the replayed run's end, no medal jingle |
+| license replay / license demo of a run with a medal | "jg12" at the replayed run's end, no medal jingle |
 | Demo | nothing |
 
 The jingle replaces whatever was playing (the race song stops). After it,
@@ -334,13 +334,15 @@ the music stays silent until the next piece starts (a presentation's,
 If the run is restarted (finished goes back to false), the jingle state
 clears and the race songs resume after the next start.
 
-For a licence replay, "finished" is the moment the replay reaches the live
-run's end time (or the demo's judge ends the run), and "failed" is the live
-run's result.
+For a license replay, "finished" is the moment the replay reaches the live
+run's end time (or the demo's judge ends the run). "Failed" is what the live
+run played; for a demo, its own judged result: no medal (slower than bronze or
+out of the course) plays "fail", a medal "jg12" (`race::license_fail_jingle`,
+test `sound_race_licence_jingles`).
 
-### §3.2 Licence medal jingles
+### §3.2 License medal jingles
 
-After a licence pass, once the medal is known and **37 frames (37/60 s)**
+After a license pass, once the medal is known and **37 frames (37/60 s)**
 have passed since the finish (the end of the result screen's dimming), the
 engine plays the medal's jingle once: gold 0x1D, silver 0x1E, bronze 0x1F.
 It plays one per finish.
@@ -353,7 +355,7 @@ menu level 0.8, §6):
 | Quick menu | Music |
 |---|---|
 | race results (races and 2P battles that have a result) | 0x16 "result" |
-| everything else: the pre-race menu, time trials, licence tests, machine tests | 0x15 "shortmenu-2" |
+| everything else: the pre-race menu, time trials, license tests, machine tests | 0x15 "shortmenu-2" |
 
 The quick menus' music follows the options' **Menu BGM** switch ("menu music
 on", §2.1), not the run's music switch: with Race BGM off a quick menu still
@@ -386,7 +388,7 @@ later one wins:
 | `cd/...`, `00cmn/cd_ride_sure` (car dealers) | `dealer01` |
 | `at/...`, `00cmn/ws_fit_sure` (car wash, wheel shop) | `wash01` |
 | `hm/...` (home) | `home01` |
-| `lc/...` (licence centre) | `license01` |
+| `lc/...` (license center) | `license01` |
 | `r/...`, `00cmn/race_info` (races) | `gorace01` |
 | `replay_theater` | stream 0x1A "Are You Gonna Go My Way" (GT remix), looping |
 | `ts/...` (tune shops) | `tune01` |
@@ -410,7 +412,7 @@ The prize and award pages play streamed music instead:
 
 | Page | Music |
 |---|---|
-| `license_get` (licence card) | 0x21 "champ-2", looping |
+| `license_get` (license card) | 0x21 "champ-2", looping |
 | `trophy_get` (championship trophy) | 0x18 "champ-3", looping |
 | `car_get` (prize car) | 0x19 "getacar", **once** |
 | `arcade_mini`, `gtmode_mini`, `consolation_prize` | 0x17 "jg05", looping |
@@ -578,7 +580,7 @@ ahead), for every track with markers:
 - on a new piece's first frame every marked track fires once, the cursors go
   back to the start and the interval is that to the first marker.
 
-Without a marked song (jingles, licence runs, an empty playlist, silence)
+Without a marked song (jingles, license runs, an empty playlist, silence)
 no event fires and every interval is "none".
 
 ## §9 Music jukebox

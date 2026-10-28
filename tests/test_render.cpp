@@ -44,6 +44,15 @@ TEST(render_mip_chain_down_to_one_texel) {
     CHECK(w == 1 && h == 1);
 }
 
+TEST(render_mali_bifrost_by_device_name) {
+    // Bifrost: no background pipeline warm-up. Valhall and later (the Galaxy A15's G57) keep it.
+    for (const char* n : {"Mali-G52", "Mali-G52 MC2", "Mali-G31", "Mali-G51", "Mali-G71", "Mali-G72", "Mali-G76 MP12"})
+        CHECK(mali_bifrost(n));
+    for (const char* n : {"Mali-G57", "Mali-G510", "Mali-G610 MC6", "Mali-G715-Immortalis MC11", "Mali-G5", "Mali-G",
+                          "Mali-T880", "Adreno (TM) 610", "PowerVR B-Series BXM-8-256", "", "Mali-G52x"})
+        CHECK(!mali_bifrost(n));
+}
+
 TEST(render_half_size_averages_each_block) {
     // Per channel, alpha too, rounded to nearest: (1 + 2 + 3 + 4 + 2) / 4 = 3.
     const u32 px[4] = {0x01FF0001u, 0x02000002u, 0x03FF0003u, 0x04000004u};
@@ -53,6 +62,22 @@ TEST(render_half_size_averages_each_block) {
     const u32 col[4] = {0x00000000u, 0x000000FFu, 0x00000010u, 0x00000030u};
     h = half_size(col, 1, 4);
     CHECK(h.size() == 2 && h[0] == 0x00000080u && h[1] == 0x00000020u);
+}
+
+TEST(render_pending_gpu_work_waits_past_a_limit_until_a_frame) {
+    PendingGpuWork w;
+    for (u32 i = 1; i < PendingGpuWork::kMaxSubmits; ++i) CHECK(!w.add(1, 1024));
+    CHECK(w.add(1, 1024)); // the 128th submit since the last frame: wait, counting from 0
+    CHECK(!w.add(1, 0));
+    // Staged data alone: three 30 MB model uploads.
+    w.frame_presented();
+    CHECK(!w.add(1, 30ull << 20) && !w.add(1, 30ull << 20));
+    CHECK(w.add(1, 30ull << 20));
+    // A presented frame recycled everything: a frame's own submits never wait.
+    for (int frame = 0; frame < 1000; ++frame) {
+        for (int i = 0; i < 40; ++i) CHECK(!w.add(1, 4096));
+        w.frame_presented();
+    }
 }
 
 namespace {
@@ -138,6 +163,48 @@ TEST(render_dynamic_scale_is_calm) {
     CHECK(d.scale() < 0.8f);
 }
 
+TEST(render_dynamic_scale_ignores_a_capped_wobble) {
+    // A Pixel 10 holds games to 60 fps on its 120 Hz screen: frame times wobble around 16.7 ms,
+    // a 22 ms frame made up by an 11 ms one, a few times a second, while the GPU keeps up with
+    // room to spare. Not misses: the scale climbs from the Auto start to full resolution.
+    render::DynamicScale d;
+    d.reset(1.0f, 120, 0.83f);
+    for (int s = 0; s < 60; ++s)
+        for (int i = 0; i < 60; ++i) d.frame(i % 20 == 7 ? 22.0 : i % 20 == 8 ? 11.3 : 16.67, 9.0);
+    CHECK(near(d.scale(), 1.0f));
+    // A frame really shown a refresh late (25 ms, not made up) still counts: three a second
+    // while waiting on the GPU step the scale down.
+    d.reset(1.0f, 120);
+    for (int i = 0; i < 180; ++i) d.frame(i % 20 == 7 ? 25.0 : 16.67, 9.0);
+    CHECK(d.scale() < 1.0f);
+}
+
+TEST(render_dynamic_scale_climbs_quickly_after_a_load) {
+    // A race start (a frame over 250 ms) on a phone with room to spare: from the Auto start to
+    // full resolution in about 5 s, a step every clean second, the slow first second included.
+    render::DynamicScale d;
+    d.reset(1.0f, 120, 0.83f);
+    d.frame(400, 390);
+    for (int i = 0; i < 60; ++i) d.frame(i == 30 ? 104.0 : 16.67, 9.0); // the start's hitch
+    run_frames(d, 120, 8.0, 5.0, 5.0);
+    CHECK(near(d.scale(), 1.0f));
+    // A phone that is slow while the race starts neither climbs nor drops in those 5 s, then
+    // steps down as usual.
+    d.reset(1.0f, 90, 0.83f);
+    d.frame(400, 390);
+    run_frames(d, 90, 60.0, 5.0, 4.9);
+    CHECK(near(d.scale(), 0.83f));
+    run_frames(d, 90, 60.0, 5.0, 2.0);
+    CHECK(d.scale() < 0.83f);
+    // Once a step up has missed, the rest are 5 s apart again: a GPU that keeps up at 70% but not
+    // at 75% is at most at 75% for a second at a time.
+    d.reset(1.0f, 60, 0.5f);
+    d.frame(400, 390);
+    int changes = run_frames(d, 60, 32.0, 2.0, 120, 100);
+    CHECK(d.scale() <= 0.71f);
+    CHECK(changes <= 8);
+}
+
 TEST(render_dynamic_scale_starts_below_its_ceiling) {
     // Auto on a phone: starts at the fixed Auto size and climbs to full resolution when the GPU
     // keeps up...
@@ -155,6 +222,20 @@ TEST(render_dynamic_scale_starts_below_its_ceiling) {
     CHECK(near(d.scale(), 0.7f));
     d.reset(0.7f, 60, 0.2f);
     CHECK(near(d.scale(), render::DynamicScale::kMin));
+}
+
+TEST(render_dynamic_scale_supersamples) {
+    // 3D resolution 200% with dynamic resolution: from 200% down to what the GPU keeps up with
+    // (6 ms at 100%: 60 fps up to about 165%), and back up to 200% when it has room again.
+    render::DynamicScale d;
+    d.reset(2.0f, 60);
+    CHECK(near(d.scale(), 2.0f));
+    run_frames(d, 60, 6.0, 2.0, 300);
+    CHECK(d.scale() > 1.0f && d.scale() <= 1.66f);
+    run_frames(d, 60, 2.0, 2.0, 600);
+    CHECK(near(d.scale(), 2.0f));
+    d.reset(9.0f, 60); // at most 400%
+    CHECK(near(d.scale(), 4.0f));
 }
 
 TEST(render_perspective_depth_range) {

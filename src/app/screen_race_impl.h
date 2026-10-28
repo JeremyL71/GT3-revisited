@@ -21,26 +21,26 @@
 #include "base/log.h"
 #include "base/hitch.h"
 #include "formats/model/wheel_spec.h"
-#include "ai/ai_driver.h"
-#include "ai/ai_rules.h"
 #include "game/gt_mode_menu.h"
 #include "game/gt_save.h"
-#include "sim/models.h"
+#include "sim/engine_condition.h"
 #include "game/data/car_database.h"
 #include "race/backend.h"
 #include "race/camera_rig.h"
 #include "race/controls.h"
 #include "race/field.h"
+#include "race/exact_field.h"
+#include "race/exact_setup.h"
 #include "race/car_sfx.h"
 #include "race/ghost.h"
 #include "audio/course_ambience.h"
 #include "formats/sound/crss.h"
 #include "race/demo_replay.h"
+#include "race/exact_demo.h"
 #include "render/prize_view.h"
 #include "race/license.h"
 #include "race/machine_test.h"
 #include "track/track.h"
-#include "race/pit.h"
 #include "race/post_run.h"
 #include "race/billboards.h"
 #include "race/lamp_glows.h"
@@ -117,7 +117,6 @@ struct DebugPreset {
     bool gt_result = false;  // gtq=1: the GT-mode result quick menu (screenshots)
     bool watch = false, save = false, ghost = true, music = true;
     double warp = 0, quit = 0, rwarp = 0;
-    double lic_finish = 0;   // tests: a running licence test finishes at this elapsed time (forced result)
     bool demo_drive = false; // tests: the player's run driven by the disc's demo inputs (judged as a real run)
     double leave = 0; // tests: back to the menus this many seconds after the finish (posts the result)
     int exit_laps = 0; // screenshots: a run ends as the pause menu's Exit once it has this many laps
@@ -134,7 +133,6 @@ struct DebugPreset {
     std::string script;
     int prize = -1;          // licence result: show this medal (0 gold .. 2 bronze), for screenshots
     bool demo = false;       // start the demonstration (licence: the disc's demo run)
-    bool pit = false;        // auto-drive takes the pit lane (and stops) at the next entry marker
     std::string qm;          // quick menu: choose this item when it opens ("option", "record", "data_logger", ...)
     int ropts = -1;          // replays (screenshots): open REPLAY OPTIONS with the cursor on this row
     int rmode = -1;          // replays (screenshots): this view mode (not stored)
@@ -144,8 +142,6 @@ struct DebugPreset {
     int rcam = -1;           // replays (screenshots): this camera mode instead of the replay cameras (2: in-car)
     float lcursor = -1;      // the Analyzer (screenshots): its cursor at this distance (m); lpanel=1: EXPRESSION open
     float oyaw = 0.6f, opitch = 0.25f, odist = 7.0f;
-    float at = -1, at_kmh = 150; // time trial: start moving at this distance past the line (debug shots)
-    float turn = 0;              // debug shots: the standing start turned about +Y by this many degrees
 };
 
 // The GT3R_RACE debug preset (have = false when the variable is not set).
@@ -243,16 +239,22 @@ private:
     void resolve_launch();
 
     // Run setup (screen_race_setup.cpp)
-    TrackPose flying_pose(float metres_before) const;
     void start(App& app, const Replay* replay = nullptr);
     void warp(App& app, double seconds);
     void build_tv_cameras();
-    void load_saved_ghost();
+    bool load_saved_ghost(); // false: none found (the ghost is unchanged)
+    // A solo run's recorders at the end of a saved run (a free run's best lap: LOAD GHOST), played headless.
+    std::optional<sim::exact::SoloRecorders> solo_recorders_of(const Replay& r);
+    void take_best_run_ghost();
+    // The original's ghosts (presentation §G11): the whole-run ghost of licence tests, time
+    // trials and machine tests, and the free run's lap ghost; no other run has one.
+    bool whole_run_ghost() const;
+    bool lap_ghost() const;
+    double ghost_run_time() const; // the time the whole-run ghost rules compare (s), < 0 = none
     void restart();
     void drop_vehicle();
     bool build_vehicle(App& app);
-    bool build_vehicle_inner(App& app);
-    ReplayBattle live_battle(App& app, const std::string& car2, int course_category) const;
+    ReplayBattle live_battle(App& app) const;
     void reset_run_state();
     // Engine condition (physics §10.3): every live run starts with run_condition_ (the
     // request's garage car words, then what the previous live run left) and hands its words
@@ -260,10 +262,9 @@ private:
     void take_live_condition();
     void seed_vehicle_condition(const sim::EngineCondition& c, bool live);
     sim::EngineCondition live_condition() const;
-    static std::string respawn_mode(App& app);
     std::optional<Bytes> read_car(App& app, const std::string& model) const;
     // Flying start (physics §9.1, 9.4: licence tests and time trials with the event's
-    // distance and speed): the computer drives the player's car until the first line crossing.
+    // distance and speed): the race's AI drives the player's car until the first line crossing.
     bool flying_runup() const { return !race_mode_ && tt_start_.flying() && track_ && !track_->lap_started(); }
     // The player's car's lap counter (race::lap_counter: 0 before the start line), as the
     // replay cameras take it.
@@ -275,12 +276,13 @@ private:
     }
     // A live view: not a replay, demonstration, attract demo or menu backdrop.
     bool live_view() const { return !replaying_ && !demo_ && !attract_ && !backdrop_; }
-    // Rolling start: the computer drives the player's car for the first 300 ticks (counted in
+    // Rolling start: the race's AI drives the player's car for the first 300 ticks (counted in
     // ticks, so the hand-over cannot drift by a frame).
     bool rolling_runup() const { return rolling_ && field_ && std::llround(field_->race_time() * 60.0) < 300; }
     // A flying start's start signal (presentation §B2): the line crossing that ends the
     // computer's run-up starts the run as GO starts a standing one.
     void flying_start_signal(App& app);
+    void trace_tick(); // GT3R_RACE_TRACE: the player's car after each race step
     // Machine tests (presentation §B7): the time tests (0-400 m, 0-1000 m) rank the time to the
     // goal, the top-speed test the top speed.
     bool machine_time_test() const { return machine_ && machine_->timed(); }
@@ -290,24 +292,16 @@ private:
     bool solo_free_run() const {
         return from_menu_ && !field_ && (launch_.request.mode == "free_run" || launch_.request.mode == "go_free_run");
     }
+    // The car's driver kind on the last step (RaceVehicle::driver_kind: 0 the player drives).
+    int driver_kind() const { return vehicle_ ? vehicle_->driver_kind() : 0; }
 
     // Drive loop (screen_race_drive.cpp)
-    sim::ControlInputs scripted_inputs(double t) const;
+    sim::ControlInputs scripted_inputs(double t, bool& reverse) const; // GT3R_RACE script=
     void next_view(CameraRig& cam, int player);
-    void respawn();
-    void apply_respawn(const TrackPose& p);
-    sim::ControlInputs autodrive(const sim::VehicleState& s);
-    // The player's driver parameters (ai §9.1): the course's set for the car's driveline class
-    // (else the course category's built-in set); with `event`, the race / licence event's
-    // overrides on top (ai §1.1: re-applied at the end of a run).
-    ai::DriverParams player_params(bool event) const;
-    // The player's AI driver for the pit lane / the end of the run (created on first use).
-    ai::AiDriver& player_auto_driver();
-    // How the run ended, for the end-of-run driver (ai::end_of_run).
-    ai::EndOfRun player_end_of_run() const;
     void tick(App& app, const PadState& pad);
     void update_drive(App& app, double dt);
-    static ForceFeedbackState feedback(const sim::Vehicle& v, const sim::ControlInputs& in, float wall, float car);
+    static ForceFeedbackState feedback(const sim::VehicleState& s, const sim::VehicleTelemetry& t, const sim::ControlInputs& in,
+                                       float wall, float car_hit);
     void update_gear_hint(const sim::VehicleState& s);
     void update_dirt(double dt);
     void update_pylons(double dt);
@@ -339,7 +333,9 @@ private:
                      bool half = false);
     CarShadowParams shadow_params() const;
     void draw_car_icon(App& app, int car, const SDL_FRect& rc, size_t slot, bool on_bar = false);
-    CarLook car_look(const sim::VehicleState& s, bool player) const;
+    // `slot`: 0 the player, 1 player 2, 2 + i opponent i (as brake_lamps_).
+    CarLook car_look(const sim::VehicleState& s, bool player, size_t slot) const;
+    int car_lamp_index(const sim::VehicleState& s, size_t slot) const;
     static TyreSmoke::View smoke_view(const CameraRig& c, float aspect, float fovy);
     // `mirror`: the rear-view mirror's pass (its own sky; CourseScene::add_items).
     void collect_items(const render::Vec3& eye, const sim::Vec3& right = {1, 0, 0}, bool player = true,
@@ -374,8 +370,8 @@ private:
     // Every car's tyre loops and the followed cars' collision one-shots, each physics step (sound §7.6).
     void update_tyre_sounds(App& app, const sim::VehicleState& s);
     SoundCar car_sound_facts(const std::string& label) const;
-    static CarExtraSounds::Frame extra_frame(const sim::Vehicle& v, const sim::VehicleState& s, const SoundCar& car,
-                                             bool onboard, float x, float z, SoundView view);
+    static CarExtraSounds::Frame extra_frame(const CarFacts& facts, const sim::VehicleTelemetry& t, const sim::VehicleState& s,
+                                             const SoundCar& car, bool onboard, float x, float z, SoundView view);
     void silence(App& app);
     // The original's global SE gain: race SE in live play, replay SE in replays and demos.
     // (The race behind a quick menu is silent: ours, its sound behind the menu not traced.)
@@ -488,7 +484,10 @@ private:
     // The post-process pass (presentation §G6, §G16): the grade (the shot's levels / filter over
     // the course's Env0 values), the dissolve and the trail.
     void apply_post_pass(render::DrawOptions& o) const;
-    std::string replay_dir(App& app) const { return app.data_dir() + "replays"; }
+    // The disc region's replays (race::replay_dir).
+    std::string replay_dir(App& app) const {
+        return race::replay_dir(app.data_dir(), app.vfs() ? app.vfs()->region().region : Region::America);
+    }
 
     // After a run (screen_race_post_run.cpp; race/post_run.h): the race-exit transition, the
     // prize / trophy and name-entry presentations, the automatic replay, the quick menu and
@@ -502,6 +501,7 @@ private:
     enum class ExitThen { RunEnd, Menu };
     void begin_exit_transition(ExitThen then);
     void after_run(App& app);        // the live run's transition is over
+    void solo_run_ghost();           // the best run and the ghost after a live solo run
     void start_auto_replay(App& app); // the run's replay, by itself
     void return_to_menu(App& app);   // a replay's (or the licence demonstration's) transition is over
     // The quick menu's backdrop (race::menu_backdrop): the race in play mode 2, the licence
@@ -516,8 +516,13 @@ private:
     void load_analyzer(App& app);
     void open_session_analyzer(App& app);
     void setup_logger(App& app);
-    AnalyzerTrack sample_replay(App& app, const Replay& r);
-    AnalyzerTrack sample_other_replay(App& app, const Replay& r);
+    AnalyzerTrack exact_logger_track(App& app, const Replay& r);
+    // GT3's Analyzer race over two replays on the exact core (tracks A and B in one race, B as its ghost car): the pass's
+    // tracks, and its tables for the REPLAY view's jumps (false: not such a pair of replays, or the race cannot be built).
+    bool exact_analysis_pass(App& app, const Replay& a, std::shared_ptr<const sim::exact::RaceRecord> b, AnalyzerTrack& ta,
+                             AnalyzerTrack& tb);
+    // The REPLAY view of it: its race (a replay of track A, built with the analysis) jumped to the logger's entry k.
+    void exact_analysis_jump(App& app, int k);
     void logger_seek(App& app, float d);
     bool update_logger(App& app, double dt);
 
@@ -526,7 +531,7 @@ private:
     int net_index(u8 player) const;
     void online_retire(int i);
     void online_event(App& app, const net::Event& e);
-    bool online_update(App& app);
+    bool online_update(App& app, double dt);
     int online_ticks(int n);
     void online_before_step(double dt);
     void online_after_step();
@@ -541,7 +546,8 @@ private:
     void end_demo(App& app);
     static std::string license_title(const std::string& code);
     void begin_license();
-    void update_license(const sim::VehicleState& s, double dt);
+    // The licence run is over, as the race flow judged it (finished with `time` and `medal`, -1 none, or failed).
+    void license_end(LicenseRun::State r, double time, int medal, const std::string& failure);
     // The disc demo's steering is +-4096 with positive to the left; ours is positive right.
     static inline float kDemoSteerSign = std::getenv("GT3R_DEMO_SIGN") ? float(std::atof(std::getenv("GT3R_DEMO_SIGN"))) : -1.0f;
 
@@ -549,7 +555,41 @@ private:
 
     DebugPreset preset_;
     MenuLaunch launch_;
-    std::shared_ptr<const sim::CarSpec> launch_spec_;
+    // The same car for the exact core (its equipment: the label with the parts and settings or tyres it came with), and
+    // player 2's; unset: the car entry's label.
+    std::optional<ExactCarSource> launch_source_, launch_source2_;
+    Bytes course_bytes_; // the run's course file (the exact core's course)
+    // The program's data every race runs on (sim::exact::ProgramData: the disc's program, the tables as values); false with
+    // error_ set when there is none (no disc, or its program cannot be decoded).
+    bool load_program_data(App& app);
+    // The options every race on the exact core shares (program data and rules, course, player 1, replay record, ghost).
+    ExactFieldOptions exact_options(App& app);
+    // Whether this build can play the replay (on the program it was recorded on); why not.
+    bool can_play(const Replay& r, std::string* why = nullptr);
+    // The race record the exact core plays instead of running a live race: a replay's (v11), the disc's demonstration's
+    // (race::demo_record) while a demonstration runs; null for a live run. Every ExactFieldOptions the screen builds takes it
+    // as its playback.
+    std::shared_ptr<const sim::exact::RaceRecord> exact_playback() const;
+    // A demonstration the exact core plays from its record (the race judges and drives it: no screen-side takeover).
+    bool exact_demo() const { return demo_ && demo_record_ && exact_field() && exact_race_of(*exact_field()); }
+    // The solo modes (screen_race_solo.cpp): the time trial, licence test, machine test, free run and free practice as
+    // GT3 runs them (their conductors' race flow judges the run, times its laps, sectors and splits; the free run's lap
+    // handlers keep its best lap and drive its ghost car). The run's field is solo_field_ (field_ stays null: the screen's
+    // solo paths); exact_field() is the run's field either way.
+    std::optional<sim::exact::Conductor> solo_conductor() const;
+    bool build_exact_solo(App& app);
+    void exact_solo_step();      // after each step: the run's end and result from the race flow
+    bool exact_solo() const { return solo_field_ != nullptr; }
+    RaceField* exact_field() const { return field_ ? field_.get() : solo_field_.get(); }
+    std::string solo_event_;     // the solo run's event (the licence test's, the machine test's, the time attack's)
+    // The visit's session best (race info + 0x8AC: the sector times and the lap, ms), carried from run to run.
+    std::array<u32, 5> exact_session_{0x157529FF, 0x157529FF, 0x157529FF, 0x157529FF, 0x157529FF};
+    // The visit's free run recorders (its best lap and the ghost's playback), carried from run to run (ExactFieldOptions::free_run).
+    std::shared_ptr<sim::exact::SoloRecorders> exact_free_run_;
+    bool solo_result_done_ = false; // the run's end has been taken from the race flow
+    // The whole-run ghost's run for the next live run on the exact core (null: none, a replay, a demonstration).
+    std::shared_ptr<const sim::exact::RaceRecord> exact_ghost_source() const;
+    std::shared_ptr<const sim::exact::ProgramData> exact_data_;
     std::string launch_model_;
     std::vector<double> lap_times_;
     double finish_wait_ = 0, all_done_at_ = -1;
@@ -563,13 +603,7 @@ private:
     int panel_sel_ = 0;
     LapLogger logger_;
     bool imperial_ = true; // speeds in mph
-    std::shared_ptr<ai::AiCourse> hint_course_;   // recommended-gear hint (passive AI bookkeeping)
-    std::unique_ptr<ai::AiDriver> hint_driver_;
-    std::shared_ptr<ai::AiCourse> runup_course_;  // rolling / flying run-up: the CPU AI driver
-    std::unique_ptr<ai::AiDriver> runup_driver_;
-    // The AI driving the player's car in the pit lane and after the run (ai §1.1, ai §13).
-    std::unique_ptr<ai::AiDriver> auto_driver_;
-    bool end_of_run_ = false; // the end-of-run driver has taken over
+    std::string lang_ = "US"; // the game's language (App::language): menu/<lang>/, race/<lang>/
     int hint_gear_ = -1;
     bool hint_blink_ = false;
     // The request's engine condition (has_condition_: the run hands it back to GT mode),
@@ -579,18 +613,21 @@ private:
     bool live_condition_ = false;
     double car_dirt_ = 0;
     int launch_tire_stage_ = -1;
-    std::shared_ptr<const sim::CarSpec> launch_spec2_; // 2P: player 2's arcade car (own parts, tyres)
-    int car2_paint_ = -1, manual2_ = -1;               // 2P: player 2's paint and gearbox (-1 = default) // arcade car: tyre stage used (10 racing, 11 drift, ...); -1 = none
+    int car2_paint_ = -1, manual2_ = -1; // 2P: player 2's paint and gearbox (-1 = default)
     bool dirt_dims_ = true;               // false on the wet Route 5 (GT3 uses 0 there)
     std::string course_label_for_dirt_;   // course label (course table category)
+    bool course_dirt_ = false;            // a dirt course (course table +0x08 = 2): no course-out
     CoursePointLights point_lights_;
+    // Point-light courses: each car's lamp index (by car_look slot), set from its front-left
+    // wheel's road attribute A on a road hit and kept while the wheel finds no road.
+    mutable std::vector<int> lamp_index_;
     BrakeLamps brake_lamps_;
     std::string car_folder_ = "cars/day/"; // the course's car time of day (day / eve / night)
     CarLampGlows car_lamps_;
     WetRoad wet_;                                // the wet-road reflection pass (course slots 9 / 13)
     std::vector<render::DrawItem> wet_items_;    // its buffer's scene
     Pylons pylons_;
-    bool pylon_hit_ = false; // the player's car touched a pylon (licence: FAIL)
+    bool pylon_hit_ = false; // the player's car touched a pylon
     TyreSmoke smoke_;                             // tyre smoke / dirt dust (course slots 26 / 32)
     // Per-car light sets this frame (stable addresses; filled while collecting the draw items).
     mutable std::deque<render::ItemLights> item_lights_;
@@ -620,10 +657,17 @@ private:
     bool abandoned_ = false;
     bool attract_ = false, attract_interrupted_ = false; // title-screen attract demo
     bool theater_ = false;     // started by the Replay Theater (theater_replay / theater_demo / logger)
-    // The Analyzer (data logger): the theater's (logger_mode_) or the quick menu's.
+    // The Analyzer (data logger): the theater's (logger_mode_) or the quick menu's; its REPLAY's ghost (track B's lap).
     Analyzer analyzer_;
+    GhostLap logger_ghost_;
     bool analyzer_loaded_ = false, logger_mode_ = false;
-    u32 logger_begin_ = 0, logger_end_ = 0; // track A's lap in its replay (ticks)
+    u32 logger_begin_ = 0, logger_end_ = 0; // track A's lap in its replay (ticks; the Analyzer's race: track A's device frames)
+    // The Analyzer's race on the exact core (exact_analysis_pass): track B's record (its ghost car), the pass's logger tables, the
+    // pass's step at each of track A's device frames.
+    bool analysis_ = false;
+    std::shared_ptr<const sim::exact::RaceRecord> analysis_b_;
+    std::shared_ptr<const std::vector<std::map<s32, sim::exact::Snapshot>>> analysis_tables_;
+    std::vector<u32> analysis_steps_;
     double logger_acc_ = 0;
     // REPLAY OPTIONS and the replay view mode (presentation §G).
     ReplaySettings replay_settings_;
@@ -652,10 +696,9 @@ private:
     bool driver_view_ = false;
     int attract_car_frames_ = 0;
     std::string theater_demo_; // theater_demo: the demonstration's event code
-    static constexpr double kAttractSeconds = 1800.0 / 60.0; // RaceArcadeDemo's 1800-step timer
+    static constexpr double kAttractSeconds = 1800.0 / 60.0; // Arcade demo's 1800-step timer
     float demo_start_kmh_ = 0;    // demo events: every car starts at this speed
     bool setting_pending_ = false;
-    bool respawn_all_ = false;           // [race] respawn = all: the player's car too
     bool tt_failed_ = false;
     SunGlare sun_;
     bool no_course_fog_ = SDL_getenv("GT3R_NO_COURSE_FOG") != nullptr; // compare with the old linear fog
@@ -665,6 +708,7 @@ private:
     bool original_res_ = false, original_nearest_ = true;
     double script_time_ = 0;
     double leave_clock_ = 0; // preset leave: seconds since the finish
+    double license_clock_start_ = 0; // a licence test's clock origin: GO, or a flying test's first line crossing (race time)
     std::optional<BestLicense> best_license_; // the best finished licence run of this visit
     int demo_drive_tick_ = 0; // preset demo_drive: ticks since the run started
     bool preview_ = false;               // licence menu: the demonstration in the preview box
@@ -704,6 +748,7 @@ private:
     bool show_perf_ = false;
     u16 race_prev_ = 0; // race pad buttons of the last frame (edges)
     bool init_ = false, db_ok_ = false, hud_loaded_ = false, paused_ = false;
+    bool launch_failed_ = false; // a menu's (or the lobby's) race could not be set up: its message (error_) is up
     menu::flow::LoadingPicture loading_; // the menu's frame and transition (or our own black one)
     SDL_Texture* loading_own_ = nullptr;  // the black frame when no menu frame was handed over
     u64 loading_ns_ = 0;                  // when the loading picture was last drawn
@@ -716,7 +761,6 @@ private:
     std::vector<CarEntry> cars_;
     int course_sel_ = 0, car_sel_ = 0, column_ = 0, pause_sel_ = 0;
     bool pause_more_ = false;
-    int scripted_kind_ = 0;
     race::TitleClock title_clock_;
     race::ReplayMarkTimer mark_timer_;
     int last_shot_ = -2; // the director's cut the shot filter was rolled for
@@ -726,9 +770,9 @@ private:
 
     CarSetup car_;
     std::unique_ptr<RaceTrack> track_;
-    std::unique_ptr<RaceVehicle> own_vehicle_;
-    RaceVehicle* vehicle_ = nullptr; // own_vehicle_ or the field's player
+    RaceVehicle* vehicle_ = nullptr; // the run's field's player
     std::unique_ptr<RaceField> field_;
+    std::unique_ptr<RaceField> solo_field_; // a solo run on the exact core (exact_solo)
     std::vector<std::shared_ptr<CarVisual>> opp_visuals_;
     bool race_mode_ = false;
     // --- online battle (docs/dev/ONLINE.md) ---
@@ -746,13 +790,13 @@ private:
         u32 state_tick = 0;
         Bytes car_info; // our game::OnlineCar
         bool physics = SDL_getenv("GT3R_NET_PREDICT") == nullptr || SDL_getenv("GT3R_NET_PREDICT")[0] != 'd'; // "dead" = dead reckoning
-        bool dirt = false;
+        std::vector<float> top_speed; // opponent index -> its car's geared top speed (m/s; plausibility)
         int contacts_applied = 0; // hits only the other machine saw
+        int contacts_sent = 0;    // hits ours saw, sent to the other cars' owners
         std::vector<bool> ghost;   // remote cars currently ghosted (any rule)
         std::vector<Plausibility> checks;
         std::vector<double> claims; // finish claims not yet checked against what we saw
-        int respawn_ticks = 0;      // our states carry "respawned" this many more ticks
-        net::InputFrame inputs[net::kInputHistory];
+        net::PadInput inputs[net::kInputHistory];
         int input_count = 0;
     } net_;
     // 2P battle (split screen): player 2 drives the field's second car with pad 2.
@@ -789,11 +833,10 @@ private:
     u16 pad2_prev_ = 0;
     std::string race_event_;
     std::vector<std::string> race_opponents_;
-    bool field_grid_by_power_ = false, field_cpu_respawn_ = true; // the field's rules (recorded in replays)
+    bool field_grid_by_power_ = false; // the field's rules (recorded in replays)
     ReplayBattle battle_; // 2P battle: the field's set-up (recorded in replays)
     int race_laps_ = 0;
     bool rolling_ = false;   // rolling start (GT endurance)
-    PitLane pit_;
     // The event displays (presentation §D6), one per player half: lap times, splits, gaps,
     // "+N Laps" and "%s Pitting in..."; the race gaps' passing order; time trials' best lap
     // of the visit (kept across retries).
@@ -825,15 +868,13 @@ private:
     double machine_time_ = -1;
     float top_speed_kmh_ = 0;     // best speed of the run until its finish (GameResult::top_speed_kmh)
     float hud_top_kmh_ = 0;       // the HUD's highest speed so far (the top-speed test's "Best" line)
-    LicenseRun license_, demo_judge_;
-    double license_dist_ = 0;          // the judge's previous unwrapped track distance
-    bool license_dist_valid_ = false;
+    LicenseRun license_; // the licence test's rules and, once it ends, its result (the race flow judges it)
     std::optional<DemoReplay> disc_demo_; // demo/<event>: the game's demonstration run
+    std::shared_ptr<const sim::exact::RaceRecord> demo_record_; // its race on the exact core (race::demo_record)
     bool disc_demo_tried_ = false;
     size_t demo_tick_ = 0;
-    bool demo_off_ = false; // the demonstration's car put two wheels off the road: the AI drives on
+    bool demo_logged_ = false; // a demonstration: its result logged
     LicenseTimes license_times_;
-    float license_progress_ = 0;  // metres since the start line at the last tick
     double tt_hold_ = 0;     // seconds of standing-start hold left (time trial / licence)
     EventStart tt_start_;    // time trial / licence event start (flying start when initial speed > 0)
     double time_limit_ = 0;  // time-limited race (s), 0 = laps
@@ -876,8 +917,18 @@ private:
     ReplayPlayer player_;
     bool replaying_ = false;
     CameraMode drive_camera_ = CameraMode::Bumper; // GT3 starts every race in the in-car view
-    GhostLap ghost_, cur_lap_;
+    // The original's ghosts (presentation §G11). The whole-run ghost (licence tests, time trials, machine tests) is a
+    // car of the race (ExactFieldOptions::ghost): its run's record and time; the session's best run (the last run that set
+    // the session record; a free run: the run that drove its best lap): its time and recording (what SAVE GHOST writes),
+    // whose record becomes the ghost after a run that beats it. A free run's lap ghost is its race's own (the free run's
+    // recorders, exact_free_run_).
+    std::shared_ptr<const sim::exact::RaceRecord> ghost_record_, best_run_record_;
     double ghost_time_ = -1;
+    double best_run_time_ = -1;
+    std::optional<Replay> best_run_replay_;
+    bool best_lap_in_run_ = false; // a free run: this run drove the session's best lap
+    bool ghost_shown_ = true;      // Select's ghost display switch (the visit's)
+    bool ghost_ask_ = false;       // the next quick menu opens on "Update Ghost?" (the Ghost option off)
     u32 lap_ticks_ = 0, lap_begin_tick_ = 0;
     bool was_started_ = false;
     std::unique_ptr<GtrcScript> gtrc_;
@@ -893,10 +944,7 @@ private:
     bool show_replays_ = false;
     std::vector<ReplayFile> replay_files_;
     int replay_sel_ = 0;
-    int auto_shift_ = 0;
-    double stuck_time_ = 0, best_progress_ = -1;
-    double race_time_ = 0, offroad_time_ = 0, clock_ = 0, frame_ms_ = 0;
-    float lowest_ = -1000;
+    double race_time_ = 0, clock_ = 0, frame_ms_ = 0;
     Uint64 last_counter_ = 0;
     Perf perf_;
 };

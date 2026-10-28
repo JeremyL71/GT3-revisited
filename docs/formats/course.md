@@ -182,6 +182,13 @@ Offsets are relative to `GTRW`. Implemented in `road.h`.
   lit by up to four lamps picked from the nine around the index under its front-left wheel, weighted
   w = 1 / (c0 + c1 d + c2 d²) (× max(r·axis, 0)^exp inside the cutoff), as directional lights along car →
   lamp with the record's colours × w; node 1 of the car model casts one shadow per lamp.
+  - The index is attribute A of the hit road triangle's first vertex, read as a **signed** 16-bit value. The
+    nine candidates start 4 before it (plus the lamp count when that is negative) and wrap from the last lamp
+    to lamp 0. A car keeps its last index while that wheel finds no road.
+  - On all ten point-light files every vertex's A is a lamp index, except on a strip at the start line
+    (between the last lamp and lamp 0, 9–944 vertices per file) that holds 0xFFFF = -1: its candidates are
+    the last five lamps and lamps 0–3. Read as unsigned (65535), the candidates would lie on the far side of
+    the course and a car crossing the line would go dark.
 - **Segment** (the road is cut into 20–204 pieces, about 30 m each, 0x40 bytes):
   - `u16 vertex_count`, `u16 triangle_count`, `u32 vertices`, `u32 triangles`, `u32 0`, `u32 wall_refs`, `u16 ?` (+0x14),
     `u16 neighbour_count` (+0x16), then `neighbour_count` × `u16` segment ids (+0x18, room for 20), zeros.
@@ -197,8 +204,9 @@ Offsets are relative to `GTRW`. Implemented in `road.h`.
     shaded stretches). The race averages them over the four wheels and scales the car lights by them: s = P2 +
     (1 - P2) b (1 - (1 - P1)(1 - a)) with (P1, P2) = Env0 +0xAC8/+0xACC (ambient), +0xAB4/+0xABC (diffuse),
     +0xAC0/+0xAC4 (specular); the car's light shadow takes F = (AB8 + (AB0 - AB8) a) b (Env0 +0xAB0/+0xAB8).
-    On point-light courses A holds the index of the nearest lamp record and B = A + 1. The query also keeps the
-    raw A of the hit triangle's first vertex.
+    On point-light courses A holds the index of the nearest lamp record (0xFFFF = -1 on the start-line strip,
+    see "Point-light courses") and B = A + 1 (0 after the last lamp on Route 11 and the circle tests). The
+    query also keeps the raw A of the hit triangle's first vertex.
   - Triangles are `{u16 a, b, c, u16 0; u16 material, u16 0; u16 flags, u16 0}` (the zero halves are zero on all
     1,142,387 triangles of the 80 US courses). The wheel query copies the material and flag bytes.
   - The wall_refs block lists u16 indices into the wall points that bound the segment (one 16-byte row in trialmt). It is kept raw.
@@ -230,7 +238,8 @@ Offsets are relative to `GTRW`. Implemented in `road.h`.
 - **Start grid**: `{f32 x, y, z, yaw}`. The car's heading is `yaw + pi` (the game's accessor adds pi). With the car nose along -Z that gives forward = `(-sin h, 0, -cos h)`; this faces along the lap for every slot on all 80 US courses. y is 0 on most courses but carries real heights on some (smtsouth). Licence variants use only slot 0; the other slots are leftovers (one faces backwards in L_smtsouth1).
 - **Header +0x1C**: 0 in 26 courses, the lap length in some base files, other values in licence files (L_smtsouth1: 833.8 m with slot 0 at 3246.8 m on a 3290.6 m lap), so possibly the goal distance of a licence test ❓. **+0x20**: 1, or 0x101 on the circle and route5/route11 courses ❓.
 - **Grid A (+0x48): triangle lookup grid** (decoded, `Road::grid_index`). `u32 cells_off`, `s16 nx`, `s16 nz`, `f32 xs[nx]`, `f32 zs[nz]` (sorted breakpoints, uniform 8 m on every course), then at `cells_off` `(nx-1)·(nz-1)` u32 offsets, one per cell (index `zi·(nx-1)+xi`). Each points at groups `{u16 n, u16 segment, u16 triangle[n]}` ending with `n = 0`; empty cells share an empty list. Every triangle is listed in every cell it overlaps (verified on 79 of 80 courses; in r_route11 one triangle corner lies outside the breakpoint range). Points outside the breakpoint range have no road.
-- **Grid B (+0x4C)**: same layout, but the ids index the wall/obstacle points (+0x3C); every point appears exactly once. The game uses it to find wall points near a car.
+- **Grid B (+0x4C)**: same layout, but the ids index the wall/obstacle points (+0x3C) (decoded, `Road::wall_grid`). Every point appears exactly once, in the cell that holds it (`bp[i] ≤ x < bp[i+1]`); groups in a cell have distinct, ascending segment ids, and ids in a group ascend (all 80 US courses). The collision step walks it for the wall segments near a car (physics §5.3: the box grown by 8 m, clamped into the grid, groups of the car's road segment and its neighbours).
+- **Before the segment table**: the game reads a car's neighbour list for road segment −1 (a car off the road mesh) from the words just before the segment table: a u16 count at `segments_off − 0x2A` and ids from `segments_off − 0x28` (the end of the start grid table or padding). The count is 0 on most courses and in the thousands on others (`Road::before_segments`).
 - **Markers**: about 20 `(u16 kind 0/1/2, s16 -1/0/1, f32 distance)` records, distances increasing. Possibly corner/section marks ❓.
 
 ## AI lines (slot 31)
@@ -261,10 +270,11 @@ Each of the four slots holds the AI driver parameter set for one driveline class
 slot 37 + class, with class 0 = FR / MR / RR, 1 = FF and four-wheel drive system 0, 2 = other
 four-wheel drive systems, 3 = four-wheel drive system 3. An offset of 0 means the course has no
 set for that class; the game then uses its built-in set for the course category (ai §9.1).
-Code: `src/formats/course/driver_sets.*`, conversion `ai::DriverParams::from_bytes`.
+Code: `src/formats/course/driver_sets.*`; the race start reads them (`src/sim/exact/start.*`).
 
 Each section is 0x40 bytes. The first 32 bytes are the set; the other 32 are zero on the disc.
-Bytes 0–24 are read, 25–31 are not (they are 0 or a small u16 on the disc).
+Bytes 0–26 are read, 27–31 are not. Bytes 25 and 26 are read only from the class-0 set, by the
+start of a time trial or free run whose event gives no flying start (both must be non-zero).
 
 | Byte | Meaning | Conversion |
 |---|---|---|
@@ -288,6 +298,8 @@ Bytes 0–24 are read, 25–31 are not (they are 0 or a small u16 on the disc).
 | 21, 22 | ASCC C gain / threshold | × 0.01 |
 | 23 | ASCC E gain | × 0.01 |
 | 24 | TCS slip scale | × 0.01 (0 and 100 → 1) |
+| 25 | time trial / free run flying start: distance before the line | byte × 10 m (0: none) |
+| 26 | its speed | byte × 5 km/h (0: none) |
 
 Survey of the 80 US files: 79 carry all four sets; L_circle60_wet1 has none (all four
 offsets 0). The sets differ by course and often by class: braking percentages 100–200,

@@ -13,7 +13,6 @@
 #include "race/lamp_glows.h"
 #include "render/view3d.h"
 #include "sim/sim_types.h"
-#include "sim/vehicle.h"
 
 #include <array>
 #include <memory>

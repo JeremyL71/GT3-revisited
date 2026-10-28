@@ -78,11 +78,12 @@ game with a message.
 | `config.ini [video]` | Command line | Default | Effect |
 |---|---|---|---|
 | `gpu` | `--no-gpu` | 1 | Use the SDL_GPU path |
-| `msaa` | `--msaa N` | 4 (desktop), 2 (Android: phones, tablets, Quest) | 1/2/4/8, clamped to device support. Phones default to 2x: on a Moto G Power 2024 (Trial Mountain, 6 cars, fixed 60% scale) 4x cost about 19% of the frame and 2x about 3% vs off, and with 4x dynamic resolution sat at its 50% floor. See `platform::default_msaa` |
+| `msaa` | `--msaa N` | 4 (desktop), 2 (Android: phones, tablets, Quest) | 1/2/4/8, the nearest the device offers: a missing 2x becomes 4x (Mali GPUs offer 1x, 4x and 8x only; on a Galaxy A15 4x cost about 5 points of dynamic resolution), other missing levels the next lower. Phones default to 2x: on a Moto G Power 2024 (Trial Mountain, 6 cars, fixed 60% scale) 4x cost about 19% of the frame and 2x about 3% vs off, and with 4x dynamic resolution sat at its 50% floor. See `platform::default_msaa` |
 | `vsync` | | 1 | Present with vsync |
 | `limit_60fps` | | off | `on` (Settings → Display → Limit to 60 fps): on 120 Hz and faster displays draw every Nth refresh (120 Hz → 60 fps, 144 → 72) through SDL's main loop rate (`App::apply_frame_limit`); off: every refresh |
 | `gpu_debug` | | 0 | Backend validation layers |
-| `render_scale` | `--render-scale X` | auto | 0.5..1.0: 3D views render at this fraction of their on-screen pixel size and are upscaled (linear) when composited; UI and HUD stay native. `auto` = 1.0 on desktop; on Android/iOS about 900 lines of the 16:9 game area (e.g. 0.63 on a 2560×1600 tablet, 0.70 on a 2856×1280 phone). See `src/platform/render_scale.*` |
+| `anisotropy` | | 4 | 1 (off), 2, 4, 8 or 16: the mipmapped samplers' anisotropy (not the `no_mips` ones). A GPU without anisotropic filtering gets none (`GpuContext::anisotropy_supported`) |
+| `render_scale` | `--render-scale X` | auto | 0.5..4.0: 3D views render at this fraction of their on-screen pixel size and are scaled (linear) when composited; UI and HUD stay native. `auto` = 1.0 on desktop; on Android/iOS about 900 lines of the 16:9 game area (e.g. 0.63 on a 2560×1600 tablet, 0.70 on a 2856×1280 phone). Above 1 (supersampling) within `platform::supersample_limit`: 16384 pixels a side per view, the largest 2D texture SDL_GPU assumes (400% up to 4096 pixels across, 320% of 5120×2880); no memory cap, and like any 3D resolution it costs frame rate unless dynamic resolution is on. Supersampled targets are not cycled: SDL keeps a cycled target once per frame in flight, and 400% of 3840×2160 with 4x MSAA then took over 20 GB, which SDL's Vulkan backend put in system memory (it only warns, once per device) on a 10 GB RTX 3080: about a frame a second. Uncycled (about 5 GB), the 3080 draws it in 29.9 ms a frame, 10.3 ms with MSAA off; an M4 Pro draws 400% of 2560×1440 at 48–55 fps (42–46 cycled). A picture over twice the on-screen size is halved first by a linear `SDL_BlitGPUTexture` (each pixel a 2×2 mean), so the composite's linear filter misses no texel. A view whose supersampled targets cannot be created steps down to 75% of that size per failed frame, at most to native. See `src/platform/render_scale.*` |
 | `dynamic_resolution` | | on (phones, tablets), off (desktop) | Settings → Display → Dynamic resolution: `render_scale` becomes the ceiling (with `auto`, the screen's full resolution up to 1440 lines of the 16:9 game area, `platform::dynamic_ceiling`; it starts at the fixed `auto` size, or with `auto` where the last race's scale ended, `[video] dynamic_start`, saved when a race ends and when the app goes to the background and cleared when 3D resolution or dynamic resolution change; a manual 3D resolution always starts at its own value) and `render::DynamicScale` lowers the 3D scale in 5% steps (to 0.5) when frames miss the target while waiting on the GPU, and steps back up when they keep it. Target: 60 fps, or the first whole number of refreshes at or above 1/60 s with vsync (45 fps on 90 Hz). Judged each second; the 5 s after a load or pause are skipped. Calm on purpose (each change is a visible twitch, each missed refresh a judder): it steps down when frames keep missing a refresh (3 in a second) or are slow on average, skips the second after a step down, and steps up only after 5 s without a miss; a step up that misses is undone and not retried for 1, then 2, then 3 minutes. Off for `--shot`, `--render-scale` and VR. A Galaxy A15 on Tokyo R246 (6 cars): 50–75%, 42–49 fps |
 
 ## Shaders
@@ -213,8 +214,9 @@ Light sources per scene:
 
 Textures are uploaded as RGBA8 with a full mip chain built on the CPU (2×2
 box filter; SDL's Vulkan mipmap blits go zero-sized on non-square textures,
-which loses the device on Mali GPUs) and linear/trilinear filtering with 4×
-anisotropy. Models share textures with identical texels
+which loses the device on Mali GPUs) and linear/trilinear filtering with
+`[video] anisotropy` (default 4×; Settings → Display → Anisotropic filtering
+recreates the samplers). Models share textures with identical texels
 (`GpuContext::acquire_texture`: a race asks for ~3,700, ~840 distinct, and a
 Mali driver spends ~185 KB on each texture object); a CLUT-animated texture
 becomes its model's own before its first update. Each `Uploader` batch goes
@@ -232,7 +234,16 @@ background thread at start-up (about 5 s on the A15, ~14 s on the Moto, while th
 and title play): the frame's own combinations, then the same for transparent pictures (coverage:
 car models on the race's gap pop-ups and results bar, the online pickers' cars), whose first
 mid-race pop-up otherwise stalled the Moto for 0.5 s. Others are still created on first use, and
-the log names each one ("3D pipeline built on first use"). There are eight samplers: the
+the log names each one ("3D pipeline built on first use"). Mali Bifrost GPUs (G31, G51, G52,
+G71, G72, G76, by Vulkan device name: `mali_bifrost`) warm up on the render thread instead: a
+Mali-G52 driver (Android 11) crashed in its shader compiler during the background warm-up,
+likely compiling on both threads at once (SDL's 2D renderer builds its own pipelines on first
+draw). `warm_step` builds one pipeline after each presented frame from start-up (the menus lag
+for a few seconds, ~0.1 s a frame), and a race's load (`finish_warming`) builds whatever is
+left, so races never compile. On Android the compiling thread is named after the key while
+the driver works ("pipe" + blend, cull, depth write, lines, coverage, alpha, "x" MSAA, e.g.
+`pipe100000x4`), so a crash report names the pipeline. The start-up log line "3D renderer: GPU
+…, driver …" gives the device name and driver version. There are eight samplers: the
 `clamp_u`/`clamp_v` combinations (otherwise repeat), each with mipmaps or without
 (`scene::Texture::no_mips`: the full-size image only, no anisotropy; the tyres).
 `texture = -1` binds a 1×1 white texture.

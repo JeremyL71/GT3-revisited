@@ -60,6 +60,8 @@ void RaceScreen::reset_lap_events() {
 void RaceScreen::reset_session_best() {
     best_splits_.reset();
     session_best_ms_ = -1;
+    exact_session_.fill(0x157529FF); // (the exact core's: race info + 0x8AC, none)
+    exact_free_run_.reset();
 }
 
 std::optional<int> RaceScreen::car_at_position(int position) const {

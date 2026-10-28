@@ -28,6 +28,7 @@ AiLines AiLines::parse(ByteSpan d) {
                 pt.segment = rd32(d, p + 16);
                 pt.lateral = float(s32(rd32(d, p + 24))) / 4096.0f;
                 pt.packed = rd32(d, p + 36);
+                pt.raw_x = s32(rd32(d, p + 4)), pt.raw_z = s32(rd32(d, p + 8)), pt.raw_radius = s32(rd32(d, p + 24));
                 // Sim-frame heading (1/4096 turn); mirroring X negates the angle.
                 pt.heading = -float(s16(pt.packed & 0xFFFF)) * float(2 * std::numbers::pi / 4096.0);
                 line.points.push_back(pt);

@@ -207,7 +207,7 @@ disc's CORE.GT3 (bytes `B[i]`, read once at race start):
   drops under 75 % it fires once with strength `max(load - 0.8, 0) / 256`,
   scaled by 2.5, times the channel gain and `32/d`.
 - **Other per-car slots**: four tyres x six surface loops
-  ([sound §7.6](../behaviour/sound.md#76-tyres)), `body_noiz` (wired but
+  ([sound §7.6](../behaviour/sound.md#76-tires)), `body_noiz` (wired but
   always gain 0), and one-shots `clash`, `clash2`, `clash3` by collision type.
 
 `EngineUnit` plays the wind bank with the same layer player as

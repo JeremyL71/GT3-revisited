@@ -3,9 +3,10 @@
 // AI driver parameter sets of a course (course file slots 37-40, no magic; docs/formats/course.md
 // "Driver parameter sets"). One section per driveline class: slot 37 + class (0 FR / MR / RR,
 // 1 FF and 4WD system 0, 2 other 4WD, 3 4WD system 3). Each section is 0x40 bytes; the first
-// 32 are the set (bytes 0-24 used, the rest 0 or unused), the other 32 are zero on the disc.
+// 32 are the set (bytes 0-24 the driver's; 25 and 26 a time trial's or free run's flying start, read from the class-0
+// set; 27-31 0 or unused), the other 32 are zero on the disc.
 // A slot whose offset is 0 has no set: the race then uses the built-in set of the course
-// category (ai::DriverParams::builtin). The byte meanings are ai::DriverParams::from_bytes's.
+// category. The byte meanings: the table there and ai §9.1 (the race start reads them, sim/exact/start.h).
 
 #include "base/bytes.h"
 

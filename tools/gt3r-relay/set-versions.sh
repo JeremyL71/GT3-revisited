@@ -55,5 +55,5 @@ $SUDO chmod 644 "$conf.new"
 $SUDO mv "$conf.new" "$conf"
 $SUDO systemctl reload gt3r-relay
 sleep 1
-$SUDO journalctl -u gt3r-relay --no-pager -n 20 -o cat | grep 'reload:' | tail -n 1
+$SUDO journalctl --namespace=gt3r-relay -u gt3r-relay --no-pager -n 20 -o cat | grep 'reload:' | tail -n 1
 REMOTE

@@ -3,7 +3,7 @@
 An open-source reimplementation of the *Gran Turismo 3 A-Spec* engine for
 modern platforms: **Windows, macOS, Linux, Android and Meta Quest (VR)**.
 
-GT3 Revisited contains **no game content and no original code**. It needs a
+GT3 Revisited contains **no game data or assets**. It needs a
 disc image (`.iso`) that you made from your own copy of the game. At runtime
 it reads the image directly and decodes the assets. Nothing is extracted to
 disk or redistributed.
@@ -13,8 +13,7 @@ disk or redistributed.
 > endurance races with pit stops, endings), Arcade (single race, time trial,
 > free run, 2-player split screen), AI opponents, replays with the TV
 > cameras, the Replay Theater and Analyzer, movies, music and sound, all from
-> your disc. The physics follows the original's documented behaviour and is
-> verified against it. The remaining
+> your disc. The physics is verified against the original. The remaining
 > differences are small and listed [below](#differences-from-the-original).
 
 ## What you get
@@ -28,21 +27,20 @@ disk or redistributed.
 | **Saves** | any number of named saves; import from and export to the PS2 original |
 | **Modern display** | any resolution and aspect ratio, widescreen, high refresh rates (or a 60 fps limit), MSAA, dynamic resolution, or the original 640×448 look |
 | **VR** | Meta Quest: the menus on a large virtual screen, races in stereo from the driver's seat, Touch controllers (sticks and analog triggers, or grab a steering wheel) |
-| **Controllers** | keyboard, any gamepad, wheels and pedals, all remappable; analog pressure buttons, DualSense adaptive triggers, Xbox impulse triggers, wheel force feedback, tilt steering, touch controls on phones and tablets |
+| **Controllers** | keyboard, any gamepad, wheels and pedals, all remappable; analog pressure buttons, DualSense adaptive triggers, Xbox impulse triggers, wheel force feedback, tilt steering, touch controls on phones and tablets (move, resize or hide each one) |
 | **Mods** | replace any game file, add music, add new cars (electric ones too) to the dealers |
 
 ## How it's built
 
-GT3 Revisited is an independent reimplementation written from documented
-behaviour: the disc's file formats ([FORMATS](docs/FORMATS.md),
-[docs/formats/](docs/formats/)) and how the game behaves, described per
+GT3 Revisited is an independent reimplementation. The disc's file formats
+are documented in [FORMATS](docs/FORMATS.md) and
+[docs/formats/](docs/formats/), and how the game behaves is described per
 system in [docs/behaviour/](docs/behaviour/) (physics, AI, GT Mode, menus,
 race presentation, sound, music), with implementation notes in
-[docs/dev/](docs/dev/). It is verified against the
-original's observable behaviour, side by side and with automated tests. It
-contains no original code, data or assets; all game content is read from
-your own disc at runtime. The rules for contributions are in
-[CONTRIBUTING](CONTRIBUTING.md).
+[docs/dev/](docs/dev/). It is verified against the original, side by side
+and with automated tests. It contains no game data or assets; all game
+content is read from your own disc at runtime. The rules for contributions
+are in [CONTRIBUTING](CONTRIBUTING.md).
 
 ## Installing
 
@@ -114,7 +112,6 @@ game:
 | Play | back to the game (opening movie, then the title menu) |
 | Online battle | race other players over the internet or a LAN |
 | Settings | display, audio, controls, force feedback, touch, disc, online |
-| Controller setup | bind keyboards, pads and wheels, per player |
 | Mods | enable or disable installed mods |
 | Music jukebox | the soundtrack from your disc |
 | Quick race | any event with any car |
@@ -135,7 +132,8 @@ Settings, saves, replays, mods and screenshots live in:
 - Windows: `%APPDATA%\GT3Revisited\GT3Revisited\`
 - macOS: `~/Library/Application Support/GT3Revisited/GT3Revisited/`
 - Linux: `~/.local/share/GT3Revisited/GT3Revisited/`
-- Android: the app's private storage
+- Android: the app's private storage, shown in the Files app as **GT3 Revisited**
+  (the Mods screen's **Open folder** goes there)
 
 If a `portable.ini` file sits next to the executable, all user data is kept
 beside it instead.
@@ -167,22 +165,24 @@ are only there:
 | `[video] vsync` | `1` / `0` | wait for the display refresh |
 | `[video] limit_60fps` | `on` / `off` | on 120 Hz and faster displays, draw about 60 frames a second (every Nth refresh) |
 | `[video] msaa` | `1` `2` `4` `8` | 3D anti-aliasing (clamped to the GPU); default 4, 2 on Android (phones, tablets, Quest) |
-| `[video] render_scale` | `auto`, `0.5`..`1.0` | 3D resolution vs. the screen |
+| `[video] anisotropy` | `1` `2` `4` `8` `16` | anisotropic texture filtering (`1` = off); default 4 |
+| `[video] render_scale` | `auto`, `0.5`..`4.0` | 3D resolution vs. the screen; above `1.0` the 3D views render larger and are scaled down (supersampling), up to 16384 pixels a side |
 | `[video] dynamic_resolution` | `on` / `off` | lower the 3D resolution (to 50% at most) when the GPU can't keep up and raise it while it keeps up, up to `render_scale`; with `auto`, up to the screen's full resolution (at most 1440 lines), starting where the last race ended (kept in `dynamic_start`). Default on for phones and tablets |
 | `[video] gpu` | `1` / `0` | SDL_GPU 3D renderer; `0` = 2D-only (restart required) |
 | `[video] original_res` | `on` / `off` | *(file)* races at the PS2's 640×448 in a 4:3 frame |
 | `[video] original_filter` | `nearest` / `bilinear` | *(file)* upscaling filter for `original_res` |
 | `[video] car_reflections`, `car_shadows` | `on` / `off` | *(file)* |
+| `[audio] device` | device name | output device (Windows, macOS, Linux); absent: the system default. A device that isn't connected plays on the default until it is |
 | `[audio] music_volume`, `sfx_volume` | `0.0`..`1.0` | |
 | `[audio] surround_cue` | `on` / `off` | GT3's rear-channel phase cue for Pro Logic decoders |
 | `[race] views` | `all` / `gt3` | race views: GT3's plus bumper without mirror and far chase, or GT3's only |
 | `[race] camera_shake` | `on` / `off` | GT3's in-car vibration |
-| `[race] units` | `kmh` / `mph` | *(file)* speed unit (default: the disc's) |
+| `[race] units` | `kmh` / `mph` | speed unit in races and menus (absent: the disc's, mph on the North American disc, km/h on the European and Japanese ones) |
 | `[race] split` | `auto` / `horizontal` / `vertical` | *(file)* 2P split (default: as GT3) |
-| `[race] respawn` | `cpu` / `all` / `off` | *(file)* put stuck cars back on the road (not in the original) |
-| `[player1]`, `[player2]` | `preset`, `device`, `keyboard`, `race`; `phone_vibration` (player 1, Android) | see [INPUT](docs/INPUT.md#race-controls) |
+| `[race] analog_response` | `linear` / `original` | sticks, triggers, wheels, touch and tilt: a linear response (default) or GT3's DualShock 2 curves (Settings → Controls) |
+| `[player1]`, `[player2]` | `controller` (auto, a device name, or keyboard), `keyboard`, `race`; `phone_vibration` (player 1, Android) | see [INPUT](docs/INPUT.md#controller) |
 | `[ffb]` | see [INPUT](docs/INPUT.md) | DualSense/Xbox triggers and wheel force feedback |
-| `[touch]` | see [INPUT](docs/INPUT.md) | on-screen controls on phones and tablets |
+| `[touch]` | see [INPUT](docs/INPUT.md#touch-controls-phones-and-tablets) | on-screen controls on phones and tablets; Customize layout moves, resizes and hides each one |
 | `[online] server` | host name | relay server (default `gt3r.gameversions.com`; set in the lobby) |
 | `[online] update_check` | `on` / `off` | ask the relay server for a newer version at startup (Settings → Online) |
 | `[options]` | | the game's own Options menu (set in game) |
@@ -199,21 +199,25 @@ cannot be read (damaged, or from a newer version) is never written over.
 
 **Saves from and to the PS2 original:** on the Load game and File Operation
 pages, "FROM A FILE" imports a save from anywhere (a GT3 Revisited `.sav` or
-a PS2 save), and "Export to PS2" in a save's menu writes it as a `.psu` or a
-PCSX2 `.ps2` card image. Home → Trade and the arcade's Load Garage take a
+a PS2 save), and "Export to PS2" in a save's menu asks for the format: a
+`.psu`, a PCSX2 `.ps2` card image or a raw save (`.raw`), then where to put
+it. The raw save is the bare `BASCUS-97102GAMEDATA` file that save editors
+such as [GT3SaveEditor](https://github.com/zyzalfors/GT3SaveEditor) open; an
+edited one imports like any other save. Home → Trade and the arcade's Load Garage take a
 friend's save the same way. The original's save is the NTSC-U
 `BASCUS-97102GAMEDATA` save, which both NTSC-U discs use. `gt3tool` converts
 on the command line too (it needs your disc for the game data):
 
 ```text
 gt3tool save-import <iso> <ps2 save> <saves folder>/name.sav
-gt3tool save-export <iso> <saves folder>/name.sav <out.psu | out.ps2 | out folder>
+gt3tool save-export <iso> <saves folder>/name.sav <out.psu | out.ps2 | out.raw | out folder>
 ```
 
-`<ps2 save>` can be the `BASCUS-97102GAMEDATA` data file, its save folder, a
-PCSX2 folder memory card, a `.psu` (uLaunchELF / EMS export) or a PCSX2
-`.ps2` / `.mcd` card image (8 MB, read only). The export writes a `.psu`, a
-new 8 MB `.ps2` card image holding just this save, or a folder
+`<ps2 save>` can be the `BASCUS-97102GAMEDATA` data file (under any name,
+e.g. a `.raw`), its save folder, a PCSX2 folder memory card, a `.psu`
+(uLaunchELF / EMS export) or a PCSX2 `.ps2` / `.mcd` card image (8 MB, read
+only). The export writes a `.psu`, a new 8 MB `.ps2` card image holding just
+this save, the data file alone (`.raw`) or a folder
 `<out>/BASCUS-97102GAMEDATA/`. To move a save onto a PCSX2 card you already
 use, import the `.psu` with a memory-card manager. Compressed `.max` / `.cbs`
 saves (Action Replay, CodeBreaker) are not read; convert them to `.psu`
@@ -239,6 +243,14 @@ players, each on their own machine:
   under **Relay server** in the lobby.
 - **Host by address / Join by address** works without any server, on a LAN
   or with UDP port 47630 forwarded to the host.
+- Every car of the game can race, none locked: chosen by maker, by class, or from
+  your GT Mode garage. The classes are the arcade's C, B, A, S and rally cars: its
+  class lists' cars (raced as the arcade does), and every other car by its weight
+  per power, as GT3 classes garage cars.
+- The host's **Car rules** limit the cars: class, production or race cars,
+  drivetrain, NA or turbo, stock cars only, a power limit, mod cars. The car
+  page can list only the cars allowed.
+- Every lobby page works with a mouse, touch or a VR controller's pointer too.
 - Mod cars are offered to the other players as checked downloads.
 - The other players can see your IP address, as in any peer-to-peer game.
 - **Updates.** At startup the game asks the relay server whether a newer
@@ -260,10 +272,12 @@ How it works, and how to run your own relay: [ONLINE](docs/dev/ONLINE.md).
 
 ### Mods
 
-Mods go in `mods/` in the user data folder (the Mods screen shows it; press
-Start there to open it). A mod can replace any file of the game, add music,
-or add cars, defined in small text files, that appear at the dealers, in the
-arcade and online. See [MODDING](docs/MODDING.md).
+The **Mods** screen installs mods from a .zip (**Install from .zip**, or drop
+the .zip onto the window on a computer), turns them on and off, and removes
+them. Mods live in `mods/` in the user data folder; **Open folder** opens it
+(on Android, in the Files app). A mod can replace any file of the game, add
+music, or add cars, defined in small text files, that appear at the dealers,
+in the arcade and online. See [MODDING](docs/MODDING.md).
 
 ## Differences from the original
 
@@ -271,17 +285,18 @@ arcade and online. See [MODDING](docs/MODDING.md).
   memory-card pages are replaced by a save list on the same artwork. PS2
   saves move both ways (above).
 - **i.LINK Battle** is online play over UDP; it does not talk to real PS2s.
-- **Physics** follows the original's documented behaviour and has been
-  verified against it model by model; replays of the original's license
-  demos stay in lock step until float rounding differences take over.
-  Wall contacts at corners are still approximate ([PHYSICS](docs/dev/PHYSICS.md#known-remaining-deviations)).
+- **Physics** runs at 60 steps a second on every disc, with the rules of the
+  disc's release; races, replays and the disc's demonstrations play out as in
+  the game ([PHYSICS](docs/dev/PHYSICS.md), European and Japanese discs:
+  [COMPATIBILITY](docs/COMPATIBILITY.md)). Electric mod cars race on their donor
+  car's engine for now ([MODDING](docs/MODDING.md)).
 - A few presentation details are measured from captures rather than
   specified exactly, and a few effects that come from PS2 microcode are
   approximated ([RACE](docs/dev/RACE.md#known-gaps),
   [GT_MODE](docs/dev/GT_MODE.md#what-is-left-against-the-original)).
 - Added on top, all optional: the main menu, Quick race, extra race views,
   widescreen and high refresh rates, touch controls, modern controller
-  features, mods and a stuck-car respawn.
+  features and mods.
 
 ## Building
 
@@ -328,7 +343,7 @@ gt3r [disc.iso] [--hub] [--screen <id>] [--browse <vol path>] [--shot <out.png>]
 
 - `--hub` starts in Developer options (or set `start = hub` under `[app]`).
 - `--screen <id>` opens a screen: the main menu's `online`, `settings`,
-  `input`, `mods`, `jukebox`, `quickrace`, `race` (time trial), `movies`,
+  `mods`, `jukebox`, `quickrace`, `race` (time trial), `movies`,
   `database`, or a developer tool (`browser`, `gt3menu`, `cars`, `courses`,
   `menu`, `text`, `sound`, `sim`, `ai`, `viewer`, ...).
 - `--browse <path>` opens the asset browser on a file in `GT3.VOL`.
@@ -378,7 +393,7 @@ Third-party components keep their own licenses (below).
 
 Gran Turismo is a trademark of Sony Interactive Entertainment. This project
 is not affiliated with or endorsed by Sony or Polyphony Digital. It ships no
-copyrighted game data or code. It exists for interoperability with your own
+game data or assets. It exists for interoperability with your own
 copy of the game: owning the game is required to play. Please do not open
 issues or pull requests that contain game files, extracted assets, or the
 original program's code in any form.

@@ -2,7 +2,7 @@
 
 #include "base/file.h"
 #include "base/log.h"
-#include "sim/car_spec_io.h"
+#include "sim/exact/race_record.h"
 
 #include <SDL3/SDL.h>
 
@@ -112,12 +112,7 @@ Bytes Replay::serialize() const {
     w.put<u8>(automatic ? 1 : 0);
     w.put<u8>(u8(std::clamp(paint, 0, 255)));
     w.pose(start);
-    w.put<u32>(u32(events.size()));
-    for (const ReplayEvent& e : events) {
-        w.put<u32>(e.tick);
-        w.put<u8>(e.kind);
-        w.pose(e.pose);
-    }
+    w.put<u32>(0); // (no events)
     w.put<double>(best_lap);
     w.put<u32>(best_lap_begin);
     w.put<u32>(best_lap_end);
@@ -136,30 +131,30 @@ Bytes Replay::serialize() const {
     w.str(car_model);
     w.str(wheel);
     w.put<s64>(saved);
-    auto put_spec = [&](const std::shared_ptr<const sim::CarSpec>& sp) {
-        Bytes sb = sp ? sim::serialize_car_spec(*sp) : Bytes{};
-        w.put<u32>(u32(sb.size()));
-        w.out.insert(w.out.end(), sb.begin(), sb.end());
-    };
-    put_spec(spec);
+    w.put<u32>(0); // (no car spec)
     w.put<u32>(condition.odometer);
     w.put<float>(condition.wear_m);
     w.put<float>(condition.oil_m);
     auto rule = [](const std::optional<bool>& b) { return u8(!b ? 0 : *b ? 2 : 1); };
-    w.put<u8>(u8(rule(grid_by_power) | rule(cpu_respawn) << 2));
+    w.put<u8>(rule(grid_by_power));
     if (!car2.empty()) {
         w.put<u8>(battle ? 1 : 0);
         if (battle) {
             const ReplayBattle& b = *battle;
             w.put<u16>(u16(std::clamp(b.laps, 0, 0xFFFF)));
-            w.put<float>(b.boost_amount), w.put<float>(b.boost_start), w.put<float>(b.boost_full);
+            w.put<float>(b.catchup == 1 ? 0.15f : b.catchup == 2 ? 0.20f : 0.0f), w.put<float>(0), w.put<float>(0);
             w.put<float>(b.handicap_m);
             w.put<u8>(b.tyre_damage ? 1 : 0);
             w.str(b.model2);
             w.str(b.wheel2);
             w.put<u8>(u8(std::clamp(b.paint2, 0, 255)));
-            put_spec(b.spec2);
+            w.put<u32>(0); // (no car spec)
         }
+    }
+    {
+        const Bytes xb = exact ? exact->serialize() : Bytes{};
+        w.put<u32>(u32(xb.size()));
+        w.out.insert(w.out.end(), xb.begin(), xb.end());
     }
     for (size_t i = 0; i < inputs.size(); ++i) {
         const sim::ControlInputs& in = inputs[i];
@@ -169,6 +164,7 @@ Bytes Replay::serialize() const {
         w.put<u16>(q_pedal(in.brake));
         w.put<u8>(u8((in.handbrake ? 1 : 0) | (in.shift_up ? 2 : 0) | (in.shift_down ? 4 : 0) | (in.automatic ? 8 : 0) | (in.controller_kind == 2 ? 16 : 0) | (in.controller_kind == 3 ? 32 : 0) |
                      (dk == 1 ? 64 : dk == 5 ? 128 : dk == 8 ? 192 : 0)));
+        w.put<u8>(u8(i < reverse.size() && reverse[i] ? 1 : 0));
     }
     if (!car2.empty())
         for (size_t i = 0; i < inputs.size(); ++i) {
@@ -177,6 +173,7 @@ Bytes Replay::serialize() const {
             w.put<u16>(q_pedal(in.throttle));
             w.put<u16>(q_pedal(in.brake));
             w.put<u8>(u8((in.handbrake ? 1 : 0) | (in.shift_up ? 2 : 0) | (in.shift_down ? 4 : 0) | (in.automatic ? 8 : 0) | (in.controller_kind == 2 ? 16 : 0) | (in.controller_kind == 3 ? 32 : 0)));
+            w.put<u8>(u8(i < reverse2.size() && reverse2[i] ? 1 : 0));
         }
     return std::move(w.out);
 }
@@ -186,15 +183,12 @@ Replay Replay::parse(ByteSpan data) {
     Reader r(data.subspan(8));
     Replay rp;
     u32 version = r.get<u32>();
-    if (version < 1 || version > kVersion) throw FormatError("unsupported replay version " + std::to_string(version));
-    auto get_spec = [&]() -> std::shared_ptr<const sim::CarSpec> {
-        u32 ns = r.get<u32>();
+    if (version >= 1 && version < kVersion) throw ReplayTooOld(kReplayTooOld);
+    if (version != kVersion) throw FormatError("unsupported replay version " + std::to_string(version));
+    auto skip_spec = [&] { // (a car spec of a run before the exact core: not used)
+        const u32 ns = r.get<u32>();
         if (ns > data.size()) throw FormatError("replay truncated");
-        if (!ns) return nullptr;
-        if (std::optional<sim::CarSpec> sp = sim::parse_car_spec(r.bytes(ns)))
-            return std::make_shared<const sim::CarSpec>(std::move(*sp));
-        LOG_WARN("Replay: car spec not readable (the database car is used)");
-        return nullptr;
+        r.bytes(ns);
     };
     u32 n = r.get<u32>();
     rp.tick_hz = r.get<double>();
@@ -206,62 +200,55 @@ Replay Replay::parse(ByteSpan data) {
     rp.start = r.pose();
     u32 ne = r.get<u32>();
     if (ne > n + 1) throw FormatError("bad replay event count");
-    for (u32 i = 0; i < ne; ++i) {
-        ReplayEvent e;
-        e.tick = r.get<u32>();
-        e.kind = ReplayEvent::Kind(r.get<u8>());
-        e.pose = r.pose();
-        rp.events.push_back(e);
-    }
+    for (u32 i = 0; i < ne; ++i) r.get<u32>(), r.get<u8>(), r.pose(); // (respawn events: none in a race on the exact core)
     rp.best_lap = r.get<double>();
     rp.best_lap_begin = r.get<u32>();
     rp.best_lap_end = r.get<u32>();
     rp.final_position.x = r.get<float>(), rp.final_position.y = r.get<float>(), rp.final_position.z = r.get<float>();
-    if (version >= 2) {
-        rp.event = r.str();
-        u16 no = r.get<u16>();
-        if (no > 64) throw FormatError("bad replay opponent count");
-        for (u16 i = 0; i < no; ++i) rp.opponents.push_back(r.str());
-    }
-    if (version >= 3) rp.car2 = r.str();
-    if (version >= 4) rp.start_speed = r.get<float>();
-    if (version >= 6) rp.paint_seed = r.get<u32>();
-    if (version >= 7) {
-        rp.comment = r.str();
-        rp.kind = ReplayKind(r.get<u8>());
-        rp.laps = r.get<u16>();
-        rp.total_time = r.get<double>();
-        rp.power_ps = r.get<float>();
-        rp.car_model = r.str();
-        rp.wheel = r.str();
-        rp.saved = r.get<s64>();
-        rp.spec = get_spec();
-    }
-    if (version >= 8) {
-        rp.condition.odometer = r.get<u32>();
-        rp.condition.wear_m = r.get<float>();
-        rp.condition.oil_m = r.get<float>();
-    }
-    if (version >= 9) {
+    rp.event = r.str();
+    u16 no = r.get<u16>();
+    if (no > 64) throw FormatError("bad replay opponent count");
+    for (u16 i = 0; i < no; ++i) rp.opponents.push_back(r.str());
+    rp.car2 = r.str();
+    rp.start_speed = r.get<float>();
+    rp.paint_seed = r.get<u32>();
+    rp.comment = r.str();
+    rp.kind = ReplayKind(r.get<u8>());
+    rp.laps = r.get<u16>();
+    rp.total_time = r.get<double>();
+    rp.power_ps = r.get<float>();
+    rp.car_model = r.str();
+    rp.wheel = r.str();
+    rp.saved = r.get<s64>();
+    skip_spec();
+    rp.condition.odometer = r.get<u32>();
+    rp.condition.wear_m = r.get<float>();
+    rp.condition.oil_m = r.get<float>();
+    {
         auto rule = [](u8 v) { return v == 0 ? std::nullopt : std::optional<bool>(v == 2); };
         u8 f = r.get<u8>();
-        rp.grid_by_power = rule(f & 3), rp.cpu_respawn = rule((f >> 2) & 3);
+        rp.grid_by_power = rule(f & 3);
         if (!rp.car2.empty() && r.get<u8>()) {
             ReplayBattle b;
             b.laps = r.get<u16>();
-            b.boost_amount = r.get<float>(), b.boost_start = r.get<float>(), b.boost_full = r.get<float>();
+            const float catchup = r.get<float>();
+            r.get<float>(), r.get<float>();
+            b.catchup = catchup <= 0 ? 0 : catchup < 0.18f ? 1 : 2;
             b.handicap_m = r.get<float>();
             b.tyre_damage = r.get<u8>() != 0;
             b.model2 = r.str();
             b.wheel2 = r.str();
             b.paint2 = r.get<u8>();
-            b.spec2 = get_spec();
+            skip_spec();
             rp.battle = std::move(b);
         }
-    } else if (version >= 7) {
-        rp.grid_by_power = rp.kind == ReplayKind::GtRace;
     }
-    if (size_t(n) * 7 > data.size()) throw FormatError("replay truncated");
+    const u32 nx = r.get<u32>();
+    if (!nx) throw ReplayTooOld(kReplayTooOld); // (a run before every race ran on the exact core)
+    if (nx > data.size()) throw FormatError("replay truncated");
+    rp.exact = std::make_shared<const sim::exact::RaceRecord>(sim::exact::RaceRecord::parse(r.bytes(nx)));
+    const bool flags2 = true; // the second flags byte (reverse)
+    if (size_t(n) * 8 > data.size()) throw FormatError("replay truncated");
     rp.inputs.reserve(n);
     for (u32 i = 0; i < n; ++i) {
         sim::ControlInputs in;
@@ -273,6 +260,7 @@ Replay Replay::parse(ByteSpan data) {
             in.controller_kind = (f & 16) ? 2 : (f & 32) ? 3 : 0;
         rp.inputs.push_back(in);
         rp.driver_kind.push_back(u8((f & 192) == 192 ? 8 : (f & 64) ? 1 : (f & 128) ? 5 : 0));
+        if (flags2) rp.reverse.push_back(u8(r.get<u8>() & 1));
     }
     if (!rp.car2.empty())
         for (u32 i = 0; i < n; ++i) {
@@ -284,6 +272,7 @@ Replay Replay::parse(ByteSpan data) {
             in.handbrake = f & 1, in.shift_up = f & 2, in.shift_down = f & 4, in.automatic = f & 8;
             in.controller_kind = (f & 16) ? 2 : (f & 32) ? 3 : 0;
             rp.inputs2.push_back(in);
+            if (flags2) rp.reverse2.push_back(u8(r.get<u8>() & 1));
         }
     return rp;
 }
@@ -315,18 +304,22 @@ void ReplayRecorder::set_driver_kind(int kind) {
     replay_.driver_kind.back() = u8(kind == 1 || kind == 8 ? kind : kind >= 5 && kind <= 7 ? 5 : 0);
 }
 
+void ReplayRecorder::set_reverse(bool on) {
+    if (!active_ || replay_.inputs.empty()) return;
+    replay_.reverse.resize(replay_.inputs.size(), 0);
+    replay_.reverse.back() = on ? 1 : 0;
+}
+
+void ReplayRecorder::set_second_reverse(bool on) {
+    if (!active_ || replay_.inputs2.empty()) return;
+    replay_.reverse2.resize(replay_.inputs2.size(), 0);
+    replay_.reverse2.back() = on ? 1 : 0;
+}
+
 sim::ControlInputs ReplayRecorder::record_second(const sim::ControlInputs& in) {
     sim::ControlInputs q = quantize(in);
     if (active_) replay_.inputs2.push_back(q);
     return q;
-}
-
-void ReplayRecorder::respawn_second(const TrackPose& pose) {
-    if (active_) replay_.events.push_back({tick(), ReplayEvent::Respawn2, pose});
-}
-
-void ReplayRecorder::respawn(const TrackPose& pose) {
-    if (active_) replay_.events.push_back({tick(), ReplayEvent::Respawn, pose});
 }
 
 void ReplayRecorder::lap(double time, u32 begin_tick, u32 end_tick) {
@@ -336,11 +329,6 @@ void ReplayRecorder::lap(double time, u32 begin_tick, u32 end_tick) {
         replay_.best_lap_begin = begin_tick;
         replay_.best_lap_end = end_tick;
     }
-}
-
-const ReplayEvent* ReplayPlayer::pending_event() {
-    if (!r_ || event_ >= r_->events.size() || r_->events[event_].tick > tick_) return nullptr;
-    return &r_->events[event_++];
 }
 
 sim::ControlInputs ReplayPlayer::second_inputs() const {

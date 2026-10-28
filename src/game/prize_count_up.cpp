@@ -4,6 +4,12 @@ namespace gt3r::game {
 
 namespace {
 
+// Program constants of the counter's step (called by the prize counter control item):
+// the creep's 90 steps (90.0f), the creep velocity, the
+// acceleration cap, the acceleration and the velocity cap. The
+// NTSC-J program holds the same values and counts its x100 sums with
+// them unchanged. (The PAL program's, for its 50 Hz frames, are 75 steps, 0.2857143,
+// 569.3805, 7.591740 and the same cap.)
 constexpr int kCreepSteps = 90; // the creep's last step is the one after the 90th
 constexpr float kCreepVelocity = 0.2380952388048172f, kAccel = 5.2720417976379395f;
 constexpr float kAccelCap = 474.4837646484375f, kVelocityCap = 142345.125f;

@@ -22,8 +22,10 @@
 // and brake 0..4096, two spare axes.
 
 #include "base/bytes.h"
+#include "sim/exact/tick.h"
 #include "sim/sim_types.h"
 
+#include <array>
 #include <optional>
 #include <string>
 #include <vector>
@@ -37,12 +39,23 @@ struct DemoFrame {
     s8 shift = 0;      // +1 up, -1 down
     u8 kind = 2;
     u8 flags = 31;     // pad record flags (bit 0: analog steering)
+    s16 abs_steer = 0; // +0x6 |steer|
+    s16 back = 0;      // +0xC the back axis
+    s16 third = 0;     // +0xE the third axis
 };
 
 struct DemoReplay {
     u32 time_ms = 0;        // the run's recorded time
     bool automatic = true;  // car record transmission
     Bytes car_record;       // the car record's first 0x1D0 bytes: a CarSaveEquipments (car, parts, settings)
+    // The rest of the car record (the race's car loading writes it from the race entry): the condition words (entry
+    // + 0x2104 ..), EQ + 0x1E8, the grid slot, pedal style, spec flag, steering-wheel type and the ASM / TCS switches
+    // (entry + 0x20E0 .. + 0x20F4).
+    std::array<u32, 8> condition{};
+    u32 eq_1e8 = 0;
+    s32 grid_slot = 0;
+    u8 pedal_style = 0, spec_flag = 0, wheel_type = 0;
+    bool asm_on = true, tcs_on = true;
     std::vector<DemoFrame> frames;
 
     // nullopt (with *error) when the data is not a version-3 replay with an input stream.
@@ -51,6 +64,9 @@ struct DemoReplay {
     sim::ControlInputs inputs(size_t i) const;
     // The pad record kind of frame i (2 analog, 3 digital steering; 3 past the end).
     int kind(size_t i) const { return i < frames.size() ? frames[i].kind : 3; }
+    // Frame i as the race step's phase 3 reads it (the 16-byte pad record; past the end an empty frame), and as its bytes.
+    sim::exact::PadFrame pad_frame(size_t i) const;
+    void pad_bytes(size_t i, u8* out16) const;
     size_t size() const { return frames.size(); }
 };
 

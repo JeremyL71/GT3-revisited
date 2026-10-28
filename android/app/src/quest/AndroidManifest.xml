@@ -66,5 +66,17 @@
                 <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
             </intent-filter>
         </activity>
+        <!-- The user data folder (mods, screenshots, settings) in the Files app and file pickers:
+             app storage is private otherwise (GT3DocumentsProvider) -->
+        <provider
+            android:name=".GT3DocumentsProvider"
+            android:authorities="${applicationId}.documents"
+            android:grantUriPermissions="true"
+            android:exported="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
     </application>
 </manifest>

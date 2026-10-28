@@ -56,7 +56,10 @@ std::string cut(std::string s, size_t n) {
 
 SaveLibrary::SaveLibrary(std::string dir, bool tracked) : dir_(with_sep(std::move(dir))), tracked_(tracked) {}
 
-std::string SaveLibrary::user_dir() { return user_data_dir() + "saves/"; }
+std::string SaveLibrary::user_dir(Region region) {
+    std::string dir = user_data_dir() + "saves/";
+    return region == Region::America ? dir : dir + region_key(region) + "/";
+}
 std::string SaveLibrary::legacy_path() { return user_data_dir() + "gtmode.sav"; }
 
 int SaveLibrary::migrate(const std::string& legacy) {
@@ -74,6 +77,26 @@ int SaveLibrary::migrate(const std::string& legacy) {
         if (!SDL_CopyFile(from.c_str(), to.c_str())) continue;
         if (n++ == 0 && tracked_) set_current(to);
     }
+    return n;
+}
+
+int SaveLibrary::copy_library(const std::string& from) {
+    if (host_is_directory(dir_)) return 0;
+    if (!SDL_CreateDirectory(dir_.c_str())) return 0;
+    const std::string src = with_sep(from);
+    int n = 0, count = 0;
+    std::string copied_current;
+    const std::string current = SaveLibrary(src).current();
+    if (char** names = SDL_GlobDirectory(src.c_str(), "*.sav", SDL_GLOB_CASEINSENSITIVE, &count)) {
+        for (int i = 0; i < count; ++i) {
+            const std::string f = src + names[i];
+            if (host_is_directory(f) || !SDL_CopyFile(f.c_str(), (dir_ + names[i]).c_str())) continue;
+            ++n;
+            if (same_file(f, current)) copied_current = dir_ + names[i];
+        }
+        SDL_free(names);
+    }
+    if (!copied_current.empty() && tracked_) set_current(copied_current);
     return n;
 }
 

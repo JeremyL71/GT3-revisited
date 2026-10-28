@@ -7,15 +7,19 @@
 #include "gtmode_synth.h"
 
 #include "game/gt_mode_menu.h"
+#include "game/gt_save.h"
 #include "game/gt_setting.h"
 #include "game/prize_count_up.h"
 #include "game/save_library.h"
 #include "menu/flow/game_flow.h"
 #include "menu/flow/gt_mode_hooks.h"
+#include "vfs/vfs.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <functional>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -205,7 +209,7 @@ TEST(gtmode_synth_world_loads) {
     CHECK(d.demos.size() == 2 && d.demos[1].event == "demo_syn_2" && d.demos[1].course == "syn_hill");
     CHECK(d.arcade_courses.at("SINGLE_RACE").size() == 3 && d.arcade_courses.at("SINGLE_RACE")[2].level == 1);
     CHECK(d.arcade_classes.at("CLASS_C").size() == 2 && d.arcade_classes.at("CLASS_C")[0].image() == w::kCoupe);
-    CHECK(d.name_chars.size() == 5 && d.name_chars.at("key_b") == "B"); // (every item with a text)
+    CHECK(d.name_entry_chars("US").size() == 5 && d.name_entry_chars("US").at("key_b") == "B"); // (every item with a text)
     game::GtMode gt(data);
     auto rules = gt.rules("Gsyn_e_0001");
     CHECK(rules && rules->course == "syn_ring" && rules->prize[0] == 1500 && rules->trophy_class == 5 &&
@@ -213,6 +217,56 @@ TEST(gtmode_synth_world_loads) {
     auto lic = gt.rules("L0B0003");
     CHECK(lic && lic->license_ms[0] == 30000 && lic->license_ms[1] == 32500 && lic->entries[0] == "syv_lic_b");
     CHECK(gt.car_flags(w::kRacer) == 3 && gt.car_category(w::kRacer) == 1);
+    // The prize pages' word before "Cr." from the realtime text, in the language.
+    CHECK(d.prize_prefix == "Prize");
+}
+
+// The game config's sums come from the disc: a game config without one of them is refused (the
+// program has no fallback), whatever the others hold; in Japanese they are x100.
+TEST(gtmode_synth_game_config_sums) {
+    World world;
+    for (const char* name : {"initial", "car_wash", "oil_change", "wheel"}) {
+        FileReader read = [&world, name](const std::string& p) -> std::optional<Bytes> {
+            std::optional<Bytes> b = world.read(p);
+            if (!b || p != "gameconf/product.gcf") return b;
+            // Rename the entry ("wheel" -> "wheeX"): its value is no longer found.
+            const std::string key = std::string(1, '\0') + name + '\0';
+            auto at = std::search(b->begin(), b->end(), key.begin(), key.end());
+            if (at != b->end()) *(at + std::ptrdiff_t(key.size()) - 2) = 'X';
+            return b;
+        };
+        game::GtData d;
+        CHECK(!d.load(read) && d.error().find(std::string("'") + name + "'") != std::string::npos);
+    }
+    FileReader japanese = [&world](const std::string& p) -> std::optional<Bytes> {
+        if (p == Vfs::kLanguageFile) return Bytes{'J', 'P'};
+        return world.read(p);
+    };
+    game::GtData jp;
+    CHECK(jp.load(japanese) && jp.money_scale == 100);
+    CHECK(jp.starting_credits() == 100 * u32(w::kStartCredits) && jp.car_wash_price() == 6000 &&
+          jp.oil_change_price() == 30000 && jp.wheel_price() == 70000);
+    CHECK(jp.prize_prefix == "\xBE\xDE\xB6\xE2"); // the Japanese pool of the realtime text
+}
+
+// The dealer region pages leave out the Opel button in British English, the Vauxhall one in
+// the other languages (docs/dev/GT_MODE.md "Language"); other pages list every item.
+TEST(gtmode_synth_dealer_buttons_by_language) {
+    for (const char* lang : {"US", "BR"}) {
+        World world;
+        FileReader read = [&world, lang](const std::string& p) -> std::optional<Bytes> {
+            if (p == Vfs::kLanguageFile) return Bytes(lang, lang + 2);
+            return world.read(p);
+        };
+        GameFlow f(read, "US");
+        CHECK(start_title(f) != nullptr);
+        const GtModeHooks& h = gt_mode_hooks();
+        menu::MblItem opel, vauxhall;
+        opel.name = "opel", vauxhall.name = "vauxhall";
+        const bool br = std::string(lang) == "BR";
+        CHECK(h.listed("cd/cd_ger", opel) == !br && h.listed("cd/cd_eng", vauxhall) == br);
+        CHECK(h.listed("hm/hm", opel) && h.listed("hm/hm", vauxhall));
+    }
 }
 
 // install_gt_mode_menu(): every hook the GT-mode code provides is set; opening the GT-mode
@@ -220,7 +274,7 @@ TEST(gtmode_synth_world_loads) {
 TEST(gtmode_synth_install_and_attach) {
     World world;
     const GtModeHooks& h = gt_mode_hooks();
-    CHECK(h.attach && h.on_event && h.intercept && h.enabled && h.widget_text && h.hide_art && h.on_frame &&
+    CHECK(h.attach && h.on_event && h.intercept && h.enabled && h.listed && h.widget_text && h.hide_art && h.on_frame &&
           h.map_input && h.prepare_request && h.on_result && h.next_request && h.extra_draws && h.tap && h.hover &&
           h.take_popup && h.name_backspace && h.take_movie && h.attract_idle_frames && h.attract_demo &&
           h.on_arcade_result && h.arcade_parts && h.arcade_gauges && h.arcade_colors && h.arcade_image &&
@@ -253,6 +307,45 @@ TEST(gtmode_synth_install_and_attach) {
     CHECK(hidden("cd/acme_coupe_car", "car_render_from") && hidden("hm/hm_car", "car_color_box"));
     CHECK(hidden("ar/goodies", "end_button")); // no league complete, no course open beyond level 0
     CHECK(!hidden("map", "end_button"));
+}
+
+// The disc data loads at the first title and stays for the game's later starts, until the
+// mods change (App::rescan_mods): the next start then loads it with the mods' files as they
+// are (a mod installed after the first title was missing from GT mode and arcade).
+TEST(gtmode_synth_data_reloads_after_mods_change) {
+    World world;
+    auto files = std::make_shared<std::map<std::string, Bytes>>(synth::gtmode_files());
+    const FileReader read = [files](const std::string& p) -> std::optional<Bytes> {
+        auto it = files->find(p);
+        if (it == files->end()) return std::nullopt;
+        return it->second;
+    };
+    const GtModeHooks& h = gt_mode_hooks();
+    std::shared_ptr<const game::GtData> first;
+    {
+        GameFlow f(read, "US");
+        game::GtModeSession* s = start_title(f);
+        CHECK(s != nullptr);
+        if (!s) return;
+        first = s->gt().data_ptr();
+        CHECK(h.attract_idle_frames() == w::kTitleIdleSeconds * 60);
+    }
+    // A mod's product.gcf: the title idle time (section 0, the first) is 7 s.
+    Bytes& gcf = (*files)["gameconf/product.gcf"];
+    synth::p32(gcf, rd32(gcf, 12), 7);
+    {
+        GameFlow f(read, "US"); // back to the title: the data it had
+        game::GtModeSession* s = start_title(f);
+        CHECK(s && s->gt().data_ptr() == first);
+        CHECK(h.attract_idle_frames() == w::kTitleIdleSeconds * 60);
+    }
+    game::reload_gt_mode_data();
+    {
+        GameFlow f(read, "US");
+        game::GtModeSession* s = start_title(f);
+        CHECK(s && s->gt().data_ptr() != first);
+        CHECK(h.attract_idle_frames() == 7 * 60);
+    }
 }
 
 // The title (GameFlow start) and GT mode's map: the status bar, the map pointer moving
@@ -477,8 +570,260 @@ TEST(gtmode_synth_dealer) {
     choose(f, "beta");
     choose(f, "_syn_racer_03");
     CHECK(s->focus_car == w::kRacer && text_of(f, "focused_carname") == "Synthetic Racer");
+    CHECK(text_of(f, "car_buy_price") == "----"); // no price for a car not for sale
     choose(f, "buy");
     CHECK(page(f) == "00cmn/not_for_buy" && gt.state().garage.size() == 2);
+}
+
+// The dealer's list (gt_mode §7): each car's price as "Cr. 12,000", "----" for a car whose
+// not-for-sale flag (bit 0) is set, here the prize-only racer at its dealer; x100 in Japanese
+// (gt_mode §2).
+TEST(gtmode_synth_dealer_list_not_for_sale) {
+    for (const char* lang : {"US", "JP"}) {
+        World world;
+        FileReader read = [&world, lang](const std::string& p) -> std::optional<Bytes> {
+            if (p == Vfs::kLanguageFile) return Bytes(lang, lang + 2);
+            return world.read(p);
+        };
+        GameFlow f(read, "US");
+        game::GtModeSession* s = start_title(f);
+        CHECK(s != nullptr);
+        if (!s) return;
+        const game::GtMode& gt = s->gt();
+        const bool jp = std::string(lang) == "JP";
+        CHECK(gt.data().money_scale == (jp ? 100 : 1));
+        choose(f, "gt_mode");
+        choose(f, "cd_cd");
+        choose(f, "jp");
+        choose(f, "acme");
+        CHECK(page(f) == "cd/cd_jp_acme");
+        CHECK(text_named(f, "syn_coupe_01_price") == (jp ? "Cr. 1,200,000" : "Cr. 12,000"));
+        CHECK(text_named(f, "syn_wagon_02_price") == (jp ? "Cr. 3,000,000" : "Cr. 30,000"));
+        press(f, MenuKey::Cancel);
+        choose(f, "beta");
+        CHECK(page(f) == "cd/cd_jp_beta");
+        // The racer has a catalogue price, but the list shows none.
+        CHECK(gt.car_price(w::kRacer) == (jp ? 9000000 : 90000) && (gt.car_flags(w::kRacer) & 1));
+        CHECK(text_named(f, "_syn_racer_03_price") == "----");
+    }
+}
+
+// The wheel inventory (gt_mode §7): 200 slots with the stock-wheel placeholder in one, so 199
+// wheels can be bought. With no slot free the shop's confirm page still opens (its pre-check
+// refuses only a wheel already held or too little money), buying adds nothing and charges
+// nothing, and "fit it?" still puts the wheel on the ride car, for free and outside the
+// inventory, as GT3's shop does on a full inventory. The synthetic wheel price is 700 (x100 in
+// Japanese, gt_mode §2).
+TEST(gtmode_synth_wheel_inventory_full) {
+    for (const char* lang : {"US", "JP"}) {
+        World world;
+        FileReader read = [&world, lang](const std::string& p) -> std::optional<Bytes> {
+            if (p == Vfs::kLanguageFile) return Bytes(lang, lang + 2);
+            return world.read(p);
+        };
+        GameFlow f(read, "US");
+        game::GtModeSession* s = start_title(f);
+        CHECK(s != nullptr);
+        if (!s) return;
+        game::GtMode& gt = s->gt();
+        const s64 price = std::string(lang) == "JP" ? 70000 : 700;
+        CHECK(gt.data().wheel_price() == price);
+        const GtModeHooks& h = gt_mode_hooks();
+        // The wheel shop's confirm page for a wheel: "" (it opens) or the refusal popup.
+        auto buy_sure = [&](const std::string& wheel) {
+            menu::MblItem it;
+            it.name = wheel + "_link";
+            it.link = "00cmn/ws_buy_sure";
+            return h.intercept("at/ws/ws_x", it);
+        };
+        std::vector<std::string> log;
+        auto action = [&](const std::string& a, const std::string& item = {}) {
+            MenuEvent e;
+            e.kind = MenuEvent::Kind::Action;
+            e.action = a;
+            e.item = item;
+            e.page = a == "buy_wheel" ? "00cmn/ws_buy_sure" : "at/ws/ws_x";
+            return h.on_event(e, log);
+        };
+        gt.state().credits = 100000000;
+        CHECK(gt.buy_car(w::kCoupe) == 0 && gt.state().wheels.empty());
+        s64 credits = gt.state().credits;
+        for (int i = 0; i < 198; ++i) CHECK(gt.buy_wheel("syn_wheel_" + std::to_string(i)));
+        CHECK(gt.state().wheels.size() == 198 && gt.state().credits == credits - 198 * price);
+        // The 199th, through the shop's pre-check and actions: bought and charged.
+        credits = gt.state().credits;
+        CHECK(buy_sure("syn_wheel_198").empty());
+        action("set_focus_wheel_code", "syn_wheel_198_link");
+        action("buy_wheel");
+        CHECK(gt.state().wheels.size() == 199 && gt.state().wheels.back() == "syn_wheel_198");
+        CHECK(gt.state().credits == credits - price);
+        action("fit_wheel");
+        CHECK(gt.state().ride_car()->wheel == "syn_wheel_198" && gt.state().credits == credits - price);
+        // The 200th: no slot is free.
+        credits = gt.state().credits;
+        CHECK(buy_sure("syn_wheel_199").empty() && gt.can_buy_wheel("syn_wheel_199") == game::Check::Ok);
+        action("set_focus_wheel_code", "syn_wheel_199_link");
+        CHECK(s->focus_wheel == "syn_wheel_199");
+        action("buy_wheel");
+        CHECK(gt.state().wheels.size() == 199 && gt.state().wheels.back() == "syn_wheel_198");
+        CHECK(gt.state().credits == credits);
+        CHECK(!gt.buy_wheel("syn_wheel_199") && gt.state().wheels.size() == 199 && gt.state().credits == credits);
+        // "Fit it?" yes: the ride car wears the wheel the inventory had no slot for; nothing is charged.
+        action("fit_wheel");
+        CHECK(gt.state().ride_car()->wheel == "syn_wheel_199" && gt.state().credits == credits);
+        CHECK(gt.state().wheels.size() == 199 &&
+              std::find(gt.state().wheels.begin(), gt.state().wheels.end(), "syn_wheel_199") == gt.state().wheels.end());
+        // The garage's car page shows the car on it, and the save keeps it.
+        std::string shown, wheel;
+        int paint = -1;
+        CHECK(game::car_for_widget("hm/hm_car", "car_render_garage", shown, paint, &wheel));
+        CHECK(shown == w::kCoupe && wheel == "syn_wheel_199");
+        const game::GameState saved = game::load_from_text(game::save_to_text(gt.state()));
+        CHECK(saved.garage.size() == 1 && saved.garage[0].wheel == "syn_wheel_199" && saved.wheels == gt.state().wheels);
+        // Once changed, it cannot be put back: the garage offers only the inventory's wheels.
+        CHECK(gt.fit_wheel(gt.state().ride, "") && !gt.fit_wheel(gt.state().ride, "syn_wheel_199"));
+        // The usual refusals still come first.
+        CHECK(buy_sure("syn_wheel_0") == "00cmn/already_you_have");
+        gt.state().credits = price - 1;
+        CHECK(buy_sure("syn_wheel_199") == "00cmn/no_money");
+    }
+}
+
+// The garage's wheel list (gt_mode §7; extra_draws, on_frame): one button per wheel inventory
+// entry in a row centred in the "menu_wheel" window, 4 units apart, the stock-wheel button first
+// ("default_wheel" tile), then the bought wheels with their own tiles in the "wheel" frame; the
+// "mark" on the worn entry, the cursor starting there (the first button, unmarked, for a wheel
+// the inventory does not hold); Left / Right move it and the car shows the wheel; "Equip this
+// wheel?" yes fits it (the stock-wheel button: the car's own wheels). The scroll bar shows only
+// while the row is longer than the window, with the pinch over the visible share. The tile named
+// after a car model is never drawn. The wheel shop's brand page starts on the worn wheel.
+TEST(gtmode_synth_garage_wheel_list) {
+    World world;
+    GameFlow f(world.read, "US");
+    game::GtModeSession* s = start_title(f);
+    CHECK(s != nullptr);
+    if (!s) return;
+    game::GtMode& gt = s->gt();
+    gt.state().credits = 1000000;
+    CHECK(gt.buy_car(w::kCoupe) == 0 && gt.buy_wheel(w::kRimA) && gt.buy_wheel(w::kRimB));
+    const game::GarageCar& car = gt.state().garage[0];
+    choose(f, "gt_mode");
+    choose(f, "hm_hm");
+    choose(f, "hm_gr");
+    choose(f, "car1");
+    choose(f, "wheel");
+    CHECK(page(f) == "hm/hm_wheel");
+    auto boxes = [&](const std::string& name) {
+        std::vector<float> xs;
+        for (const menu::ElementDraw& d : draws_named(f, name))
+            if (d.has_box) xs.push_back(d.box.x);
+        std::sort(xs.begin(), xs.end());
+        xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+        return xs;
+    };
+    auto preview = [&] {
+        std::string c, wheel = "?";
+        int paint = -1;
+        game::car_for_widget(page(f), "car_render_wheel", c, paint, &wheel);
+        return wheel;
+    };
+    auto settle_scroll = [&] {
+        for (int i = 0; i < 60; ++i) f.tick(0);
+    };
+    settle_scroll();
+    // Three buttons (188 units) centred in the 620-unit window from x 10: frames at 226, 290, 354.
+    const std::vector<float> frames = boxes("wheel");
+    CHECK((frames == std::vector<float>{226, 290, 354}));
+    CHECK((boxes("default_wheel") == std::vector<float>{230}) && (boxes(w::kRimA) == std::vector<float>{294}) &&
+          (boxes(w::kRimB) == std::vector<float>{358}));
+    CHECK((boxes("mark") == std::vector<float>{226}) && s->wheel_cursor == 0 && preview().empty());
+    CHECK(draws_named(f, "zz0001").empty() && draws_named(f, "scroll_bar").empty() && draws_named(f, "pinch").empty());
+    // A hovering pointer moves the cursor to the button under it, a tap on another button too,
+    // and a tap on the cursor's button asks "Equip this wheel?" (here: no).
+    CHECK(f.hover(354 + 30, 95 + 30) && s->wheel_cursor == 2 && preview() == w::kRimB);
+    CHECK(f.tap(226 + 30, 95 + 30) && s->wheel_cursor == 0);
+    CHECK(f.tap(226 + 30, 95 + 30));
+    f.tick(0); // (the tap's confirm goes in on the next frame)
+    settle(f);
+    CHECK(page(f) == "hm/hm_change_wheel_sure");
+    choose(f, "no1");
+    CHECK(page(f) == "hm/hm_wheel" && s->wheel_cursor == 0 && car.wheel.empty());
+    // Right: the first bought wheel on the car; Right again stops at the end.
+    f.take_sounds();
+    press(f, MenuKey::Right);
+    CHECK(s->wheel_cursor == 1 && preview() == w::kRimA && has_sound(f.take_sounds(), "cursor"));
+    press(f, MenuKey::Right);
+    press(f, MenuKey::Right);
+    CHECK(s->wheel_cursor == 2 && preview() == w::kRimB);
+    press(f, MenuKey::Left);
+    // Equip it.
+    press(f, MenuKey::Confirm);
+    CHECK(page(f) == "hm/hm_change_wheel_sure");
+    choose(f, "yes1");
+    CHECK(car.wheel == w::kRimA && page(f) == "hm/hm_wheel_changed");
+    choose(f, "buy3");
+    CHECK(page(f) == "hm/hm_car");
+    choose(f, "wheel");
+    settle_scroll();
+    CHECK(s->wheel_cursor == 1 && (boxes("mark") == std::vector<float>{290}));
+    // The stock-wheel button: back on the car's own wheels.
+    press(f, MenuKey::Left);
+    press(f, MenuKey::Confirm);
+    choose(f, "yes1");
+    CHECK(car.wheel.empty());
+    choose(f, "buy3");
+    // A wheel the inventory does not hold: no mark, the first button.
+    gt.state().garage[0].wheel = "syn_rim_c";
+    choose(f, "wheel");
+    settle_scroll();
+    CHECK(s->wheel_cursor == 0 && boxes("mark").empty());
+    press(f, MenuKey::Cancel);
+    gt.state().garage[0].wheel.clear();
+    // Ten more wheels (13 buttons, 828 units): left-aligned near the start, the scroll bar and
+    // the pinch as wide as the visible share (620 / 828 of the bar).
+    for (int i = 0; i < 10; ++i) CHECK(gt.buy_wheel("syn_more_" + std::to_string(i)));
+    choose(f, "wheel");
+    settle_scroll();
+    CHECK(boxes("wheel").front() == 10 && draws_named(f, "scroll_bar").size() == 1);
+    {
+        auto p = draws_named(f, "pinch");
+        CHECK(p.size() == 1 && std::abs(p[0].box.x - 10) < 0.01f && std::abs(p[0].box.w - 620.0f * 620.0f / 828.0f) < 0.01f);
+    }
+    // In the middle the cursor's button is centred (button 6: offset 310 - (384 + 30) = -104),
+    // the pinch at 10 + 104 x 620 / 828.
+    for (int i = 0; i < 6; ++i) press(f, MenuKey::Right);
+    settle_scroll();
+    {
+        auto p = draws_named(f, "pinch");
+        CHECK(s->wheel_cursor == 6 && (boxes("wheel").size() >= 7));
+        CHECK(p.size() == 1 && std::abs(p[0].box.x - (10 + 104.0f * 620.0f / 828.0f)) < 0.01f);
+    }
+    // At the far end the row is right-aligned and the pinch at the bar's end.
+    for (int i = 0; i < 6; ++i) press(f, MenuKey::Right);
+    settle_scroll();
+    {
+        auto p = draws_named(f, "pinch");
+        CHECK(s->wheel_cursor == 12 && boxes("wheel").back() == 630 - 60);
+        CHECK(p.size() == 1 && std::abs(p[0].box.x + p[0].box.w - 630) < 0.01f);
+    }
+    // The wheel shop's brand page starts on the wheel the ride car wears.
+    gt.state().garage[0].wheel = w::kRimB;
+    press(f, MenuKey::Cancel);
+    press(f, MenuKey::Cancel);
+    press(f, MenuKey::Cancel);
+    press(f, MenuKey::Cancel);
+    CHECK(page(f) == "map");
+    choose(f, "at_at");
+    choose(f, "ws");
+    choose(f, "syn");
+    CHECK(page(f) == "at/ws/ws_syn" && f.controller()->focus() == 1);
+    // Its two 52-unit tiles 4 apart (108 units) centred in the 600-unit window from x 20.
+    CHECK(draws_named(f, w::kRimA).size() == 1 && draws_named(f, w::kRimA)[0].box.x == 20 + 246);
+    CHECK(draws_named(f, w::kRimB).size() == 1 && draws_named(f, w::kRimB)[0].box.x == 20 + 246 + 56);
+    gt.state().garage[0].wheel.clear();
+    press(f, MenuKey::Cancel);
+    choose(f, "syn");
+    CHECK(page(f) == "at/ws/ws_syn" && f.controller()->focus() == 0);
 }
 
 // The garage list (code-drawn rows in extra_draws), its cursor (on_frame), the sort panel,
@@ -497,8 +842,9 @@ TEST(gtmode_synth_garage) {
     choose(f, "hm_hm");
     choose(f, "hm_gr");
     CHECK(page(f) == "hm/hm_gr");
-    // Rows in the "menu_garage" window (y up: 400 - 22 per row), date order, the cursor row
-    // in the template's focused look; the MAKE column; the ride car's mark.
+    // Rows in the "menu_garage" window (y up: from its top at 400, 24 apart: the 20-unit rows
+    // and GT3's button list gap of 4), date order, the cursor row in the template's focused look;
+    // the MAKE column; the ride car's mark.
     auto rows = [&] {
         std::vector<std::pair<std::string, menu::ElementDraw>> out;
         for (const menu::ElementDraw& d : f.draw_list())
@@ -509,7 +855,7 @@ TEST(gtmode_synth_garage) {
         auto r = rows();
         CHECK(r.size() == 2);
         if (r.size() == 2) {
-            CHECK(r[0].first == "Synthetic Wagon" && box_is(r[0].second, 40, 378, 300, 20));
+            CHECK(r[0].first == "Synthetic Wagon" && box_is(r[0].second, 40, 380, 300, 20));
             CHECK(r[1].first == "Synthetic Coupe" && box_is(r[1].second, 40, 356, 300, 20));
             CHECK(r[0].second.element == &f.controller()->items()[0].element->alt[0]); // the cursor row
         }
@@ -556,6 +902,142 @@ TEST(gtmode_synth_garage) {
     CHECK(text_of(f, "car_sell_price") == "----");
     choose(f, "sell");
     CHECK(page(f) == "00cmn/not_for_sell" && gt.state().garage.size() == 2);
+}
+
+// The garage list as GT3's vertical button list (menus §4.6, §9.7; gt_mode §5, §19): the 20-unit
+// rows 24 apart from the
+// window's top; a list that fits stays there, with no scroll bar at all (track included); a
+// longer one keeps the cursor row centred, held at the window's top and bottom near the ends,
+// its offset easing 30 % a frame; the scroll bar's pinch is window h x bar h / list h high, its
+// top at bar top - offset x bar h / list h (top-down). The rows are clipped to the window; a
+// hovering pointer moves the cursor without scrolling, a tap moves it and a second confirms.
+// The trade list (the guest garage) is the same list.
+TEST(gtmode_synth_garage_list_scroll) {
+    World world;
+    GameFlow f(world.read, "US");
+    game::GtModeSession* s = start_title(f);
+    CHECK(s != nullptr);
+    if (!s) return;
+    game::GtMode& gt = s->gt();
+    gt.state().credits = 100000000;
+    CHECK(gt.buy_car(w::kCoupe, 0) == 0);
+    CHECK(gt.buy_car(w::kWagon, 0) == 0);
+    choose(f, "gt_mode");
+    choose(f, "hm_hm");
+    choose(f, "hm_gr");
+    CHECK(page(f) == "hm/hm_gr");
+    // The list's rows (the code-drawn ones, clipped to the window) top to bottom, and the
+    // cursor row's.
+    auto rows = [&] {
+        std::vector<menu::ElementDraw> out;
+        for (const menu::ElementDraw& d : f.draw_list())
+            if (d.element && d.text && d.element->name == "car1" && d.has_clip) out.push_back(d);
+        std::sort(out.begin(), out.end(), [](const menu::ElementDraw& a, const menu::ElementDraw& b) { return a.box.y > b.box.y; });
+        return out;
+    };
+    auto cursor_y = [&] {
+        for (const menu::ElementDraw& d : rows())
+            if (d.element == &f.controller()->items()[0].element->alt[0]) return d.box.y;
+        return -1000.0f;
+    };
+    auto near = [](float a, float b) { return std::fabs(a - b) < 0.01f; };
+    {
+        auto r = rows();
+        CHECK(r.size() == 2 && box_is(r[0], 40, 380, 300, 20) && box_is(r[1], 40, 356, 300, 20));
+        for (const menu::ElementDraw& d : r)
+            CHECK(near(d.clip.x, 40) && near(d.clip.y, 100) && near(d.clip.w, 420) && near(d.clip.h, 300));
+        CHECK(draws_named(f, "scroll_bar").empty() && draws_named(f, "pinch").empty());
+    }
+    // Twenty cars: 20 x 20 + 19 x 4 = 476 units in the 300-unit window.
+    press(f, MenuKey::Cancel);
+    for (int i = 0; i < 18; ++i) CHECK(gt.buy_car(w::kCoupe, 0) == 0);
+    choose(f, "hm_gr");
+    CHECK(page(f) == "hm/hm_gr" && gt.state().garage.size() == 20 && s->garage_cursor == 0);
+    const float total = 476, ph = 300 * 300 / total;
+    // The cursor row at offset `off` (row c's top 400 - off - 24 c), the scroll bar's track and
+    // its pinch.
+    auto at = [&](int c, float off) {
+        auto p = draws_named(f, "pinch");
+        return s->garage_cursor == c && near(cursor_y(), 400 - off - 24.0f * float(c) - 20) &&
+               draws_named(f, "scroll_bar").size() == 1 && p.size() == 1 &&
+               box_is(p[0], 20, 400 + off * 300 / total - ph, 8, ph);
+    };
+    auto settle_list = [&] {
+        for (int i = 0; i < 60; ++i) f.tick(0);
+    };
+    CHECK(at(0, 0));
+    CHECK(rows().size() == 13 && near(rows().back().box.y, 92)); // rows 0-12, the last one in part
+    // Down: the cursor sound; the list stays at the top while the cursor row starts less than
+    // 150 units down (row 6 at 144).
+    f.take_sounds();
+    press(f, MenuKey::Down);
+    CHECK(s->garage_cursor == 1 && has_sound(f.take_sounds(), "cursor"));
+    s->garage_cursor = 6;
+    settle_list();
+    CHECK(at(6, 0));
+    // Row 10 centred: offset 150 - (240 + 10); rows 4 to 16 shown, the two ends in part.
+    s->garage_cursor = 10;
+    settle_list();
+    CHECK(at(10, -100));
+    {
+        auto r = rows();
+        CHECK(r.size() == 13 && near(r.front().box.y, 384) && near(r.back().box.y, 96));
+    }
+    // One frame towards row 11's -124: 30 % of the way (-107.2), then -112.24.
+    s->garage_cursor = 11;
+    f.tick(0);
+    CHECK(at(11, -107.2f));
+    f.tick(0);
+    CHECK(at(11, -112.24f));
+    settle_list();
+    CHECK(at(11, -124));
+    // Near the end the list is held at the window's bottom (300 - 476); Down stops at the last.
+    s->garage_cursor = 13;
+    settle_list();
+    CHECK(at(13, -176));
+    for (int i = 0; i < 8; ++i) press(f, MenuKey::Down);
+    settle_list();
+    CHECK(at(19, -176) && near(cursor_y(), 100));
+    // A hovering pointer: over row 15 (its top at 400 + 176 - 360) the cursor moves there and the
+    // list holds still; a key lets it ease again.
+    s->garage_cursor = 10;
+    settle_list();
+    CHECK(f.hover(100, 400 + 100 - 24 * 12 - 10)); // row 12, 10 units into it
+    settle_list();
+    CHECK(at(12, -100));
+    CHECK(f.hover(100, 400 + 100 - 24 * 12 - 10) && s->garage_cursor == 12); // still over it
+    CHECK(!f.hover(100, 420)); // above the window
+    press(f, MenuKey::Down);
+    settle_list();
+    CHECK(at(13, -176));
+    // A tap on another row moves the cursor; on the cursor row it opens the car.
+    CHECK(f.tap(100, 400 + 176 - 24 * 14 - 10));
+    f.tick(0);
+    settle(f);
+    settle_list();
+    CHECK(at(14, -176) && page(f) == "hm/hm_gr");
+    CHECK(f.tap(100, 400 + 176 - 24 * 14 - 10));
+    f.tick(0);
+    settle(f);
+    CHECK(page(f) == "hm/hm_car");
+    // Back on the list: placed at once on the cursor row's offset.
+    press(f, MenuKey::Cancel);
+    CHECK(page(f) == "hm/hm_gr" && at(14, -176));
+    // The trade list: the guest garage, the same list.
+    s->guest = std::make_unique<game::GtMode>(gt.data_ptr());
+    s->guest->state().credits = 100000000;
+    for (int i = 0; i < 3; ++i) CHECK(s->guest->buy_car(w::kWagon, 0) == 0);
+    press(f, MenuKey::Cancel);
+    CHECK(f.controller()->open("hm/hm_gr_trade"));
+    settle(f);
+    CHECK(page(f) == "hm/hm_gr_trade" && s->trade && s->garage_cursor == 0);
+    {
+        auto r = rows();
+        CHECK(r.size() == 3 && near(r[0].box.y, 380) && near(r[1].box.y, 356) && near(r[2].box.y, 332));
+        CHECK(draws_named(f, "scroll_bar").empty() && draws_named(f, "pinch").empty());
+    }
+    s->trade = false;
+    s->guest.reset();
 }
 
 // The tune shop: no ride car, buying and fitting a part through the popup chain, the part
@@ -764,10 +1246,13 @@ TEST(gtmode_synth_race_and_prizes) {
         auto rows = permitted();
         CHECK(rows.size() == 2);
         if (rows.size() == 2) {
-            CHECK(*rows[0].text == "Synthetic Coupe" && box_is(rows[0], 60, 298, 300, 20));
+            CHECK(*rows[0].text == "Synthetic Coupe" && box_is(rows[0], 60, 300, 300, 20));
             CHECK(*rows[1].text == "Synthetic Wagon Touring" && box_is(rows[1], 60, 276, 300, 20));
             CHECK(rows[0].element == &f.controller()->items()[0].element->alt[0]); // the cursor row
         }
+        // (Rows 24 apart from the window's top, GT3's vertical button list; the list fits: no
+        // scroll bar, track included.)
+        CHECK(draws_named(f, "scroll_bar").empty() && draws_named(f, "pinch").empty());
     }
     press(f, MenuKey::Down);
     CHECK(s->regulated_cursor == 1);
@@ -782,7 +1267,7 @@ TEST(gtmode_synth_race_and_prizes) {
     if (!r) return;
     CHECK(r->mode == "go_race" && r->race_code == "Gsyn_e_0001" && r->event == "Gsyn_e_0001");
     CHECK(r->page == "r/beginner/gsyn_e_entry");
-    CHECK(r->car == w::kCoupe && r->car_model == "zz0001" && r->car_color == 0 && !r->car_spec && !r->racing_gearbox);
+    CHECK(r->car == w::kCoupe && r->car_model == "zz0001" && r->car_color == 0 && r->car_parts && !r->racing_gearbox);
     CHECK(r->opponents.size() == 5 && r->champ_round == 0);
     for (const std::string& o : r->opponents) CHECK(o == "syv_coupe_a" || o == "syv_wagon_b");
     CHECK(gt.state().day == 2);
@@ -1322,8 +1807,9 @@ TEST(gtmode_synth_machine_test_and_records) {
     rec.start("records", "records_free_tt");
     settle(rec);
     CHECK(rec.control() == "records" && page(rec) == "records_free_tt" && rec.gt_active());
-    // Every place of the table, 24 apart from the window's top: the bar and the texts; the
-    // empty ones with no name, the time and date placeholders and no car.
+    // Every place of the table, 28 apart from the window's top (the 24-unit bars and the gap of
+    // 4; the twelve fill the window): the bar and the texts; the empty ones with no name, the
+    // time and date placeholders and no car.
     auto texts = [&](const char* name) {
         std::vector<std::string> out;
         for (const menu::ElementDraw& d : rec.draw_list())
@@ -1343,11 +1829,32 @@ TEST(gtmode_synth_machine_test_and_records) {
     int bars = 0;
     for (const menu::ElementDraw& d : rec.draw_list())
         if (d.element && d.element->name == "record_bar")
-            bars += box_is(d, 40, 364, 560, 24) || box_is(d, 40, 340, 560, 24) || box_is(d, 40, 100, 560, 24);
-    CHECK(bars == 3);
+            bars += box_is(d, 40, 336, 560, 24) || box_is(d, 40, 56, 560, 24);
+    CHECK(bars == 2);
+    // The first place has the cursor: its bar in the item's focused look.
+    int focused = 0;
+    for (const menu::ElementDraw& d : rec.draw_list())
+        focused += d.element == &rec.controller()->items()[0].element->alt[0] && d.has_clip && box_is(d, 40, 364, 560, 24);
+    CHECK(focused == 1);
     for (const menu::ElementDraw& d : rec.draw_list())
         if (d.element && d.element->name == "record_name" && d.text)
             CHECK(d.box.w == 200); // left-aligned: room to the right
+    // Up / Down move the cursor over the places (the plain list's "select"; held at the ends);
+    // a hovering pointer moves it too.
+    auto cursor_bar = [&] {
+        for (const menu::ElementDraw& d : rec.draw_list())
+            if (d.element == &rec.controller()->items()[0].element->alt[0] && d.has_clip) return d.box.y;
+        return -1.0f;
+    };
+    rec.take_sounds();
+    press(rec, MenuKey::Down);
+    CHECK(s->records_cursor == 1 && cursor_bar() == 336 && has_sound(rec.take_sounds(), "select"));
+    press(rec, MenuKey::Up);
+    press(rec, MenuKey::Up);
+    CHECK(s->records_cursor == 0 && cursor_bar() == 364);
+    CHECK(rec.hover(300, 56 + 10) && s->records_cursor == 11 && cursor_bar() == 56);
+    press(rec, MenuKey::Down);
+    CHECK(s->records_cursor == 11);
     press(rec, MenuKey::Cancel);
     CHECK(rec.exited());
     // A licence test's page: its 6 places, no car.
@@ -1724,7 +2231,7 @@ TEST(gtmode_synth_arcade_single_race) {
     if (!r) return;
     CHECK(r->mode == "single_race" && r->race_code == "ANCT0001" && r->difficulty == 1 && r->page == "ar/select_car");
     CHECK(r->course == "syn_ring" && r->car == w::kCoupe && r->car_class == "class_c" && r->car_color == 1);
-    CHECK(r->transmission == 1 && r->tire_mode == 0 && !r->car_spec);
+    CHECK(r->transmission == 1 && r->tire_mode == 0 && !r->car_parts);
     // An arcade car runs with a fresh engine; its distance still counts in the total.
     CHECK(r->car_condition && r->garage_car == -1 && r->car_odometer == 0 && r->car_wear_m == 0);
     // Won: the difficulty's cup (OK after 180 frames), the course recorded.
@@ -1732,7 +2239,8 @@ TEST(gtmode_synth_arcade_single_race) {
     CHECK(s->gt().state().distance_m == 4000.0);
     CHECK(f.control() == "arcade_mini" && page(f) == "arcade_mini");
     CHECK(game::presentation_model("arcade_mini") == "race/a_normal_gold.prm" && text_of(f, "rank_disp") == "1st");
-    CHECK(s->gt().state().arcade.best[size_t(game::kArcadeCourses)] == 0 && s->gt().state().trophies == 1);
+    // Normal, course 0: record 1 x the SINGLE_RACE list's three courses + 0.
+    CHECK(s->gt().arcade_best(1, 0) == 0 && s->gt().state().arcade.best[3] == 0 && s->gt().state().trophies == 1);
     CHECK(!f.controller()->item_enabled(0));
     for (int i = 0; i < 180; ++i) f.tick(0);
     CHECK(f.controller()->item_enabled(0));
@@ -2237,7 +2745,7 @@ TEST(gtmode_synth_hook_branches) {
     CHECK(gt.state().rankings["at:AT010001"].size() == 1 && !h.presentation());
 }
 
-// The car wash and the oil change (gt_mode §13.2), and touch on the garage list (garage_tap /
+// The car wash and the oil change (gt_mode §13.2), and touch on the garage list (gt_mode §5; garage_tap /
 // garage_hover: a row moves the cursor, the cursor row opens the car). Each runs under a
 // progress popup that takes the controls away until it is over: no input and no "Complete"
 // button until then. The car is washed spinning (its turntable pushed round, car_wash_spin) and

@@ -1,15 +1,15 @@
-// Time trial (milestone M2): choose a course and a car, then drive. The
-// simulation runs at a fixed tick (sim::kDefaultTickHz) decoupled from the
-// frame rate; rendering interpolates between the last two ticks.
+// The race screen: every race, solo run, replay and demonstration (on the exact core, race/exact_field.h). The
+// race steps at a fixed rate (RaceField::tick_hz) decoupled from the frame rate; rendering interpolates between the last
+// two steps. On its own (--screen race): choose a course and a car, then a time trial.
 //
 // Driving controls come from each player's race pad (InputManager::race_pad: the race
 // layout, modern or GT3's own, with buttons in GT3's meaning): Cross throttle, Square brake
 // (pressure), Circle handbrake, Triangle reverse, left stick / d-pad steer, R2/L2 shift
-// (manual), R1 camera, L1 look back, Select respawn on the track, Start pause (Restart /
+// (manual), R1 camera, L1 look back, Start pause (Restart /
 // camera / gearbox / exit). See race/controls.h and docs/INPUT.md.
 //
 // GT3R_RACE="course=trialmt,car=r34_gtr_v_99,cam=0,auto=1,warp=6,mt=0,quit=20,paint=0"
-// skips the selection: auto=1 drives along the centre line, warp=N
+// skips the selection: auto=1 lets the race's AI drive the player's car, warp=N
 // simulates N seconds before the first frame (driving screenshots with
 // --shot), quit=N exits after N seconds (frame-time measurements).
 //
@@ -20,6 +20,7 @@
 // (Race screen code map: docs/dev/RACE.md.)
 
 #include "app/screen_race_impl.h"
+#include "game/language_rules.h"
 
 namespace gt3r::race_screen {
 
@@ -112,6 +113,15 @@ void RaceScreen::update(App& app, double dt) {
         begin(app);
         return;
     }
+    if (launch_failed_) { // the message, then back to the menus with any button
+        const MenuInput& m = app.menu();
+        for (PadButton b : {PadButton::Cross, PadButton::Circle, PadButton::Triangle, PadButton::Start})
+            if (m.pressed(b)) {
+                app.pop();
+                return;
+            }
+        return;
+    }
     if (stage_ == Stage::Select) update_select(app);
     else if (stage_ == Stage::Drive) update_drive(app, dt);
     // Screenshots: the pause menu's Exit in a live run once it has driven exit_laps laps.
@@ -150,6 +160,13 @@ TouchLayout RaceScreen::touch_layout() const {
 }
 
 void RaceScreen::render(App& app, Ui& ui) {
+    if (launch_failed_) {
+        ui.fill(0, 0, float(Ui::kWidth), float(Ui::kHeight), Color{0, 0, 0, 255});
+        ui.text_center(Ui::kHeight / 2.0f - 16, "The race cannot start.", colors::kText);
+        ui.text_center(Ui::kHeight / 2.0f, Ui::clip(error_, Ui::kWidth - 40.0f), colors::kDim);
+        ui.footer("Press any button to return");
+        return;
+    }
     if (stage_ == Stage::Drive) render_drive(app, ui);
     else if ((from_menu_ || online_) && error_.empty()) render_loading(app, ui);
     else render_select(app, ui);
@@ -197,7 +214,7 @@ void RaceScreen::init(App& app) {
     }
     db_ok_ = db_.load(*app.vfs());
     if (!colors_.load(*app.vfs())) LOG_WARN("Race: database/carcolor.db not loaded (opponents in default paint)");
-    if (!db_ok_) error_ = "Car database: " + db_.error();
+    if (!db_ok_) error_ = db_.player_error();
     for (const data::Course& c : db_.courses()) {
         if (c.label.rfind("L_", 0) == 0 || course_path(*app.vfs(), c.label).empty()) continue;
         courses_.push_back({c.label, c.name.empty() ? c.label : c.name});
@@ -226,14 +243,17 @@ void RaceScreen::init(App& app) {
     if (!preset_.tt_event.empty())
         if (const data::Event* te = db_.event(preset_.tt_event)) { // the event's own layout (licence sections)
             preset_.course = te->course;
+            solo_event_ = preset_.tt_event;
             if (license_times(*te).valid()) license_event_ = preset_.tt_event;
             if (preset_.tt_event == "M400" || preset_.tt_event == "M1000" || preset_.tt_event == "MMAX")
                 machine_.emplace(int(te->laps)); // the event's test byte (presentation §B7)
             if (preset_.car.empty() && !te->entries.empty()) { // licence tests: the event's car
-                const std::string& e0 = te->entries[0];
-                if (license_times(*te).valid() && te->bytes.size() >= 0x114) event_paint_id_ = rd32(te->bytes, 0x110);
-                if (std::optional<sim::CarSpec> vs = sim::build_car_spec(db_, e0))
-                    launch_spec_ = std::make_shared<const sim::CarSpec>(std::move(*vs));
+                // (gt_mode §21; in the game's language: docs/dev/GT_MODE.md "Language")
+                const bool lic = license_times(*te).valid();
+                const game::LicenseCar lc = game::license_car(db_, *te, db_.language());
+                const std::string e0 = lic ? lc.entry : te->entries[0];
+                if (lic) event_paint_id_ = lc.color;
+                launch_source_ = ExactCarSource{e0};
                 if (db_.car(e0)) preset_.car = e0;
                 else if (const data::CarVariant* v = db_.variant(e0)) preset_.car = v->car;
             }
@@ -276,6 +296,9 @@ void RaceScreen::init(App& app) {
 }
 
 void RaceScreen::begin(App& app) {
+    // Mali Bifrost: what the render thread's warm-up has not built yet, in the load rather than
+    // as stutters in the race.
+    if (app.gpu()) app.gpu()->finish_warming();
     if (!preset_.replay.empty()) {
         std::vector<ReplayFile> files = list_replays(replay_dir(app));
         for (const ReplayFile& f : files)
@@ -288,9 +311,10 @@ void RaceScreen::begin(App& app) {
         return;
     }
     if (preset_.have && !courses_.empty() && !cars_.empty()) start(app);
-    if (from_menu_ && stage_ != Stage::Drive) {
+    if ((from_menu_ || online_) && stage_ != Stage::Drive) { // (it says why, then back to the menus)
         LOG_WARN("Race: could not start the menu's race: %s", error_.c_str());
-        app.pop();
+        if (error_.empty()) error_ = "The race could not be set up.";
+        launch_failed_ = true;
     }
 }
 

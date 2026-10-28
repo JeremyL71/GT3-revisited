@@ -10,10 +10,8 @@
 #include "game/gt_setting.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <ctime>
 
 namespace gt3r::game::gt_menu {
@@ -130,23 +128,6 @@ std::vector<SavePage::File> save_page_files(SavePage::Mode m) {
 }
 
 namespace {
-
-// Ends in ".psu" / ".ps2" / ".mcd": that container; a path without an extension (a save
-// dialog that adds none) gets ".psu"; Android's content:// URIs are written as they are.
-std::string export_target(const std::string& out, bool* card) {
-    auto ends = [&](const char* ext) {
-        size_t n = std::strlen(ext);
-        if (out.size() < n) return false;
-        for (size_t i = 0; i < n; ++i)
-            if (std::tolower(u8(out[out.size() - n + i])) != ext[i]) return false;
-        return true;
-    };
-    *card = ends(".ps2") || ends(".mcd");
-    if (*card || ends(".psu") || out.rfind("content://", 0) == 0) return out;
-    size_t sl = out.find_last_of("/\\");
-    std::string base = sl == std::string::npos ? out : out.substr(sl + 1);
-    return base.find('.') == std::string::npos ? out + ".psu" : out;
-}
 
 int save_page_run(SavePage::Mode m, SavePage::Op op, const SavePage::File& f, const std::string& arg) {
     MenuState& ms = menu_state();
@@ -296,16 +277,22 @@ int save_page_run(SavePage::Mode m, SavePage::Op op, const SavePage::File& f, co
         if (f.current) return SavePage::WriteError; // the page never offers it
         if (!write) return SavePage::Ok;
         return lib.remove(f.id) ? SavePage::Ok : SavePage::WriteError;
-    case SavePage::OpExport: {
-        // To the PS2: a .psu or a memory-card image (PCSX2 .ps2) holding this save.
+    case SavePage::OpExport: return SavePage::WriteError; // (the page runs the format chosen)
+    case SavePage::OpExportPsu:
+    case SavePage::OpExportCard:
+    case SavePage::OpExportRaw: {
+        // To the PS2: a .psu or a memory-card image (PCSX2 .ps2) holding this save, or the
+        // raw data file for save editors; the format as chosen, whatever the file is called.
         std::optional<GameState> st;
         if (f.current) st = live;
         else st = read_save(f.id, &err);
         if (!st) return read_result(err);
-        bool card = false;
-        const std::string out = export_target(arg, &card);
+        const Ps2Export format = op == SavePage::OpExportCard  ? Ps2Export::Card
+                                 : op == SavePage::OpExportRaw ? Ps2Export::Raw
+                                                               : Ps2Export::Psu;
+        const std::string out = SavePage::export_path(arg, op); // (the page names it the same way)
         try {
-            Bytes b = export_ps2_save_container(*st, s->gt().data_ptr(), ms.reader, card);
+            Bytes b = export_ps2_save_container(*st, s->gt().data_ptr(), ms.reader, format);
             if (!write_host_file(out, b)) throw FormatError("cannot write " + out);
         } catch (const std::exception& e) {
             LOG_WARN("gt mode: export failed: %s", e.what());
@@ -325,8 +312,10 @@ int save_page_run(SavePage::Mode m, SavePage::Op op, const SavePage::File& f, co
         }
         std::string base = st.file_comment;
         if (base.empty()) {
+            const menu::flow::FileDialogs& d = menu::flow::file_dialogs();
             size_t sl = arg.find_last_of("/\\");
-            base = arg.rfind("content://", 0) == 0 ? std::string() : arg.substr(sl == std::string::npos ? 0 : sl + 1);
+            if (arg.rfind("content://", 0) != 0) base = arg.substr(sl == std::string::npos ? 0 : sl + 1);
+            else if (d.name) base = d.name(arg); // (its display name)
             if (size_t dot = base.rfind('.'); dot != std::string::npos && dot > 0) base.resize(dot);
             if (base.empty() || base == kPs2GameDir) base = "PS2 GAME";
         }

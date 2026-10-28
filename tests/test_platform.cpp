@@ -71,7 +71,15 @@ TEST(platform_render_scale) {
     CHECK(!platform::parse_render_scale("fast"));
     CHECK(*platform::parse_render_scale(" 0.75 ") == 0.75f);
     CHECK(*platform::parse_render_scale("0.2") == 0.5f);
-    CHECK(*platform::parse_render_scale("3") == 1.0f);
+    CHECK(*platform::parse_render_scale("3") == 3.0f); // supersampling
+    CHECK(*platform::parse_render_scale("9") == platform::kMaxRenderScale);
+    // Supersampling's limit: 16384 pixels a side, never below native.
+    CHECK(platform::supersample_limit(3840, 2160) == 4.0f);
+    CHECK(platform::supersample_limit(2340, 1080) == 4.0f); // phone
+    CHECK(std::fabs(platform::supersample_limit(5120, 2880) - 3.2f) < 1e-4f);
+    CHECK(std::fabs(platform::supersample_limit(7680, 4320) - 16384.0f / 7680.0f) < 1e-4f);
+    CHECK(platform::supersample_limit(20000, 9000) == 1.0f);
+    CHECK(platform::supersample_limit(0, 0) == 1.0f);
     // Desktop: always native.
     CHECK(platform::auto_render_scale(3840, 2160, false) == 1.0f);
     // Mobile: about 900 lines of 16:9 game area.

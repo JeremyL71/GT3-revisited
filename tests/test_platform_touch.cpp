@@ -7,6 +7,7 @@
 #include "input/input_manager.h"
 #include "input/touch_controls.h"
 
+#include <algorithm>
 #include <cmath>
 
 using namespace gt3r;
@@ -257,23 +258,21 @@ TEST(input_race_layout_per_player) {
     PadTarget view;
     view.kind = PadTarget::Kind::Button;
     view.button = PadButton::R1;
-    InputSource y;
-    CHECK(InputSource::parse("pad.north", y));
-    InputSource rb;
-    CHECK(InputSource::parse("pad.rightshoulder", rb));
-    input.bind_race(0, view, rb, true); // player 1 only
+    InputSource c_key, v_key;
+    CHECK(InputSource::parse("key.C", c_key) && InputSource::parse("key.V", v_key));
+    input.bind_race(0, view, v_key, true); // player 1 only (no device here: the keyboard's set)
     CHECK(input.is_race_custom(0) && !input.is_race_custom(1));
     IniDocument out;
     input.save(out);
     CHECK(out.get("player1", "race") == "modern" && out.get("player2", "race") == "gt3");
-    CHECK(out.get("player1.race", "R1") == "pad.rightshoulder");
-    CHECK(!out.find("player2.race"));
+    CHECK(out.get("player1.keyboard.race", "R1") == "key.V");
+    CHECK(!out.find("player2.keyboard.race") && !out.find("player1.race"));
     InputManager again;
     again.load(out);
     CHECK(again.is_race_custom(0) && again.race_layout(1) == "gt3" && again.race_uses_menu_pad(1));
-    bool north_view = false;
-    for (const Binding& b : again.race_profile(0).bindings) north_view |= b.source == y && b.target == view;
-    CHECK(!north_view); // replaced
+    bool c_view = false;
+    for (const Binding& b : again.race_profile(0).bindings) c_view |= b.source == c_key && b.target == view;
+    CHECK(!c_view); // replaced
     // Old configs: [race] buttons = auto picks GT3's layout for the classic preset.
     InputManager old;
     old.load(IniDocument::parse("[player1]\npreset = classic\n"));
@@ -288,34 +287,606 @@ TEST(input_race_layout_per_player) {
     CHECK(input.race_pad(0).press(PadButton::Cross) == 90);
 }
 
-// The keyboard preset with the keyboard switched off left player 1 nothing to control the game
-// with. A profile only the keyboard can drive keeps player 1's keyboard live; the setting
-// itself is kept as the player chose it.
-TEST(input_keyboard_preset_never_locks_out) {
+// Keyboard only: no controller drives the player and the keyboard does, whatever the Keyboard
+// toggle says (Settings hides it). Auto with nothing connected drives with the keyboard's bindings
+// too, and keeps player 1's keyboard live even with the toggle off.
+TEST(input_keyboard_only) {
     CHECK(make_preset("keyboard").keyboard_only());
-    CHECK(!make_preset("racing").keyboard_only() && !make_preset("classic").keyboard_only() &&
-          !make_preset("wheel").keyboard_only());
+    CHECK(!make_preset("pad").keyboard_only() && !make_preset("wheel").keyboard_only());
     InputManager input;
-    input.load(IniDocument::parse("[player1]\npreset = keyboard\nkeyboard = off\n[player2]\npreset = keyboard\n"));
-    CHECK(!input.keyboard_enabled(0) && input.keyboard_fallback(0) && input.keyboard_active(0));
-    CHECK(!input.keyboard_enabled(1) && !input.keyboard_fallback(1)); // player 2 shares the keyboard: no fallback
-    auto press_return = [&] {
+    input.load(IniDocument::parse("[player1]\ncontroller = keyboard\nkeyboard = off\n[player2]\ncontroller = keyboard\n"));
+    CHECK(input.keyboard_only(0) && input.kind(0) == DeviceKind::Keyboard && input.device_name(0) == "Keyboard");
+    CHECK(!input.keyboard_enabled(0) && input.keyboard_active(0));
+    CHECK(input.keyboard_only(1) && input.keyboard_active(1)); // player 2 too, when chosen
+    auto press = [&](int player, SDL_Scancode key) {
         SDL_Event e{};
         e.type = SDL_EVENT_KEY_DOWN;
-        e.key.scancode = SDL_SCANCODE_RETURN;
+        e.key.scancode = key;
         input.handle_event(e);
         input.update(0.016);
-        return input.pad(0).down(PadButton::Cross);
+        return input.pad(player).down(PadButton::Cross);
     };
-    CHECK(press_return()); // Return = Cross reaches player 1
-    CHECK(!input.pad(1).down(PadButton::Cross));
+    auto press_return = [&](int player) { return press(player, SDL_SCANCODE_RETURN); };
+    CHECK(press_return(0) && !press_return(1));  // Return = Cross for player 1
+    CHECK(press(1, SDL_SCANCODE_O) && !press(0, SDL_SCANCODE_O)); // O = Cross for player 2
     IniDocument out;
     input.save(out);
-    CHECK(out.get("player1", "keyboard") == "off");
-    // A preset a controller can drive: the keyboard setting applies as before.
-    input.apply_preset(0, "racing");
-    CHECK(!input.keyboard_fallback(0) && !input.keyboard_active(0));
-    CHECK(!press_return());
+    CHECK(out.get("player1", "controller") == "keyboard" && out.get("player1", "keyboard") == "off");
+    CHECK(out.get("player1", "preset") == "keyboard" && out.get("player1", "device") == "auto"); // older builds
+    // Auto with nothing connected: the keyboard's bindings; player 1 keeps the keyboard, player 2
+    // (keyboard off) has nothing.
+    input.set_device_filter(0, "auto");
+    input.set_device_filter(1, "auto");
+    CHECK(!input.keyboard_only(0) && input.kind(0) == DeviceKind::Keyboard && input.keyboard_fallback(0));
+    CHECK(!input.keyboard_active(1));
+    CHECK(press_return(0) && !press_return(1));
+}
+
+// Auto takes a device SDL identifies as a wheel, otherwise the first free gamepad, otherwise any
+// other joystick: an odd HID device SDL lists as a joystick (flight stick, macro pad) never takes
+// a player's gamepad. The kind of device then picks the buttons. With none connected nothing
+// is pressed: the wheel's pedals are never read without a wheel (issue 23: they read as half-held
+// Cross and Square).
+TEST(input_auto_prefers_a_wheel) {
+    // Free devices in connection order.
+    using R = AutoRank;
+    CHECK(pick_auto_device({R::Gamepad}) == 0);
+    CHECK(pick_auto_device({R::Gamepad, R::Wheel}) == 1); // a wheel connects: it takes over
+    CHECK(pick_auto_device({R::Wheel, R::Gamepad}) == 0);
+    CHECK(pick_auto_device({R::Other, R::Gamepad}) == 1); // an unknown joystick never beats a gamepad
+    CHECK(pick_auto_device({R::Gamepad, R::Other}) == 0);
+    CHECK(pick_auto_device({R::Other, R::Wheel}) == 1);
+    CHECK(pick_auto_device({R::Gamepad, R::Gamepad}) == 0);
+    CHECK(pick_auto_device({R::Other}) == 0); // nothing better: still a controller
+    CHECK(pick_auto_device({}) == -1);
+    CHECK(device_kind_preset(DeviceKind::Pad) == pad_preset() && device_kind_preset(DeviceKind::Wheel) == "wheel" &&
+          device_kind_preset(DeviceKind::Keyboard) == "keyboard");
+    // The kind: only a wheel SDL knows (or the 0.3 wheel the player named) gets the wheel layout;
+    // any other joystick (an arcade stick, its axes resting at 0) has no default bindings, so its
+    // axes never read as the wheel's pedals half pressed.
+    CHECK(device_kind(false, false, false, false) == DeviceKind::Keyboard);
+    CHECK(device_kind(true, true, false, false) == DeviceKind::Pad);
+    CHECK(device_kind(true, true, true, false) == DeviceKind::Pad); // a wheel SDL maps as a gamepad
+    CHECK(device_kind(true, false, true, false) == DeviceKind::Wheel);
+    CHECK(device_kind(true, false, false, true) == DeviceKind::Wheel);
+    CHECK(device_kind(true, false, false, false) == DeviceKind::Joystick);
+    PlayerBindings b;
+    for (bool race : {false, true}) {
+        CHECK(b.set(DeviceKind::Joystick, race, BindingSet::Controller).bindings.empty());
+        for (const Binding& x : b.combined(DeviceKind::Joystick, race).bindings)
+            CHECK(binding_set(x.source) == BindingSet::Keyboard);
+    }
+    // What the player binds on it is kept, in its own sections.
+    PadTarget cross;
+    InputSource button0;
+    CHECK(PadTarget::parse("Cross", cross) && InputSource::parse("joy.button0", button0));
+    CHECK(b.bind(DeviceKind::Joystick, false, cross, button0, true));
+    IniDocument out;
+    b.save(out, "player1");
+    CHECK(out.get("player1.joystick.bindings", "Cross") == "joy.button0" && !out.find("player1.wheel.bindings"));
+    PlayerBindings again;
+    again.load(out, "player1");
+    CHECK(again.set(DeviceKind::Joystick, false, BindingSet::Controller).bindings.size() == 1);
+    InputManager input;
+    input.load(IniDocument::parse("[player1]\npreset = wheel\n"));
+    input.update(0.016);
+    CHECK(input.device_filter(0) == "auto" && input.kind(0) == DeviceKind::Keyboard);
+    CHECK(input.device_name(0) == "Keyboard");
+    for (const PadState* s : {&input.pad(0), &input.race_pad(0)}) {
+        CHECK(s->buttons == 0);
+        CHECK(s->press(PadButton::Cross) == 0 && s->press(PadButton::Square) == 0);
+    }
+}
+
+// Configs from before the Controller choice: `preset` chose the buttons. racing and classic are
+// the pad, wheel is Auto (which prefers a wheel), keyboard is Keyboard only (unless its bindings
+// had controller inputs: its device stays), and a named device stays. Their one custom profile per
+// player splits by input type: pad inputs to the pad's set, raw joystick inputs to the wheel's,
+// keys, mouse buttons and tilt to the keyboard's; a part that is just the layout's isn't kept.
+TEST(input_old_preset_migration) {
+    struct Case {
+        const char* preset;
+        const char* controller;
+        const char* base; // where the pad inputs go
+    };
+    for (const Case& c : {Case{"racing", "auto", "player1"}, Case{"classic", "auto", "player1"},
+                          Case{"wheel", "auto", "player1"}, Case{"keyboard", "auto", "player1"}}) {
+        InputManager input;
+        input.load(IniDocument::parse(std::string("[player1]\npreset = ") + c.preset +
+                                      "\n[player1.bindings]\nCircle = pad.north | key.K\n"
+                                      "[player1.race]\nR1 = pad.west | key.V\n"));
+        CHECK(input.device_filter(0) == c.controller);
+        CHECK(input.is_custom(0) && input.is_race_custom(0)); // no device here: the keyboard's set
+        IniDocument out;
+        input.save(out);
+        CHECK(out.get("player1", "controller") == c.controller);
+        CHECK(out.get(std::string(c.base) + ".bindings", "Circle") == "pad.north");
+        CHECK(out.get(std::string(c.base) + ".race", "R1") == "pad.west");
+        CHECK(out.get("player1.keyboard.bindings", "Circle") == "key.K");
+        CHECK(out.get("player1.keyboard.race", "R1") == "key.V");
+        InputManager again; // read back as a new config: the same
+        again.load(out);
+        IniDocument out2;
+        again.save(out2);
+        CHECK(out2.serialize() == out.serialize());
+    }
+    // keyboard with keys only: Keyboard only.
+    InputManager keys_only;
+    keys_only.load(IniDocument::parse("[player1]\npreset = keyboard\n[player1.bindings]\nCross = key.K\n"));
+    CHECK(keys_only.keyboard_only(0));
+    // A wheel's input under another preset goes to the wheel's set (a G29 named with racing).
+    InputManager g29;
+    g29.load(IniDocument::parse("[player1]\npreset = racing\ndevice = G29\n[player1.bindings]\n"
+                                "Cross = joy.axis2 pedal invert | pad.east\n"));
+    IniDocument g29_out;
+    g29.save(g29_out);
+    CHECK(g29.device_filter(0) == "G29" && !g29_out.get("player1", "wheel_device"));
+    const std::string wheel_cross = g29_out.get("player1.wheel.bindings", "Cross").value_or("");
+    CHECK(wheel_cross.rfind("joy.axis2", 0) == 0 && wheel_cross.find("pad.") == std::string::npos);
+    CHECK(g29_out.get("player1.bindings", "Cross") == "pad.east");
+    // wheel with a named device: that device keeps the wheel layout whatever SDL makes of it.
+    InputManager named_wheel;
+    named_wheel.load(IniDocument::parse("[player1]\npreset = wheel\ndevice = Thrustmaster\n"));
+    IniDocument wheel_out;
+    named_wheel.save(wheel_out);
+    CHECK(wheel_out.get("player1", "controller") == "Thrustmaster");
+    CHECK(wheel_out.get("player1", "wheel_device") == "Thrustmaster");
+    InputManager wheel_again;
+    wheel_again.load(wheel_out);
+    IniDocument wheel_out2;
+    wheel_again.save(wheel_out2);
+    CHECK(wheel_out2.get("player1", "wheel_device") == "Thrustmaster");
+    // Only controller inputs: no keyboard set of its own (the layout's stays).
+    InputManager pad_only;
+    pad_only.load(IniDocument::parse("[player1]\npreset = racing\n[player1.bindings]\nCross = pad.east\n"));
+    IniDocument out;
+    pad_only.save(out);
+    CHECK(out.get("player1.bindings", "Cross") == "pad.east" && !out.find("player1.keyboard.bindings"));
+    CHECK(!pad_only.is_custom(0));
+    // A named device stays; classic's race layout was GT3's ([race] buttons = auto).
+    InputManager named;
+    named.load(IniDocument::parse("[player1]\npreset = classic\ndevice = DualSense\n"));
+    CHECK(named.device_filter(0) == "DualSense" && named.race_layout(0) == "gt3");
+    // A new config's controller wins over the preset it keeps for older builds.
+    InputManager both;
+    both.load(IniDocument::parse("[player1]\ncontroller = auto\npreset = keyboard\n"));
+    CHECK(!both.keyboard_only(0));
+}
+
+// A player's keyboard and controller are separate sets of bindings: capturing a key replaces only
+// the action's keyboard input, a controller input only its controller input, and clearing works
+// per set. The keyboard's set is one per player, the same whatever controller is in use (Keyboard
+// only too); the controller's is per kind (pad, wheel).
+TEST(input_binding_sets) {
+    auto src = [](const char* s) {
+        InputSource out;
+        CHECK((InputSource::parse(s, out)));
+        return out;
+    };
+    auto target = [](const char* s) {
+        PadTarget out;
+        CHECK((PadTarget::parse(s, out)));
+        return out;
+    };
+    auto sources = [](const Profile& p, const PadTarget& t) {
+        std::vector<InputSource> out;
+        for (const Binding& b : p.bindings)
+            if (b.target == t) out.push_back(b.source);
+        return out;
+    };
+    using V = std::vector<InputSource>;
+    constexpr DeviceKind Pad = DeviceKind::Pad, Wheel = DeviceKind::Wheel, Alone = DeviceKind::Keyboard;
+    constexpr BindingSet Ctl = BindingSet::Controller, Keys = BindingSet::Keyboard;
+    const PadTarget accel = target("Cross"), cross = target("Cross"), circle = target("Circle");
+    PlayerBindings b;
+    CHECK((sources(b.set(Pad, true, Ctl), accel) == V{src("pad.righttrigger")}));
+    CHECK((sources(b.set(Pad, true, Keys), accel) == V{src("key.W"), src("key.Up")}));
+    b.bind(Pad, true, accel, src("pad.east"), true); // a controller input: the controller's only
+    CHECK((sources(b.set(Pad, true, Ctl), accel) == V{src("pad.east")}));
+    CHECK((sources(b.set(Pad, true, Keys), accel) == V{src("key.W"), src("key.Up")}));
+    b.bind(Pad, true, accel, src("key.K"), true); // a key: the keyboard's only
+    CHECK((sources(b.set(Pad, true, Ctl), accel) == V{src("pad.east")}));
+    CHECK((sources(b.set(Pad, true, Keys), accel) == V{src("key.K")}));
+    b.clear(Pad, true, accel, Keys);
+    CHECK((sources(b.set(Pad, true, Keys), accel).empty() && sources(b.set(Pad, true, Ctl), accel) == V{src("pad.east")}));
+    // The wheel keeps its own controller set, and shares the keyboard's.
+    CHECK((sources(b.set(Wheel, true, Ctl), accel) == V{src("joy.axis1")}));
+    CHECK((sources(b.set(Wheel, true, Keys), accel).empty() && b.custom(Wheel, true)));
+    // Menus: a key bound with the pad in use drives the player with a wheel or the keyboard alone.
+    b.bind(Pad, false, cross, src("key.K"), true);
+    CHECK((sources(b.set(Wheel, false, Keys), cross) == V{src("key.K")}));
+    CHECK((sources(b.set(Alone, false, Keys), cross) == V{src("key.K")}));
+    CHECK((sources(b.combined(Pad, false), cross) == (V{src("pad.south"), src("key.K")})));
+    CHECK((b.set(Alone, false, Ctl).bindings.empty())); // no controller with the keyboard alone
+    // A controller input with no controller in use goes to the pad's set.
+    b.bind(Alone, false, circle, src("pad.north"), true);
+    CHECK((sources(b.set(Pad, false, Ctl), circle) == V{src("pad.north")}));
+    // Saved and read back; each section holds its own set's inputs.
+    IniDocument out;
+    b.save(out, "player1");
+    CHECK((out.get("player1.keyboard.bindings", "Cross") == "key.K" && out.get("player1.race", "Cross") == "pad.east"));
+    PlayerBindings again;
+    again.load(out, "player1");
+    for (DeviceKind k : {Pad, Wheel, Alone})
+        for (bool race : {false, true})
+            for (BindingSet s : {Ctl, Keys})
+                CHECK((sources(again.set(k, race, s), cross) == sources(b.set(k, race, s), cross)));
+    // Choosing the layout again resets both sets.
+    b.reset(Pad, true);
+    CHECK((!b.custom(Pad, true) && sources(b.set(Pad, true, Keys), accel) == V{src("key.W"), src("key.Up")}));
+}
+
+// The back paddles shift by default (right up, left down) in both race layouts: the modern one
+// binds them, and under GT3 original the race reads the menu pad, whose paddles press R2 / L2.
+// Each is its own control: bound to another action it stops shifting. They read as "Right paddle".
+TEST(input_paddles) {
+    InputSource right, left, right2, left2, south;
+    CHECK(InputSource::parse("pad.paddle1", right) && InputSource::parse("pad.paddle2", left));
+    CHECK(InputSource::parse("pad.paddle3", right2) && InputSource::parse("pad.paddle4", left2));
+    CHECK(InputSource::parse("pad.south", south));
+    CHECK(right.paddle_name() == "Right paddle" && left.paddle_name() == "Left paddle");
+    CHECK(right2.paddle_name() == "Right paddle 2" && left2.paddle_name() == "Left paddle 2");
+    CHECK(south.paddle_name().empty());
+    InputManager input;
+    CHECK(input.describe(0, right) == "Right paddle" && input.describe(0, left2) == "Left paddle 2");
+
+    PadTarget reverse, up, down;
+    CHECK(PadTarget::parse("Triangle", reverse) && PadTarget::parse("R2", up) && PadTarget::parse("L2", down));
+    auto targets = [](const Profile& p, const InputSource& s) {
+        std::vector<PadTarget> out;
+        for (const Binding& b : p.bindings)
+            if (b.source == s) out.push_back(b.target);
+        return out;
+    };
+    using T = std::vector<PadTarget>;
+    for (const Profile& layout : {make_race_preset("modern", "pad"), make_preset("pad")}) {
+        CHECK(targets(layout, right) == T{up} && targets(layout, left) == T{down});
+        Profile p = layout;
+        p.bind(reverse, right, true); // Reverse on the right paddle: it no longer shifts up
+        CHECK(targets(p, right) == T{reverse} && targets(p, left) == T{down});
+        CHECK(std::any_of(p.bindings.begin(), p.bindings.end(),
+                          [&](const Binding& b) { return b.target == up; })); // shift up keeps its button
+        p.bind(reverse, left, false); // added: the left paddle too
+        CHECK(targets(p, left) == T{reverse} && targets(p, right) == T{reverse});
+    }
+    // A player's race controls under GT3 original start from the menu buttons, paddles included.
+    PlayerBindings b;
+    b.race_layout = "gt3";
+    CHECK(b.race_reads_menu(DeviceKind::Pad));
+    b.bind(DeviceKind::Pad, true, reverse, right2, true);
+    CHECK(!b.race_reads_menu(DeviceKind::Pad));
+    const Profile& race = b.set(DeviceKind::Pad, true, BindingSet::Controller);
+    CHECK(targets(race, right2) == T{reverse} && targets(race, right) == T{up});
+}
+
+// Player 1 must always have a way through the menus: when nothing they have can confirm (Cross)
+// and move (Up / Down or the left stick's Y), the menus outside races read every device
+// (InputManager::menu_pad).
+TEST(input_menus_drivable) {
+    const Profile pad = make_preset("pad"), keys = make_preset("keyboard"), wheel = make_preset("wheel");
+    CHECK(menus_drivable(pad, true, false, false));   // the gamepad
+    CHECK(menus_drivable(pad, false, false, true));   // its layout's keys
+    CHECK(!menus_drivable(pad, false, false, false)); // nothing connected, no keyboard
+    CHECK(menus_drivable(keys, false, false, true));
+    CHECK(!menus_drivable(keys, true, true, false));  // Keyboard only without a keyboard
+    CHECK(menus_drivable(wheel, false, true, false)); // a wheel's buttons and hat
+    CHECK(!menus_drivable(Profile{}, true, true, true)); // a joystick nothing is bound to yet
+    Profile no_cross = pad;
+    PadTarget cross;
+    CHECK(PadTarget::parse("Cross", cross));
+    no_cross.remove_target(cross);
+    CHECK(!menus_drivable(no_cross, true, false, true));
+}
+
+// A capture is cancelled by Esc and Android Back (they are never bound), so a key meant for the
+// game's back button can't take Cross's place by accident.
+TEST(input_capture_cancel) {
+    InputManager input;
+    auto key = [&](SDL_Scancode k) {
+        SDL_Event e{};
+        e.type = SDL_EVENT_KEY_DOWN;
+        e.key.scancode = k;
+        input.handle_event(e);
+    };
+    for (SDL_Scancode cancel : {SDL_SCANCODE_ESCAPE, SDL_SCANCODE_AC_BACK}) {
+        input.begin_capture();
+        CHECK(input.capturing());
+        key(cancel);
+        CHECK(!input.capturing() && !input.poll_capture());
+    }
+    input.begin_capture();
+    key(SDL_SCANCODE_K);
+    InputSource k;
+    CHECK(InputSource::parse("key.K", k));
+    CHECK(!input.capturing() && input.poll_capture() == std::optional<InputSource>(k));
+}
+
+// A button or key on a whole stick axis (Steer, the menu sticks) could push it only one way: it is
+// refused, and the axis keeps its inputs (the keyboard's A / D halves included). Tilt sits in the
+// keyboard's set, so it is read whatever the controller, a phone with no pad included.
+TEST(input_full_axis_and_tilt) {
+    auto src = [](const char* s) {
+        InputSource out;
+        CHECK(InputSource::parse(s, out));
+        return out;
+    };
+    PadTarget steer;
+    CHECK(PadTarget::parse("LX", steer));
+    PlayerBindings b;
+    const std::string before = b.combined(DeviceKind::Pad, true).name;
+    CHECK(!b.bind(DeviceKind::Pad, true, steer, src("key.K"), true));
+    CHECK(!b.bind(DeviceKind::Pad, true, steer, src("pad.south"), true));
+    CHECK(!b.custom(DeviceKind::Pad, true) && b.combined(DeviceKind::Pad, true).name == before);
+    CHECK(b.bind(DeviceKind::Pad, true, steer, src("pad.rightx"), true)); // an analog input is fine
+    // Tilt.
+    CHECK(binding_set(src("tilt")) == BindingSet::Keyboard);
+    InputManager phone;
+    phone.load(IniDocument::parse("[player1]\npreset = racing\n[player1.bindings]\nLX = pad.leftx | tilt curve=1.5\n"));
+    CHECK(phone.kind(0) == DeviceKind::Keyboard); // no pad
+    bool tilt = false;
+    for (const Binding& x : phone.profile(0).bindings) tilt |= x.source.kind == InputSource::Kind::Tilt;
+    CHECK(tilt);
+}
+
+// A config with no custom sections shows no Custom row, whatever the kind in use (a playtest config
+// with a DualSense showed Race controls = Custom).
+TEST(input_no_false_custom) {
+    // An old version's config set to Modern with no custom sections, and the same after a save.
+    for (const char* controller : {"", "controller = auto\n"}) {
+    const IniDocument cfg = IniDocument::parse(
+        std::string("[player1]\npreset = racing\ndevice = auto\nkeyboard = on\nrace = modern\nphone_vibration = off\n") +
+        controller + "[player2]\npreset = racing\ndevice = auto\nkeyboard = off\nrace = modern\n" + controller);
+    InputManager input;
+    input.load(cfg);
+    for (int p = 0; p < InputManager::kMaxPlayers; ++p) {
+        CHECK(!input.is_custom(p) && !input.is_race_custom(p) && input.race_layout(p) == "modern");
+        IniDocument out;
+        input.save(out);
+        for (const char* s : {".bindings", ".race", ".wheel.bindings", ".keyboard.race"})
+            CHECK(!out.find("player" + std::to_string(p + 1) + s));
+    }
+    for (const char* sec : {"player1", "player2"}) {
+        PlayerBindings b;
+        if (*controller) b.load(cfg, sec);
+        else b.load_old(cfg, sec);
+        for (DeviceKind k : {DeviceKind::Pad, DeviceKind::Wheel, DeviceKind::Joystick, DeviceKind::Keyboard})
+            CHECK(!b.has_custom(k, false) && !b.has_custom(k, true) && !b.custom(k, true));
+    }
+    }
+}
+
+// Choosing a layout keeps the custom set: it stays saved and comes back with Custom, for the race
+// controls and the menu buttons alike.
+TEST(input_custom_kept) {
+    PadTarget view, circle;
+    InputSource rb, k;
+    CHECK(PadTarget::parse("R1", view) && PadTarget::parse("Circle", circle));
+    CHECK(InputSource::parse("pad.rightshoulder", rb) && InputSource::parse("key.K", k));
+    auto has = [](const Profile& p, const PadTarget& t, const InputSource& src) {
+        return std::any_of(p.bindings.begin(), p.bindings.end(), [&](const Binding& b) { return b.target == t && b.source == src; });
+    };
+    PlayerBindings b;
+    CHECK(b.bind(DeviceKind::Pad, true, view, rb, true) && b.bind(DeviceKind::Pad, false, circle, k, true));
+    CHECK(b.custom(DeviceKind::Pad, true) && b.custom(DeviceKind::Pad, false));
+    b.set_race_layout(DeviceKind::Pad, "modern"); // Modern chosen
+    b.reset(DeviceKind::Pad, false);              // the menu layout chosen
+    CHECK(!b.custom(DeviceKind::Pad, true) && b.has_custom(DeviceKind::Pad, true));
+    CHECK(!b.custom(DeviceKind::Pad, false) && b.has_custom(DeviceKind::Pad, false));
+    CHECK(!has(b.combined(DeviceKind::Pad, true), view, rb) && !has(b.combined(DeviceKind::Pad, false), circle, k));
+    IniDocument out;
+    b.save(out, "player1");
+    CHECK(out.get("player1.race", "R1") == "pad.rightshoulder" && out.get("player1", "race_custom") == "off");
+    CHECK(out.find("player1.keyboard.bindings") && out.get("player1", "menu_custom") == "off");
+    PlayerBindings again;
+    again.load(out, "player1");
+    CHECK(again.has_custom(DeviceKind::Pad, true) && !again.custom(DeviceKind::Pad, true));
+    again.use_custom(true); // Custom chosen again
+    again.use_custom(false);
+    CHECK(has(again.combined(DeviceKind::Pad, true), view, rb) && has(again.combined(DeviceKind::Pad, false), circle, k));
+    // Through InputManager (no device here: the keyboard's set).
+    InputManager input;
+    CHECK(input.bind_race(0, view, k, true) && input.is_race_custom(0));
+    input.set_race_layout(0, "gt3");
+    CHECK(!input.is_race_custom(0) && input.has_custom(0, true) && input.race_uses_menu_pad(0));
+    input.use_custom(0, true);
+    CHECK(input.is_race_custom(0) && !input.race_uses_menu_pad(0) && has(input.race_profile(0), view, k));
+}
+
+// GT3 original is a starting point: editing a race control under it makes custom race controls
+// from its mapping (the menu buttons' inputs, both sets) plus the edit, replacing a kept custom set
+// (Settings asks first).
+TEST(input_gt3_start_custom) {
+    PadTarget view, accel;
+    InputSource rb, south, ret, east;
+    CHECK(PadTarget::parse("R1", view) && PadTarget::parse("Cross", accel));
+    CHECK(InputSource::parse("pad.rightshoulder", rb) && InputSource::parse("pad.south", south));
+    CHECK(InputSource::parse("key.Return", ret) && InputSource::parse("pad.east", east));
+    auto has = [](const Profile& p, const PadTarget& t, const InputSource& src) {
+        return std::any_of(p.bindings.begin(), p.bindings.end(), [&](const Binding& b) { return b.target == t && b.source == src; });
+    };
+    PlayerBindings b;
+    CHECK(b.bind(DeviceKind::Pad, true, accel, east, true)); // a custom set made under Modern
+    b.set_race_layout(DeviceKind::Pad, "gt3");
+    CHECK(b.race_reads_menu(DeviceKind::Pad) && b.has_custom(DeviceKind::Pad, true));
+    CHECK(b.bind(DeviceKind::Pad, true, view, rb, true)); // edited under GT3 original
+    CHECK(b.custom(DeviceKind::Pad, true) && !b.race_reads_menu(DeviceKind::Pad));
+    const Profile race = b.combined(DeviceKind::Pad, true);
+    CHECK(has(race, view, rb));                                // the edit
+    CHECK(has(race, accel, south) && has(race, accel, ret));   // GT3's Cross, from the menu buttons
+    CHECK(!has(race, accel, east));                            // the old custom set replaced
+}
+
+// Player 2's default keys sit around I / J / K / L, apart from player 1's: no key is in both
+// players' defaults (race and menu buttons), and player 1's right stick is off that cluster.
+TEST(input_player_keys_apart) {
+    auto keys = [](const Profile& p) {
+        std::vector<int> out;
+        for (const Binding& b : p.bindings)
+            if (b.source.kind == InputSource::Kind::Key) out.push_back(b.source.code);
+        return out;
+    };
+    PlayerBindings p1, p2;
+    p2.player2 = true;
+    std::vector<int> one, two;
+    for (bool race : {false, true}) {
+        for (int c : keys(p1.set(DeviceKind::Keyboard, race, BindingSet::Keyboard))) one.push_back(c);
+        for (int c : keys(p2.set(DeviceKind::Keyboard, race, BindingSet::Keyboard))) two.push_back(c);
+    }
+    for (int c : two) CHECK(std::find(one.begin(), one.end(), c) == one.end());
+    // Every one of player 2's keys parsed: 14 menu buttons, 11 race controls.
+    CHECK(keys(p2.set(DeviceKind::Keyboard, false, BindingSet::Keyboard)).size() == 14);
+    CHECK(keys(p2.set(DeviceKind::Keyboard, true, BindingSet::Keyboard)).size() == 11);
+    // Race: I accelerates, K brakes, J / L steer.
+    InputSource i, k, j;
+    CHECK(InputSource::parse("key.I", i) && InputSource::parse("key.K", k) && InputSource::parse("key.J", j));
+    PadTarget accel, brake, left;
+    CHECK(PadTarget::parse("Cross", accel) && PadTarget::parse("Square", brake) && PadTarget::parse("LX-", left));
+    const Profile& race = p2.set(DeviceKind::Keyboard, true, BindingSet::Keyboard);
+    auto on = [&](const PadTarget& t, const InputSource& s) {
+        return std::any_of(race.bindings.begin(), race.bindings.end(), [&](const Binding& b) { return b.target == t && b.source == s; });
+    };
+    CHECK(on(accel, i) && on(brake, k) && on(left, j));
+    // Player 1's right stick: Home / End / Page Up / Page Down.
+    InputSource home;
+    CHECK(InputSource::parse("key.Home", home));
+    PadTarget rx;
+    CHECK(PadTarget::parse("RX-", rx));
+    const Profile& menu1 = p1.set(DeviceKind::Keyboard, false, BindingSet::Keyboard);
+    CHECK(std::any_of(menu1.bindings.begin(), menu1.bindings.end(), [&](const Binding& b) { return b.target == rx && b.source == home; }));
+    // InputManager gives player 2 their own set.
+    InputManager input;
+    CHECK(input.bindings(1, true, BindingSet::Keyboard).bindings.size() == race.bindings.size());
+}
+
+// Any binding can come from any connected device: an input captured from another device than the
+// player's Controller names it (InputSource::device), and reads only that device; untagged ones read
+// the Controller. Two devices of one name are told apart ("#2"), a named device that isn't connected
+// presses nothing, and Auto never hands the other player a device someone's bindings name.
+TEST(input_binding_devices) {
+    // No serial or port path reported: the name, and the order among devices of that name.
+    const std::vector<DeviceId> names = {{"Wireless Controller", "", ""}, {"G29 Pedals", "", ""},
+                                         {"Wireless Controller", "", ""}};
+    CHECK(device_tag(names, 0) == "Wireless Controller" && device_tag(names, 1) == "G29 Pedals");
+    CHECK(device_tag(names, 2) == "Wireless Controller#2");
+    CHECK(find_device_tag(names, "Wireless Controller#2") == 2 && find_device_tag(names, "Wireless Controller") == 0);
+    CHECK(find_device_tag(names, "G29 Pedals") == 1);
+    CHECK(find_device_tag(names, "Wireless Controller#3") == -1 && find_device_tag(names, "Missing") == -1); // not connected
+    CHECK(find_device_tag({}, "G29 Pedals") == -1);
+    CHECK(device_tag_label(names, "Wireless Controller#2") == "Wireless Controller 2");
+    CHECK(device_tag_label(names, "G29 Pedals") == "G29 Pedals" && device_tag_label({}, "Pad#2") == "Pad 2");
+    // Serials: two identical pads keep their bindings whichever connects first.
+    const std::vector<DeviceId> first = {{"DualSense Wireless Controller", "aa:01", "p1"},
+                                         {"DualSense Wireless Controller", "bb:02", "p2"}};
+    const std::vector<DeviceId> reversed = {first[1], first[0]};
+    const std::string second_pad = device_tag(first, 1);
+    CHECK(second_pad == "DualSense Wireless Controller@s:bb:02");
+    CHECK(find_device_tag(first, second_pad) == 1 && find_device_tag(reversed, second_pad) == 0);
+    CHECK(device_tag_label(first, second_pad) == "DualSense Wireless Controller 2"); // never the serial
+    CHECK(device_tag_label(reversed, second_pad) == "DualSense Wireless Controller");
+    // The name first: a serial on a device of another name doesn't match.
+    CHECK(find_device_tag({{"Other Pad", "bb:02", ""}}, second_pad) == -1);
+    // Pad B switched off: its binding reads nothing, never the look-alike pad A (whose R2 may
+    // accelerate). The same for a port path.
+    CHECK(find_device_tag({first[0]}, second_pad) == -1);
+    CHECK(find_device_tag({{"Pad", "", "usb-1"}}, "Pad@p:usb-2") == -1);
+    // Never the player's own Controller: its inputs are untagged, so a tag landing on it reads nothing.
+    CHECK(resolve_device_tag(first, second_pad, 0) == 1 && resolve_device_tag(first, second_pad, 1) == -1);
+    CHECK(resolve_device_tag(names, "Wireless Controller#2", 2) == -1 && resolve_device_tag(names, "G29 Pedals", -1) == 1);
+    // Port paths when there's no serial, or the serial doesn't tell them apart.
+    const std::vector<DeviceId> ports = {{"Pad", "", "usb-1"}, {"Pad", "", "usb-2"}};
+    CHECK(device_tag(ports, 1) == "Pad@p:usb-2");
+    CHECK(find_device_tag({ports[1], ports[0]}, "Pad@p:usb-2") == 0);
+    const std::vector<DeviceId> same_serial = {{"Pad", "000", ""}, {"Pad", "000", ""}};
+    CHECK(device_tag(same_serial, 1) == "Pad#2" && find_device_tag(same_serial, "Pad#2") == 1);
+    // A tag saved before a serial was known still finds its device by name and order.
+    CHECK(find_device_tag(first, "DualSense Wireless Controller#2") == 1);
+    // Auto: a device the other player's bindings name is reserved.
+    CHECK((reserved_devices(names, {"Wireless Controller#2"}) == std::vector<bool>{false, false, true}));
+    CHECK((reserved_devices(names, {"Missing"}) == std::vector<bool>{false, false, false}));
+    CHECK((reserved_devices(reversed, {second_pad}) == std::vector<bool>{true, false}));
+    // Saved as the binding's device option, and read back.
+    auto bindings = Binding::parse_line("Square", "pad.lefttrigger device=Wireless%20Controller#2 | pad.lefttrigger");
+    CHECK(bindings.size() == 2);
+    if (bindings.size() != 2) return;
+    CHECK(bindings[0].source.device == "Wireless Controller#2" && bindings[1].source.device.empty());
+    CHECK(!(bindings[0].source == bindings[1].source)); // a tagged input is another input
+    CHECK(bindings[0].source_with_options() == "pad.lefttrigger device=Wireless%20Controller#2");
+    auto again = Binding::parse_line("Square", bindings[0].source_with_options());
+    CHECK(again.size() == 1 && again[0].source == bindings[0].source);
+    // Brake on a second pad's trigger, added (Square) beside the player's own trigger.
+    PlayerBindings b;
+    PadTarget brake;
+    CHECK(PadTarget::parse("Square", brake));
+    CHECK(b.bind(DeviceKind::Pad, true, brake, bindings[0].source, false));
+    std::vector<InputSource> on_brake;
+    for (const Binding& x : b.set(DeviceKind::Pad, true, BindingSet::Controller).bindings)
+        if (x.target == brake) on_brake.push_back(x.source);
+    CHECK(on_brake.size() == 2 && on_brake[0] == bindings[1].source && on_brake[1] == bindings[0].source);
+    CHECK(b.devices() == std::vector<std::string>{"Wireless Controller#2"});
+    IniDocument out;
+    b.save(out, "player1");
+    CHECK(out.get("player1.race", "Square") == "pad.lefttrigger | pad.lefttrigger device=Wireless%20Controller#2");
+    PlayerBindings loaded;
+    loaded.load(out, "player1");
+    CHECK(loaded.devices() == b.devices());
+    // Shown with the device's name; with no such device connected it reads nothing (no device here).
+    InputManager input;
+    CHECK(input.describe(0, bindings[0].source) == "Wireless Controller 2: Left trigger");
+    CHECK(input.describe(0, bindings[1].source) == "Left trigger");
+    InputSource axis2;
+    CHECK(InputSource::parse("joy.axis2", axis2));
+    axis2.device = "G29 Pedals";
+    CHECK(input.describe(0, axis2) == "G29 Pedals: Axis 2");
+    CHECK(!input.wheel_steering(0));
+}
+
+// Settings reads every controller and the keyboard with the default buttons as well as player 1's
+// pad, so a controller choice or bindings that leave player 1's controller dead (Keyboard only,
+// custom bindings, the keyboard switched off) can always be changed back. Player 1's pad, which the
+// game's menus and races read, is unchanged.
+TEST(input_settings_menu_any_device) {
+    auto bit = [](PadButton b) { return u16(1u << unsigned(b)); };
+    PadState a, b;
+    a.connected = true;
+    a.buttons = bit(PadButton::Cross);
+    a.pressure[size_t(PadButton::Cross)] = 40;
+    a.axes[size_t(PadAxis::LY)] = 0; // stick up
+    b.connected = true;
+    b.buttons = bit(PadButton::Down) | bit(PadButton::Cross);
+    b.pressure[size_t(PadButton::Cross)] = 200;
+    b.axes[size_t(PadAxis::LY)] = 200; // less far from rest
+    b.axes[size_t(PadAxis::LX)] = 250;
+    PadState m = merge_pads({a, b, PadState{}});
+    CHECK(m.connected && m.down(PadButton::Cross) && m.down(PadButton::Down) && !m.down(PadButton::Up));
+    CHECK(m.press(PadButton::Cross) == 200);
+    CHECK(m.axis(PadAxis::LY) == 0 && m.axis(PadAxis::LX) == 250 && m.axis(PadAxis::RX) == 128); // no cancelling
+    CHECK(!merge_pads({}).connected && merge_pads({}).buttons == 0);
+
+    auto press = [](InputManager& in, SDL_Scancode key) {
+        SDL_Event e{};
+        e.type = SDL_EVENT_KEY_DOWN;
+        e.key.scancode = key;
+        in.handle_event(e);
+        in.update(0.016);
+    };
+    // Custom bindings: player 1's own (K = Cross) and the default keys both work there.
+    InputManager custom;
+    custom.load(IniDocument::parse("[player1]\ncontroller = auto\n[player1.keyboard.bindings]\nCross = key.K\n"));
+    press(custom, SDL_SCANCODE_K);
+    CHECK(custom.pad(0).down(PadButton::Cross) && custom.any_device_pad().down(PadButton::Cross));
+    press(custom, SDL_SCANCODE_DOWN);
+    CHECK(custom.any_device_pad().down(PadButton::Down) && !custom.pad(0).down(PadButton::Down));
+    press(custom, SDL_SCANCODE_ESCAPE);
+    CHECK(custom.any_device_pad().down(PadButton::Triangle) && !custom.pad(0).down(PadButton::Triangle));
+    custom.update(0.016);
+    CHECK(custom.any_device_pad().buttons == 0);
+    // Player 1's touch controls are part of player 1's pad.
+    PadState ov;
+    ov.connected = true;
+    ov.buttons = bit(PadButton::Circle);
+    custom.set_overlay(0, ov);
+    custom.update(0.016);
+    CHECK(custom.any_device_pad().down(PadButton::Circle));
 }
 
 TEST(touch_tap_shorter_than_a_frame) {
@@ -458,6 +1029,137 @@ TEST(touch_gt3_race_buttons) {
     CHECK(find_widget(t, Widget::Kind::Button, PadButton::R2)->label == "UP");
     CHECK(find_widget(t, Widget::Kind::Button, PadButton::L2)->label == "DOWN");
     CHECK(find_widget(t, Widget::Kind::Button, PadButton::R1)->label == "CAM");
-    CHECK(find_widget(t, Widget::Kind::Button, PadButton::Select)->label == "RST");
+    CHECK(find_widget(t, Widget::Kind::Button, PadButton::Select) == nullptr); // no respawn, as in GT3
     CHECK(find_widget(t, Widget::Kind::Button, PadButton::Triangle) == nullptr);
+}
+
+namespace {
+
+float cx(const TouchRect& r) { return r.x + r.w / 2; }
+float cy(const TouchRect& r) { return r.y + r.h / 2; }
+
+} // namespace
+
+TEST(touch_placement_parse_and_format) {
+    TouchPlacement p = TouchPlacement::parse("right 40 bottom 66 size 1.2");
+    CHECK(p.ax == TouchPlacement::AnchorX::Right && p.ay == TouchPlacement::AnchorY::Bottom);
+    CHECK(p.x == 40 && p.y == 66 && std::fabs(p.scale - 1.2f) < 1e-6f && !p.hidden);
+    CHECK(TouchPlacement::parse(p.to_string()) == p);
+    TouchPlacement q = TouchPlacement::parse("Centre -12.5, Top 20, hidden");
+    CHECK(q.ax == TouchPlacement::AnchorX::Centre && q.x == -12.5f && q.ay == TouchPlacement::AnchorY::Top && q.hidden);
+    CHECK(q.to_string() == "center -12.5 top 20 hidden");
+    // Half a position, junk, out-of-range sizes.
+    TouchPlacement h = TouchPlacement::parse("left 30 size 9 banana");
+    CHECK(!h.moved() && h.scale == TouchPlacement::kMaxScale);
+    CHECK(TouchPlacement::parse("").is_default());
+    CHECK(TouchPlacement::parse("hidden").to_string() == "hidden");
+}
+
+TEST(touch_placement_config_roundtrip) {
+    IniDocument ini = IniDocument::parse("[touch]\nsize = 1.0\ndrive.gas = left 30 bottom 40\ndrive.camera = hidden\n"
+                                         "menu.buttons = size 1.5\nmenu.unknown = left 1 top 1\ndrive.brake = \n");
+    TouchConfig c = TouchConfig::load(ini);
+    CHECK(c.placements.size() == 3); // unknown keys and default placements are dropped
+    CHECK(c.placement("drive.gas").ax == TouchPlacement::AnchorX::Left);
+    CHECK(c.placement("drive.camera").hidden);
+    CHECK(c.customized(TouchLayout::Driving) && c.customized(TouchLayout::Menu));
+    c.set_placement("drive.camera", TouchPlacement{}); // back to default: dropped
+    c.reset_placements(TouchLayout::Menu);
+    CHECK(!c.customized(TouchLayout::Menu) && c.placements.size() == 1);
+    c.save(ini);
+    CHECK(ini.get("touch", "drive.gas") == std::optional<std::string>("left 30 bottom 40"));
+    CHECK(!ini.get("touch", "drive.camera") && !ini.get("touch", "menu.buttons") && !ini.get("touch", "drive.brake"));
+    CHECK(ini.get("touch", "menu.unknown")); // not ours: left alone
+    TouchConfig d = TouchConfig::load(ini);
+    CHECK(d.placements == c.placements);
+}
+
+TEST(touch_placement_moves_and_resizes) {
+    TouchConfig cfg;
+    TouchControls def = driving(cfg);
+    const TouchRect gas0 = def.group_bounds("drive.gas");
+    // The gas pedal 60 units in from the left edge, 80 up from the bottom, half again as big.
+    cfg.set_placement("drive.gas", TouchPlacement::parse("left 60 bottom 120 size 1.5"));
+    TouchControls t = driving(cfg);
+    const TouchRect gas = t.group_bounds("drive.gas");
+    CHECK(std::fabs(gas.w - gas0.w * 1.5f) < 0.01f && std::fabs(gas.h - gas0.h * 1.5f) < 0.01f);
+    CHECK(std::fabs(cx(gas) - (14 + 60)) < 0.01f && std::fabs(cy(gas) - (346 - 120)) < 0.01f);
+    // Everything else stays where the layout puts it.
+    CHECK(t.group_bounds("drive.brake").x == def.group_bounds("drive.brake").x);
+    // It still drives, over the steering zone (controls take touches first).
+    t.note_touch();
+    CHECK(t.finger_down(1, cx(gas), cy(gas), 1.0f));
+    t.update(0.016, 0);
+    CHECK(t.pad().down(PadButton::Cross));
+    CHECK(t.pad().axis_f(PadAxis::LX) == 0.0f);
+    // Too big to fit where it was put: pushed back inside the margin.
+    cfg.set_placement("drive.gas", TouchPlacement::parse("left 0 bottom 0 size 2"));
+    TouchControls big = driving(cfg);
+    const TouchRect g2 = big.group_bounds("drive.gas");
+    CHECK(g2.x >= 14 - 0.01f && g2.y + g2.h <= 346 + 0.01f);
+}
+
+TEST(touch_placement_follows_screen_edges) {
+    // A control placed 50 units in from the right edge and 30 from the top keeps those
+    // distances on screens of other shapes (16:9, 20:9 phone, 4:3 tablet).
+    TouchConfig cfg;
+    cfg.set_placement("drive.camera", TouchPlacement::parse("right 50 top 30"));
+    for (TouchRect s : {TouchRect{0, 0, 640, 360}, TouchRect{-80, 0, 800, 360}, TouchRect{0, -60, 640, 480}}) {
+        TouchControls t = driving(cfg);
+        t.set_screen(s.x, s.y, s.x + s.w, s.y + s.h);
+        const TouchRect b = t.group_bounds("drive.camera");
+        CHECK(std::fabs(cx(b) - (s.x + s.w - 14 - 50)) < 0.01f);
+        CHECK(std::fabs(cy(b) - (s.y + 14 + 30)) < 0.01f);
+    }
+}
+
+TEST(touch_placement_at_roundtrip) {
+    // What the editor does: drop a control at a point, save, rebuild; it is there.
+    for (bool left_handed : {false, true}) {
+        TouchConfig cfg;
+        cfg.left_handed = left_handed;
+        TouchControls t = driving(cfg);
+        t.set_screen(-70, 0, 710, 360);
+        t.set_insets(27, 11, 11, 11);
+        for (auto [x, y] : {std::pair{100.0f, 200.0f}, std::pair{330.0f, 60.0f}, std::pair{600.0f, 300.0f}}) {
+            TouchPlacement p = t.placement_at("drive.handbrake", x, y);
+            CHECK(p.moved());
+            cfg.set_placement("drive.handbrake", p);
+            t.configure(cfg);
+            const TouchRect b = t.group_bounds("drive.handbrake");
+            CHECK(std::fabs(cx(b) - x) <= 0.5f && std::fabs(cy(b) - y) <= 0.5f);
+        }
+        // Off the screen or under the cutout: kept inside the area the controls keep to.
+        cfg.set_placement("drive.handbrake", t.placement_at("drive.handbrake", -200, 500));
+        t.configure(cfg);
+        const TouchRect b = t.group_bounds("drive.handbrake");
+        CHECK(b.x >= -70 + 15 - 0.5f && b.y + b.h <= 360 - 15 + 0.5f);
+    }
+}
+
+TEST(touch_placement_groups_and_hidden) {
+    // The face buttons move and resize as one; hidden controls draw nothing and take no touches.
+    TouchConfig cfg;
+    TouchControls def;
+    def.configure(cfg);
+    def.set_layout(TouchLayout::Menu);
+    const TouchRect g0 = def.group_bounds("menu.buttons");
+    cfg.set_placement("menu.buttons", TouchPlacement::parse("left 60 top 60 size 0.8"));
+    cfg.set_placement("menu.select", TouchPlacement::parse("hidden"));
+    TouchControls t;
+    t.configure(cfg);
+    t.set_layout(TouchLayout::Menu);
+    t.note_touch();
+    const TouchRect g = t.group_bounds("menu.buttons");
+    CHECK(std::fabs(g.w - g0.w * 0.8f) < 0.01f);
+    CHECK(std::fabs(cx(g) - (14 + 60)) < 0.01f && std::fabs(cy(g) - (14 + 60)) < 0.01f);
+    const Widget cross = *find_widget(t, Widget::Kind::Button, PadButton::Cross);
+    const Widget tri = *find_widget(t, Widget::Kind::Button, PadButton::Triangle);
+    CHECK(cross.y > tri.y && std::fabs(cross.x - tri.x) < 0.01f); // still a diamond
+    const Widget sel = *find_widget(t, Widget::Kind::Button, PadButton::Select);
+    CHECK(sel.hidden && !t.hit(sel.x + sel.w / 2, sel.y + sel.h / 2));
+    CHECK(t.key_at(sel.x + sel.w / 2, sel.y + sel.h / 2) == "menu.select"); // the editor still finds it
+    CHECK(t.control_bounds().size() + 1 == t.widgets().size());            // all but the hidden one
+    CHECK(!t.finger_down(1, sel.x + sel.w / 2, sel.y + sel.h / 2, 1.0f));
+    CHECK(t.key_at(320, 200).empty());
 }

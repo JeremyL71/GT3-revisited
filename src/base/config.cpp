@@ -104,4 +104,9 @@ void IniDocument::set(std::string_view section, std::string_view key, std::strin
     s.entries.emplace_back(std::string(key), std::string(value));
 }
 
+void IniDocument::remove(std::string_view section, std::string_view key) {
+    for (Section& s : sections_)
+        if (s.name == section) std::erase_if(s.entries, [&](const auto& e) { return e.first == key; });
+}
+
 } // namespace gt3r

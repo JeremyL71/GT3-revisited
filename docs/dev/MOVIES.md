@@ -1,7 +1,9 @@
 # Movies (FMV playback)
 
-GT3's FMVs are the 51 `stream/*.pss` files: MPEG-2 program streams with
-MPEG-2 video and PS-ADPCM audio (format details: [../formats/pss.md](../formats/pss.md)).
+GT3's FMVs are the 51 `stream/*.pss` files (49 on the PAL disc): MPEG-2
+program streams with MPEG-2 video and PS-ADPCM audio (format details:
+[../formats/pss.md](../formats/pss.md), with the regional differences: NTSC
+640×448 at 29.97 / 30 fps, PAL 640×512 at 25 fps).
 They are played from the user's disc through the VFS, decoded by our own
 code, with no extra dependency.
 
@@ -77,8 +79,10 @@ so it never underruns while video decodes.
 
 On the main thread `update()` advances the clock by wall time and, while
 audio plays, steers it toward `audio start offset + (samples put − samples
-still queued) / rate` (5% per frame; jumps if more than 100 ms off — the
-raw audio position moves in device-buffer steps of 10–20 ms);
+still queued) / rate` (`audio_clock_correction`: over about 2 s within 30 ms,
+over a quarter second further off, a jump past 100 ms after a stall — the raw
+audio position moves in device-buffer steps of 10–20 ms, so a stronger pull
+would make the clock's steps uneven);
 silent movies (48 of 51) and the tail after the audio ends use the wall
 clock. The newest frame whose PTS is due is uploaded with
 `SDL_UpdateYUVTexture` (IYUV, BT.601 limited range, SDL's default for YUV
@@ -86,20 +90,48 @@ textures); late frames are dropped. Pause stops the audio device and freezes
 the clock. `start_seconds` decodes and discards up to a start time (used for
 screenshots; there is no index for real seeking).
 
+Frames are shown by their timestamps whatever the movie's rate and the
+display's: on a 60 Hz display a 25 fps PAL movie's 50 fields a second take
+1 or 2 refreshes each (6 refreshes per 5 fields), on 120 Hz 2 or 3 (12 per
+5); NTSC's 60 fields a second take one refresh each on 60 Hz and two on
+120 Hz (at 29.97 fps one field in 1,000 takes an extra one). A frame and its
+second field are both due up to 2 ms early (`kEarly`); when only frames were,
+29.97 fps at 60 Hz showed no second fields for about 2 s in every 16.7 s, while
+the refreshes fell just before the frames' times. `set_time_source()` steps
+the clock like a display's refreshes in tests (`video_player_cadence_pal_ntsc`,
+and `video_player_audio_steering` against a simulated audio position).
+A full-screen movie logs one line when it ends or is skipped, e.g.
+`Movie stream/opening.pss: 640x512 25.00 fps (2 fields/frame), 219.12 s:
+5472 frames shown, 7 dropped, audio clock, A/V within 16 ms` (dropped: frames
+passed over after a late refresh; a stall past 100 ms adds "1 jump back in
+sync after a stall").
+
+**Picture shape** (`movie_display_aspect`, `fit_4_3`): the PS2 shows a movie
+in its 640-pixel-wide display frame, which fills the 4:3 TV picture: 448
+lines on NTSC and 512 on PAL, told apart by the frame rate (PAL movies run at
+25 fps). Both 640×448 and 640×512 movies therefore show at 4:3; smaller
+pictures keep that pixel shape (`menu_bg2`'s 320×112 strip). Menu pages draw
+their movies into the page's own movie box instead.
+
 ### Field-split movies
 
-48 of the 51 movies are *field-split*: each 640×448 MPEG frame is two
-640×224 pictures stacked — the first field on top, the second field (1/60 s
-later) below. The PS2 sends them to the TV as the two interlaced fields; FFmpeg
+48 of the 51 movies (46 of PAL's 49) are *field-split*: each 640×448 MPEG
+frame is two 640×224 pictures stacked — the first field on top, the second
+field (1/60 s later) below. PAL's 640×512 frames hold two 640×256 fields
+1/50 s apart, in the same order and line positions (checked on the disc: the
+motion from the top half to the bottom half continues into the next frame's
+top half, and the top half woven onto the even lines is the smooth picture).
+The PS2 sends them to the TV as the two interlaced fields; FFmpeg
 shows the stacked halves as-is. Nothing in the stream marks this, so
 `FieldLayoutDetector` (`src/video/field_layout.*`) decides per movie from the
 first 16 non-flat frames: the luma rows on either side of the middle seam
 are discontinuous in field-split frames (ratio of seam difference to
 neighbouring row differences > 3). Survey: the 48 field-split movies have
 ≥ 94% of frames above the threshold, the 3 progressive ones (`ending_long_full`,
-`ending_short_full`, `menu_bg2`) ≤ 1.6%. The player then draws the top half
-for the first half of each frame period and the bottom half for the second
-("bob", 60 pictures/s, each field stretched to the full height).
+`ending_short_full`, `menu_bg2`) ≤ 1.6% (PAL: ≥ 97% and ≤ 0.4%). The player
+then draws the top half for the first half of each frame period and the bottom
+half for the second ("bob", 60 pictures/s, 50 on PAL, each field stretched to
+the full height).
 `MoviePlayer::picture_rects()`/`draw()` place each field with its half-line
 offset (first field on even frame lines, second on odd: source rows mapped
 with +1/4 resp. −1/4 field line, drawn over frame rows [0, H−1) resp.
@@ -115,7 +147,7 @@ per-movie flag (pss.md).
 | Full-screen movie, then continue | `play_movie(app, "stream/opening.pss", on_done, options)` / `make_movie_screen(...)` in `src/app/screen_movies.h`. Pops itself at the end, on skip (Cross/Start/Circle unless `skippable = false`) or if the file cannot be opened, then calls `on_done(app)`. `loop = true` for attract loops. |
 | Boot | screen id `boot` (`make_boot_screen()`): opening movie, then the `gt3menu` screen |
 | Movie inside a menu page | `video::MoviePlayer`: `start_loop([vfs]{ return video::open_movie(*vfs, "stream/menu_bg2.pss"); })`, `update(renderer)` every frame, `draw(renderer, rect)` (handles field-split movies) |
-| Course preview stills | `video::CoursePreviews`: `load(vfs)`, `image("akasaka")` → `RgbaImage` (640×448 RGBA, cached) |
+| Course preview stills | `video::CoursePreviews`: `load(vfs)`, `image("akasaka")` → `RgbaImage` (640×448 RGBA, 640×512 on PAL, cached) |
 
 `GT3R_SKIP_MOVIES=1` makes game-flow movies end immediately (development).
 
@@ -146,6 +178,24 @@ dequantisation, mismatch control, motion compensation, rounding of
 bidirectional prediction, reordering — matches exactly. Full per-file results
 come from `gt3tool video-psnr` against FFmpeg's decode of every file.
 
+### Playback timing in the app
+
+The opening of each release, played in a windowed app on an M-series Mac with
+every refresh traced (picture, field, clock, audio position): fields skipped
+without a late refresh before them, and how many refreshes each field stayed
+on screen, before and after the two fixes above (the gentler audio steering,
+the second field's early rule).
+
+| Opening, display | Before | After |
+|---|---|---|
+| NTSC-U, 60 Hz | 282 skipped, 316 twice; no second fields for 19 s in all | 29 skipped, 34 twice (a few at each 16.7 s drift past a field's time) |
+| NTSC-U, 120 Hz | 6 skipped; 1,553 fields 1 refresh, 1,529 3 (of 13,000) | none skipped; 258 and 260 (12,547 two) |
+| PAL, 60 Hz | 3 skipped | 1 skipped; 8,550 one, 2,130 two (6 refreshes per 5 fields) |
+| PAL, 120 Hz | 1 skipped | none; 6,281 two, 4,163 three (12 per 5) |
+
+The clock kept to the wall clock within 10 ms over the whole movie, and to the
+audio position within 6 ms on average (16–43 ms at worst, at the start).
+
 ### Audio
 
 The concatenated `BD` payloads (`gt3tool video-ads`) are recognised by FFmpeg
@@ -166,11 +216,16 @@ half-pel vector), a
 synthetic program stream for the demuxer (packs, padding, resync, private
 stream 1 sub-header), a synthetic movie with audio, a synthetic `ipua`
 archive, the field-split detector on synthetic frames, and disc tests (skipped
-without `GT3R_DISC`): `menu_bg2.pss` fully (360 frames), `opening.pss` start
-with audio, the first frames of every movie, and the course preview stills.
-12 tests: 8 run without the disc, 4 skip. The IDCT meets every IEEE 1180 limit
-(peak error 1, worst per-pixel MSE 0.017 vs 0.06, overall MSE ≤ 0.014 vs
-0.02, means ≤ 0.0035 / 0.00026 vs 0.015 / 0.0015).
+without `GT3R_DISC`; any region's disc, with its own sizes and rates):
+`menu_bg2.pss` fully (360 frames, PAL 300), `opening.pss` start with audio
+and its timestamps, the first frames of every movie and their picture shape,
+and the course preview stills (none on the NTSC-J disc). Playback timing:
+`MoviePlayer` stepped like 60 and 120 Hz displays through synthetic 25, 30
+and 29.97 fps field-split movies, checking every refresh's picture and field
+against the timestamps, and the audio steering against a position that moves
+in device buffers. 15 tests: 11 run without the disc, 4 skip. The IDCT
+meets every IEEE 1180 limit (peak error 1, worst per-pixel MSE 0.017 vs 0.06,
+overall MSE ≤ 0.014 vs 0.02, means ≤ 0.0035 / 0.00026 vs 0.015 / 0.0015).
 
 The Android
 build (`libmain.so`) includes the movie code.

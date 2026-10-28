@@ -3,6 +3,7 @@
 // (Race screen code map: docs/dev/RACE.md.)
 
 #include "app/screen_race_impl.h"
+#include "sim/exact/race.h"
 
 namespace gt3r::race_screen {
 
@@ -36,16 +37,21 @@ void RaceScreen::music_cues(App& app) {
         c.finished = replay_finish_.update(done, replay_focus_ + 1);
     }
     c.position = 1; // every finish plays the jingle; in 2P the first one is the winner's
-    // The fail jingle: a licence FAIL, a licence time slower than bronze (GT3 posts
-    // ExamFail for both), a voided time trial.
-    c.failed = tt_failed_ || (!license_event_.empty() && (license_.state() == LicenseRun::State::Failed ||
-                                                           (license_.state() == LicenseRun::State::Finished && shown_medal_ < 0)));
+    // The fail jingle: a licence run without a medal (a FAIL, a time slower than bronze: GT3's failed event for both,
+    // race::license_fail_jingle), a voided time trial.
+    c.failed = tt_failed_ || (!license_event_.empty() && license_.state() != LicenseRun::State::Running &&
+                              race::license_fail_jingle(license_.state(), shown_medal_));
     c.medal = license_event_.empty() ? -1 : shown_medal_;
-    if (lic_replay) { // the replayed / demo run's own end: the judge (demo) or the live run's end time (replay)
-        bool demo_end = demo_ && demo_judge_.state() != LicenseRun::State::Running;
-        bool replay_end = replaying_ && music_license_end_s_ >= 0 && race_time_ >= music_license_end_s_;
+    if (lic_replay) { // the replayed / demo run's own end: as its race ends it (demo) or the live run's end time (replay)
+        const sim::exact::ExactRace* er = demo_ && exact_field() ? exact_race_of(*exact_field()) : nullptr;
+        const bool demo_end = er && !er->cars().empty() && er->cars()[0].finished != 0;
+        const bool replay_end = replaying_ && music_license_end_s_ >= 0 && race_time_ >= music_license_end_s_;
         c.finished = demo_end || replay_end;
-        c.failed = demo_end ? demo_judge_.state() == LicenseRun::State::Failed : music_license_failed_;
+        // A demonstration: its run's judged result (2..4 a medal; 0 slower than bronze, -1 out of the course: failed);
+        // a replay: what its live run played.
+        c.failed = demo_end ? er->kind() == sim::exact::Conductor::License &&
+                                  race::license_fail_jingle(race::license_outcome(er->flow().result, er->flow().result_time, true, -1))
+                            : music_license_failed_;
     }
     c.since_finish = finish_wait_;
     bool results = (field_ || two_player_) && license_event_.empty() && !machine_;
@@ -92,11 +98,11 @@ void RaceScreen::update_course_ambience(App& app) {
 void RaceScreen::update_tyre_sounds(App& app, const sim::VehicleState& s) {
     VoiceMixer& mixer = app.audio().voices();
     auto step = [](const CameraRig& cam, const sim::VehicleState& st, const sim::VehicleSetup& setup,
-                   const sim::Vehicle* v, SoundView view) {
+                   const sim::VehicleTelemetry* t, SoundView view) {
         CarSfx::Step p;
         p.state = &st;
         p.setup = &setup;
-        p.telemetry = v ? &v->telemetry() : nullptr;
+        p.telemetry = t;
         p.view = view;
         p.eye = to_sim(cam.eye());
         p.right = cam_right(cam);
@@ -104,7 +110,7 @@ void RaceScreen::update_tyre_sounds(App& app, const sim::VehicleState& s) {
         return p;
     };
     const bool tv = camera_.mode() == CameraMode::Tv || replaying_;
-    CarSfx::Step p1 = step(camera_, s, vehicle_->setup(), vehicle_->sim_vehicle(),
+    CarSfx::Step p1 = step(camera_, s, vehicle_->setup(), vehicle_->telemetry(),
                            camera_.onboard() ? SoundView::InCarTarget : tv ? SoundView::Other : SoundView::ChaseTarget);
     // The listener moves with the followed car (as for the other cars' engines, sound §8).
     sim::Vec3 listener_v = s.velocity;
@@ -120,7 +126,7 @@ void RaceScreen::update_tyre_sounds(App& app, const sim::VehicleState& s) {
     p1.car_impulse = replaying_ ? 0.0f : vehicle_->car_impulse();
     car_sfx_.update(sfx_, mixer, p1);
     if (field_ && field_->has_second()) {
-        CarSfx::Step p2 = step(camera2_, field_->second_state(), field_->second_setup(), field_->second_vehicle(),
+        CarSfx::Step p2 = step(camera2_, field_->second_state(), field_->second_setup(), field_->second_telemetry(),
                                camera2_.onboard() ? SoundView::InCarTarget : SoundView::ChaseTarget);
         p2.wall_impulse = field_->second_wall_impulse();
         p2.car_impulse = field_->second_car_impulse();
@@ -136,7 +142,7 @@ void RaceScreen::update_tyre_sounds(App& app, const sim::VehicleState& s) {
     const SoundView other = camera_.onboard() ? SoundView::InCarOther : tv ? SoundView::Other : SoundView::ChaseOther;
     for (int i = 0; i < n; ++i) {
         const sim::VehicleState& os = field_->opponent_state(i);
-        CarSfx::Step p = step(camera_, os, field_->opponent_setup(i), field_->opponent_vehicle(i), other);
+        CarSfx::Step p = step(camera_, os, field_->opponent_setup(i), field_->opponent_telemetry(i), other);
         p.doppler = doppler(os, p.eye);
         opp_sfx_[size_t(i)].update(sfx_, mixer, p);
     }
@@ -161,28 +167,24 @@ RaceScreen::SoundCar RaceScreen::car_sound_facts(const std::string& label) const
     return c;
 }
 
-CarExtraSounds::Frame RaceScreen::extra_frame(const sim::Vehicle& v, const sim::VehicleState& s, const SoundCar& car,
-                                              bool onboard, float x, float z, SoundView view) {
+CarExtraSounds::Frame RaceScreen::extra_frame(const CarFacts& facts, const sim::VehicleTelemetry& t, const sim::VehicleState& s,
+                                              const SoundCar& car, bool onboard, float x, float z, SoundView view) {
     CarExtraSounds::Frame f;
-    const sim::VehicleTelemetry& t = v.telemetry();
-    const sim::CarSpec& spec = v.spec();
     f.u = s.speed_kmh / 3.6f;
-    [&](const auto& tt) {
-        if constexpr (requires { tt.slipstream; }) f.slipstream = tt.slipstream;
-    }(t);
+    f.slipstream = t.slipstream;
     f.cd = car.cd;
     f.whine = car.whine;
     f.clutch = t.clutch > 0.01f ? 1 : 0;
     f.torque = t.engine_torque;
-    const std::vector<float>& r = spec.gearbox.ratios;
+    const std::vector<float>& r = facts.ratios;
     if (!r.empty()) {
         f.first_ratio = r[0];
-        f.ratio = s.gear >= 1 && size_t(s.gear) <= r.size() ? r[size_t(s.gear - 1)] : s.gear < 0 ? spec.gearbox.reverse : 0.0f;
+        f.ratio = s.gear >= 1 && size_t(s.gear) <= r.size() ? r[size_t(s.gear - 1)] : s.gear < 0 ? facts.reverse_ratio : 0.0f;
     }
     // Driven axle speed: rear, front, or the mean of all four (4WD).
     float front = 0.5f * (std::fabs(s.wheels[0].angular_velocity) + std::fabs(s.wheels[1].angular_velocity));
     float rear = 0.5f * (std::fabs(s.wheels[2].angular_velocity) + std::fabs(s.wheels[3].angular_velocity));
-    sim::Drive d = spec.drivetrain.drive;
+    sim::Drive d = facts.drive;
     f.shaft = d == sim::Drive::FF ? front : d == sim::Drive::AWD ? 0.5f * (front + rear) : rear;
     if (onboard) x = 0, z = 1; // the followed car's own sounds sit in front in the in-car view
     f.x = x, f.z = z;

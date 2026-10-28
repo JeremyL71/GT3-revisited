@@ -1,19 +1,17 @@
 #pragma once
 
-// The race scene talks to the vehicle simulation and the track runtime only
-// through these two small interfaces, so it can run on the real
-// implementations (sim::Vehicle from the physics workstream, track::Track
-// from the track workstream) or on the simple stand-ins in this directory
-// (KinematicVehicle, RoadTrack) while those are not available.
-//
-// make_track()/make_vehicle() pick the real implementation when it exists
-// and fall back to the stand-ins otherwise (see backend.cpp).
+// The race scene talks to the course and the player's car only through these small interfaces: RaceTrack (the course's
+// track runtime, track::Track: its surfaces, start grid, centre line and lap timer) and RaceVehicle (the player's car of a
+// race on the exact core, race/exact_field.h).
 
 #include "formats/model/car_model.h"
+#include "input/virtual_pad.h"
+#include "sim/car_spec.h"
 #include "sim/sim_types.h"
-#include "sim/vehicle.h"
 
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -26,10 +24,6 @@ namespace track {
 class Track;
 }
 } // namespace gt3r
-
-namespace gt3r::sim {
-class Vehicle;
-} // namespace gt3r::sim
 
 namespace gt3r::race {
 
@@ -48,9 +42,28 @@ struct LapCrossing {
     long long split_ms = 0; // since the lap's start (at the line: the lap time)
 };
 
+// A race that times the player's laps itself (the exact core's race flow): the track's lap queries answer from it
+// (RaceTrack::set_lap_source) instead of the track's own lap timer.
+class LapSource {
+public:
+    virtual ~LapSource() = default;
+    virtual bool lap_completed() const = 0; // the last step completed a lap
+    virtual int laps_completed() const = 0;
+    virtual bool lap_started() const = 0;
+    virtual double current_lap_time(double now) const = 0;
+    virtual double last_lap_time() const = 0;
+    virtual double best_lap_time() const = 0;
+    virtual float lap_progress() const = 0;
+    virtual bool wrong_way() const = 0;
+    virtual std::vector<LapCrossing> lap_crossings() const = 0;
+    virtual double race_distance() const = 0;
+};
+
 // Track runtime as seen by the race scene.
 class RaceTrack {
 public:
+    // The lap queries from `src` while it is set (nullptr: the track's own lap timer).
+    virtual void set_lap_source(const LapSource* src) { (void)src; }
     virtual ~RaceTrack() = default;
     virtual const char* backend_name() const = 0;
     virtual const sim::TrackQuery& query() const = 0;
@@ -58,29 +71,17 @@ public:
 
     virtual int grid_count() const = 0;
     virtual TrackPose grid_pose(int slot) const = 0;
-    // Pose on the centre line nearest to `p` (respawn after leaving the track).
-    virtual TrackPose respawn_pose(const sim::Vec3& p) const = 0;
-    // Centre-line point `metres` further along the lap than the point nearest
-    // to `p` (auto-drive / demo steering).
-    virtual sim::Vec3 point_ahead(const sim::Vec3& p, float metres) const = 0;
     // Centre-line point at track distance s (wrapped), `lateral` metres to the left.
     virtual sim::Vec3 point_at(float s, float lateral = 0) const = 0;
     // Track distance of the centre-line point nearest to p.
     virtual float distance_of(const sim::Vec3& p) const = 0;
-    // The real track runtime when this is backed by it (opponents need it), else nullptr.
+    // The track runtime behind it (its road, AI lines and walls).
     virtual const track::Track* runtime() const { return nullptr; }
     // Player's race distance (laps * length + distance), for positions.
     virtual double race_distance() const = 0;
 
-    // Walls and surface grip for the vehicle simulation.
-    virtual const sim::WorldQuery& world() const = 0;
-    // Surface classes for effects (rumble, sounds).
-    virtual bool is_kerb(u32 surface) const = 0;
-    virtual bool is_offroad(const sim::SurfaceHit& hit) const = 0;
-
     // Lap timing for the player's car.
     virtual void lap_reset(double time) = 0;
-    virtual void lap_teleport(const sim::Vec3& p) = 0;
     virtual bool lap_update(const sim::Vec3& p, double time) = 0; // true when a lap was completed
     virtual int laps_completed() const = 0;
     virtual bool lap_started() const = 0;
@@ -103,64 +104,62 @@ struct CarSetup {
     std::string label;      // database car label, e.g. "r34_gtr_v_99"
     std::string name;       // display name
     std::string model;      // car model id, e.g. "ni0137"
-    float mass_kg = 1300;
-    std::vector<float> curve_rpm, curve_torque_nm; // engine torque curve
-    float idle_rpm = 900, redline_rpm = 7000, limit_rpm = 7500;
+    float limit_rpm = 7500;    // the engine's rev limit (the HUD's speedometer scale)
     std::vector<float> ratios; // forward gears
-    float reverse_ratio = 3.5f, final_drive = 4.0f;
-    int drive_type = 0;        // database DriveType (FR, FF, ...)
+    float final_drive = 4.0f;
     WheelSpec wheels;          // placement and tyre size
     CarBodyMod body_mod;       // mod cars: stretched shell or a body of their own (paint 0)
     u16 sound_id = 0;          // engine sound bank
     u8 sound_variant = 0;
-    // A fully built spec (e.g. a GT-mode garage car with parts and settings);
-    // when set the vehicle is created from it instead of from `label`.
-    std::shared_ptr<const sim::CarSpec> spec;
 };
 
 // Fills a CarSetup from the database (defaults where something is missing).
 CarSetup car_setup_from_database(const data::CarDatabase& db, const std::string& car_label);
 
+// What the race screen reads of a car's make-up besides its geometry (VehicleSetup): sounds, force feedback, pylons.
+struct CarFacts {
+    float mass = 1300;            // kg
+    float front_weight = 0.55f;   // the front axle's static share
+    float front_extent = 2.25f, rear_extent = 2.25f; // body ahead of / behind the car-frame origin (m)
+    float width = 1.75f, length = 4.5f;
+    bool turbo = false;
+    std::vector<float> ratios; // forward gears (any common scale: only their proportions are read)
+    float reverse_ratio = 0;
+    sim::Drive drive = sim::Drive::FR;
+};
+
+// The player's car (race/exact_field.h): the car's record as the screen reads it, its own race logic (its AI drives the
+// run-ups, the pit lane and the end of a run; it judges laps and finishes) and its race pad.
 class RaceVehicle {
 public:
     virtual ~RaceVehicle() = default;
     virtual const char* backend_name() const = 0;
-    // Respawns (the player's car, replayed respawn events). Real vehicles use
-    // the spawn hold: held 0.3 m up for 2 s, then dropped (sim::Vehicle::spawn).
-    virtual void reset(const TrackPose& pose) = 0;
-    // Grid start (physics §9): placed at rest without the spawn hold.
-    virtual void place(const TrackPose& pose) { reset(pose); }
-    // Dirt course (course table 34 +0x08 = 2): the physics §10.4 front-brake cut with steering.
-    // In a field this applies to every car.
-    virtual void set_dirt_course(bool dirt) { (void)dirt; }
-    // Rolling / flying starts: placed moving straight ahead at speed (m/s), no spawn hold.
-    virtual void reset_moving(const TrackPose& pose, float speed_mps) { reset(pose); (void)speed_mps; }
+    // One race step: the race pad set with set_pad (or, where the screen gives none - scripts, demos, replays of inputs - a
+    // frame made from `in`).
     virtual void step(const sim::ControlInputs& in, double dt) = 0;
     virtual const sim::VehicleState& state() const = 0;
     // Wheel placement, gear count and rpm range (tach) in the car frame.
     virtual const sim::VehicleSetup& setup() const = 0;
-    // Velocity change from wall hits during the last step (m/s), for rumble.
-    virtual float last_impact() const = 0;
-    // Turbo boost (sim::VehicleTelemetry::boost; 0 for NA cars and the stand-in).
+    // Turbo boost (sim::VehicleTelemetry::boost; 0 for NA cars).
     virtual float boost() const { return 0; }
-    // The simulation vehicle behind this one (spec, telemetry), or nullptr (stand-ins).
-    virtual const sim::Vehicle* sim_vehicle() const { return nullptr; }
-    // Player reverse (GT3's "back" action): requests reverse gear (sim::Vehicle::set_reverse_request).
+    // The brake pedal the car's last step ran with (0..1; its brake lamps).
+    virtual float brake_pedal() const { return 0; }
+    // The last step's telemetry (sounds, smoke, dirt, force feedback).
+    virtual const sim::VehicleTelemetry* telemetry() const = 0;
+    // The car's make-up.
+    virtual std::optional<CarFacts> facts() const = 0;
+    // The recommended-gear hint the car's race logic keeps (the AI driver object's +0xAC / +0xAD: the gear, -1 none, and
+    // whether it blinks).
+    virtual int gear_hint(bool& blink) const { blink = false; return -1; }
+    // The driver kind the car's last step ran with (0 normal, 1 the AI drives, 2-4 the pit lane, 5-7 stopping, 8 parked).
+    virtual int driver_kind() const { return 0; }
+    // The race pad's state for the next step (the car reads the pad itself, as in GT3).
+    virtual void set_pad(const PadState* pad) { (void)pad; }
+    // The car's own AI takes the car over (a race's demonstration); false when it cannot.
+    virtual bool ai_take_over() { return false; }
+    // Player reverse (GT3's "back" action) for a step without a pad.
     virtual void set_reverse_request(bool on) { (void)on; }
-    // Scripted driving (sim::Vehicle::set_driver_kind; 0 = the driver): the pit lane's
-    // auto drive sets its state (2 lane, 3 box line, 4 leaving): aids off like a CPU car.
-    virtual void set_driver_kind(int kind) { (void)kind; }
-    // The AI aid block the physics reads while the computer drives this car (sim::Vehicle::
-    // set_scripted_aids; the player's AI parameter set, ai §9.1).
-    virtual void set_scripted_aids(const sim::ScriptedAids& a) { (void)a; }
-    // The start-countdown hold (sim::Vehicle::set_race_hold, physics §9.3): the car is held in place, the
-    // brakes stay off and the engine can rev. Returns false when the backend has no such hold (the
-    // caller then holds the car with the brakes).
-    virtual bool set_race_hold(bool on) { (void)on; return false; }
-    // The pit-box stop (sim::Vehicle::begin_pit_stop): 5 s, tyres changed at 1 s.
-    virtual void begin_pit_stop(const sim::Quat& box) { (void)box; }
-    // Engine condition (sim::Vehicle::set_engine_condition, physics §10.3): what the run starts
-    // with and, read back, what it hands on. The stand-in has none (a fresh engine).
+    // Engine condition (physics §10.3): what the run starts with and, read back, what it hands on.
     virtual void set_engine_condition(const sim::EngineCondition& c) { (void)c; }
     virtual sim::EngineCondition engine_condition() const { return {}; }
     // Wall impulse of the last step (N*s; sim::VehicleTelemetry::wall_impulse), for sounds.
@@ -169,7 +168,7 @@ public:
     virtual float car_impulse() const { return 0; }
 };
 
+// The course's track runtime; throws FormatError when the course file has none.
 std::unique_ptr<RaceTrack> make_track(const Vfs& vfs, ByteSpan course_file, const std::string& label);
-std::unique_ptr<RaceVehicle> make_vehicle(const CarSetup& car, const data::CarDatabase* db, const RaceTrack& track);
 
 } // namespace gt3r::race

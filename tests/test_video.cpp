@@ -9,6 +9,7 @@
 #include "video/idct.h"
 #include "video/ipu.h"
 #include "video/movie.h"
+#include "video/movie_player.h"
 #include "video/mpeg2_decoder.h"
 #include "video/mpeg2_tables.h"
 
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <numbers>
 #include <random>
@@ -127,13 +129,14 @@ void put_intra_mb(BitWriter& w, int y, int cb, int cr, int pred[3]) {
     w.str("10");
 }
 
-Bytes sequence_prefix() {
+// frame_rate_code: 5 = 30 fps, 3 = 25 fps (PAL).
+Bytes sequence_prefix(int frame_rate_code = 5) {
     BitWriter w;
     w.start_code(0xB3);
     w.put(kW, 12);
     w.put(kH, 12);
     w.put(1, 4);       // aspect ratio
-    w.put(5, 4);       // 30 fps
+    w.put(u32(frame_rate_code), 4);
     w.put(1000, 18);   // bit rate
     w.put(1, 1);       // marker
     w.put(20, 10);     // vbv buffer size
@@ -791,18 +794,219 @@ TEST(video_movie_synthetic) {
 }
 
 // =================================================================================================
+// Playback timing (MoviePlayer)
+// =================================================================================================
+
+namespace {
+
+// A video-only movie of `frames` pictures (an I picture, then zero-vector P pictures: all the same
+// picture, whose macroblock rows differ at the middle, so the player takes it as field-split) at
+// frame_rate_code's rate, one PES packet per picture with its PTS.
+Bytes timed_movie(int frame_rate_code, double fps, int frames) {
+    Bytes s;
+    const s64 base = 90000;
+    for (int k = 0; k < frames; ++k) {
+        Bytes v;
+        if (k == 0) append(v, sequence_prefix(frame_rate_code));
+        append(v, k == 0 ? build_i_picture(0) : build_p_picture(k));
+        if (k == frames - 1) append(v, sequence_end());
+        append(s, pack_header());
+        append(s, pes_packet(0xE0, v, base + s64(std::llround(k * 90000.0 / fps))));
+    }
+    append(s, Bytes{0, 0, 1, 0xB9});
+    return s;
+}
+
+struct Cadence {
+    int refreshes = 0, mismatches = 0, skips = 0;
+    u64 dropped = 0;
+    std::map<int, int> per_field; // refreshes a field stayed on screen -> how many fields
+    int fields = 0;
+};
+
+// Plays `frames` pictures at `fps` on a display refreshing at `hz` (the player's clock stepped like
+// the refreshes, 0.8 ms off the pictures' times so none falls on the 2 ms early limit) and
+// checks every refresh shows the picture and field its timestamps say.
+Cadence play_cadence(int frame_rate_code, double fps, double hz, int frames) {
+    Cadence c;
+    const Bytes s = timed_movie(frame_rate_code, fps, frames);
+    SDL_Surface* surface = SDL_CreateSurface(64, 64, SDL_PIXELFORMAT_RGBA32);
+    SDL_Renderer* r = surface ? SDL_CreateSoftwareRenderer(surface) : nullptr;
+    CHECK(r != nullptr);
+    if (!r) {
+        SDL_DestroySurface(surface);
+        return c;
+    }
+    u64 now = 1'000'000'000;
+    {
+        MoviePlayer player;
+        player.set_time_source([&now] { return now; });
+        player.start(std::make_unique<Movie>(buffer_reader(s), s.size()));
+        CHECK(std::abs(player.info().frame_rate - fps) < 1e-9);
+        const double period = 1.0 / fps;
+        int last_field = -1, run = 0;
+        for (int k = 0;; ++k) {
+            const double t = 0.0008 + double(k) / hz;
+            if (t >= double(frames - 1) * period) break; // the last picture: until the movie ends
+            now = 1'000'000'000 + u64(std::llround(t * 1e9));
+            player.wait_for_frame(2.0); // the decoder keeps up (in the app it runs ahead in real time)
+            player.update(r);
+            ++c.refreshes;
+            // The clock is the display's time (no drift); the picture is the newest whose time has
+            // come (2 ms early at most), and in it the field whose half of the frame period has
+            // come (by the same rule).
+            const double clock = player.position();
+            const double due = std::floor((clock + 0.002) * fps) * period;
+            const bool second = clock + 0.002 - due >= period * 0.5;
+            if (std::abs(clock - t) > 1e-6 || std::abs(player.picture_time() - due) > 1e-6 ||
+                player.second_field() != second)
+                ++c.mismatches;
+            const int field = int(std::lround(player.picture_time() * fps)) * 2 + int(player.second_field());
+            if (field != last_field) {
+                if (last_field >= 0) ++c.per_field[run], ++c.fields;
+                if (last_field >= 0 && field - last_field >= 2) ++c.skips;
+                last_field = field;
+                run = 0;
+            }
+            ++run;
+        }
+        CHECK(player.field_split());
+        c.dropped = player.stats().dropped;
+    }
+    SDL_DestroyRenderer(r);
+    SDL_DestroySurface(surface);
+    return c;
+}
+
+} // namespace
+
+// PAL movies (25 fps, two fields a frame) on 60 and 120 Hz displays, against NTSC's 30 fps: every
+// refresh shows the field its timestamps say, nothing is dropped, and the fields take turns in the
+// only cadence the rates allow (50 fields into 60 refreshes: 1 or 2 refreshes each, 6 per 5
+// fields; into 120: 2 or 3, 12 per 5).
+TEST(video_player_cadence_pal_ntsc) {
+    {
+        Cadence c = play_cadence(3, 25.0, 60.0, 50);
+        CHECK(c.mismatches == 0 && c.dropped == 0);
+        CHECK(c.per_field.size() == 2 && c.per_field[1] > 0 && c.per_field[2] > 0);
+        CHECK(std::abs(c.per_field[1] - 4 * c.per_field[2]) <= 4);
+    }
+    {
+        Cadence c = play_cadence(3, 25.0, 120.0, 50);
+        CHECK(c.mismatches == 0 && c.dropped == 0);
+        CHECK(c.per_field.size() == 2 && c.per_field[2] > 0 && c.per_field[3] > 0);
+        CHECK(std::abs(c.per_field[2] * 2 - c.per_field[3] * 3) <= 6);
+    }
+    {
+        Cadence c = play_cadence(5, 30.0, 60.0, 60); // NTSC: one refresh per field
+        CHECK(c.mismatches == 0 && c.dropped == 0);
+        CHECK(c.per_field.size() == 1 && c.per_field[1] == c.fields);
+    }
+    {
+        // 29.97 fps at 60 Hz for 20 s: the refreshes drift past every point of the fields, also
+        // the 2 ms before a frame's time; every field is shown, one twice every 16.7 s.
+        Cadence c = play_cadence(4, 30000.0 / 1001.0, 60.0, 600);
+        CHECK(c.mismatches == 0 && c.dropped == 0 && c.skips == 0);
+        CHECK(c.per_field[2] <= 2 && c.per_field[1] + c.per_field[2] == c.fields);
+    }
+}
+
+namespace {
+
+struct SteerRun {
+    int skips = 0, repeats = 0, resyncs = 0;
+    double off_ms = 0; // the most the clock was off the audio, after the start and a stall
+};
+
+// A movie clock on a display refreshing at `hz` against an audio position that moves in device
+// buffers (512 frames at 48 kHz, as the position SDL reports does), for `seconds`, with a
+// one-second stall at 20 s: how often the field shown skips one or repeats.
+SteerRun steer_run(double fields_per_s, double hz, double seconds) {
+    SteerRun r;
+    const double buffer = 512.0 / 48000.0;
+    double clock = 0, t = 0;
+    long last_field = -1;
+    for (int k = 1; t < seconds; ++k) {
+        double step = 1.0 / hz;
+        if (k == int(20 * hz)) step = 1.0; // the stall
+        t += step;
+        const double audio = std::floor((t + 0.0047) / buffer) * buffer;
+        clock += std::min(step, 0.1);
+        const double err = audio - clock;
+        if (std::abs(err) > 0.1) ++r.resyncs;
+        clock += audio_clock_correction(err, std::min(step, 0.1));
+        const long field = long(std::floor(clock * fields_per_s));
+        const bool settled = t > 3.0 && !(t > 20.0 && t < 23.0);
+        if (settled && last_field >= 0) {
+            if (field - last_field >= 2) ++r.skips;
+            if (field == last_field) ++r.repeats;
+            r.off_ms = std::max(r.off_ms, std::abs(clock - t) * 1000.0);
+        }
+        last_field = field;
+    }
+    return r;
+}
+
+} // namespace
+
+// The clock steered toward the audio (audio_clock_correction) moves as evenly as the refreshes:
+// 29.97 fps fields at 60 Hz take one refresh each, one twice when the rates have drifted a field
+// apart (every 16.7 s), none skipped; PAL's 50 fields a second at 60 Hz only repeat (10 a
+// second); the clock stays within about a device buffer of the audio, and a stall jumps it back.
+TEST(video_player_audio_steering) {
+    const SteerRun ntsc = steer_run(60000.0 / 1001.0, 60.0, 80.0);
+    std::printf("  29.97 fps at 60 Hz: %d skipped, %d repeated, A/V within %.1f ms\n", ntsc.skips, ntsc.repeats,
+                ntsc.off_ms);
+    CHECK(ntsc.skips == 0);
+    CHECK(ntsc.repeats <= 5);
+    CHECK(ntsc.off_ms < 20.0);
+    CHECK(ntsc.resyncs == 1);
+    const SteerRun ntsc120 = steer_run(60000.0 / 1001.0, 120.0, 80.0);
+    CHECK(ntsc120.skips == 0 && ntsc120.off_ms < 20.0);
+    const SteerRun pal = steer_run(50.0, 60.0, 80.0);
+    std::printf("  25 fps at 60 Hz: %d skipped, %d repeated, A/V within %.1f ms\n", pal.skips, pal.repeats, pal.off_ms);
+    CHECK(pal.skips == 0 && pal.off_ms < 20.0);
+    CHECK(std::abs(pal.repeats - 10 * 74) < 20); // a repeat every 6 refreshes, 74 settled seconds
+    const SteerRun pal120 = steer_run(50.0, 120.0, 80.0);
+    CHECK(pal120.skips == 0 && pal120.off_ms < 20.0);
+}
+
+// The TV picture: full-size NTSC and PAL movies both fill 4:3; smaller ones keep the pixel shape.
+TEST(video_display_aspect) {
+    MovieInfo ntsc;
+    ntsc.width = 640, ntsc.height = 448, ntsc.frame_rate = 30000.0 / 1001.0;
+    CHECK(std::abs(movie_display_aspect(ntsc) - 4.0 / 3.0) < 1e-9);
+    ntsc.frame_rate = 30.0;
+    CHECK(std::abs(movie_display_aspect(ntsc) - 4.0 / 3.0) < 1e-9);
+    MovieInfo pal;
+    pal.width = 640, pal.height = 512, pal.frame_rate = 25.0;
+    CHECK(std::abs(movie_display_aspect(pal) - 4.0 / 3.0) < 1e-9);
+    MovieInfo strip; // menu_bg2: half the width, a quarter of the lines
+    strip.width = 320, strip.height = 112, strip.frame_rate = 30.0;
+    CHECK(std::abs(movie_display_aspect(strip) - 8.0 / 3.0) < 1e-9);
+    strip.frame_rate = 25.0;
+    CHECK(std::abs(movie_display_aspect(strip) - 320.0 / 112.0 * 512.0 / 480.0) < 1e-9);
+    CHECK(std::abs(movie_display_aspect(MovieInfo{}) - 4.0 / 3.0) < 1e-9);
+}
+
+// =================================================================================================
 // Disc
 // =================================================================================================
 
+// The movies of each release: NTSC-U and NTSC-J 640x448 at 29.97 / 30 fps, PAL 640x512 at 25 fps
+// (the same 12 s menu strip as 300 instead of 360 pictures).
+static bool pal_disc(const Disc& d) { return d.info().region == Region::Europe; }
+
 TEST(video_disc_menu_bg2) {
-    Disc* disc = test::test_disc();
+    Disc* disc = test::any_region_disc();
     if (!disc) SKIP("needs GT3R_DISC");
     Volume& vol = disc->volume();
     const Volume::Entry* e = vol.find("stream/menu_bg2.pss");
     if (!e) SKIP("stream/menu_bg2.pss not on this disc");
     auto m = open_disc_movie(vol, *e);
+    const bool pal = pal_disc(*disc);
     CHECK(m->info().width == 320 && m->info().height == 112);
-    CHECK(std::abs(m->info().frame_rate - 30.0) < 0.01);
+    CHECK(std::abs(m->info().frame_rate - (pal ? 25.0 : 30.0)) < 0.01);
     CHECK(!m->info().has_audio);
 
     int count = 0;
@@ -826,43 +1030,53 @@ TEST(video_disc_menu_bg2) {
         }
         ++count;
     }
-    CHECK(count == 360);
+    CHECK(count == (pal ? 300 : 360));
     CHECK(var100 > 10.0);
     CHECK(m->decoder().stats().slice_errors == 0);
     CHECK(m->decoder().stats().skipped_pictures == 0);
 }
 
 TEST(video_disc_opening) {
-    Disc* disc = test::test_disc();
+    Disc* disc = test::any_region_disc();
     if (!disc) SKIP("needs GT3R_DISC");
     Volume& vol = disc->volume();
     const Volume::Entry* e = vol.find("stream/opening.pss");
     if (!e) SKIP("stream/opening.pss not on this disc");
     auto m = open_disc_movie(vol, *e);
-    CHECK(m->info().width == 640 && m->info().height == 448);
+    const int lines = pal_disc(*disc) ? 512 : 448;
+    CHECK(m->info().width == 640 && m->info().height == lines);
+    CHECK(std::abs(movie_display_aspect(m->info()) - 4.0 / 3.0) < 1e-9);
     CHECK(m->info().has_audio);
-    CHECK(m->info().audio_rate == 44100 && m->info().audio_channels == 2);
+    const u32 rate = disc->info().region == Region::Japan ? 48000 : 44100;
+    CHECK(m->info().audio_rate == rate && m->info().audio_channels == 2);
+    // Audio and video start together (the A/V clock's offset).
+    CHECK(m->info().audio_start_pts == m->info().start_pts);
 
     Frame f;
     int count = 0;
+    s64 last = -1;
+    const s64 period = s64(std::llround(90000.0 / m->info().frame_rate));
     while (count < 60 && m->next_frame(f)) {
-        CHECK(f.width == 640 && f.height == 448);
+        CHECK(f.width == 640 && f.height == lines);
+        if (last >= 0) CHECK(f.pts - last == period); // pictures one frame period apart, in display order
+        last = f.pts;
         ++count;
     }
     CHECK(count == 60);
     CHECK(m->decoder().stats().slice_errors == 0);
 
-    std::vector<s16> pcm(44100 * 2);
-    size_t n = m->read_audio(pcm.data(), 44100);
-    CHECK(n == 44100);
+    std::vector<s16> pcm(rate * 2);
+    size_t n = m->read_audio(pcm.data(), rate);
+    CHECK(n == rate);
     bool nonzero = false;
     for (size_t i = 0; i < n * 2; ++i) nonzero |= pcm[i] != 0;
     CHECK(nonzero);
 }
 
 TEST(video_disc_all_headers) {
-    Disc* disc = test::test_disc();
+    Disc* disc = test::any_region_disc();
     if (!disc) SKIP("needs GT3R_DISC");
+    const bool pal = pal_disc(*disc);
     Volume& vol = disc->volume();
     int movies = 0;
     for (const Volume::Entry& e : vol.entries()) {
@@ -878,7 +1092,13 @@ TEST(video_disc_all_headers) {
             continue;
         }
         CHECK(m->info().width > 0 && m->info().height > 0);
-        CHECK(m->info().frame_rate > 0);
+        // The release's TV system: 25 fps on PAL, 29.97 / 30 elsewhere; full-size pictures show at 4:3.
+        const double fps = m->info().frame_rate;
+        CHECK(pal ? std::abs(fps - 25.0) < 0.01 : fps > 29.9 && fps < 30.01);
+        if (m->info().width == 640) {
+            CHECK(m->info().height == (pal ? 512 : 448));
+            CHECK(std::abs(movie_display_aspect(m->info()) - 4.0 / 3.0) < 1e-9);
+        }
         Frame f;
         int n = 0;
         while (n < 3 && m->next_frame(f)) ++n;
@@ -942,10 +1162,15 @@ TEST(video_field_layout_synthetic) {
 }
 
 TEST(video_disc_course_ipic) {
-    Disc* disc = gt3r::test::test_disc();
+    Disc* disc = gt3r::test::any_region_disc();
     if (!disc) SKIP("needs GT3R_DISC");
     Volume& vol = disc->volume();
     const Volume::Entry* e = vol.find("stream/course.ipic");
+    if (disc->info().region == Region::Japan) { // the Japanese release has no course stills
+        CHECK(e == nullptr);
+        return;
+    }
+    const int lines = pal_disc(*disc) ? 512 : 448;
     CHECK(e != nullptr);
     if (!e) return;
     Bytes data = vol.read(*e);
@@ -961,7 +1186,7 @@ TEST(video_disc_course_ipic) {
         }
         mean /= double(f.y.size());
         double var = sq / double(f.y.size()) - mean * mean;
-        if (f.width == 640 && f.height == 448 && var > 10) ++ok;
+        if (f.width == 640 && f.height == lines && var > 10) ++ok;
     }
     CHECK(ok == 42);
 }

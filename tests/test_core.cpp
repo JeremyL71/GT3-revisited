@@ -107,7 +107,7 @@ TEST(bindings) {
     CHECK(Binding::parse_line("Cross", "pad.nonsense").empty());
     CHECK(Binding::parse_line("NotAButton", "pad.south").empty());
 
-    for (auto name : preset_names()) CHECK(!make_preset(name).bindings.empty());
+    for (auto name : {"pad", "quest", "wheel", "keyboard"}) CHECK(!make_preset(name).bindings.empty());
 }
 
 namespace {
@@ -122,13 +122,18 @@ std::vector<std::string> targets_of(const Profile& p, std::string_view source) {
 
 TEST(race_layout_presets) {
     using V = std::vector<std::string>;
-    // The menu pad is the DualShock 2 1:1: triggers on L2/R2, Triangle on north.
-    Profile menu = make_preset("racing");
+    // The menu pad is the DualShock 2 1:1: triggers on L2/R2, Triangle on north, and the back
+    // paddles shift (right R2, left L2), so they shift under the "gt3" race layout too.
+    Profile menu = make_preset("pad");
     CHECK(targets_of(menu, "pad.righttrigger") == V{"R2"});
     CHECK(targets_of(menu, "pad.north") == V{"Triangle"});
+    CHECK(targets_of(menu, "pad.paddle1") == V{"R2"} && targets_of(menu, "pad.paddle2") == V{"L2"});
+    CHECK(targets_of(make_preset("quest"), "pad.paddle1") == V{"R2"});
     // Modern race layout (targets in GT3's race meaning): triggers throttle / brake, Cross /
-    // Square shift, Triangle change view (never respawn), R3 look back, L1 reverse.
-    Profile modern = make_race_preset("modern", "racing");
+    // Square shift, Triangle change view (never respawn), R3 look back, L1 reverse; the
+    // paddles shift here too.
+    Profile modern = make_race_preset("modern", "pad");
+    CHECK(targets_of(modern, "pad.paddle1") == V{"R2"} && targets_of(modern, "pad.paddle2") == V{"L2"});
     CHECK(targets_of(modern, "pad.righttrigger") == V{"Cross"});
     CHECK(targets_of(modern, "pad.lefttrigger") == V{"Square"});
     CHECK(targets_of(modern, "pad.south") == V{"R2"});
@@ -137,9 +142,9 @@ TEST(race_layout_presets) {
     CHECK(targets_of(modern, "pad.north") == V{"R1"});
     CHECK(targets_of(modern, "pad.rightstick") == V{"L1"});
     CHECK(targets_of(modern, "pad.leftshoulder") == V{"Triangle"});
-    // Respawn (Select) is keyboard only: no controller button restarts the car by accident.
+    // Select has no race action (no respawn, as in GT3): nothing binds it.
     CHECK(targets_of(modern, "pad.back").empty());
-    CHECK(targets_of(modern, "key.Backspace") == V{"Select"});
+    CHECK(targets_of(modern, "key.Backspace").empty());
     CHECK(targets_of(make_race_preset("modern", "wheel"), "joy.button8").empty());
     CHECK(targets_of(modern, "key.Escape") == V{"Start"});
     CHECK(targets_of(modern, "key.W") == V{"Cross"});
@@ -154,7 +159,7 @@ TEST(race_layout_presets) {
     CHECK(targets_of(make_race_preset("modern", "wheel"), "joy.axis1") == V{"Cross"});
     CHECK(targets_of(make_race_preset("modern", "keyboard"), "pad.righttrigger").empty());
     // GT3's own layout: the race reads the menu pad itself.
-    Profile gt3 = make_race_preset("gt3", "racing");
+    Profile gt3 = make_race_preset("gt3", "pad");
     CHECK(gt3.name == "gt3" && gt3.bindings.empty());
 }
 

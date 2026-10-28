@@ -8,15 +8,34 @@
 
 namespace gt3r {
 
-Volume::Volume(File& file, u64 base_offset, u64 length) : file_(file), base_(base_offset), length_(length) {
-    Bytes hdr = file.read_at(base_, 0x14);
+Volume::Volume(File& file, u64 base_offset, u64 length) : file_(file) {
+    parts_.push_back({base_offset, length});
+    read_toc(0);
+    LOG_INFO("GT3.VOL: %zu files", entries_.size());
+}
+
+void Volume::add_part(u64 base_offset, u64 length) {
+    if (parts_.size() >= 255) throw FormatError("GT3.VOL: too many volumes");
+    parts_.push_back({base_offset, length});
+    const size_t before = entries_.size();
+    read_toc(u8(parts_.size() - 1));
+    LOG_INFO("GT3.VOL: %zu more files from volume %zu", entries_.size() - before, parts_.size() - 1);
+}
+
+void Volume::read_toc(u8 part) {
+    const Part& p = parts_[part];
+    Bytes hdr = file_.read_at(p.base, 0x14);
     if (rd32(hdr, 0) != kMagic) throw FormatError("GT3.VOL: bad magic");
     u32 toc_size = rd32(hdr, 0x08);
-    if (toc_size < 0x14 || toc_size > length) throw FormatError("GT3.VOL: bad toc size");
-    Bytes toc = file.read_at(base_, toc_size);
-    walk(toc, 0x14, "", 0);
-    for (size_t i = 0; i < entries_.size(); ++i) index_[entries_[i].path] = i;
-    LOG_INFO("GT3.VOL: %zu files", entries_.size());
+    if (toc_size < 0x14 || toc_size > p.length) throw FormatError("GT3.VOL: bad toc size");
+    Bytes toc = file_.read_at(p.base, toc_size);
+    const size_t first = entries_.size();
+    walk(toc, 0x14, "", 0, part);
+    // A path the set already has stays the earlier volume's.
+    std::vector<Entry> kept(entries_.begin(), entries_.begin() + ptrdiff_t(first));
+    for (size_t i = first; i < entries_.size(); ++i)
+        if (!index_.count(entries_[i].path)) index_[entries_[i].path] = kept.size(), kept.push_back(std::move(entries_[i]));
+    entries_ = std::move(kept);
 }
 
 std::string Volume::node_name(ByteSpan toc, u32 offset) {
@@ -25,7 +44,7 @@ std::string Volume::node_name(ByteSpan toc, u32 offset) {
     return s;
 }
 
-void Volume::walk(ByteSpan toc, u32 node, const std::string& prefix, int depth) {
+void Volume::walk(ByteSpan toc, u32 node, const std::string& prefix, int depth, u8 part) {
     if (depth > 32) throw FormatError("GT3.VOL: directory tree too deep");
     u32 count = rd32(toc, node + 4);
     for (u32 i = 1; i < count; ++i) { // child 0 is the parent link
@@ -34,7 +53,7 @@ void Volume::walk(ByteSpan toc, u32 node, const std::string& prefix, int depth) 
         u32 flags = word >> 24;
         std::string name = prefix + node_name(toc, word & 0xFFFFFF);
         if (flags & 1) {
-            walk(toc, child, name + "/", depth + 1);
+            walk(toc, child, name + "/", depth + 1, part);
             continue;
         }
         Entry e;
@@ -43,7 +62,8 @@ void Volume::walk(ByteSpan toc, u32 node, const std::string& prefix, int depth) 
         e.size = rd32(toc, child + 8);
         e.compressed = (flags & 2) != 0;
         e.stored_size = e.compressed ? rd32(toc, child + 12) : e.size;
-        if (u64(e.sector) * kSectorSize + e.stored_size > length_)
+        e.part = part;
+        if (u64(e.sector) * kSectorSize + e.stored_size > parts_[part].length)
             throw FormatError("GT3.VOL: entry out of range: " + e.path);
         entries_.push_back(std::move(e));
     }
@@ -72,7 +92,9 @@ std::vector<std::string> Volume::list_dir(const std::string& dir) const {
     return out;
 }
 
-Bytes Volume::read_raw(const Entry& e) const { return file_.read_at(base_ + u64(e.sector) * kSectorSize, e.stored_size); }
+Bytes Volume::read_raw(const Entry& e) const {
+    return file_.read_at(parts_[e.part].base + u64(e.sector) * kSectorSize, e.stored_size);
+}
 
 Bytes Volume::read(const Entry& e) const {
     Bytes raw = read_raw(e);
@@ -82,7 +104,7 @@ Bytes Volume::read(const Entry& e) const {
 void Volume::read_range(const Entry& e, u64 offset, void* out, size_t len) const {
     if (e.compressed) throw FormatError("range read of compressed entry: " + e.path);
     if (offset > e.size || e.size - offset < len) throw FormatError("range read out of bounds: " + e.path);
-    file_.read_at(base_ + u64(e.sector) * kSectorSize + offset, out, len);
+    file_.read_at(parts_[e.part].base + u64(e.sector) * kSectorSize + offset, out, len);
 }
 
 std::optional<Bytes> Volume::read_program() const {

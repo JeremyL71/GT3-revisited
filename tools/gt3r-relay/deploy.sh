@@ -1,23 +1,28 @@
 #!/bin/sh
 # Builds and installs gt3r-relay on a fresh Debian/Ubuntu server over SSH.
 #
-#   tools/gt3r-relay/deploy.sh root@203.0.113.7          # first install or update
-#   tools/gt3r-relay/deploy.sh root@203.0.113.7 --dry-run  # only build the source bundle
+#   tools/gt3r-relay/deploy.sh root@203.0.113.7              # first install or update
+#   tools/gt3r-relay/deploy.sh root@203.0.113.7 --when-idle  # restart only with no sessions open
+#   tools/gt3r-relay/deploy.sh root@203.0.113.7 --dry-run    # only build the source bundle
 #
 # Copies only the relay's own sources (no game code or data), installs g++ and cmake,
 # builds, installs /usr/local/bin/gt3r-relay (and gt3r-relay-bench) and the systemd unit, opens UDP 47631 in
 # ufw when ufw is active, and (re)starts the service. Run it again to update. The game versions the
 # relay announces live in /etc/gt3r-relay/versions.conf (set-versions.sh); an update keeps them.
+# Also: the relay's own journal with its own size cap (journald@gt3r-relay.conf; read it with
+# journalctl --namespace=gt3r-relay) and the country list for its log (update-geoip.sh, monthly timer).
 set -eu
 
 target=${1:-}
-[ -n "$target" ] || { echo "usage: $0 user@host [--dry-run]" >&2; exit 2; }
+[ -n "$target" ] || { echo "usage: $0 user@host [--when-idle | --dry-run]" >&2; exit 2; }
+when_idle=0
+[ "${2:-}" = "--when-idle" ] && when_idle=1
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 mkdir -p "$work/gt3r-relay/src/net" "$work/gt3r-relay/src/base" "$work/gt3r-relay/src/sim" "$work/gt3r-relay/tools"
-cp "$root"/src/net/socket.* "$root"/src/net/protocol.* "$root"/src/net/rendezvous.* "$root"/src/net/relay_server.* \
+cp "$root"/src/net/socket.* "$root"/src/net/protocol.* "$root"/src/net/rendezvous.* "$root"/src/net/relay_server.* "$root"/src/net/geoip.* \
    "$work/gt3r-relay/src/net/"
 cp "$root/src/base/bytes.h" "$work/gt3r-relay/src/base/"
 cp "$root/src/sim/sim_types.h" "$work/gt3r-relay/src/sim/"
@@ -41,13 +46,13 @@ for try in 1 2 3; do
 done
 trap 'ssh $opts -O exit "$target" 2>/dev/null; rm -rf "$work"' EXIT
 scp -q $opts "$work/gt3r-relay.tgz" "$target:/tmp/gt3r-relay.tgz"
-ssh $opts "$target" 'sh -s' <<'REMOTE'
+ssh $opts "$target" "WHEN_IDLE=$when_idle sh -s" <<'REMOTE'
 set -eu
 SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO=sudo
 export DEBIAN_FRONTEND=noninteractive
-command -v g++ >/dev/null && command -v cmake >/dev/null || {
+command -v g++ >/dev/null && command -v cmake >/dev/null && command -v curl >/dev/null || {
     $SUDO apt-get update -q
-    $SUDO apt-get install -y -q --no-install-recommends g++ cmake make
+    $SUDO apt-get install -y -q --no-install-recommends g++ cmake make curl ca-certificates
 }
 rm -rf /tmp/gt3r-relay && tar -C /tmp -xzf /tmp/gt3r-relay.tgz
 cmake -S /tmp/gt3r-relay/tools/gt3r-relay -B /tmp/gt3r-relay/build -DCMAKE_BUILD_TYPE=Release >/dev/null
@@ -60,6 +65,13 @@ else
     echo "note: gt3r-relay-bench did not build (the relay is fine)" >&2
 fi
 $SUDO install -m 644 /tmp/gt3r-relay/tools/gt3r-relay/gt3r-relay.service /etc/systemd/system/gt3r-relay.service
+$SUDO install -m 644 /tmp/gt3r-relay/tools/gt3r-relay/journald@gt3r-relay.conf /etc/systemd/journald@gt3r-relay.conf
+# The country list for the log, refreshed monthly (a failed fetch only means "??" countries).
+$SUDO install -m 755 /tmp/gt3r-relay/tools/gt3r-relay/update-geoip.sh /usr/local/bin/gt3r-relay-update-geoip
+$SUDO install -m 644 /tmp/gt3r-relay/tools/gt3r-relay/gt3r-relay-geoip.service /etc/systemd/system/gt3r-relay-geoip.service
+$SUDO install -m 644 /tmp/gt3r-relay/tools/gt3r-relay/gt3r-relay-geoip.timer /etc/systemd/system/gt3r-relay-geoip.timer
+[ -f /var/lib/gt3r-relay/country.csv ] || $SUDO /usr/local/bin/gt3r-relay-update-geoip ||
+    echo "note: no country list yet (the log shows ?? countries until gt3r-relay-geoip.timer fetches one)" >&2
 # Game versions (set-versions.sh writes the file; an update keeps it).
 $SUDO install -d -m 755 /etc/gt3r-relay
 if command -v ufw >/dev/null && $SUDO ufw status | grep -q active; then
@@ -67,9 +79,28 @@ if command -v ufw >/dev/null && $SUDO ufw status | grep -q active; then
 fi
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable gt3r-relay >/dev/null 2>&1
+$SUDO systemctl enable --now gt3r-relay-geoip.timer >/dev/null 2>&1
+# --when-idle: restart once the running relay's newest stats line shows no sessions and no lobby
+# was opened or joined since (checked every 10 s, for up to 6 hours).
+idle() {
+    { $SUDO journalctl --namespace=gt3r-relay -u gt3r-relay --since -3min -o cat --no-pager 2>/dev/null
+      $SUDO journalctl -u gt3r-relay --since -3min -o cat --no-pager 2>/dev/null; } | grep '^20' | sort -s -k1,2 |
+        awk '/ stats: / { n = $4; busy = n != 0 } / registered by | join / { busy = 1 } END { exit !(n != "" && !busy) }'
+}
+if [ "$WHEN_IDLE" = 1 ] && $SUDO systemctl is-active --quiet gt3r-relay; then
+    waited=0
+    until idle; do
+        [ "$waited" = 0 ] && echo "waiting for the relay to have no sessions before restarting..."
+        [ "$waited" -ge 21600 ] && { echo "still busy after 6 hours: the new build is installed but not running" >&2; exit 1; }
+        sleep 10
+        waited=$((waited + 10))
+    done
+    echo "no sessions: restarting"
+fi
 $SUDO systemctl restart gt3r-relay
-sleep 1
-$SUDO systemctl --no-pager --lines=4 status gt3r-relay | sed -n '1,9p'
+sleep 2
+$SUDO systemctl --no-pager --lines=0 status gt3r-relay | sed -n '1,5p'
+$SUDO journalctl --namespace=gt3r-relay -u gt3r-relay --no-pager -n 6 -o cat
 [ -f /etc/gt3r-relay/versions.conf ] || echo "note: no /etc/gt3r-relay/versions.conf yet: every game version may play (tools/gt3r-relay/set-versions.sh)"
 rm -rf /tmp/gt3r-relay /tmp/gt3r-relay.tgz
 REMOTE

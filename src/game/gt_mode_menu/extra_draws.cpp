@@ -98,11 +98,13 @@ void raise_prize_model(const MenuController& ctl, const std::string& page, DrawL
 // Status bar: the day counter ("day 12", widget_text) in the unit widgets' own style
 // (grey, black shadow), right-aligned. The widget is 24 px wide; the original does not
 // squeeze the text into it, and the reference screens end it 10 px before the box's right
-// edge (M: maybe the width of the "day %d" template is what is aligned).
+// edge (M: maybe the width of the "day %d" template is what is aligned). A unit widget without
+// "%d" is a plain label (the Japanese layout) and stays in its own box.
 void place_status_day(const MenuController& ctl, DrawList& out) {
     if (ctl.page().flow && ctl.page().flow->str44 == "00cmn/status")
         for (menu::ElementDraw& d : out)
-            if (d.element && d.element->widget_class && *d.element->widget_class == "user_day_unit") {
+            if (d.element && d.element->widget_class && *d.element->widget_class == "user_day_unit" &&
+                d.element->text && d.element->text->text.find("%d") != std::string::npos) {
                 const float right = d.element->x + d.element->w - 10;
                 d.has_box = true;
                 d.box = {right - 96, d.element->y, 96, d.element->h};
@@ -238,106 +240,110 @@ void draw_slider_marks(const MenuController& ctl, GtModeSession& s, const PageRe
         }
 }
 
-// Records menu: the ranking rows (the "record_bar" template and the hidden
-// record_* text elements) in the "menu_records" window (gt_mode §17.2): every place of the
-// table (12, a licence test's 6), an empty one with no name and the value and date
-// placeholders. The machine tests' and the course time trials' pages also show each entry's car,
-// after the car icon.
+// Records menu: the ranking rows (the "record_bar" template, "record_bar1" on the cursor row,
+// and the hidden record_* text elements) in the "menu_records" window (gt_mode §17.2): every
+// place of the table (12, a licence test's 6) as a vertical list (ListRows: 60 units apart, the
+// six places of a licence test filling the window), an empty one with no name and the value and
+// date placeholders. The machine tests' and the course time trials' pages also show each
+// entry's car, after the car icon.
 void draw_records(const MenuController& ctl, GtModeSession& s, const PageRef& ref, const std::string& page,
                   DrawList& out) {
-    if (page == "records_free_tt" && !ctl.items().empty() && ctl.items()[0].element) {
-        const Element& bar = *ctl.items()[0].element;
-        const Element* win = find_widget_named(ref.layout(), "menu_records");
-        if (win) {
-            const GtMode& gt = s.gt();
-            const bool speed = s.records_key == "mt:MMAX";
-            const bool with_car = starts(s.records_key, "mt:") || starts(s.records_key, "ct:");
-            const size_t places = starts(s.records_key, "lic:") ? 6 : 12;
-            const std::vector<RankEntry> table = gt.ranking_top(s.records_key, places);
-            const int rows = std::max(1, int(win->h / bar.h));
-            for (int i = 0; i < int(places) && i < rows; ++i) {
-                const RankEntry* r = size_t(i) < table.size() ? &table[size_t(i)] : nullptr;
-                const float y = win->y + win->h - float(i + 1) * bar.h;
-                auto put = [&](const Element* el, std::string text) {
-                    if (!el) return;
-                    menu::ElementDraw d;
-                    d.scene = ref.scene;
-                    d.element = el;
-                    d.has_box = true;
-                    // Left-aligned texts get room to the right; centred ones (the rank) keep their box.
-                    bool left = el->text && (el->text->align & 0x0F) % 3 == 0;
-                    d.box = {el->x, y + (el->y - bar.y), left ? std::max(el->w, 200.0f) : el->w, el->h};
-                    d.z = el->z;
-                    if (!text.empty() || el->text) d.text = std::make_shared<const std::string>(std::move(text));
-                    out.push_back(d);
-                };
-                menu::ElementDraw b;
-                b.scene = ref.scene;
-                b.element = &bar;
-                b.has_box = true;
-                b.box = {bar.x, y, bar.w, bar.h};
-                b.z = bar.z;
-                out.push_back(b);
-                const std::string data = speed ? race::record_speed_text(r ? r->value : 0, gt.data().imperial)
-                                         : r   ? format_time_ms(u32(std::llround(r->value * 1000)))
-                                               : std::string("--'--.---");
-                put(hidden_element(ref.layout(), "record_rank_shadow"), std::to_string(i + 1));
-                put(hidden_element(ref.layout(), "record_rank"), std::to_string(i + 1));
-                put(hidden_element(ref.layout(), "record_name"), r ? gt.ranking_name(*r) : std::string());
-                if (with_car) {
-                    // "<name> <second name>" (the car's two name strings), nothing without a car.
-                    std::string car;
-                    if (r && !r->car.empty()) {
-                        const data::Car* c = gt.db().car(r->car);
-                        car = c ? c->name + " " + c->name_alt : r->car;
-                    }
-                    put(hidden_element(ref.layout(), "record_car_pict"), std::string());
-                    put(hidden_element(ref.layout(), "record_car"), car);
-                }
-                put(hidden_element(ref.layout(), "record_data"), data);
-                put(hidden_element(ref.layout(), "record_date"), record_date_text(r ? r->stamp : 0));
+    ListRows g;
+    if (page != "records_free_tt" || !records_rows(ctl, s, records_places(s), g)) return;
+    const Element& bar = *g.tmpl;
+    const GtMode& gt = s.gt();
+    const bool speed = s.records_key == "mt:MMAX";
+    const bool with_car = starts(s.records_key, "mt:") || starts(s.records_key, "ct:");
+    const std::vector<RankEntry> table = gt.ranking_top(s.records_key, size_t(g.n));
+    const SDL_FRect clip = g.clip();
+    for (int i = 0; i < g.n; ++i) {
+        if (!g.shown(i)) continue;
+        const RankEntry* r = size_t(i) < table.size() ? &table[size_t(i)] : nullptr;
+        const float y = g.box(i).y;
+        auto put = [&](const Element* el, std::string text) {
+            if (!el) return;
+            menu::ElementDraw d;
+            d.scene = ref.scene;
+            d.element = el;
+            d.has_box = true;
+            // Left-aligned texts get room to the right; centred ones (the rank) keep their box.
+            bool left = el->text && (el->text->align & 0x0F) % 3 == 0;
+            d.box = {el->x, y + (el->y - bar.y), left ? std::max(el->w, 200.0f) : el->w, el->h};
+            d.has_clip = true;
+            d.clip = clip;
+            d.z = el->z;
+            if (!text.empty() || el->text) d.text = std::make_shared<const std::string>(std::move(text));
+            out.push_back(d);
+        };
+        menu::ElementDraw b;
+        b.scene = ref.scene;
+        b.element = i == g.cursor && !bar.alt.empty() ? &bar.alt[0] : &bar;
+        b.has_box = true;
+        b.box = {bar.x, y, bar.w, bar.h};
+        b.has_clip = true;
+        b.clip = clip;
+        b.z = bar.z;
+        out.push_back(b);
+        const std::string data = speed ? race::record_speed_text(r ? r->value : 0, gt.data().imperial())
+                                 : r   ? format_time_ms(u32(std::llround(r->value * 1000)))
+                                       : std::string("--'--.---");
+        put(hidden_element(ref.layout(), "record_rank_shadow"), std::to_string(i + 1));
+        put(hidden_element(ref.layout(), "record_rank"), std::to_string(i + 1));
+        put(hidden_element(ref.layout(), "record_name"), r ? gt.ranking_name(*r) : std::string());
+        if (with_car) {
+            // "<name> <second name>" (the car's two name strings), nothing without a car.
+            std::string car;
+            if (r && !r->car.empty()) {
+                const data::Car* c = gt.db().car(r->car);
+                car = c ? c->name + " " + c->name_alt : r->car;
             }
+            put(hidden_element(ref.layout(), "record_car_pict"), std::string());
+            put(hidden_element(ref.layout(), "record_car"), car);
         }
+        put(hidden_element(ref.layout(), "record_data"), data);
+        put(hidden_element(ref.layout(), "record_date"), record_date_text(r ? r->stamp : 0, gt.data().language));
     }
 }
 
 // Race information -> Cars Permitted: one row per permitted car, the "link_menu" template
-// ("active_menu" on the cursor row) in the "menu_regulated_car" window; without a list
-// the hidden "No Limitations" (in its own place, the middle of the box: M).
+// ("active_menu" on the cursor row) as a vertical list in the "menu_regulated_car" window
+// (ListRows: 24 units apart) with its scroll bar; without a list the hidden "No Limitations"
+// (in its own place, the middle of the box: M).
 void draw_permitted_cars(const MenuController& ctl, GtModeSession& s, const PageRef& ref,
                          const std::string& page, DrawList& out) {
-    if (page == "00cmn/car_reguration") {
-        const std::vector<std::string> names = permitted_car_names(s.gt(), s.race_code);
-        GarageRows g;
-        if (names.empty()) {
-            if (const Element* none = hidden_element(ref.layout(), "no_regulated_car")) {
-                menu::ElementDraw d;
-                d.scene = ref.scene;
-                d.element = none;
-                d.z = none->z;
-                out.push_back(d);
-            }
-        } else if (regulated_rows(ctl, s, int(names.size()), g)) {
-            for (int i = g.first; i < g.n && i < g.first + g.rows; ++i) {
-                const Element* e = i == s.regulated_cursor && !g.tmpl->alt.empty() ? &g.tmpl->alt[0] : g.tmpl;
-                menu::ElementDraw d;
-                d.scene = ref.scene;
-                d.element = e;
-                d.has_box = true;
-                d.box = {g.win->x, g.y(i), g.tmpl->w, g.tmpl->h};
-                d.z = g.tmpl->z;
-                d.text = std::make_shared<const std::string>(names[size_t(i)]);
-                d.text_dx = menu::kTextInset; // left-aligned text 12 units in (menus §5.7 "Text inset")
-                out.push_back(d);
-            }
+    if (page != "00cmn/car_reguration") return;
+    const std::vector<std::string> names = permitted_car_names(s.gt(), s.race_code);
+    if (names.empty())
+        if (const Element* none = hidden_element(ref.layout(), "no_regulated_car")) {
+            menu::ElementDraw d;
+            d.scene = ref.scene;
+            d.element = none;
+            d.z = none->z;
+            out.push_back(d);
         }
+    ListRows g;
+    if (!regulated_rows(ctl, s, int(names.size()), g)) return;
+    for (int i = 0; i < g.n; ++i) {
+        if (!g.shown(i)) continue;
+        menu::ElementDraw d;
+        d.scene = ref.scene;
+        d.element = i == g.cursor && !g.tmpl->alt.empty() ? &g.tmpl->alt[0] : g.tmpl;
+        d.has_box = true;
+        d.box = g.box(i);
+        d.has_clip = true;
+        d.clip = g.clip();
+        d.z = g.tmpl->z;
+        d.text = std::make_shared<const std::string>(names[size_t(i)]);
+        d.text_dx = menu::kTextInset; // left-aligned text 12 units in (menus §5.7 "Text inset")
+        out.push_back(d);
     }
+    list_scroll_bar(g, ref, out);
 }
 
 // Wheel shop: the brand page's wheels as tiles in a row in the "menu_wheel_shop" window
-// (WheelShopButton: each tile is the page's hidden image named after the wheel, 52 x 52,
-// with "sold_out" over it for a wheel already owned; the reference: tiles 56.5 units
-// apart, centred while they fit, the focused one washed light grey).
+// (wheel shop button: each tile is the page's hidden image named after the wheel, 52 x 52,
+// with "sold_out" over it for a wheel already owned; placed by WheelRow, the focused one
+// washed light grey).
 void draw_wheel_tiles(const MenuController& ctl, GtModeSession& s, const PageRef& ref, DrawList& out) {
     if (WheelRow row; wheel_row(ctl, row)) {
         const Element* win = row.win;
@@ -382,6 +388,72 @@ void draw_wheel_tiles(const MenuController& ctl, GtModeSession& s, const PageRef
     }
 }
 
+// The garage's wheel list (hm/hm_wheel, WheelList): per button the page's "wheel" frame, the
+// "mark" frame over the entry the car wears, then the entry's tile in the middle (WheelButton
+// the program draws them in that order), clipped to the "menu_wheel" window. The focused button
+// keeps the controller's own draws of the item (its focus look), moved to where the list puts
+// it. The scroll bar shows only when the row is longer than it (ScrollBar): the track
+// (the widget's own art) with the hidden "pinch" over the visible share at the row's scroll
+// position. (The page's hidden tiles named after car models are never drawn: GT3's list only
+// names the placeholder's "default_wheel" and the bought wheels.)
+void draw_garage_wheels(const MenuController& ctl, GtModeSession& s, DrawList& out) {
+    WheelList r;
+    if (!wheel_list(ctl, s, r)) return;
+    const PageRef ref = ctl.page();
+    const menu::Page& lay = ref.layout();
+    const SDL_FRect clip = {r.win->x, r.win->y, r.win->w, r.win->h};
+    const GameState& st = s.gt().state();
+    const GarageCar* car = wheel_page_car(s);
+    const int worn = car ? worn_wheel_entry(st, *car) : -1;
+    const int focus = std::clamp(s.wheel_cursor, 0, r.n - 1);
+    const Element* mark = hidden_element(lay, "mark");
+    for (menu::ElementDraw& d : out)
+        if (d.element && (d.element == r.button || (!r.button->alt.empty() && d.element == &r.button->alt[0]))) {
+            const SDL_FRect b = r.box(focus);
+            d.has_box = true;
+            d.box = {b.x, b.y, d.element->w, d.element->h};
+            d.has_clip = true;
+            d.clip = clip;
+        }
+    auto put = [&](const Element* e, const SDL_FRect& box, float z) {
+        if (!e) return;
+        menu::ElementDraw d;
+        d.scene = ref.scene;
+        d.element = e;
+        d.has_box = true;
+        d.box = box;
+        d.has_clip = true;
+        d.clip = clip;
+        d.z = z;
+        out.push_back(d);
+    };
+    const float z = r.button->z;
+    for (int i = 0; i < r.n; ++i) {
+        const SDL_FRect b = r.box(i);
+        if (b.x + b.w < clip.x || b.x > clip.x + clip.w) continue;
+        if (i != focus) put(r.button, b, z);
+        if (i == worn && mark) put(mark, {b.x + (b.w - mark->w) * 0.5f, b.y + (b.h - mark->h) * 0.5f, mark->w, mark->h}, z + 0.01f);
+        const Element* tile = hidden_element(lay, i == 0 ? std::string("default_wheel") : wheel_list_entry(st, i));
+        if (tile) put(tile, {b.x + (b.w - tile->w) * 0.5f, b.y + (b.h - tile->h) * 0.5f, tile->w, tile->h}, z + 0.02f);
+    }
+    // The scroll bar: none while the row fits; else the pinch, as wide as the visible share of
+    // the row, at its scroll position.
+    const Element* bar = find_widget_named(lay, "scroll_bar");
+    const Element* pinch = hidden_element(lay, "pinch");
+    if (bar && r.total <= bar->w)
+        out.erase(std::remove_if(out.begin(), out.end(), [&](const menu::ElementDraw& d) { return d.element == bar; }),
+                  out.end());
+    else if (bar && pinch) {
+        menu::ElementDraw d;
+        d.scene = ref.scene;
+        d.element = pinch;
+        d.has_box = true;
+        d.box = {bar->x + (-r.off / r.total) * bar->w, bar->y, bar->w * r.win->w / r.total, bar->h};
+        d.z = bar->z + 0.001f;
+        out.push_back(d);
+    }
+}
+
 // Dealer car page: one swatch per paint of the model in a column ending one step above
 // the "car_color_box" widget, the first on top, 12.5 px apart, each over a soft drop
 // shadow (+3, +3); the chosen one is marked by a white 8 x 10 square 4 px to its left
@@ -421,15 +493,14 @@ void draw_paint_column(GtModeSession& s, const PageRef& ref, const std::string& 
     }
 }
 
-// Garage list (code-drawn): rows of the "car1" template in the "menu_garage"
-// window, in the chosen sort order, with the sort column header and values.
+// Garage list (code-drawn): rows of the "car1" template ("car_a1" on the cursor row) as a
+// vertical list in the "menu_garage" window (ListRows: 28 units apart) with its scroll bar, in
+// the chosen sort order, with the sort column header and values.
 void draw_garage_list(const MenuController& ctl, GtModeSession& s, const PageRef& ref, const std::string& page,
                       DrawList& out) {
-    if ((page != "hm/hm_gr" && page != "hm/hm_gr_trade") || ctl.depth() != 0) return;
-    if (ctl.items().empty() || !ctl.items()[0].element) return;
-    const Element& tmpl = *ctl.items()[0].element;
-    const Element* win = find_widget_named(ref.layout(), page == "hm/hm_gr_trade" ? "menu_garage_trade" : "menu_garage");
-    if (!win) return;
+    ListRows g;
+    if (!garage_rows(ctl, s, g)) return;
+    const Element& tmpl = *g.tmpl;
     // Date / name order show the MAKE column (as the original's new-game garage does).
     static const char* const kHeader[] = {"maker", "maker", "maker", "color", "price", "distance", "power", "drive", "aspiration"};
     const int key = std::clamp(s.sort_key, 0, 8);
@@ -446,20 +517,19 @@ void draw_garage_list(const MenuController& ctl, GtModeSession& s, const PageRef
     GtMode& lg = s.list_gt(); // the guest garage during a trade
     const GameState& st = lg.state();
     const std::vector<int> order = lg.garage_order(s.sort_key);
-    const float row = tmpl.h + 2;
-    const int rows = std::max(1, int(win->h / row));
-    const int n = int(order.size());
-    int first = std::clamp(s.garage_cursor - rows / 2, 0, std::max(0, n - rows));
-    for (int i = first; i < n && i < first + rows; ++i) {
+    const SDL_FRect clip = g.clip();
+    for (int i = 0; i < g.n && i < int(order.size()); ++i) {
+        if (!g.shown(i)) continue;
         const GarageCar& car = st.garage[size_t(order[size_t(i)])];
-        const bool focus = i == s.garage_cursor;
-        const Element* e = focus && !tmpl.alt.empty() ? &tmpl.alt[0] : &tmpl;
-        const float y = win->y + win->h - float(i - first + 1) * row;
+        const bool focus = i == g.cursor;
+        const float y = g.box(i).y;
         menu::ElementDraw d;
         d.scene = ref.scene;
-        d.element = e;
+        d.element = focus && !tmpl.alt.empty() ? &tmpl.alt[0] : &tmpl;
         d.has_box = true;
-        d.box = {win->x, y, tmpl.w, tmpl.h};
+        d.box = g.box(i);
+        d.has_clip = true;
+        d.clip = clip;
         d.z = tmpl.z;
         d.text = std::make_shared<const std::string>(car_name(lg, car.car));
         out.push_back(d);
@@ -471,6 +541,8 @@ void draw_garage_list(const MenuController& ctl, GtModeSession& s, const PageRef
                 m.element = mk;
                 m.has_box = true;
                 m.box = {412, y + (tmpl.h - mk->h) * 0.5f, mk->w, mk->h}; // place from the reference (M)
+                m.has_clip = true;
+                m.clip = clip;
                 m.z = tmpl.z + 0.02f;
                 out.push_back(m);
             }
@@ -484,14 +556,41 @@ void draw_garage_list(const MenuController& ctl, GtModeSession& s, const PageRef
             t.element = ie;
             t.has_box = true;
             t.box = {ie->x, y, ie->w, tmpl.h};
+            t.has_clip = true;
+            t.clip = clip;
             t.z = tmpl.z + 0.01f;
             t.text = std::make_shared<const std::string>(v);
             out.push_back(t);
         }
     }
+    list_scroll_bar(g, ref, out);
 }
 
 } // namespace
+
+void list_scroll_bar(const ListRows& g, const PageRef& ref, DrawList& out) {
+    const Element* bar = find_widget_named(ref.layout(), "scroll_bar");
+    if (!bar) return;
+    if (g.total <= bar->h) {
+        // (The controller drew the track with the page's widgets.)
+        out.erase(std::remove_if(out.begin(), out.end(), [&](const menu::ElementDraw& d) { return d.element == bar; }),
+                  out.end());
+        return;
+    }
+    const Element* pinch = hidden_element(ref.layout(), "pinch");
+    if (!pinch) return;
+    // (Layout coordinates: y up. The offset is downwards from the window's top, so the pinch
+    // goes down the bar as the list scrolls up.)
+    const float h = g.win->h * bar->h / g.total;
+    const float top = bar->y + bar->h + g.off * bar->h / g.total;
+    menu::ElementDraw d;
+    d.scene = ref.scene;
+    d.element = pinch;
+    d.has_box = true;
+    d.box = {bar->x, top - h, bar->w, h};
+    d.z = bar->z + 0.001f;
+    out.push_back(d);
+}
 
 void extra_draws(const MenuController& ctl, std::vector<menu::ElementDraw>& out) {
     GtModeSession* s = S();
@@ -519,6 +618,7 @@ void extra_draws(const MenuController& ctl, std::vector<menu::ElementDraw>& out)
     }
     draw_paint_column(*s, ref, page, out);
     draw_garage_list(ctl, *s, ref, page, out);
+    draw_garage_wheels(ctl, *s, out);
 }
 
 } // namespace gt3r::game::gt_menu

@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -72,17 +73,25 @@ public:
     // with game::begin_race_game_save's snapshot); exited() turns true when the page ends.
     void start_save_game();
     bool exited() const { return exited_; }
+    // The language page (start("language", "root"), PAL's first start): the chosen language's
+    // code ("BR", "FR", "IT", "GR", "SP") once an item is confirmed; the flow has then exited.
+    std::optional<std::string> take_language() { return std::exchange(language_choice_, std::nullopt); }
     void tick(MenuKeys held);
     // Touch: a tap at a point in menu layout coordinates (640x448, x right, y up
     // from the bottom-left). Tapping an item focuses it, tapping the focused
     // item confirms it; on code-drawn pickers (arcade course/car carousels) an
     // icon of the strip is chosen the same way, elsewhere the left / right
-    // thirds step the entry and the middle confirms. Returns true when the tap
-    // was used (the caller should then not treat it as a key).
+    // thirds step the entry and the middle confirms; the save page takes its own
+    // (SavePage::tap). Returns true when the tap was used (the caller should then
+    // not treat it as a key).
     bool tap(float x, float y);
     // A hovering pointer (mouse, VR controller) at a point: focuses the item under it where
     // items stay put (MenuController::hover, the GT Mode garage rows), so a click confirms.
     bool hover(float x, float y);
+    // Ours: the pointer's back (a right click), Cancel for one frame like a tap's key.
+    void back() {
+        if (ctl_ && !switching() && !waiting_game_) injected_ |= key_bit(MenuKey::Cancel);
+    }
 
     std::vector<ElementDraw> draw_list() const;
     // Text width in menu units for a pmb font spec ("sw_20") at its own size: places the
@@ -116,6 +125,11 @@ public:
         options_ = cfg;
         options_changed_ = std::move(changed);
     }
+    // Ours: the Key Configuration page (option "key/key") shows a "Controller Settings" button in
+    // place of the original's DualShock 2 table; it was chosen (Confirm, or a tap on it). The
+    // screen opens our controller settings over the menus, which stay on the page and carry on
+    // when it closes. True once per choice.
+    bool take_controller_settings() { return std::exchange(controller_settings_, false); }
 
     const std::string& control() const { return control_; }
     // True for the GT-mode control and its prize / license presentations
@@ -182,7 +196,7 @@ public:
         std::vector<std::string> cars;    // the chosen class's open cars
         int car = 0, paint = 0, transmission = 0, tire_mode = 0;
         int age = 0;                      // frames since the current car / class appeared
-        float scroll = 0, pulse = 1;      // the row's MiniCursor
+        float scroll = 0, pulse = 1;      // the row's mini cursor
         float paint_pos = 0;
         MenuKeys prev = 0;                // key repeat
         int repeat = 0;
@@ -202,6 +216,7 @@ private:
     void handle_gt(const MenuEvent& e);
     void handle_arcade(const MenuEvent& e);
     void handle_option(const MenuEvent& e);
+    void handle_language(const MenuEvent& e);
     void arcade_step(int step);
     void arcade_back();
     void arcade_start_race();
@@ -273,6 +288,7 @@ private:
     bool race_tracks_loaded_ = false;
     MusicListPage music_page_, music_view_;
     std::optional<int> preview_request_;
+    std::optional<std::string> language_choice_;
     const std::vector<MusicTrack>& race_tracks();
     race::RacePlaylist music_playlist(); // [options] music_playlist, or a new list (stored)
     void open_music_list(bool editable);
@@ -280,6 +296,8 @@ private:
     bool music_list_area(SDL_FRect& area) const;
     void option_draws(std::vector<ElementDraw>& out) const;
     std::function<void()> options_changed_;
+    bool key_config_page() const; // the Key Configuration page is up and takes input
+    bool controller_settings_ = false;
     SavePage save_page_;
     bool save_mode_ = false; // the "memorycard" control shows the save page
     bool name_mode_ = false; // the save page's name entry (Edit file name, a new save)

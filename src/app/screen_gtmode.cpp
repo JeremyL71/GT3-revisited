@@ -228,7 +228,7 @@ private:
                 ++show_.load_wait;
                 continue;
             }
-            // The MenuCarCamera integrator: v += a / 60, v -= v c / 60, x += v / 60.
+            // The menu car camera integrator: v += a / 60, v -= v c / 60, x += v / 60.
             auto spring = [](float& x, float& v, float target, float k, float c) {
                 v += (target - x) * k / 60.0f;
                 v -= v * c / 60.0f;
@@ -366,7 +366,7 @@ private:
             area = SDL_FRect{box.x - e.x * sx, box.y - (448 - e.y - e.h) * sy, 640 * sx, 448 * sy};
             // The championship trophy item draws 160 pixels left of centre (gt_mode §18, M).
             if (trophy) area.x -= 160 * sx;
-            // Race prizes (MiniPrize): the cup appears smaller and higher than the .prm camera
+            // Race prizes (mini prize): the cup appears smaller and higher than the .prm camera
             // over the full frame gives (M: fitted to the reference capture of the Sunday Cup
             // cup page: 0.86 x about the frame centre).
             if (mini) {
@@ -554,7 +554,7 @@ private:
             // Showroom pose: the body rides q (ride height, spec 0x5C) above the floor, the
             // wheels stay on it (wheel centres R - q below the body origin).
             if (auto spec = sim::build_car_spec(s->gt().db(), car)) {
-                float q = spec->axle[0].susp.valid ? spec->axle[0].susp.ride_height : 0.0f;
+                float q = spec->axle[0].ride_height;
                 for (scene::Mesh& mesh : m.meshes)
                     if (mesh.name.rfind("wheel_", 0) != 0) mesh.transform[13] += q;
                 m.bounds_max[1] += q;
@@ -683,7 +683,7 @@ public:
             // Columns: name, then the figures (proportional text, so not space-padded).
             const Color col = int(i) == s.ride ? colors::kAccent : colors::kText;
             if (int(i) == s.ride) ui.text(8, y, "*", col);
-            ui.text(16, y, Ui::clip(car && !car->name.empty() ? car->name : c.car, 216), col);
+            ui.text(16, y, Ui::clip(car && !car->latin_name.empty() ? car->latin_name : c.car, 216), col);
             ui.text_right(280, y, gt_->power_text(ps, " "), col);
             std::snprintf(b, sizeof b, "%.1f km", c.cond.odometer_m / 1000.0);
             ui.text_right(350, y, b, col);
@@ -708,6 +708,7 @@ private:
             return;
         }
         gt_ = std::make_unique<game::GtMode>(data);
+        game::ensure_gt_mode_session(menu::flow::vfs_reader(*app.vfs())); // this disc's region's saves
         path_ = game::current_save_path();
         std::string err;
         if (auto st = game::read_save(path_, &err)) gt_->state() = std::move(*st);

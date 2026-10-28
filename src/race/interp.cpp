@@ -17,6 +17,15 @@ int FixedStep::advance(double frame_dt, int max_ticks) {
     return n;
 }
 
+int FixedStep::follow(double clock_ticks, long long& done, int max_ticks) {
+    const long long due = (long long)std::floor(clock_ticks);
+    const int n = int(std::clamp<long long>(due - done, 0, max_ticks));
+    done += n;
+    // Behind (a stall past max_ticks): the newest state; ahead (the clock was set back): the last.
+    accum_ = std::clamp(clock_ticks - double(done), 0.0, 1.0) * step_;
+    return n;
+}
+
 sim::Quat normalize(const sim::Quat& q) {
     float l = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
     if (l <= 0) return {};
@@ -53,6 +62,14 @@ sim::Vec3 lerp(const sim::Vec3& a, const sim::Vec3& b, float t) { return a + (b 
 float lerp(float a, float b, float t) { return a + (b - a) * t; }
 } // namespace
 
+float spin_change(const sim::WheelState& a, const sim::WheelState& b) {
+    constexpr float kTwoPi = 6.2831853f;
+    const float d = b.spin_angle - a.spin_angle;
+    const float e = std::remainder(d - b.spin_step, kTwoPi);
+    if (std::fabs(e) < 1e-2f) return b.spin_step + e; // b one tick after a: the tick's own turn
+    return std::remainder(d, kTwoPi);
+}
+
 sim::VehicleState interpolate(const sim::VehicleState& a, const sim::VehicleState& b, float t) {
     t = std::clamp(t, 0.0f, 1.0f);
     sim::VehicleState r = b;
@@ -69,7 +86,7 @@ sim::VehicleState interpolate(const sim::VehicleState& a, const sim::VehicleStat
         sim::WheelState& w = r.wheels[i];
         w.contact = lerp(wa.contact, wb.contact, t);
         w.steer_angle = lerp(wa.steer_angle, wb.steer_angle, t);
-        w.spin_angle = lerp(wa.spin_angle, wb.spin_angle, t);
+        w.spin_angle = wa.spin_angle + spin_change(wa, wb) * t;
         w.angular_velocity = lerp(wa.angular_velocity, wb.angular_velocity, t);
         w.suspension = lerp(wa.suspension, wb.suspension, t);
         w.flap = lerp(wa.flap, wb.flap, t);

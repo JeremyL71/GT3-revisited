@@ -52,11 +52,12 @@ void RaceMusic::stop(AudioEngine& audio) {
 std::vector<RaceMusic::Action> RaceMusic::decide(const Cues& c, bool music_playing) {
     using Op = Action::Op;
     std::vector<Action> out;
-    // A new run: no jingle state carried over. (The run's BGM switch does not change the
-    // requests: off, they are made at level 0, RaceMusicLevel.)
+    // A new run: no jingle or pause state carried over (a retry from the pause window stopped the
+    // paused piece: nothing to resume). (The run's BGM switch does not change the requests: off,
+    // they are made at level 0, RaceMusicLevel.)
     const bool first = !seen_;
     if (first) {
-        jingle_ = start_jingle_ = medal_played_ = demo_played_ = false;
+        jingle_ = start_jingle_ = medal_played_ = demo_played_ = was_paused_ = false;
         was_finished_ = c.finished;
         was_holding_ = false;
     }
