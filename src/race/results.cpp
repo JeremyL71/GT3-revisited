@@ -10,8 +10,10 @@
 #include "vfs/vfs.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 namespace gt3r::race {
 
@@ -491,10 +493,75 @@ std::string QuickMenu::action(const std::string& item) const {
     return {};
 }
 
+QmColumn quick_menu_column(const menu::Element& e, int& row) {
+    auto numbered = [&row](const std::string& s, const char* prefix) {
+        const size_t n = std::strlen(prefix);
+        if (s.size() <= n || s.compare(0, n, prefix) != 0 || !std::isdigit(static_cast<unsigned char>(s[n]))) return false;
+        row = std::atoi(s.c_str() + n) - 1;
+        return row >= 0;
+    };
+    if (e.widget_class) {
+        const std::string& c = *e.widget_class;
+        if (numbered(c, "qm_list_car_name")) return QmColumn::Name;
+        if (numbered(c, "qm_list_time")) return QmColumn::Time;
+        if (numbered(c, "qm_pt")) return QmColumn::Points;
+    }
+    const std::string& n = e.name;
+    if (n.size() > 6 && n.compare(0, 4, "rank") == 0) {
+        const size_t us = n.find('_');
+        row = std::atoi(n.c_str() + 4) - 1;
+        if (us == std::string::npos || row < 0) return QmColumn::None;
+        const std::string kind = n.substr(us);
+        if (kind == "_name") return QmColumn::Name;
+        if (kind == "_time") return QmColumn::Time;
+    }
+    return QmColumn::None;
+}
+
+std::vector<ResultRow> result_menu_list(ResultList kind, bool finished, std::vector<ResultRow> finish,
+                                        const std::optional<std::vector<ResultRow>>& grid) {
+    if (finished) return finish;
+    if (kind == ResultList::Championship && grid) return *grid;
+    if (kind == ResultList::GtRace)
+        for (ResultRow& r : finish) {
+            r.name = "---";
+            r.time = kNoTimeText;
+            r.player = false;
+        }
+    return finish;
+}
+
+bool practice_regrids(std::span<const u32> best) {
+    return !best.empty() && best[0] < kPracticeNoTime; // (a time below GT3's "no time")
+}
+
+std::vector<int> practice_grid(std::span<const u32> best) {
+    const size_t n = best.size();
+    std::vector<int> count(n, 0), slot(n, 0);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = i + 1; j < n; ++j)
+            if (best[i] != best[j]) ++count[best[j] < best[i] ? i : j];
+    std::vector<bool> taken(n, false);
+    for (size_t k = 0; k < n; ++k) {
+        int s = count[k];
+        while (taken[size_t(s)]) ++s;
+        slot[k] = s;
+        taken[size_t(s)] = true;
+    }
+    return slot;
+}
+
+void practice_list_times(std::vector<ResultRow>& rows, std::span<const u32> best) {
+    for (ResultRow& r : rows) {
+        const size_t e = size_t(r.car + 1); // the entry: 0 the player, k opponent k - 1
+        r.time = menu_time_text(r.car >= -1 && e < best.size() ? best[e] : kPracticeNoTime);
+    }
+}
+
 void QuickMenu::draw(SDL_Renderer*, const SDL_FRect& dst) {
     if (!ctl_ || !renderer_) return;
     std::vector<menu::ElementDraw> list = ctl_->draw_list();
-    // Code-filled widgets: the result list (rank<i>_name / _time) and named texts.
+    // Code-filled widgets: named texts, class texts, then the list (quick_menu_column).
     for (menu::ElementDraw& d : list) {
         if (!d.element || d.kind != menu::ElementDraw::Kind::Element) continue;
         const std::string& n = d.element->name;
@@ -507,19 +574,19 @@ void QuickMenu::draw(SDL_Renderer*, const SDL_FRect& dst) {
                 d.text = std::make_shared<const std::string>(it->second);
                 continue;
             }
-        if (n.size() > 6 && n.compare(0, 4, "rank") == 0) {
-            size_t us = n.find('_');
-            int i = std::atoi(n.c_str() + 4) - 1;
-            if (us == std::string::npos || i < 0) continue;
-            std::string kind = n.substr(us);
-            if (kind != "_name" && kind != "_time") continue;
-            d.text = std::make_shared<const std::string>(
-                size_t(i) < rows_.size() ? (kind == "_name" ? rows_[size_t(i)].name : rows_[size_t(i)].time) : std::string());
-            // The player's row in orange (reference captures: about (255, 116, 0)).
-            if (size_t(i) < rows_.size() && rows_[size_t(i)].player) {
-                d.has_text_color = true;
-                d.text_color = {1.0f, 116.0f / 255.0f, 0.0f, 1.0f};
-            }
+        int i = -1;
+        const QmColumn col = quick_menu_column(*d.element, i);
+        if (col == QmColumn::None) continue;
+        const ResultRow* r = size_t(i) < rows_.size() ? &rows_[size_t(i)] : nullptr;
+        d.text = std::make_shared<const std::string>(!r                      ? std::string()
+                                                     : col == QmColumn::Name ? r->name
+                                                     : col == QmColumn::Time ? r->time
+                                                                             : r->points);
+        // The player's row in orange (all three setters: 0x800080FF when the entry's flag
+        // +0x10 is set; reference captures: about (255, 116, 0)).
+        if (r && r->player) {
+            d.has_text_color = true;
+            d.text_color = {1.0f, 116.0f / 255.0f, 0.0f, 1.0f};
         }
     }
     menu::apply_text_inset(list);

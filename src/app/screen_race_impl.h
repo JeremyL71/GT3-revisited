@@ -407,6 +407,9 @@ private:
     // queued (make_presentation_screen) to run before the quick menu.
     bool record_run();
     void fill_top3();
+    // Championship texts of the quick menus: the round (qm_session_num) and, before the round,
+    // every row's points (qm_pt<n>).
+    void fill_championship(std::vector<ResultRow>* rows);
     // The quick menu's item switches (menus §11): the visit's runs' and this run kind's, handed
     // to the menu shown (again after they change while it is up).
     void update_quick_menu_items();
@@ -421,6 +424,13 @@ private:
     void draw_panel(App& app, const SDL_FRect& dst);
     bool results_panel_up() const { return field_ && finished_ && !replaying_ && !two_player_ && finish_wait_ >= 5.0; }
     bool championship() const { return from_menu_ && launch_.request.champ_round > 0; }
+    // Which result list rule applies (race::result_menu_list): a championship round, a GT race
+    // (its qm_gt_result menu), or any other run.
+    race::ResultList result_list() const {
+        if (championship()) return race::ResultList::Championship;
+        if (field_ && ((from_menu_ && launch_.request.mode == "go_race") || preset_.gt_result)) return race::ResultList::GtRace;
+        return race::ResultList::Other;
+    }
 
     // Pause (screen_race_pause.cpp)
     std::vector<std::string> pause_items() const;
@@ -439,7 +449,8 @@ private:
     menu::flow::GameResult build_result() const;
     void leave(App& app);
     int presented_medal() const;
-    std::string race_text(const char* key, const char* fallback);
+    // `game_text`: the value's own bytes (what the menu font draws: quick-menu widgets), else UTF-8.
+    std::string race_text(const char* key, const char* fallback, bool game_text = false);
     // Tells the menus how the requested race went (GT mode awards prizes from it).
     void post_result() { menu::flow::post_game_result(result_latch_.for_leave(build_result())); }
     // Frames since the result was decided (the presenter's clock).
@@ -581,9 +592,11 @@ private:
     // The solo modes (screen_race_solo.cpp): the time trial, licence test, machine test, free run and free practice as
     // GT3 runs them (their conductors' race flow judges the run, times its laps, sectors and splits; the free run's lap
     // handlers keep its best lap and drive its ghost car). The run's field is solo_field_ (field_ stays null: the screen's
-    // solo paths); exact_field() is the run's field either way.
+    // solo paths); exact_field() is the run's field either way, and the cars on the course are its opponents (free
+    // practice: the race's field; the other solo runs have none).
     std::optional<sim::exact::Conductor> solo_conductor() const;
     bool build_exact_solo(App& app);
+    void load_opponent_cars(App& app, const RaceField& f);
     void exact_solo_step();      // after each step: the run's end and result from the race flow
     bool exact_solo() const { return solo_field_ != nullptr; }
     RaceField* exact_field() const { return field_ ? field_.get() : solo_field_.get(); }
@@ -728,12 +741,24 @@ private:
     bool prerace_ = false;
     bool free_run_ = false;              // free run before a GT race (back to the pre-race menu)
     int free_run_laps_ = 0;               // the pre-race quick menu (before the race starts)
+    // The last free practice of the visit: each entry's best lap (0 the player, k opponent k - 1; empty before the first),
+    // and the grid it left (race::practice_grid; empty: the event's), which the race and later practices start from.
+    std::vector<u32> practice_best_;
+    std::vector<int> practice_grid_;
+    std::vector<u32> practice_entry_best_; // each entry's best lap so far (entry + 0x11D8), the next practice's start
+    static constexpr int kNoPoleCar = -100;
+    bool practice_ready_posted_ = false;   // the free practice's "Qualifying starts after 1 warm-up lap" (once a run)
+    bool practice_pit_exit_ = false;       // the player's car left the pit lane this step (START, count_s)
+    int practice_pole_car_ = kNoPoleCar;   // the free practice's P.P. car (-1 the player, k opponent k; none before a lap)
     bool music_on_ = true, menu_music_on_ = true, rumble_on_ = true, rumble2_on_ = true;
     bool aids_options_apply_ = false, asm_on_ = true, tcs_on_ = true;
     bool race_se_ = true, replay_se_ = true, ghost_on_ = true, wide_mode_ = false;
     QuickMenu quick_menu_;
     RaceResultLatch result_latch_;
     std::optional<std::vector<ResultRow>> latched_rows_; // the result menu's rows, kept with the latched result
+    // The last pre-race menu's list (the grid, no times): a championship round left by pause EXIT
+    // shows it in its result menu (race::result_menu_list).
+    std::optional<std::vector<ResultRow>> prerace_rows_;
     PauseMenu pause_menu_;
     bool pause_loaded_ = false;
     menu::flow::MenuSounds quick_sounds_; // the menus' sound effects (quick / pause menus)

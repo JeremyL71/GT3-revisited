@@ -574,7 +574,7 @@ The card directory `BASCUS-97102GAMEDATA` holds four files, written in this orde
 
 The game data holds:
 
-- the scalars (including the GT-mode random state);
+- the scalars (including the GT-mode random state and the endings-seen flags, §10);
 - cars and wheels;
 - license records;
 - race results in gcf section-4 order;
@@ -641,7 +641,7 @@ GT3 Revisited's own options, its race playlist included, are kept in `config.ini
 - a championship suspended between rounds (it restarts);
 - license rankings beyond the best time;
 - the prize-car origin;
-- the endings-seen flags and the file name;
+- the file name;
 - the setting files, which are separate card files (§19).
 
 The total distance is stored in 2 m units, so it can lose up to 2 m on export.
@@ -651,10 +651,12 @@ The total distance is stored in 2 m units, so it can lose up to 2 m on export.
 A few results are written while the race screen is still open, so they are kept if the
 game is closed before it returns to the menus. Each is a copy of the game with the result
 recorded. The running game is recorded from the result when the race screen closes, and
-that autosave replaces the copy (`src/game/gt_mode_menu/session.cpp`):
+that autosave replaces the copy (`src/game/gt_mode_menu/session.cpp`). A copy records no
+prize car: the car is rolled and added only when the running game records the result, so
+the car the prize page shows is the one saved:
 
-- **A GT single race** (not a championship round, not a practice run) that finished
-  classified is written as its result is taken, before its replay: the place, the prize
+- **A GT single race** (not a championship round, not a practice run) that was started
+  and finished classified is written as its result is taken, before its replay: the place, the prize
   and the best place, as §3.4 records them (`save_race_run`).
 - **A license test** run with a medal (not a practice run or the demonstration) is
   written as soon as it is judged (`save_license_run`).
@@ -1194,8 +1196,24 @@ prize-model flag (§3.2).
 **Prize car** (`car_get`):
 
 - the reason line comes from the prize set (table below);
-- for a set with several candidates, the candidates flash by, a new one every 6
-  frames, for 150 frames (2.5 s), and then the car won is shown in its paint.
+- every candidate of the set stands on a slowly turning carousel, each turning on its own spot
+  and shown as a black silhouette. A light on the floor marks the car the roulette is on: it
+  comes on at once and fades out over 20 frames when the roulette moves on;
+- the roulette rests on the first candidate for 120 frames, then moves from car to car at 0.1
+  car a frame for 60 frames, then slows down (never below one car every 60 frames). It travels
+  whole turns of the carousel (12 cars' worth for 2, 3 or 4 candidates) plus the way to the car
+  won, and stops only when that car is under the light. The car it stops on is always the car
+  you get. With 2 to 4 candidates it stops 379 to 432 frames (6.3 to 7.2 s) after the page opens;
+- a set with one car has no roulette: the car is shown alone for 210 frames;
+- once the roulette stops, the other cars and their floor lights fade out over 41 frames. Then
+  the camera flies in on the car won, the carousel and the cars' turning slow down, and the
+  other cars, now out of sight, sink through the floor at 0.05 m a frame;
+- when they are below the floor by the height of the tallest car (times 1.1), the car won,
+  still black, is drawn alone and lights up in its paint over 30 frames;
+- when they are twice that far down (69 frames into the drop for cars up to 1.55 m tall), the OK
+  button appears, and from the next frame the dark band behind the car fades in over 24 frames
+  and the "Bonus car acquired!! Check garage." message starts. Until the OK button appears no
+  button does anything, so the page cannot be left before it shows the car won.
 
 The reason line is a hidden text element of the `car_get` page, chosen by the prize set
 (`prize_reason`):
@@ -1423,7 +1441,8 @@ the lowest on pole, and the player starts behind them:
 So close cars often tie. In the Japan Championship, a field drawn as 300ZX, 3000GT, Supra RZ,
 Lancer Evolution VI and NSX Type S Zero gives 5, 5, 4, 4 and 4 kg/HP, and the grid is Supra,
 Lancer, NSX, 300ZX, 3000GT, then the player. Where each grid place is on the course belongs to
-the race description.
+the race description. A free practice in which the player sets a lap lines the field up by best
+lap instead (§22.5).
 
 After a race, the ride car takes back the engine condition the race advanced (§13.1),
 and its dirt is set from the race (§13). Before the race the pre-race menu offers a free
@@ -1525,13 +1544,53 @@ first run starts without a ghost and gets one from its own laps, as above.
 
 ### §22.5 Free practice before a race
 
-The pre-race menu of a GT race or championship round has FREE RUN, a free practice on the
-race's course: the ride car alone, no opponents and no lap count (`RaceScreen::start_free_run`,
-`src/app/screen_race_quick_menu.cpp`). The car starts in its pit box on the course's pit stop
-line and the computer drives it out of the pits (physics page §9.4); it then runs lap after
-lap, keeping the session's best lap (`exact_game_solo_modes`). Tire wear and pit stops work
-as in the race (§22.3). Pause EXIT returns to the pre-race menu with the race's field set up
-again. Free practice costs no day, records nothing and has no replay; the engine condition and dirt it leaves carry on into the race (§13.1).
+The pre-race menu of a GT race or championship round has FREE RUN (shown as QUALIFY), a
+free practice on the race's course with the race's whole field and no lap count
+(`RaceScreen::start_free_run`, `src/app/screen_race_quick_menu.cpp`). The ride car starts in
+its pit box on the course's pit stop line and the computer drives it out of the pits
+(physics page §9.4). Each other car starts on the course behind the line, 300 m plus 200 m
+for each car before it, at 120 km/h, and the computer drives it. Every car then runs lap
+after lap (`exact_game_free_practice_field`). Tire wear and pit stops work as in the race
+(§22.3); a pit stop always services the car.
+
+**The start.** There is no countdown (`race::demo_start_type`, test `race_solo_start_type`):
+the course name shows for 2 s while the car waits in its box, then the computer drives it out
+through the pit lane and around the warm-up lap. Control comes back at the pit lane's exit
+(on Super Speedway by the cones before the line) with the START picture and its sound. The
+HUD's Lap stays at 0'00.000 until the car first crosses the line, which starts timing.
+
+**Messages** (green, 3 s each, queued):
+
+- "Qualifying starts after 1 warm-up lap", 3 s after the start;
+- "Start qualifying" when the player's car first crosses the line;
+- "<car> in pole position" whenever any car sets a new fastest lap.
+
+The texts come from the disc's race texts in the game's language.
+
+**Best laps.** Every car keeps its best lap of the practice. A course-out lap counts for it.
+A second practice before the same race starts each car from its best lap so far (only laps
+without a course-out are carried over). The HUD shows the player's place among the field by
+best lap. The P.P. line shows the session's fastest lap: the label "P.P." until the first
+lap is done, then a picture of the car that set the fastest lap in its place.
+
+**Pause EXIT** returns to the pre-race menu with the race's field set up again:
+
+- **The grid.** If the player set a lap, the field is lined up by best lap, fastest on
+  pole (`race::practice_grid`, test `race_practice_grid`). Cars with equal times, and the
+  cars without a lap (behind every car with one), keep the race's entry order: the player
+  first, then the opponents in their order. If the player set no lap, the grid stays as it
+  was (power-to-weight, §22.1, or the last practice's). The race, and any further practice,
+  starts on that grid.
+- **The list.** A GT race's pre-race list shows the cars in grid order with each car's best
+  lap of the practice, no time ("--'--.---" in the font's long dashes, presentation §D10)
+  for a car without one (`race::practice_list_times`,
+  test `race_practice_list_times`). The menu keeps these times until the next practice;
+  before the first one every car shows no time.
+- **Championship rounds.** The pre-race list shows the new grid with the points; this
+  menu has no time column. The next round starts from its usual grid again (§22.2).
+
+Free practice costs no day, records nothing and has no replay; the engine condition and dirt
+it leaves carry on into the race (§13.1).
 
 - On a dirt course the menu turns FREE RUN off (`race::QuickMenuItems`).
 - On a course without a pit box (a pit stop line with fewer than 4 points,

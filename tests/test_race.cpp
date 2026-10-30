@@ -10,6 +10,7 @@
 #include "formats/course/course_model.h"
 #include "formats/model/gtm1.h"
 #include "game/data/car_database.h"
+#include "race/exact_demo.h"
 #include "formats/db/gt_db.h"
 #include "game/gt_save.h"
 #include "race/backend.h"
@@ -1820,6 +1821,96 @@ TEST(race_result_latch_exit_paths) {
         CHECK(r.finished && r.position == 2 && r.car_condition && r.car_odometer == 2150 && r.odometer_added == 2050);
         CHECK(r.car_wear_m == -295900 && r.car_oil_m == 4100 && r.garage_car == 3);
     }
+}
+
+// The quick menus' list widgets by class (the championship pre-race layout names its rows
+// qm_grid<n> / qm_pt<n>), else by the rank<n>_name / _time names; other widgets none.
+TEST(race_quick_menu_columns) {
+    auto col = [](const char* name, const char* cls, int& row) {
+        menu::Element e;
+        e.name = name;
+        if (cls) e.widget_class = cls;
+        return quick_menu_column(e, row);
+    };
+    int row = -1;
+    CHECK(col("qm_grid1", "qm_list_car_name1", row) == QmColumn::Name && row == 0);
+    CHECK(col("qm_pt6", "qm_pt6", row) == QmColumn::Points && row == 5);
+    CHECK(col("rank3_time", "qm_list_time3", row) == QmColumn::Time && row == 2);
+    CHECK(col("rank2_name", nullptr, row) == QmColumn::Name && row == 1);
+    CHECK(col("rank1_time", "qm_rank_time1", row) == QmColumn::Time && row == 0); // (a class text wins)
+    CHECK(col("rank1_name1", "qm_rank_name1", row) == QmColumn::None);           // a shadow copy
+    CHECK(col("session_number", "qm_session_num", row) == QmColumn::None);
+    CHECK(col("laps", "qm_laps", row) == QmColumn::None);
+}
+
+// The result menu's list: the finishing order; a championship round left by pause EXIT keeps the
+// pre-round grid list (no times, the player's row still marked).
+TEST(race_result_menu_list) {
+    const std::vector<ResultRow> finish = {{"B", "1'02.000", false, 1}, {"A", "--'--.---", true, -1}};
+    const std::optional<std::vector<ResultRow>> grid =
+        std::vector<ResultRow>{{"A", "--'--.---", true, -1}, {"B", "--'--.---", false, 1}};
+    auto names = [](const std::vector<ResultRow>& rows) {
+        std::string s;
+        for (const ResultRow& r : rows) s += r.name + (r.player ? "*" : "") + " " + r.time + ";";
+        return s;
+    };
+    using K = ResultList;
+    CHECK(names(result_menu_list(K::Championship, false, finish, grid)) == "A* --'--.---;B --'--.---;");
+    CHECK(names(result_menu_list(K::Championship, true, finish, grid)) == "B 1'02.000;A* --'--.---;");
+    CHECK(names(result_menu_list(K::Other, false, finish, grid)) == "B 1'02.000;A* --'--.---;");
+    CHECK(names(result_menu_list(K::Championship, false, finish, std::nullopt)) == "B 1'02.000;A* --'--.---;");
+    // A GT race left by pause EXIT: the list cleared, every row "---" with no time, no player mark.
+    const std::string none(kNoTimeText);
+    CHECK(names(result_menu_list(K::GtRace, false, finish, grid)) == "--- " + none + ";--- " + none + ";");
+    CHECK(names(result_menu_list(K::GtRace, true, finish, grid)) == "B 1'02.000;A* --'--.---;");
+}
+
+// The free practice's re-grid: the player's lap decides whether, every car's best lap where;
+// the slower of two different times counts a place, equal times (no time too) go in entry order.
+TEST(race_practice_grid) {
+    constexpr u32 N = kPracticeNoTime;
+    auto grid = [](std::vector<u32> b) { return practice_grid(b); };
+    CHECK(!practice_regrids(std::vector<u32>{N, 60000, 61000}));
+    CHECK(practice_regrids(std::vector<u32>{90000, N, N}));
+    CHECK(!practice_regrids(std::vector<u32>{}));
+    // Fastest first; the player (entry 0) third.
+    CHECK((grid({62000, 61000, 63000, 60000}) == std::vector<int>{2, 1, 3, 0}));
+    // Ties in entry order: entries 1 and 3 share 61.000, the player and entry 2 have no time.
+    CHECK((grid({N, 61000, N, 61000, 60000}) == std::vector<int>{3, 1, 4, 2, 0}));
+    // The player alone with a lap: on pole, the others behind in entry order.
+    CHECK((grid({75000, N, N, N, N, N}) == std::vector<int>{0, 1, 2, 3, 4, 5}));
+    CHECK((grid({N, N, N}) == std::vector<int>{0, 1, 2}));
+    CHECK((grid({60000, 60000, 60000}) == std::vector<int>{0, 1, 2}));
+    // An unsigned compare: the largest value is the slowest.
+    CHECK((grid({0xFFFFFFFFu, 1}) == std::vector<int>{1, 0}));
+}
+
+// The solo modes' start type (the race's start-up from the conductor's start type): free practice has none (-1) whatever
+// the event's (GT3's practice holds no countdown: car 0 waits out its pit-box start), the time trial and free run a moving
+// start, the others the event's with the configuration's +0 clear.
+TEST(race_solo_start_type) {
+    namespace ex = sim::exact;
+    std::vector<u8> bytes(0x200, 0);
+    bytes[0x1F3] = 2; // a standing start (a GT race's)
+    data::Event ev;
+    ev.bytes = ByteSpan(bytes.data(), bytes.size());
+    CHECK(demo_start_type(ev, ex::Conductor::FreePractice) == -1);
+    CHECK(demo_start_type(ev, ex::Conductor::TimeTrial) == 3);
+    CHECK(demo_start_type(ev, ex::Conductor::FreeRun) == 3);
+    CHECK(demo_start_type(ev, ex::Conductor::License) == 2);
+}
+
+// The GT race pre-race menu's list after a free practice: each row (in grid order) its car's best lap in the menus' format,
+// no time for none.
+TEST(race_practice_list_times) {
+    const std::string none(kNoTimeText);
+    std::vector<ResultRow> rows = {{"B", "", false, 1}, {"A", "", true, -1}, {"C", "", false, 0}, {"D", "", false, 5}};
+    const std::vector<u32> best = {72500, 70100, kPracticeNoTime}; // the player, opponent 0, opponent 1
+    practice_list_times(rows, best);
+    CHECK(rows[0].time == none);       // opponent 1: no lap
+    CHECK(rows[1].time == "1'12.500"); // the player
+    CHECK(rows[2].time == "1'10.100");
+    CHECK(rows[3].time == none); // (no entry)
 }
 
 // Every item of the disc's race quick-menu layouts (menu/qm_*.mbl in the game's format, the

@@ -21,6 +21,7 @@
 //
 // All three draw the 640x448 menu frame onto a 4:3 rectangle (`dst`).
 
+#include "base/bytes.h"
 #include "formats/menu/mbl.h"
 #include "menu/flow/game_hooks.h"
 #include "menu/flow/menu_controller.h"
@@ -35,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -54,6 +56,7 @@ struct ResultRow {
     std::string time; // time column text
     bool player = false;
     int car = 0;      // -1 player, -2 second player, >= 0 opponent index (for car icons)
+    std::string points{}; // championship points column text (qm_pt<n>: "10 pts")
 };
 
 // A car's name on the race screens (results, quick menus, records, Analyzer, "Pitting in..."), as
@@ -198,6 +201,39 @@ enum class QmAction {
 };
 QmAction quick_menu_action(std::string_view action);
 
+// The list column a quick-menu widget shows and its row (0-based), by the widget's game-code
+// class, as the list setters read list entry n - 1: qm_list_car_name<n> the car
+// name, qm_list_time<n> the time, qm_pt<n> the points; else by
+// the names rank<n>_name / rank<n>_time; None for any other widget.
+enum class QmColumn { None, Name, Time, Points };
+QmColumn quick_menu_column(const menu::Element& e, int& row);
+
+// The result menu's list after a race: the finishing order `finish` (only when the
+// player finished). Left by pause EXIT (not finished): a championship round's list is not
+// refilled, the list of its pre-round menu, `grid` (the grid order, no times, the
+// player's row marked), when there is one; a GT race's is cleared, every row "---"
+// with no time and no player mark; other runs keep `finish`.
+enum class ResultList { Other, GtRace, Championship };
+std::vector<ResultRow> result_menu_list(ResultList kind, bool finished, std::vector<ResultRow> finish,
+                                        const std::optional<std::vector<ResultRow>>& grid);
+
+// The free practice before a GT race or a championship round (the pre-race menus' FREE RUN, action 5; gt_mode §22.5): every
+// car of the field runs it, and each keeps its best lap of that practice (ms; kPracticeNoTime for none). `best` is by
+// entry: 0 the player, k opponent k - 1.
+constexpr u32 kPracticeNoTime = 0x157529FF; // GT3's "no time" (359,999,999 ms)
+// Whether the practice re-grids the field (and its own test): the player set a lap.
+bool practice_regrids(std::span<const u32> best);
+// The grid after it (GT race, championship): each pair of entries with different best laps counts
+// one place against the slower (an unsigned compare, so no time is the slowest; equal times count nothing), then each
+// entry in entry order takes the slot of its count, or the next one not yet taken (equal times in entry order). Entry k's
+// new grid slot.
+std::vector<int> practice_grid(std::span<const u32> best);
+// The GT race pre-race menu's list after a free practice (with its flag 0; before the first, flag 1:
+// every time none): the rows in grid order (`rows`, by grid slot), each with its car's best lap of the practice. A
+// championship round's list is the grid with the points: its layout has no time column, and its
+// entries keep no time.
+void practice_list_times(std::vector<ResultRow>& rows, std::span<const u32> best);
+
 // The race quick menus run on the same page manager as every other menu
 // (menu::flow::MenuController over menu/<set>.mbl + menu/<LANG>/<set>1.pmb):
 // the icons in a horizontal row in the "menu" window (4 px apart, centred when
@@ -216,6 +252,7 @@ public:
     bool load(const menu::flow::FileReader& read, SDL_Renderer* r, text::GameFonts& fonts, const std::string& pmb,
               const std::string& lang = "US");
     bool loaded() const { return ctl_ != nullptr; }
+    // The list (quick_menu_column): row i = list entry i, the player's row in orange.
     void set_rows(std::vector<ResultRow> rows) { rows_ = std::move(rows); }
     // Code-filled text widgets by name (e.g. qm_license_name, qm_license_time_gold).
     void set_text(const std::string& widget, std::string text) { texts_[widget] = std::move(text); }
